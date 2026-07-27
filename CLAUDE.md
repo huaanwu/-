@@ -61,16 +61,29 @@ Web 一份代码出 APK(SPA + Capacitor 8)。**禁止换 Vue/React/TS**,保持�
 ```
 www/
 ├── index.html              # SPA 入口:含所有 <section class="page">、<script src>、Header / Nav / Modal / Toast 容器
-├── styles.css              # 全局样式(CSS 变量主题),由 index.html <link href="/styles.css"> 直接引用
+├── styles.src.css          # git 跟踪的样式源码 (FIX-1)
+├── styles.css              # build 产物 (gitignored, 由 build-web.mjs 从 src 拷出)
 ├── app.js                  # Core 入口:挂全局兼容层 (window.Core → 全局 fn alias) + 启动 init() + 设置页 _renderSettings()
 ├── core/                   # 通用模块 (Core.* 命名空间,所有 .js 内挂 window.Core)
 │   ├── util.js             # escapeHtml/safeHTML、fmtNum/fmtPct/fmtMoney、parseStockInput、uuid、debounce
 │   ├── storage.js          # Dexie 4 封装 (CRUD + cacheGet/cacheSet 带 TTL + kv + clearAll)
 │   ├── data.js             # AKShare 代理 fetch + IndexedDB 缓存 (getStockSpot/getKLine/getFundSpot/...)
 │   ├── state.js            # 全局状态 (proxyBase, apiKeys, ai, sync, currentPage, marketOpen)
+│   ├── constants.js        # 跨模块阈值常量 (FIX-2: LOT_SIZE/STOP_LOSS_RATIO_AUTO/MAX_SINGLE_STOCK_PCT/...)
+│   ├── portfolio.js        # 单一资产口径 (FIX-3: getAssets({paper}) = cash + stockMkt + fundMkt)
+│   ├── discipline.js       # 交易纪律引擎 (Phase B: preBuyCheck blocks/warns, 实盘/模拟盘共用)
+│   ├── pending.js          # 实盘待确认交易 (Phase E: kv pending_trades, _suggestPosition 建议仓位)
+│   ├── premortem.js        # AI pre-mortem 工具 (Phase D1: bullCase/bearCase/falsify/invalidation)
+│   ├── prebacktest.js      # AI 回测前置 (Phase D2: 近2年日K → worker → sharpe/最大回撤)
+│   ├── crosscheck.js       # 双模型交叉验证 (Phase D2: pickSecondProvider + 双段并排)
+│   ├── regime.js           # 大盘状态机 gate (Z1: gateMultipliers 输出建仓乘数)
+│   ├── market-width.js     # 市场宽度信号 (Z1b: 涨跌家数/成交量, 接入 AI prompt)
+│   ├── kb.js               # 投资百科 (Y10: 高手版 AI 顾问 KB 索引)
+│   ├── ai-service.js       # LLM 客户端 (支持 deepseek/openai/moonshot/qwen/zhipu + 自定义 baseURL + callWithTimeout)
+│   ├── ai-call-log.js      # AI 调用 trace (Z6: prompt/provider/latency/tokens/error, 200 条滚动截断)
+│   ├── self-consistency.js # 多模型投票 (Z4: 替代多空辩论, 取一致答案)
 │   ├── toast.js            # 吐司提示
 │   ├── router.js           # 页面切换 (switchPage / goSettings,会触发 window._onShow_{pageId})
-│   ├── ai-service.js       # LLM 客户端 (支持 deepseek/openai/moonshot/qwen/zhipu + 自定义 baseURL)
 │   ├── macro.js            # 宏观新闻分析 (macro.py seed → JSON)
 │   ├── news.js             # 新闻筛选
 │   ├── market.js           # 市场状态/指数数据
@@ -79,11 +92,19 @@ www/
 ├── app/                    # 按域拆分的页面脚本(每域一个 .js,挂 window.{Domain})
 │   ├── watchlist.js   (行情看板)
 │   ├── holdings.js    (持仓管理)
+│   ├── paper.js       (模拟盘, AI 选股自动成交 + 每日快照 + 日终小结)
 │   ├── journal.js     (复盘笔记,Markdown 渲染)
-│   ├── screener.js    (选股筛选)
+│   ├── screener.js    (选股筛选,待确认卡片走 Core.Portfolio.getAssets)
+│   ├── stock-advisor.js (单股 AI 简评 + 历史验证 + 第二意见)
 │   ├── backtest.js    (策略回测)
 │   ├── alerts.js      (提醒/监控,本地通知)
-│   ├── fund.js        (基金专项,最大文件 ~79KB)
+│   ├── fund.js        (基金专项主文件 ~400 行,7 个 DOMAINS 公共方法)
+│   ├── fund/          (Phase F 拆分,各子文件挂 window.Fund 属性)
+│   │   ├── macro-bar.js / news-bar.js / seed.js
+│   │   ├── ai-advisor.js / portfolio-risk.js / news-impact.js
+│   │   ├── rebalance.js (含 H.1 AI 讲解 _aiExplain)
+│   │   ├── buy-import.js
+│   │   └── weekly-report.js (H.2 AI 周报)
 │   ├── account.js     (资金账户/流水)
 │   └── market-bar.js  (顶部市场条)
 ├── workers/
@@ -95,7 +116,7 @@ www/
 scripts/
 ├── dev-proxy.mjs           # Express + http-proxy-middleware, /api/akshare → AKTools, /api/llm/{provider} → LLM
 ├── copy-libs.mjs           # node_modules/{echarts,dexie} → www/lib/
-├── build-web.mjs           # dist/ → www/ (替换 styles.css link)
+├── build-web.mjs           # dist/ → www/ (回滚 styles.css 引用,src → www 复制)
 ├── supabase_schema.sql     # 可选云同步的 Postgres schema
 ├── powershell-profile.ps1  # PowerShell 7.x profile 片段(UTF-8 + gst 快捷命令)
 ├── daily_summary.mjs, e2e*.mjs, emu_e2e.mjs  # 离线数据采集 / e2e 测试 runner
