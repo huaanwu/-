@@ -1859,7 +1859,7 @@ try {
     // holdings 截断到 10 条 + 盈亏
     const longHoldings = Array.from({length: 15}, (_, i) => ({ code: `60000${i}`, name: `股${i}`, profitLossPct: 0.05 + i * 0.01 }));
     const out = A._summarizeCtx({ holdings: longHoldings });
-    if (out.includes('共 15 条') && out.includes('取前 10') && out.match(/- 600\d+ \S+ 盈亏/g).length === 10) {
+    if (out.includes('共 15 条') && out.includes('取前 10') && out.match(/- 600\d+\s+\S+\s*\[?\s*[^\]]*盈亏/g).length === 10) {
       ok('_summarizeCtx: holdings 截到 10');
     } else fail('_summarizeCtx holdings', out.slice(0, 200));
 
@@ -5356,6 +5356,35 @@ section('36] 中长线盯盘: horizon 打标 / 分层轮询(短线定时器+中�
     if (/hasCachedNarrative\s*=\s*\(\s*a\.type\s*===\s*'earnings_warning'\s*\|\|\s*a\.type\s*===\s*'valuation'\s*\|\|\s*a\.type\s*===\s*'regime_change'\s*\)/.test(alertsSrc)) {
       ok('36.10f AI 解读默认缓存: regime_change 类型纳入 hasCachedNarrative (源码对账)');
     } else fail('36.10f hasCachedNarrative regime 缓存', '源码未匹配 regime_change');
+
+    // ---- 36.X P0/P1: agents._summarizeCtx 价格注入 + 截断 + [降级] + journal 装配 ----
+    // 放在 36.10f 之后、setTimeout wait 之前, 全部源码正则
+    const agentsSrc = fs.readFileSync('www/core/agents.js', 'utf-8');
+    // 36.X.a 持仓段注入价格/市值/成本 (锚定 coach 的 targetPrice)
+    if (/currentPrice/.test(agentsSrc) && /valueByCode/.test(agentsSrc) && /costPrice/.test(agentsSrc)) {
+      ok('36.X.a _summarizeCtx 持仓段注入 currentPrice / valueByCode / costPrice');
+    } else fail('36.X.a 持仓价格注入', 'currentPrice/valueByCode/costPrice 任一缺失');
+    // 36.X.b 截断提示 (省略 N 条) — 源码里是模板字符串 `省略 ${total - shown} 条`, 跨多行, 用 [\s\S]*? 容错
+    if (/省略[\s\S]*?条/.test(agentsSrc) && /total\s*-\s*shown/.test(agentsSrc)) {
+      ok('36.X.b 截断提示: holdings/alerts/journals/observations/findings/news 末尾标注省略数');
+    } else fail('36.X.b 截断提示', '源码未匹配"省略 N 条"或 total-shown 表达式');
+    // 36.X.c [降级] 标记
+    if (/\[降级\]/.test(agentsSrc)) {
+      ok('36.X.c [降级] 标记: portfolio.quoteFail / macro / marketWidth 失败传 [降级]');
+    } else fail('36.X.c [降级] 标记', '源码未匹配"[降级]"');
+    // 36.X.d portfolio / macro / marketWidth 三段
+    if (/## 组合/.test(agentsSrc) && /## 宏观/.test(agentsSrc) && /## 市场宽度/.test(agentsSrc)) {
+      ok('36.X.d 新增段: 组合 / 宏观 / 市场宽度 (LLM 看得到组合总盘+宏观+宽度)');
+    } else fail('36.X.d 新增段', '## 组合 / ## 宏观 / ## 市场宽度 任一缺失');
+    // 36.X.e journal.js 装配 portfolio / macro / marketWidth
+    const journalSrc = fs.readFileSync('www/app/journal.js', 'utf-8');
+    if (/Core\.Portfolio\.getAssets/.test(journalSrc) && /Core\.Macro\.get/.test(journalSrc) && /Core\.MarketWidth\.getMarketWidth/.test(journalSrc)) {
+      ok('36.X.e journal._runAgentPipeline 装配 portfolio / macro / marketWidth');
+    } else fail('36.X.e journal 装配不全', 'Portfolio/Macro/MarketWidth 任一未装配');
+    // 36.X.f holding.currentPrice 注入
+    if (/h\.currentPrice\s*=/.test(journalSrc) && /getStockQuote/.test(journalSrc)) {
+      ok('36.X.f journal._runAgentPipeline 给 holdings 注入 currentPrice (via getStockQuote)');
+    } else fail('36.X.f currentPrice 注入', 'h.currentPrice = 或 getStockQuote 缺失');
 
     // _aiEarningsNarrative: AI 调通 → 写 alert.aiNarrative; AI 调失败 → 兜底
     notices.length = 0;

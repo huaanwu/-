@@ -229,7 +229,26 @@
         // 近期 7 天
         const weekAgo = Date.now() - 7 * 86400000;
         const recentJournals = allJ.filter(j => (j.createdAt || 0) >= weekAgo).slice(-5);
-        const ctx = { holdings, alerts, recentJournals };
+        // P1.1: 并行拉组合 / 宏观 / 市场宽度, 任一失败不影响其他
+        const [portfolio, macroText, marketWidth] = await Promise.all([
+          Core.Portfolio && Core.Portfolio.getAssets
+            ? Core.Portfolio.getAssets({ paper: false }).catch(e => { console.warn('[aiColleague] portfolio 拉取失败:', e); return null; })
+            : Promise.resolve(null),
+          Core.Macro && Core.Macro.get
+            ? Core.Macro.get().then(m => Core.Macro.formatForPrompt ? Core.Macro.formatForPrompt(m) : (m ? JSON.stringify(m).slice(0, 800) : null)).catch(e => { console.warn('[aiColleague] macro 拉取失败:', e); return null; })
+            : Promise.resolve(null),
+          Core.MarketWidth && Core.MarketWidth.getMarketWidth
+            ? Core.MarketWidth.getMarketWidth().catch(e => { console.warn('[aiColleague] marketWidth 拉取失败:', e); return null; })
+            : Promise.resolve(null)
+        ]);
+        // P0.1: 行情价格注入 holdings (currentPrice), 串行拉 (holdings <20 只, cache 命中后 <2s)
+        for (const h of holdings) {
+          try {
+            const q = await Core.Data.getStockQuote(h.code);
+            if (q) h.currentPrice = parseFloat(q.最新价 != null ? q.最新价 : q.price) || null;
+          } catch (e) { /* keep null, summary 里不显示价格字段 */ }
+        }
+        const ctx = { holdings, alerts, recentJournals, portfolio, macro: macroText, marketWidth };
         // 跑 pipeline
         const r = await Core.Agents.runPipeline(intent, ctx);
         // 渲染 steps

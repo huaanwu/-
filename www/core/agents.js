@@ -67,16 +67,42 @@
     if (!ctx || typeof ctx !== 'object') return '(空)';
     const lines = [];
     if (Array.isArray(ctx.holdings) && ctx.holdings.length > 0) {
-      lines.push(`## 持仓 (共 ${ctx.holdings.length} 条, 取前 10)`);
+      // P0.1: 持仓行注入成本/现价/市值, 锚定 coach 的 targetPrice
+      // P0.2: 末尾加省略提示
+      const total = ctx.holdings.length;
+      const shown = Math.min(10, total);
+      lines.push(`## 持仓 (共 ${total} 条, 取前 ${shown}${total > shown ? `, 省略 ${total - shown} 条` : ''})`);
       ctx.holdings.slice(0, 10).forEach(h => {
         const code = h.code || h['代码'] || '';
         const name = h.name || h['名称'] || '';
+        const cost = parseFloat(h.costPrice != null ? h.costPrice : h.cost) || null;
+        const price = parseFloat(h.currentPrice != null ? h.currentPrice : h.price) || null;
+        const mv = code && ctx.portfolio && ctx.portfolio.valueByCode ? ctx.portfolio.valueByCode[code] : null;
         const pl = h.profitLossPct != null ? (h.profitLossPct * 100).toFixed(1) + '%' : '';
-        lines.push(`- ${code} ${name}${pl ? ' 盈亏 ' + pl : ''}`);
+        const parts = [];
+        if (cost) parts.push(`成本 ${cost.toFixed(2)}`);
+        if (price) parts.push(`现价 ${price.toFixed(2)}`);
+        if (mv) parts.push(`市值 ${(mv / 10000).toFixed(1)}万`);
+        if (pl) parts.push(`盈亏 ${pl}`);
+        lines.push(`- ${code} ${name}${parts.length ? '  [' + parts.join(' / ') + ']' : ''}`);
       });
     }
+    // P1.2: 组合段 (在持仓后插入, LLM 看到总盘 + 现金约束)
+    if (ctx.portfolio && typeof ctx.portfolio === 'object') {
+      const p = ctx.portfolio;
+      const ta = (p.totalAssets / 10000).toFixed(1);
+      const cash = (p.cash / 10000).toFixed(1);
+      const stk = (p.stockMkt / 10000).toFixed(1);
+      const fnd = p.fundMkt > 0 ? (p.fundMkt / 10000).toFixed(1) : null;
+      const cashPct = p.totalAssets > 0 ? (p.cash / p.totalAssets * 100).toFixed(1) : '0';
+      lines.push(`## 组合 (实盘)`);
+      lines.push(`- 总资产: ${ta}万 (股票 ${stk}万${fnd ? ` / 基金 ${fnd}万` : ''} / 现金 ${cash}万 ${cashPct}%)`);
+      if (p.quoteFail > 0) lines.push(`- [降级] ${p.quoteFail} 只持仓行情拉取失败, 现价用成本价兜底, 估值偏宽`);
+    }
     if (Array.isArray(ctx.alerts) && ctx.alerts.length > 0) {
-      lines.push(`## 提醒 (共 ${ctx.alerts.length} 条, 取前 5)`);
+      const total = ctx.alerts.length;
+      const shown = Math.min(5, total);
+      lines.push(`## 提醒 (共 ${total} 条, 取前 ${shown}${total > shown ? `, 省略 ${total - shown} 条` : ''})`);
       ctx.alerts.slice(0, 5).forEach(a => {
         const code = a.code || '';
         const t = a.type || '';
@@ -85,7 +111,9 @@
       });
     }
     if (Array.isArray(ctx.recentJournals) && ctx.recentJournals.length > 0) {
-      lines.push(`## 近期复盘 (共 ${ctx.recentJournals.length} 条, 取标题前 8)`);
+      const total = ctx.recentJournals.length;
+      const shown = Math.min(8, total);
+      lines.push(`## 近期复盘 (共 ${total} 条, 取前 ${shown}${total > shown ? `, 省略 ${total - shown} 条` : ''})`);
       ctx.recentJournals.slice(0, 8).forEach(j => {
         const d = j.date || '';
         const t = j.title || j.code || '';
@@ -94,26 +122,49 @@
       });
     }
     if (Array.isArray(ctx.observations) && ctx.observations.length > 0) {
-      lines.push(`## 观察点 (${ctx.observations.length} 条)`);
+      const total = ctx.observations.length;
+      const shown = Math.min(12, total);
+      lines.push(`## 观察点 (共 ${total} 条, 取前 ${shown}${total > shown ? `, 省略 ${total - shown} 条` : ''})`);
       ctx.observations.slice(0, 12).forEach(o => {
         lines.push(`- [${o.severity || '?'}] ${o.text || JSON.stringify(o)}`);
       });
     }
     if (Array.isArray(ctx.findings) && ctx.findings.length > 0) {
-      lines.push(`## 诊断 (${ctx.findings.length} 条)`);
+      const total = ctx.findings.length;
+      const shown = Math.min(10, total);
+      lines.push(`## 诊断 (共 ${total} 条, 取前 ${shown}${total > shown ? `, 省略 ${total - shown} 条` : ''})`);
       ctx.findings.slice(0, 10).forEach(f => {
         lines.push(`- [${f.confidence || '?'}/${f.type || '?'}] ${f.text || JSON.stringify(f)}`);
       });
     }
+    // P1.2: 宏观段 (macro 已是 formatForPrompt 后的字符串, 或 {degraded,reason} 标记)
+    if (typeof ctx.macro === 'string' && ctx.macro.length > 0) {
+      lines.push(`## 宏观\n${ctx.macro.slice(0, 800)}`);
+    } else if (ctx.macro && ctx.macro.degraded) {
+      lines.push(`## 宏观\n[降级] ${ctx.macro.reason || '宏观数据不可用'}`);
+    }
+    // P1.2: 市场宽度段
+    if (ctx.marketWidth && typeof ctx.marketWidth === 'object') {
+      const w = ctx.marketWidth;
+      const statusLabel = ({ bull: '偏多', bear: '偏空', neutral: '震荡', unknown: '未知' })[w.status] || w.status || '未知';
+      const advPct = w.advancePct != null ? w.advancePct.toFixed(1) + '%' : '?';
+      lines.push(`## 市场宽度`);
+      lines.push(`- 涨 ${w.advance || 0} / 跌 ${w.decline || 0} / 平 ${w.flat || 0} (${advPct} 涨, ${statusLabel})`);
+      if (w.partial) lines.push(`- [降级] ${w.partial}`);
+    }
     if (typeof ctx.market === 'string' && ctx.market.length > 0) {
-      lines.push(`## 市场\n${ctx.market.slice(0, 800)}`);
+      // P0.2: 截断提示
+      lines.push(`## 市场\n${ctx.market.slice(0, 800)}${ctx.market.length > 800 ? '\n... [截断]' : ''}`);
     } else if (ctx.market && typeof ctx.market === 'object') {
-      lines.push(`## 市场\n${JSON.stringify(ctx.market).slice(0, 800)}`);
+      const s = JSON.stringify(ctx.market);
+      lines.push(`## 市场\n${s.slice(0, 800)}${s.length > 800 ? '\n... [截断]' : ''}`);
     }
     if (typeof ctx.news === 'string' && ctx.news.length > 0) {
-      lines.push(`## 新闻\n${ctx.news.slice(0, 800)}`);
+      lines.push(`## 新闻\n${ctx.news.slice(0, 800)}${ctx.news.length > 800 ? '\n... [截断]' : ''}`);
     } else if (Array.isArray(ctx.news) && ctx.news.length > 0) {
-      lines.push(`## 新闻 (${ctx.news.length} 条, 取前 5)`);
+      const total = ctx.news.length;
+      const shown = Math.min(5, total);
+      lines.push(`## 新闻 (共 ${total} 条, 取前 ${shown}${total > shown ? `, 省略 ${total - shown} 条` : ''})`);
       ctx.news.slice(0, 5).forEach(n => lines.push(`- ${n.title || n.text || JSON.stringify(n)}`));
     }
     return lines.length > 0 ? lines.join('\n') : '(无事实)';
