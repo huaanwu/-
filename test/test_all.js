@@ -2969,6 +2969,268 @@ section('23] Paper 模拟盘纯函数实测');
   }
 })();
 
+// ========== [23b] Paper 分账户 (sleeve, AI 短线操盘手 T1) ==========
+section('23b] Paper 分账户 sleeve 实测');
+(async () => {
+  try {
+    const paperSrc = readFileSafe(path.join(WWW, 'app', 'paper.js'));
+    if (!paperSrc) throw new Error('paper.js 读不到');
+    const K = _loadRealConstants();
+
+    // T1 常量进 Core.Constants
+    if (K.PAPER_SHORT_CASH === 30000 && typeof K.PAPER_SHORT_POSITION_PCT === 'number' && K.PAPER_SHORT_POSITION_PCT > 0) {
+      ok(`sleeve: 常量 PAPER_SHORT_CASH=30000 / PAPER_SHORT_POSITION_PCT=${K.PAPER_SHORT_POSITION_PCT}`);
+    } else fail('sleeve 常量', JSON.stringify({ c: K.PAPER_SHORT_CASH, p: K.PAPER_SHORT_POSITION_PCT }));
+
+    // 与 [23] 同款 vm sandbox (内存 mock storage)
+    const buildCtx = (storageData) => {
+      const pctx = {
+        window: {},
+        console,
+        escapeHtml: (s) => String(s == null ? '' : s),
+        fmtMoney: (n) => (typeof n === 'number' ? n.toFixed(2) : '0.00'),
+        fmtNum: (n, d) => (typeof n === 'number' ? n.toFixed(d || 0) : '0'),
+        fmtPct: (n) => (typeof n === 'number' ? (n * 100).toFixed(2) + '%' : '-'),
+        pctClass: () => '',
+        fmtDate: () => '2026-07-27',
+        uuid: () => 'sleeve-test-' + Math.random().toString(36).slice(2, 8),
+        toastSuccess: () => {}, toastError: () => {}, toastWarning: () => {},
+        confirm: () => true,
+        fetch: async () => ({ ok: true, json: async () => ({ code: 0 }) })
+      };
+      pctx.window.Core = {
+        Storage: {
+          kvGet: async (k) => (k in storageData.kv ? storageData.kv[k] : null),
+          kvSet: async (k, v) => { storageData.kv[k] = v; },
+          all: async (t) => storageData.tables[t] || [],
+          get: async (t, id) => (storageData.tables[t] || []).find(x => x.id === id) || null,
+          add: async (t, obj) => { (storageData.tables[t] = storageData.tables[t] || []).push(obj); },
+          put: async (t, obj) => {
+            const arr = (storageData.tables[t] = storageData.tables[t] || []);
+            const i = arr.findIndex(x => x.id === obj.id);
+            if (i >= 0) arr[i] = obj; else arr.push(obj);
+          },
+          remove: async (t, id) => {
+            storageData.tables[t] = (storageData.tables[t] || []).filter(x => x.id !== id);
+          }
+        },
+        Data: {
+          getStockQuote: async (code) => storageData.quotes[code] || null,
+          getIndexSpot: async () => storageData.indexSpot || []
+        },
+        Util: { stockCodePrefix: (c) => /^(60|68)/.test(c) ? 'sh' : 'sz' },
+        Constants: K
+      };
+      pctx.Core = pctx.window.Core;
+      pctx.window.document = { getElementById: () => null };
+      pctx.document = pctx.window.document;
+      vm.createContext(pctx);
+      vm.runInContext(paperSrc, pctx);
+      return pctx;
+    };
+
+    // ---- init: 双账户各自初始化 + 不覆盖 ----
+    const storeA = { kv: {}, tables: {}, quotes: {}, indexSpot: [] };
+    const PA = buildCtx(storeA).window.Paper;
+    await PA.init();
+    const accLong = await PA.getAccount();
+    const accShort = await PA.getAccount('short');
+    if (accLong.cash === 100000 && accLong.positionPct === 0.10) ok('sleeve init: 长线账户 10 万 (沿用 paper_account)');
+    else fail('sleeve init long', JSON.stringify(accLong));
+    if (accShort.cash === 30000 && accShort.initialCash === 30000 && accShort.positionPct === K.PAPER_SHORT_POSITION_PCT) {
+      ok('sleeve init: 短线账户 3 万 (kv paper_account_short)');
+    } else fail('sleeve init short', JSON.stringify(accShort));
+    storeA.kv.paper_account_short.cash = 12345;
+    await PA.init();
+    if ((await PA.getAccount('short')).cash === 12345) ok('sleeve init: 短线账户已存在不覆盖');
+    else fail('sleeve init 覆盖', '');
+
+    // ---- sleeve 过滤: 存量无字段 = 'long' ----
+    storeA.tables.holdings = [
+      { id: 'l1', code: '600519', name: '贵州茅台', shares: 100, costPrice: 10, isPaper: true },  // 存量行无 sleeve
+      { id: 's1', code: '000001', name: '平安银行', shares: 200, costPrice: 5, isPaper: true, sleeve: 'short' },
+      { id: 'r1', code: '600111', name: '北方稀土', shares: 100, costPrice: 20 }                  // 真实持仓
+    ];
+    storeA.quotes = { '600519': { 最新价: 10 }, '000001': { 最新价: 5 } };
+    const posDef = await PA.getPositions();
+    const posLong = await PA.getPositions('long');
+    const posShort = await PA.getPositions('short');
+    if (posDef.length === 1 && posDef[0].id === 'l1' && posLong.length === 1 && posLong[0].id === 'l1') {
+      ok('sleeve 过滤: 默认/显式 long 只见存量行 (无 sleeve 字段 = long)');
+    } else fail('sleeve 过滤 long', JSON.stringify(posDef.map(p => p.id)));
+    if (posShort.length === 1 && posShort[0].id === 's1') ok('sleeve 过滤: short 只见 short 行 (真实持仓永不混入)');
+    else fail('sleeve 过滤 short', JSON.stringify(posShort.map(p => p.id)));
+
+    // ---- buy: 不传 sleeve 向后兼容 = long; sleeve:'short' 独立现金 ----
+    const storeB = {
+      kv: {},
+      tables: {},
+      quotes: { '600519': { 代码: '600519', 名称: '贵州茅台', 最新价: 10 }, '000001': { 代码: '000001', 名称: '平安银行', 最新价: 5 } },
+      indexSpot: []
+    };
+    const PB = buildCtx(storeB).window.Paper;
+    await PB.init();
+    const hb1 = await PB.buy('600519', '贵州茅台', '', 100);   // 旧调用方式 (无 opts)
+    if (hb1 && hb1.sleeve === 'long' && Math.abs((await PB.getAccount()).cash - (100000 - 1005)) < 0.01) {
+      ok('sleeve buy: 不传 sleeve = long, 行写 sleeve 字段, 扣 paper_account');
+    } else fail('sleeve buy 兼容', JSON.stringify(hb1));
+    const hb2 = await PB.buy('000001', '平安银行', '', 100, { sleeve: 'short' });  // 100×5+费5=505
+    const accBLong = await PB.getAccount('long');
+    const accBShort = await PB.getAccount('short');
+    if (hb2 && hb2.sleeve === 'short'
+      && Math.abs(accBShort.cash - (30000 - 505)) < 0.01
+      && Math.abs(accBLong.cash - (100000 - 1005)) < 0.01) {
+      ok('sleeve buy: short 只扣 paper_account_short, 长线现金不动');
+    } else fail('sleeve buy short', JSON.stringify({ hb2, accBShort, accBLong }));
+    const txB = (storeB.tables.transactions || []).find(t => t.code === '000001');
+    if (txB && txB.sleeve === 'short') ok('sleeve buy: transactions 行写 sleeve');
+    else fail('sleeve buy tx', JSON.stringify(txB));
+    // 同 code 不同子账户各自成行
+    await PB.buy('600519', '', '', 100, { sleeve: 'short' });
+    const rowsB = storeB.tables.holdings.filter(h => h.code === '600519');
+    if (rowsB.length === 2 && (rowsB[0].sleeve || 'long') !== (rowsB[1].sleeve || 'long')) {
+      ok('sleeve buy: 同 code 在 long/short 各自成行 (不合并成本)');
+    } else fail('sleeve 同 code 分行', JSON.stringify(rowsB));
+
+    // ---- sell: 从持仓行读 sleeve, 现金自动回笼对应账户 ----
+    const cashShortBefore = (await PB.getAccount('short')).cash;
+    const sB = await PB.sell(hb2.id, 100);   // 卖 short 持仓 100×5, 费 5+0.25=5.25 → +494.75
+    const cashShortAfter = (await PB.getAccount('short')).cash;
+    const cashLongAfter = (await PB.getAccount('long')).cash;
+    if (sB && Math.abs(cashShortAfter - (cashShortBefore + 494.75)) < 0.01
+      && Math.abs(cashLongAfter - (100000 - 1005)) < 0.01) {
+      ok('sleeve sell: short 持仓卖出回笼 paper_account_short, 长线不动');
+    } else fail('sleeve sell', JSON.stringify({ cashShortBefore, cashShortAfter, cashLongAfter }));
+
+    // ---- resetAccount: 只清对应 sleeve ----
+    storeB.kv.paper_snapshots = [{ date: '2026-07-26', paperTotal: 100000, realTotal: 0, csi300: 3900, shortTotal: 30000 }];
+    await PB.resetAccount('short');
+    const leftHoldings = storeB.tables.holdings || [];
+    const leftTx = storeB.tables.transactions || [];
+    if (leftHoldings.every(h => (h.sleeve || 'long') === 'long') && leftHoldings.length === 1
+      && leftTx.every(t => (t.sleeve || 'long') === 'long')
+      && (await PB.getAccount('short')).cash === 30000
+      && Math.abs((await PB.getAccount('long')).cash - (100000 - 1005)) < 0.01
+      && storeB.kv.paper_snapshots.length === 1) {
+      ok('sleeve reset: resetAccount(\'short\') 只清 short 持仓/交易/现金, long 与快照不动');
+    } else fail('sleeve reset', JSON.stringify({ h: leftHoldings.length, t: leftTx.length, snaps: storeB.kv.paper_snapshots.length }));
+
+    // ---- snapshotIfNeeded: shortTotal 字段 ----
+    const storeC = {
+      kv: { paper_account: { initialCash: 100000, cash: 90000, createdAt: 1, positionPct: 0.10 } },
+      tables: { holdings: [{ id: 's9', code: '000001', shares: 200, costPrice: 5, isPaper: true, sleeve: 'short' }] },
+      quotes: { '000001': { 最新价: 6 } },
+      indexSpot: []
+    };
+    const PC = buildCtx(storeC).window.Paper;
+    await PC.init();   // 补 paper_account_short (30000)
+    const snapsC = await PC.snapshotIfNeeded();
+    // shortTotal = 30000 现金 + 200×6 = 31200
+    if (snapsC.length === 1 && snapsC[0].shortTotal === 31200 && snapsC[0].paperTotal === 90000) {
+      ok(`sleeve snapshot: shortTotal ${snapsC[0].shortTotal} (= 现金 30000 + 市值 1200)`);
+    } else fail('sleeve snapshot', JSON.stringify(snapsC[0]));
+
+    // ---- EOD: short 段 + 当日成交按 sleeve 分流 ----
+    const storeD = {
+      kv: {
+        paper_account: { initialCash: 100000, cash: 80000, createdAt: 1, positionPct: 0.10 },
+        paper_account_short: { initialCash: 30000, cash: 25000, createdAt: 1, positionPct: 0.20 },
+        paper_snapshots: [{ date: '2026-07-24', paperTotal: 99000, realTotal: 0, csi300: 3900, shortTotal: 26000 }],
+        paper_eod_reports: []
+      },
+      tables: {
+        holdings: [{ id: 'dl1', code: '600519', name: '贵州茅台', shares: 100, costPrice: 10, isPaper: true }],
+        transactions: [
+          { id: 'dt1', code: '600519', type: 'buy', date: '2026-07-27', price: 10, shares: 100, fee: 5, isPaper: true, createdAt: 1 },
+          { id: 'dt2', code: '000001', type: 'buy', date: '2026-07-27', price: 5, shares: 200, fee: 5, isPaper: true, sleeve: 'short', auto: true, createdAt: 2 }
+        ]
+      },
+      quotes: { '600519': { 最新价: 12 } },
+      indexSpot: []
+    };
+    const PD = buildCtx(storeD).window.Paper;
+    const eodD = await PD.maybeGenerateEodReport(new Date(2026, 6, 27, 16, 0));
+    if (eodD && eodD.trades.length === 1 && eodD.trades[0].code === '600519') {
+      ok('sleeve eod: 主报告成交只含 long (short 单分流到 short 段)');
+    } else fail('sleeve eod 主成交', JSON.stringify(eodD && eodD.trades));
+    if (eodD && eodD.short && eodD.short.cash === 25000 && eodD.short.totalAssets === 25000
+      && eodD.short.dayPnl === -1000 && eodD.short.trades.length === 1 && eodD.short.trades[0].auto === true) {
+      ok('sleeve eod: short 段 现金/总资产/当日盈亏(对照 shortTotal)/🤖 成交');
+    } else fail('sleeve eod short 段', JSON.stringify(eodD && eodD.short));
+    // 老快照无 shortTotal → short.dayPnl 容错为 null
+    storeD.kv.paper_eod_reports = [];
+    storeD.kv.paper_snapshots = [{ date: '2026-07-24', paperTotal: 99000, realTotal: 0, csi300: 3900 }];
+    const eodD2 = await PD.maybeGenerateEodReport(new Date(2026, 6, 27, 16, 30));
+    if (eodD2 && eodD2.short && eodD2.short.dayPnl === null) ok('sleeve eod: 老快照无 shortTotal → short.dayPnl=null 容错');
+    else fail('sleeve eod 容错', JSON.stringify(eodD2 && eodD2.short));
+
+    // ---- 纪律引擎: 锚点分 sleeve + DEFAULT_CONFIG.short 预留 ----
+    const discSrc = readFileSafe(path.join(WWW, 'core', 'discipline.js'));
+    if (!discSrc) throw new Error('discipline.js 读不到');
+    const dbuild = (storageData) => {
+      const dctx = { window: {}, console };
+      dctx.window.Core = {
+        Storage: {
+          kvGet: async (k) => (k in storageData.kv ? storageData.kv[k] : null),
+          kvSet: async (k, v) => { storageData.kv[k] = v; },
+          all: async (t) => storageData.tables[t] || [],
+          where: async (t, idx, v) => (storageData.tables[t] || []).filter(x => x[idx] === v)
+        },
+        Data: { getStockQuote: async (code) => storageData.quotes[code] || null },
+        State: { get: () => null },
+        Util: { escapeHtml: (s) => String(s == null ? '' : s) },
+        Constants: K,
+        // mock Portfolio: 与真实 portfolio.js 同款 sleeve 口径 (存量无字段 = long)
+        Portfolio: {
+          getAssets: async (opts = {}) => {
+            const sleeve = opts.sleeve === 'short' ? 'short' : 'long';
+            const key = sleeve === 'short' ? 'paper_account_short' : 'paper_account';
+            const cash = (storageData.kv[key] && storageData.kv[key].cash) || 0;
+            const filt = (storageData.tables.holdings || [])
+              .filter(h => h.isPaper && (h.sleeve || 'long') === sleeve);
+            let stockMkt = 0;
+            const valueByCode = {};
+            for (const h of filt) {
+              const v = (parseFloat(h.shares) || 0) * (parseFloat(h.costPrice) || 0);
+              valueByCode[h.code] = (valueByCode[h.code] || 0) + v;
+              stockMkt += v;
+            }
+            return { cash, stockMkt, fundMkt: 0, totalAssets: cash + stockMkt, valueByCode, quoteFail: 0, paper: true, sleeve };
+          }
+        }
+      };
+      dctx.Core = dctx.window.Core;
+      vm.createContext(dctx);
+      vm.runInContext(discSrc, dctx);
+      return dctx;
+    };
+    const storeE = {
+      kv: {
+        paper_account: { initialCash: 100000, cash: 100000, createdAt: 1, positionPct: 0.10 },
+        paper_account_short: { initialCash: 30000, cash: 30000, createdAt: 1, positionPct: 0.20 }
+      },
+      tables: { journals: [] },
+      quotes: { '600519': { 最新价: 10, 涨跌幅: 1 } }
+    };
+    const DE = dbuild(storeE).window.Core.Discipline;
+    if (DE.DEFAULT_CONFIG.short && DE.DEFAULT_CONFIG.short.maxDailyTrades === 3 && DE.DEFAULT_CONFIG.short.cooldownHours === 48) {
+      ok('sleeve discipline: DEFAULT_CONFIG.short 预留 (T2 启用)');
+    } else fail('sleeve discipline config', JSON.stringify(DE.DEFAULT_CONFIG.short));
+    const chkShort = await DE.preBuyCheck({ code: '600519', price: 10, shares: 100, amount: 1000, isPaper: true, sleeve: 'short', assumption: '业绩拐点', stopLoss: 9 });
+    if (chkShort.ok && storeE.kv.discipline_month_anchor_paper_short && storeE.kv.discipline_month_anchor_paper_short.startTotal === 30000
+      && !('discipline_month_anchor_paper' in storeE.kv)) {
+      ok('sleeve discipline: isPaper+short → 锚点写 discipline_month_anchor_paper_short');
+    } else fail('sleeve discipline 锚点 short', JSON.stringify({ chk: chkShort.blocks, kv: Object.keys(storeE.kv) }));
+    const chkLong = await DE.preBuyCheck({ code: '600519', price: 10, shares: 100, amount: 1000, isPaper: true, assumption: '业绩拐点', stopLoss: 9 });
+    if (chkLong.ok && storeE.kv.discipline_month_anchor_paper && storeE.kv.discipline_month_anchor_paper.startTotal === 100000) {
+      ok('sleeve discipline: isPaper 不传 sleeve → 锚点沿用存量 key (视为 long)');
+    } else fail('sleeve discipline 锚点 long', JSON.stringify(Object.keys(storeE.kv)));
+
+  } catch (e) {
+    fail('Paper 分账户 sleeve', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
 // ========== [24] Discipline 交易纪律引擎 (Phase B) ==========
 section('24] Discipline 交易纪律引擎纯函数 + 集成实测');
 (async () => {
@@ -5207,7 +5469,8 @@ section('36] 中长线盯盘: horizon 打标 / 分层轮询(短线定时器+中�
     function makePeSeries(currentPe, baseline = 20) {
       const out = [];
       const start = new Date('2018-01-31');
-      for (let i = 0; i < 60; i++) {
+      // lookback + 1 = 61 (产品 _judgeValuation 阈值), 多给 1 行防边界
+      for (let i = 0; i < 65; i++) {
         const d = new Date(start.getTime() + i * 30 * 86400000);
         out.push({ '日期': d.toISOString(), '平均市盈率': baseline + (i % 10) * 0.3 });
       }
@@ -5271,7 +5534,7 @@ section('36] 中长线盯盘: horizon 打标 / 分层轮询(短线定时器+中�
     // ---- 36.8 AI 解读默认走缓存 + 强制刷新开关 ----
     // 源码对账: 默认 hasCachedNarrative 命中时不会调 interpretAlert, forceRefresh=true 才调
     if (/forceRefresh\s*\|\|\s*!hasCachedNarrative/.test(alertsSrc) &&
-        /hasCachedNarrative\s*\?\s*'<button[^>]*aiInterpRefresh[^>]*🔄 AI 重新解读/.test(alertsSrc) &&
+        /hasCachedNarrative\s*\?[\s\S]*?id\s*=\s*"aiInterpRefresh"[\s\S]*?AI 重新解读/.test(alertsSrc) &&
         /if\s*\(forceRefresh\s*&&\s*hasCachedNarrative\)/.test(alertsSrc)) {
       ok('36.8 AI 解读: 默认缓存路径 + 强制刷新开关 (源码对账)');
     } else fail('36.8 AI 解读开关', '默认缓存或强制刷新分支未匹配');
@@ -5428,9 +5691,38 @@ section('[37] Core.AlertsAgent: 白名单校验 / parseIntent / preview / apply 
 
 // ========== 总结 ==========
 // 同步 section 的 ok() 已经在 console 打印;
-// async IIFE 里的 ok() 还在 microtask 队列里, 用 setImmediate 给一次机会再读 passed/failed
-// 注: 36.x 段内有 setTimeout wait 链, 真实计数可能比显示略小 (已知 harness 限制, 后续单独修)
-setImmediate(() => {
+// async IIFE 里的 ok() 还在 microtask / setTimeout 队列里, 旧版本 setImmediate 只给一次机会,
+// 36.x 段有 5×50ms=250ms 的 setTimeout wait 链 (vm 跨边界), 旧机制直接掐断 → 假绿。
+// 修法: 每 30ms poll 一次 process._getActiveHandles(), 等 timer/immediate 句柄稳定为 0,
+//      再多等 2 轮确认无遗漏, 最长封顶 5s。
+function waitForIIFEsDrain() {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const MAX_MS = 5000;
+    const INTERVAL = 30;
+    const REQUIRED_QUIET = 2;  // 连续 2 次 (60ms) 无 timer 才认为 drained
+    let quietTicks = 0;
+    const tick = () => {
+      // 过滤掉 process 自身 + 我们汇总用的 setInterval
+      const handles = process._getActiveHandles();
+      const activeTimers = handles.filter(h => {
+        // Timer / Immediate / Timeout 都是带 _idleTimeout 或带 [owner]
+        return h && (h._onTimeout || (typeof h.hasRef === 'function' && h._idleStart !== undefined && !(h.constructor && h.constructor.name === 'WriteStream')));
+      }).length;
+      if (activeTimers === 0) {
+        quietTicks++;
+        if (quietTicks >= REQUIRED_QUIET) return resolve();
+      } else {
+        quietTicks = 0;
+      }
+      if (Date.now() - start > MAX_MS) return resolve();  // 封顶
+      setTimeout(tick, INTERVAL);
+    };
+    setTimeout(tick, INTERVAL);
+  });
+}
+
+waitForIIFEsDrain().then(() => {
   console.log(`\n\x1b[1m===== 测试结果 =====\x1b[0m`);
   console.log(`\x1b[32m通过: ${passed}\x1b[0m  |  \x1b[${failed > 0 ? '31' : '32'}]m失败: ${failed}\x1b[0m`);
   if (failed > 0) {
