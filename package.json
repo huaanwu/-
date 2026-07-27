@@ -29,9 +29,9 @@
   },
   "devDependencies": {
     "concurrently": "^9.1.0",
-    "express": "^4.21.2",
+    "express": "^5.2.1",
     "http-proxy-middleware": "^3.0.3",
     "typescript": "^5.9.3",
-    "vite": "^7.3.6"
+    "vite": "^8.1.5"
   }
 }
