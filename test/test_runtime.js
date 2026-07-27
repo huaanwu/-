@@ -171,6 +171,106 @@ if (typeof u === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-
 if (uuid() !== uuid()) ok('uuid 两次不同');
 else fail('uuid 重复', '两次调用产生相同 UUID');
 
+// ========== [8] Toast 模块加载 + 函数引用 ==========
+section('8] Core.Toast 加载与函数绑定');
+const TOAST_PATH = path.join(ROOT, 'www', 'core', 'toast.js');
+if (!fs.existsSync(TOAST_PATH)) {
+  fail('toast load', `文件不存在: ${TOAST_PATH}`);
+} else {
+  // 最小 DOM mock(toast.js 用 getElementById + createElement + setTimeout)
+  const toastRootChildren = [];
+  const toastCtx = vm.createContext({
+    window: ctx.window,
+    console,
+    setTimeout, clearTimeout,
+    document: {
+      getElementById(id) {
+        if (id === 'toastRoot') {
+          return {
+            appendChild(child) { toastRootChildren.push(child); return child; }
+          };
+        }
+        return null;
+      },
+      createElement(tag) {
+        return {
+          tagName: tag,
+          className: '',
+          textContent: '',
+          style: {},
+          remove() {}
+        };
+      }
+    }
+  });
+  try {
+    vm.runInContext(fs.readFileSync(TOAST_PATH, 'utf-8'), toastCtx, { filename: TOAST_PATH });
+  } catch (e) {
+    fail('toast load', `执行失败: ${e.message}`);
+  }
+  const Toast = toastCtx.window.Core && toastCtx.window.Core.Toast;
+  if (!Toast) {
+    fail('toast', 'window.Core.Toast 未挂载');
+  } else {
+    ok('toast.js loaded → window.Core.Toast 已挂载');
+    // 函数引用齐
+    ['show', 'success', 'error', 'info', 'warning'].forEach(fn => {
+      if (typeof Toast[fn] === 'function') ok(`Toast.${fn} 是函数`);
+      else fail(`Toast.${fn}`, '类型应为 function');
+    });
+
+    // 调用 show:不依赖真实 DOM 写入,但不应抛错
+    function t_toast(name, fn, expectedType) {
+      toastRootChildren.length = 0;
+      try {
+        fn(`test-${name}`);
+        const last = toastRootChildren[toastRootChildren.length - 1];
+        if (last && last.className === `toast ${expectedType}`) ok(`${name} → appendChild class="${last.className}"`);
+        else fail(name, `appendChild 内容不符合,实际 className=${last && last.className}`);
+      } catch (e) {
+        fail(name, `调用抛出: ${e.message}`);
+      }
+    }
+    t_toast('show(info)',     (m) => Toast.show(m, 'info'),         'info');
+    t_toast('show(success)',  (m) => Toast.show(m, 'success'),      'success');
+    t_toast('show(error)',    (m) => Toast.show(m, 'error'),        'error');
+    t_toast('show(warning)',  (m) => Toast.show(m, 'warning'),      'warning');
+    t_toast('success()',      (m) => Toast.success(m),              'success');
+    t_toast('error()',        (m) => Toast.error(m),                'error');
+    t_toast('info()',         (m) => Toast.info(m),                 'info');
+    t_toast('warning()',      (m) => Toast.warning(m),              'warning');
+
+    // textContent 透传:用户消息里的 <script> 应作为纯文本(不解析为 HTML)
+    toastRootChildren.length = 0;
+    Toast.show('<script>alert(1)</script>', 'warning');
+    const xssEl = toastRootChildren[toastRootChildren.length - 1];
+    if (xssEl && xssEl.textContent === '<script>alert(1)</script>') {
+      ok('Toast 用 textContent 而非 innerHTML(XSS 安全)');
+    } else {
+      fail('Toast XSS', `textContent 应等于原文,实际 ${xssEl && JSON.stringify(xssEl.textContent)}`);
+    }
+
+    // 缺 toastRoot 元素时:不抛错,降级 console.log
+    const origLog = console.log;
+    let logMsg = null;
+    console.log = (...args) => { logMsg = args.join(' '); };
+    const noRootCtx = vm.createContext({
+      window: {},
+      console,
+      setTimeout, clearTimeout,
+      document: { getElementById: () => null }
+    });
+    vm.runInContext(fs.readFileSync(TOAST_PATH, 'utf-8'), noRootCtx, { filename: TOAST_PATH });
+    noRootCtx.window.Core.Toast.show('降级消息', 'error');
+    if (logMsg && logMsg.includes('降级消息') && logMsg.includes('error')) {
+      ok('Toast.show 无 root 时降级 console.log');
+    } else {
+      fail('Toast 降级', `日志内容不符: ${logMsg}`);
+    }
+    console.log = origLog;
+  }
+}
+
 // ========== 总结 ==========
 console.log('');
 console.log(`\x1b[1m结果:\x1b[0m 通过 ${passed}, 失败 ${failed}`);
