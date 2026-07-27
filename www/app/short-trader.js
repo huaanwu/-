@@ -300,7 +300,15 @@
         `- plans 0-${SHORT_RULES.maxDailyTrades} 条 (允许 0 条 = 空仓)`,
         '- 价格关系必须满足 stopLoss < triggerPrice < targetPrice',
         '- code 必须从候选池选, 池外代码会被直接丢弃',
-        '- probability/confidence 必填, 不自评视为无效输出'
+        '- probability/confidence 必填, 不自评视为无效输出',
+        '',
+        '【候选池 K线特征 (Bug 159)】',
+        '- 5日%: 近 5 日累计涨跌幅 (含当日), 短线趋势强度',
+        '- 振幅%: 近 20 日 (high-low)/close 均值, 反映波动率 (>5% 高波动, <2% 低波动)',
+        '- MA5/MA20: 5/20 日均线, 价在 MA 上方 = 短线偏多, 下方 = 偏空',
+        '- 量: 近 20 日均成交量 (股数), 流动性参考 (太低 = 滑点大)',
+        '- 决策建议: 突破买入(above) 优先看 MA5>MA20 + 5日%为正; 回调买入(below) 优先看 5日%已回调 3-8% 且 MA20 之上',
+        '- 缺 K线特征的代码: 退化为只参考 currentPrice, 不强求'
       ].join('\n');
     },
 
@@ -348,13 +356,16 @@
       lines.push('');
       lines.push('## 候选池 (只能从这里选 code, 价格为当前快照)');
       if (ctx.pool.length) {
-        // Bug B 修复 (现价锚定): 候选池每只带 currentPrice, AI 报 triggerPrice 时以此为锚
+        // Bug B 修复 (现价锚定) + Bug 159 (K线特征): 每只带 currentPrice + klineFeatures
         lines.push(ctx.pool.map(x => {
-          if (x.currentPrice && x.currentPrice > 0) {
-            const ch = x.changePct != null ? ` (${(x.changePct >= 0 ? '+' : '')}${x.changePct.toFixed(2)}%)` : '';
-            return `${x.code} ${x.name} @${x.currentPrice.toFixed(2)}${ch}`.trim();
-          }
-          return `${x.code} ${x.name} @未知`.trim();
+          const pricePart = x.currentPrice && x.currentPrice > 0
+            ? `@${x.currentPrice.toFixed(2)}` + (x.changePct != null ? ` (${(x.changePct >= 0 ? '+' : '')}${x.changePct.toFixed(2)}%)` : '')
+            : '@未知';
+          const kf = x.klineFeatures;
+          const kfPart = kf
+            ? ` [5日${kf.trend5pct >= 0 ? '+' : ''}${kf.trend5pct}%, 振幅${kf.range20}%, MA5=${kf.ma5}/MA20=${kf.ma20}, 量${kf.vol20}]`
+            : '';
+          return `${x.code} ${x.name} ${pricePart}${kfPart}`.trim();
         }).join(' / '));
       } else {
         lines.push('(候选池为空 → 必须输出 plans: [])');
@@ -449,6 +460,29 @@
             }
           }
         }
+        // Bug 159 修复 (两阶段选品 - 候选池 K线特征注入):
+        //   每只拉近 20 根日 K (24h 缓存), 提取 4 维特征给 AI 决策 (取代"凭记忆"瞎编)
+        //   - trend5pct: 5 日涨跌幅 (短线趋势)
+        //   - vol20: 近 20 日均量 (流动性参考)
+        //   - range20: 近 20 日振幅均值 (波动率)
+        //   - ma5/ma20: 5/20 均线偏离 (技术位)
+        //   失败 code: klineFeatures=null → AI 仍按现价锚定, 不强求 K 线
+        ctx.klineByCode = new Map();
+        if (Array.isArray(ctx.pool) && ctx.pool.length) {
+          const klineResults = await Promise.allSettled(
+            ctx.pool.map(c => Core.Data.getStockKLine(c.code, 'daily', undefined, undefined, '').catch(() => null))
+          );
+          for (let i = 0; i < ctx.pool.length; i++) {
+            const r = klineResults[i];
+            if (r && r.status === 'fulfilled' && Array.isArray(r.value) && r.value.length >= 5) {
+              const feats = this._summarizeKline(r.value);
+              if (feats) {
+                ctx.pool[i].klineFeatures = feats;
+                ctx.klineByCode.set(ctx.pool[i].code, feats);
+              }
+            }
+          }
+        }
       } catch (e) { console.warn('[ShortTrader] ctx 读自选股/注入现价失败:', e); }
       // 同代码 48h 冷却集合 (transactions 表短线卖出)
       try {
@@ -471,6 +505,51 @@
       const date = String(row.日期 || '').slice(0, 10);
       if (!(open > 0) || !(high > 0) || !(low > 0) || !(close > 0) || !date) return null;
       return { open, high, low, close, date };
+    },
+
+    /**
+     * 提取 K 线特征 (纯函数, 可单元测)
+     * 输入: 日 K 数组 [{open, high, low, close, date}] (按日期升序)
+     * 输出: { trend5pct, vol20, range20, ma5, ma20, lastClose, lastDate }
+     *   - trend5pct: 最近 5 个交易日收盘涨跌幅 (与第 6 交易日收盘比), 反映短线趋势
+     *   - vol20: 近 20 日均成交量 (股数), 流动性参考
+     *   - range20: 近 20 日振幅均值 ((high-low)/close), 波动率
+     *   - ma5/ma20: 5/20 日均线 (按收盘价算术平均)
+     *   - lastClose/lastDate: 最新一根
+     * 数据不足 (< 5 根) → null (不返回垃圾特征)
+     */
+    _summarizeKline(rows) {
+      if (!Array.isArray(rows) || rows.length < 5) return null;
+      // rows 可能是原始 aktools 格式 (字段中文), 先标准化
+      const bars = rows.map(r => this._barOf(r) || {
+        open: +r.open, high: +r.high, low: +r.low, close: +r.close, date: String(r.date || '').slice(0, 10)
+      }).filter(b => b && isFinite(b.close) && b.date);
+      if (bars.length < 5) return null;
+      const last = bars[bars.length - 1];
+      const lastClose = last.close;
+      // 5 日趋势: 用最近 5 根的最后 vs 第 6 根 (即 bars.length>=6 取 bars[length-6], 否则 vs 第 1 根)
+      const refIdx = bars.length >= 6 ? bars.length - 6 : 0;
+      const refClose = bars[refIdx].close;
+      const trend5pct = refClose > 0 ? ((lastClose - refClose) / refClose) * 100 : 0;
+      // 5/20 日均线 (不足 20 根用可用根数)
+      const window5 = bars.slice(-5).reduce((s, b) => s + b.close, 0) / 5;
+      const n = Math.min(20, bars.length);
+      const window20 = bars.slice(-n).reduce((s, b) => s + b.close, 0) / n;
+      // 近 20 日均量
+      const vol20 = bars.slice(-n).reduce((s, b) => s + (Number(b.volume) || 0), 0) / n;
+      // 近 20 日振幅均值
+      const range20 = bars.slice(-n).reduce((s, b) => {
+        return s + (b.close > 0 ? (b.high - b.low) / b.close : 0);
+      }, 0) / n;
+      return {
+        lastClose: +lastClose.toFixed(2),
+        lastDate: last.date,
+        trend5pct: +trend5pct.toFixed(2),
+        vol20: +vol20.toFixed(0),
+        range20: +(range20 * 100).toFixed(2),  // 转为百分比
+        ma5: +window5.toFixed(2),
+        ma20: +window20.toFixed(2)
+      };
     },
 
     /**
