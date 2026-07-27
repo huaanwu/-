@@ -1068,7 +1068,10 @@
         for (const p of positions) if (!p.closed) codes.add(p.code);
 
         if (codes.size === 0) {
-          await Core.Storage.kvSet('paper_cond_settle', { lastSettleDate: today });
+          // Bug F 修复 (空跑 lastSettleDate): 当日没有 pending 单也没在持仓位时, 不写 lastSettleDate.
+          // 旧逻辑会立即写 today → 之后当日即便真有成交 (例如 14:30 拉的盘中买入) 也走的是 "次日结算" 路径,
+          // 推迟到次日才结算, 体验变差且日志错乱.
+          // 新逻辑: 只在真正结算过至少 1 笔 (filled/exited/expired/cancelled > 0) 才写 lastSettleDate.
           return summary;
         }
 
@@ -1152,7 +1155,12 @@
         }
         if (posDirty) await Core.Storage.kvSet('paper_short_positions', positions);
 
-        await Core.Storage.kvSet('paper_cond_settle', { lastSettleDate: today });
+        // Bug F 修复 (空跑 lastSettleDate): 仅在真正结算过 ≥1 笔才写 lastSettleDate.
+        // 旧逻辑: 不论有没有成交都写 → 当日新加的 pending/在持仓位会被推迟到次日结算.
+        // 触发纯空跑 (codes.size===0) 已在函数顶部 return summary, 不写.
+        if (summary.filled + summary.exited + summary.expired + summary.cancelled > 0) {
+          await Core.Storage.kvSet('paper_cond_settle', { lastSettleDate: today });
+        }
         return summary;
       } catch (e) {
         console.warn('[Paper] 条件单结算失败:', e);

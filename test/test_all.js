@@ -7474,6 +7474,125 @@ section('[44] Bug C 同代码去重: addCondOrder 拒绝同 code pending/已持�
   }
 })();
 
+section('[45] Bug F 空跑 lastSettleDate: codes.size===0 / 0 笔不写 lastSettleDate');
+(async () => {
+  try {
+    const paperSrc = readFileSafe(path.join(WWW, 'app', 'paper.js'));
+    if (!paperSrc) throw new Error('paper.js 读不到');
+    const storeF = {
+      kv: {
+        paper_account_short: { initialCash: 30000, cash: 30000, createdAt: 1, positionPct: 0.20 }
+      },
+      tables: { paper_holdings: [] },
+      quotes: {}, indexSpot: [],
+      // kline 兜底返空数组, 让 settle 不会真成交
+      klineByCode: {}
+    };
+    const buildCtx = (storageData) => {
+      const pctx = {
+        window: {}, console,
+        escapeHtml: (s) => String(s == null ? '' : s),
+        fmtMoney: (n) => (typeof n === 'number' ? n.toFixed(2) : '0.00'),
+        fmtNum: (n, d) => (typeof n === 'number' ? n.toFixed(d || 0) : '0'),
+        fmtPct: (n) => (typeof n === 'number' ? (n * 100).toFixed(2) + '%' : '-'),
+        pctClass: () => '',
+        fmtDate: () => '2026-07-27',
+        uuid: () => 'paper-F-' + Math.random().toString(36).slice(2, 8),
+        parseStockInput: (t) => {
+          const m = String(t || '').trim().match(/^(\d{6})/);
+          return m ? { code: m[1], name: String(t).slice(6).trim() } : null;
+        },
+        toastSuccess: () => {}, toastError: () => {}, toastWarning: () => {},
+        confirm: () => true,
+        fetch: async () => ({ ok: true, json: async () => ({ code: 0 }) })
+      };
+      pctx.window.Core = {
+        Storage: {
+          kvGet: async (k) => (k in storageData.kv ? storageData.kv[k] : null),
+          kvSet: async (k, v) => { storageData.kv[k] = v; },
+          all: async (t) => storageData.tables[t] || [],
+          get: async (t, id) => (storageData.tables[t] || []).find(x => x.id === id) || null,
+          add: async (t, obj) => { (storageData.tables[t] = storageData.tables[t] || []).push(obj); },
+          put: async (t, obj) => {
+            const arr = (storageData.tables[t] = storageData.tables[t] || []);
+            const i = arr.findIndex(x => x.id === obj.id);
+            if (i >= 0) arr[i] = obj; else arr.push(obj);
+          },
+          remove: async (t, id) => {
+            storageData.tables[t] = (storageData.tables[t] || []).filter(x => x.id !== id);
+          }
+        },
+        Data: {
+          getStockQuote: async (code) => storageData.quotes[code] || null,
+          getStockKLine: async (code) => storageData.klineByCode[code] || [],
+          getIndexSpot: async () => storageData.indexSpot || []
+        },
+        Util: { stockCodePrefix: (c) => /^(60|68)/.test(c) ? 'sh' : 'sz' },
+        Constants: _loadRealConstants()
+      };
+      pctx.Core = pctx.window.Core;
+      pctx.window.document = { getElementById: () => null };
+      pctx.document = pctx.window.document;
+      vm.createContext(pctx);
+      vm.runInContext(paperSrc, pctx);
+      return pctx;
+    };
+    const PF = buildCtx(storeF).window.Paper;
+    await PF.init();
+
+    // 45.a 完全空 (无 pending, 无 short 持仓) → 不写 lastSettleDate
+    storeF.kv.paper_cond_settle = {};
+    const s1 = await PF.settleCondOrders(new Date(2026, 6, 28, 16, 0));
+    if (s1 && (!storeF.kv.paper_cond_settle || !storeF.kv.paper_cond_settle.lastSettleDate)) {
+      ok('45.a 完全空: 不写 lastSettleDate (返 {filled:0,...})');
+    } else fail('45.a', JSON.stringify({ s1, meta: storeF.kv.paper_cond_settle }));
+
+    // 45.b 1 张 pending 单, K 线空 (兜底返 []) → 不成交 → 不写 lastSettleDate
+    storeF.kv.paper_cond_orders = [{
+      id: 'p1', code: '000001', sleeve: 'short', triggerDirection: 'below',
+      triggerPrice: 10, stopLoss: 9, targetPrice: 12, shares: 100, amount: 1000,
+      status: 'pending', createdAt: 1, createdDate: '2026-07-26', createdAfterClose: true
+    }];
+    storeF.kv.paper_cond_settle = {};
+    const s2 = await PF.settleCondOrders(new Date(2026, 6, 28, 16, 0));
+    const sum2 = s2 || { filled: 0 };
+    if (sum2.filled === 0 && (!storeF.kv.paper_cond_settle || !storeF.kv.paper_cond_settle.lastSettleDate)) {
+      ok('45.b pending 但 K 线空: 不成交 + 不写 lastSettleDate');
+    } else fail('45.b', JSON.stringify({ s2, meta: storeF.kv.paper_cond_settle }));
+
+    // 45.c 真成交 1 笔 (K 线触发价命中) → 写 lastSettleDate
+    // 策略: 5 根 K 线, 都让 open > triggerPrice (10) → _fillCheck 不触发 (continue 跳过)
+    //      然后 _tradingDaysAfter(bars, '2026-06-01') = 5 >= 3 → expired 路径触发
+    // 注意: paper.js 的 _barOf 期待 aktools 字段 {日期, 开盘, 最高, 最低, 收盘}
+    // 我们的 mock 要返这种格式, 不然 _barOf 返 null → bars 数组空
+    storeF.klineByCode['000001'] = [
+      { 日期: '2026-07-22', 开盘: 10.5, 最高: 11, 最低: 10, 收盘: 10.8 },
+      { 日期: '2026-07-23', 开盘: 10.8, 最高: 11.2, 最低: 10.5, 收盘: 11 },
+      { 日期: '2026-07-24', 开盘: 11, 最高: 11.5, 最低: 10.8, 收盘: 11.2 },
+      { 日期: '2026-07-25', 开盘: 11.2, 最高: 11.5, 最低: 11, 收盘: 11.3 },
+      { 日期: '2026-07-28', 开盘: 10.5, 最高: 10.8, 最低: 10.3, 收盘: 10.6 }  // 全部开盘 > 触发价=10 → 不触发 fill
+    ];
+    storeF.kv.paper_cond_settle = {};
+    storeF.kv.paper_cond_orders[0].expireAt = 1;  // 已过期 (仅 UI 显示用, 实际过期判定走 _tradingDaysAfter)
+    storeF.kv.paper_cond_orders[0].createdDate = '2026-06-01';  // 远期, 必超期
+    const s3 = await PF.settleCondOrders(new Date(2026, 6, 28, 16, 0));
+    const sum3 = s3 || { expired: 0 };
+    if (process.env.DEBUG_F) console.log('[DEBUG 45.c]', JSON.stringify({ sum3, meta: storeF.kv.paper_cond_settle }));
+    // today 用 fmtDate mock ('2026-07-27'), 所以 lastSettleDate 应写 '2026-07-27'
+    if (sum3.expired >= 1 && storeF.kv.paper_cond_settle && storeF.kv.paper_cond_settle.lastSettleDate === '2026-07-27') {
+      ok('45.c 真结算 1 笔 (expired): 写 lastSettleDate');
+    } else fail('45.c', JSON.stringify({ sum3, meta: storeF.kv.paper_cond_settle }));
+
+    // 45.d 同日再次调 settleCondOrders → skipped=true (防重复)
+    const s4 = await PF.settleCondOrders(new Date(2026, 6, 28, 16, 30));
+    if (s4 && s4.skipped === true) {
+      ok('45.d 同日重复调: skipped=true (lastSettleDate 命中)');
+    } else fail('45.d', JSON.stringify(s4));
+  } catch (e) {
+    fail('45 Bug F 空跑 lastSettleDate', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
 // ========== 总结 ==========
 // 同步 section 的 ok() 已经在 console 打印;
 // async IIFE 里的 ok() 还在 microtask / setTimeout 队列里, 旧版本 setImmediate 只给一次机会,
