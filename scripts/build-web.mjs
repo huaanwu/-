@@ -141,8 +141,56 @@ async function main() {
   // 4) 清理 dist/
   await rimraf(DIST);
 
+  // 5) 注入版本号到 www/app.js (v + git desc + 日期)
+  //    防止 package.json 改了 app.js 没改导致脱节
+  //    git 不跟踪这个改动 (app.js 本来就是 gitignored 之外的产物, 不对, app.js 是 git 跟踪)
+  //    → 我们不在这里直接改 git 跟踪的 app.js, 而是写一份 .app-version-info.json 给 APK 读取
+  //    app.js 顶部的 APP_VERSION/APP_BUILD_DATE 仍由开发者手动维护, 构建时打印出来对比
+  try {
+    const pkg = JSON.parse(await fs.readFile(path.join(ROOT, 'package.json'), 'utf-8'));
+    const buildDate = new Date().toISOString().slice(0, 10);  // YYYY-MM-DD
+    const versionInfo = {
+      version: pkg.version || '0.0.0',
+      buildDate,
+      gitCommit: await _tryGitShortHash(),
+      builtAt: new Date().toISOString()
+    };
+    await fs.writeFile(
+      path.join(WWW, 'version.json'),
+      JSON.stringify(versionInfo, null, 2),
+      'utf-8'
+    );
+    console.log(`  [ver] version.json: ${versionInfo.version} · ${buildDate}${versionInfo.gitCommit ? ' · ' + versionInfo.gitCommit : ''}`);
+
+    // 对照 app.js 顶部的 APP_VERSION/APP_BUILD_DATE, 不一致则 warn
+    const appJs = await fs.readFile(path.join(WWW, 'app.js'), 'utf-8');
+    const vMatch = appJs.match(/var APP_VERSION\s*=\s*'([^']+)'/);
+    const dMatch = appJs.match(/var APP_BUILD_DATE\s*=\s*'([^']+)'/);
+    const appVer = vMatch ? vMatch[1] : '(missing)';
+    const appDate = dMatch ? dMatch[1] : '(missing)';
+    const pkgV = 'v' + versionInfo.version;
+    if (appVer !== pkgV) {
+      console.warn(`  ⚠ app.js APP_VERSION = '${appVer}' vs package.json version '${pkgV}' — 不同步, 设置页会显示旧版本`);
+    }
+    if (appDate !== buildDate) {
+      console.warn(`  ⚠ app.js APP_BUILD_DATE = '${appDate}' vs today '${buildDate}' — 构建日期不一致`);
+    }
+    if (appVer === pkgV && appDate === buildDate) {
+      console.log(`  [ver] app.js APP_VERSION/APP_BUILD_DATE 与 package.json 同步 ✓`);
+    }
+  } catch (e) {
+    console.warn('  ⚠ 版本注入失败:', e.message);
+  }
+
   console.log('✅ build-web 完成, www/ 现在包含 Vite 处理后的产物');
   console.log('   下一步: npx cap sync android');
+}
+
+async function _tryGitShortHash() {
+  try {
+    const { execFileSync } = await import('child_process');
+    return execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: ROOT, encoding: 'utf-8' }).trim();
+  } catch { return null; }
 }
 
 main().catch(e => { console.error(e); process.exit(1); });

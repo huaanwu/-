@@ -28,3 +28,4 @@ emu_screenshots/
 android/
 .claude/
 www/sw.js
+www/version.json
