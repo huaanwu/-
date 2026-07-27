@@ -44,5 +44,6 @@ for sz in sizes:
 
 os.makedirs('www/public/icons', exist_ok=True)
 out='www/public/icons/icon.ico'
-imgs[0].save(out, format='ICO', sizes=[(sz,sz) for sz in sizes], append_images=imgs[1:])
+# electron-builder 要求 ICO 第一帧 ≥ 256x256, 所以用最大帧作 base image
+imgs[-1].save(out, format='ICO', sizes=[(sz,sz) for sz in sizes], append_images=imgs[:-1])
 print('OK', out, sizes)

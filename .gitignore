@@ -29,3 +29,4 @@ android/
 .claude/
 www/sw.js
 www/version.json
+dist/
