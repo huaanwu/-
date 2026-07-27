@@ -117,6 +117,24 @@
     return await refresh();        // 无任何记录 → 现算 (失败时 refresh 内部保持默认)
   }
 
+  // ========== 订阅器 (Phase B-2: regime → alerts 通知) ==========
+  // refresh 每次发现 state 变化 (oldState !== newState) 触发回调, 通知上层写 alerts / 弹通知
+  const _subscribers = [];
+  function subscribe(cb) {
+    if (typeof cb !== 'function') return () => {};
+    _subscribers.push(cb);
+    return () => {                                  // 返回 unsubscribe
+      const i = _subscribers.indexOf(cb);
+      if (i >= 0) _subscribers.splice(i, 1);
+    };
+  }
+  function _emit(oldState, newState, rec) {
+    for (const cb of _subscribers) {
+      try { cb({ oldState, newState, rec }); }
+      catch (e) { console.warn('[Regime] 订阅回调失败:', e); }
+    }
+  }
+
   /**
    * 重算状态 (每日最多一次, lastDate 去重; app.js init 异步调用)
    * 拉沪深300 近 120 根日K → MA60/斜率/连续站上计数 → _classify 迁移 → 写回 kv
@@ -176,6 +194,8 @@
       console.warn('[Regime] 状态写回 kv 失败:', e);
     }
     _mem = rec;
+    // Phase B-2: 状态切换 → 通知订阅者 (alerts.js 监听写规则/弹通知)
+    if (old.state !== rec.state) _emit(old.state, rec.state, rec);
     return rec;
   }
 
@@ -195,6 +215,7 @@
     get,
     refresh,
     _classify,
-    gateMultipliers
+    gateMultipliers,
+    subscribe                  // Phase B-2: alerts.js 订阅状态切换
   };
 })();

@@ -1,15 +1,113 @@
 /**
- * Alerts - 提醒/监控
- * 价格/涨跌幅提醒,使用浏览器通知 / Capacitor Local Notifications
+ * Alerts - 提醒/监控 (中长线盯盘改造)
+ *
+ * 双模式分层轮询:
+ *   - 短线规则 (价格/涨跌幅/成交量, horizon='short'): 1 分钟轮询,
+ *     只在存在启用的短线规则时才起定时器 (没有就不起, 省电省请求)
+ *   - 中长线规则 (horizon='long'): 30 分钟调度 tick, 各规则按 nextCheck + 自身频率
+ *     (再平衡=intervalDays / 财报日历=日频 / 业绩预告=周频 / 大盘趋势=日频 / 估值=双周频) 决定是否真跑
+ *
+ * 中长线规则类型:
+ *   - rebalance_quarterly 季度再平衡 (已有)
+ *   - earnings_disclosure 财报披露前 N 天 (Phase U, 已有)
+ *   - earnings_warning    业绩预告异动 (预减/略减/首亏/续亏 命中实盘持仓, 周频, 全局一条)
+ *   - regime_change       大盘趋势迁移 (Core.Regime 状态变化时通知, 日频, 全局一条)
+ *   - valuation           大盘估值偏离 (指数 PE-TTM 近5年分位超阈值, 双周频, 全局一条)
+ *
+ * alert 行非索引字段: horizon / nextCheck / lastNotifiedKeys / lastState / lastNotifiedKey
+ * 通知走 _notify/_notifyLong → _doNotify, 附"上次类似情境"复盘联动 (_fetchJournalContext)
  */
 (function() {
   'use strict';
 
+  // 短线规则类型 (1 分钟轮询); 其余一律中长线
+  const SHORT_TYPES = ['price_above', 'price_below', 'change_above', 'change_below', 'volume_above'];
+
+  // 全局规则 (不绑定个股代码, 全组合/全市场维度, 每类只需一条)
+  const GLOBAL_TYPES = ['rebalance_quarterly', 'earnings_warning', 'regime_change', 'valuation'];
+
+  // 全局规则的固定 code 值 (占位, 无实际含义)
+  const GLOBAL_CODE = {
+    rebalance_quarterly: 'funds',
+    earnings_warning: 'holdings',
+    regime_change: 'market',
+    valuation: 'market'
+  };
+
+  // Regime 三态中文标签 (与 core/regime.js GATES 一致; 本地留一份兜底, vm 测试无 Core.Regime 也能跑)
+  const REGIME_LABELS = { bull: '趋势市 🐂', range: '震荡市 ↔️', bear: '下跌市 ⚠' };
+
   const Alerts = {
 
-    async init() {},
+    async init() {
+      // Phase B-2: 监听 Core.Regime 状态切换 → 弹通知 + 写 alerts 行
+      if (window.Core && Core.Regime && typeof Core.Regime.subscribe === 'function') {
+        Core.Regime.subscribe(({ oldState, newState, rec }) => {
+          this._onRegimeChange(oldState, newState, rec).catch(e =>
+            console.warn('[Alerts] 处理 regime 切换失败:', e));
+        });
+      }
+    },
+
+    /**
+     * Phase B-2: regime 状态切换处理
+     * 读取用户配置 (默认 'deteriorate_only' = 只通知恶化, 即 bull/range → bear)
+     * 命中则: 写一条 alerts 行 (active=true, type=regime_change, code='market', aiGenerated:true)
+     *         + 弹系统通知 (toast + 浏览器 Notification)
+     */
+    async _onRegimeChange(oldState, newState, rec) {
+      if (!oldState || !newState || oldState === newState) return;
+      // 读用户偏好 (deteriorate_only / all)
+      const mode = (await Core.Storage.kvGet('alerts_regime_watch_mode')) || 'deteriorate_only';
+      const isDeteriorate = (newState === 'bear') && (oldState === 'bull' || oldState === 'range');
+      if (mode === 'deteriorate_only' && !isDeteriorate) return;  // 用户要安静, 跳过
+
+      const oldLabel = REGIME_LABELS[oldState] || oldState;
+      const newLabel = REGIME_LABELS[newState] || newState;
+      const since = rec && rec.since ? rec.since : new Date().toISOString().slice(0, 10).replace(/-/g, '');
+      const summary = `${oldLabel} → ${newLabel}`;
+      const body = isDeteriorate
+        ? `大盘进入下跌市, 中长线纪律: 检查单票集中度, 不主动加仓`
+        : `大盘状态从 ${oldLabel} 切换到 ${newLabel}`;
+
+      // 1) 写 alerts 行 (单一全局规则, 已存在则更新状态)
+      const existing = await Core.Storage.where('alerts', 'type', 'regime_change');
+      const data = {
+        id: (existing && existing[0] && existing[0].id) || ('regime-' + Date.now()),
+        code: 'market',
+        name: '大盘趋势迁移',
+        type: 'regime_change',
+        active: true,
+        triggered: true,
+        hitCount: ((existing && existing[0] && existing[0].hitCount) || 0) + 1,
+        lastHit: Date.now(),
+        lastState: newState,
+        lastNotifiedKey: oldState + '_' + newState + '_' + since,
+        createdAt: (existing && existing[0] && existing[0].createdAt) || Date.now()
+      };
+      // 幂等: 同 (old → new @ since) 不重复通知
+      if (existing && existing[0] && existing[0].lastNotifiedKey === data.lastNotifiedKey) return;
+      await Core.Storage.put('alerts', data);
+
+      // 2) 弹通知 (toast + 浏览器 Notification)
+      if (window.toastWarning) toastWarning(`🌊 ${summary}\n${body}`, 8000);
+      if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+        try { new Notification('大盘状态切换', { body: `${summary} · ${body}` }); } catch (e) { /* ignore */ }
+      }
+    },
+
+    /** 暴露用户偏好 getter 给 settings 页 (Alerts._getRegimeWatchMode / _setRegimeWatchMode) */
+    async _getRegimeWatchMode() {
+      return (await Core.Storage.kvGet('alerts_regime_watch_mode')) || 'deteriorate_only';
+    },
+    async _setRegimeWatchMode(mode) {
+      if (!['deteriorate_only', 'all'].includes(mode)) throw new Error(`非法模式: ${mode}`);
+      await Core.Storage.kvSet('alerts_regime_watch_mode', mode);
+    },
 
     async render() {
+      // 规则可能有增删/启停, 顺带同步分层定时器 (幂等, fire-and-forget)
+      this._syncTimers().catch(e => console.warn('[Alerts] 定时器同步失败:', e));
       const list = await Core.Storage.all('alerts');
       const root = document.getElementById('alertsList');
 
@@ -18,7 +116,7 @@
           <div class="empty">
             <div class="empty-icon">🔔</div>
             <div>还没有提醒规则</div>
-            <div style="margin-top:8px;font-size:12px;">价格破位/涨跌幅到位时弹通知</div>
+            <div style="margin-top:8px;font-size:12px;">中长线: 业绩预告/大盘趋势/估值/再平衡 · 短线: 价格/涨跌幅</div>
           </div>
         `;
         return;
@@ -42,7 +140,7 @@
             ${list.map(a => `
               <tr>
                 <td><span class="code">${escapeHtml(a.code)}</span><br><span style="color:var(--text-muted);font-size:11px;">${escapeHtml(a.name || '')}</span></td>
-                <td>${this._typeLabel(a.type)}</td>
+                <td>${this._typeLabel(a.type)}<br>${this._horizonBadge(a.type)}</td>
                 <td>${this._conditionLabel(a)}</td>
                 <td>
                   ${a.triggered
@@ -61,6 +159,29 @@
       `;
     },
 
+    /**
+     * 规则打标: 'short' (价格/涨跌幅/成交量, 1 分钟轮询) | 'long' (其余, 低频调度)
+     * 运行时一律按 type 分类, 不依赖行上存的 horizon 字段 (老数据兼容)
+     */
+    _horizonOf(type) {
+      return SHORT_TYPES.includes(type) ? 'short' : 'long';
+    },
+
+    _horizonBadge(type) {
+      return this._horizonOf(type) === 'short'
+        ? '<span class="tag">⚡短线</span>'
+        : '<span class="tag up">📅中长线</span>';
+    },
+
+    /** 类型名归一: B 阶段占位用的 valuation_drift 并入 valuation */
+    _normType(t) {
+      return t === 'valuation_drift' ? 'valuation' : t;
+    },
+
+    _isGlobalType(t) {
+      return GLOBAL_TYPES.includes(this._normType(t));
+    },
+
     _typeLabel(t) {
       return {
         price_above: '价格 ≥',
@@ -70,15 +191,15 @@
         volume_above: '成交 ≥',
         rebalance_quarterly: '季度再平衡',
         earnings_disclosure: '📅 财报披露',
-        // B 阶段(规则类型登记, 触发逻辑在 Phase B-1/B-2/B-3 实施时接)
         earnings_warning: '⚠️ 业绩预告异动',
-        valuation_drift: '📈 估值偏离',
+        valuation: '📈 估值偏离',
+        valuation_drift: '📈 估值偏离',  // B 阶段占位类型名, 兼容老行
         regime_change: '🌊 大盘状态切换'
       }[t] || t;
     },
 
     _conditionLabel(a) {
-      switch (a.type) {
+      switch (this._normType(a.type)) {
         case 'price_above':
         case 'price_below':
         case 'volume_above':
@@ -90,6 +211,12 @@
           return (a.intervalDays || 90) + ' 天';
         case 'earnings_disclosure':
           return '提前 ' + (a.leadDays ?? 3) + ' 天';
+        case 'earnings_warning':
+          return '每周 · 实盘持仓';
+        case 'regime_change':
+          return '每日 · 状态迁移';
+        case 'valuation':
+          return '双周 · PE分位≥' + Core.Constants.VALUATION_PERCENTILE_WARN + '%';
       }
       return a.value;
     },
@@ -100,7 +227,7 @@
           <div class="modal">
             <h3>新建提醒</h3>
             <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;line-height:1.6;">
-              💡 中长线持仓(3-12 个月)推荐用上方"基本面/大盘"规则,分钟级轮询已足够覆盖<br>
+              💡 中长线持仓(3-12 个月)推荐上方"基本面/大盘"规则,低频检查足够覆盖<br>
               ⚡ 短线场景再选下方的"价格/涨跌幅"
             </div>
             <div class="form-row">
@@ -116,9 +243,9 @@
               <select id="alType" onchange="Alerts._onTypeChange()">
                 <optgroup label="📅 中长线(基本面/大盘)">
                   <option value="earnings_disclosure">📅 财报披露前 N 天</option>
-                  <option value="earnings_warning">⚠️ 业绩预告异动(B-1 阶段生效)</option>
-                  <option value="valuation_drift">📈 估值偏离(B-3 阶段生效)</option>
-                  <option value="regime_change">🌊 大盘状态切换(B-2 阶段生效)</option>
+                  <option value="earnings_warning">⚠️ 业绩预告异动(每周·实盘持仓)</option>
+                  <option value="regime_change">🌊 大盘状态切换(每日)</option>
+                  <option value="valuation">📈 估值偏离(双周·指数PE分位)</option>
                   <option value="rebalance_quarterly">季度再平衡(基金)</option>
                 </optgroup>
                 <optgroup label="⚡ 短线(价格/涨跌幅)">
@@ -130,6 +257,7 @@
                 </optgroup>
               </select>
             </div>
+            <div id="alHorizonHint" style="font-size:11px;color:var(--text-muted);margin-top:4px;line-height:1.6;"></div>
             <div class="form-row" id="alValueRow">
               <label>阈值</label>
               <input type="number" id="alValue" step="0.01" placeholder="例: 1700 或 5">
@@ -150,7 +278,8 @@
               目标配置从 Fund tab 的 type 字段自动读(short_bond=20% / pure_bond=80%)。
             </div>
             <div style="font-size:11px;color:var(--text-muted);margin-top:8px;">
-              💡 监控中:每 60 秒检查一次(浏览器必须打开)。<br>
+              💡 短线规则每 1 分钟检查(有启用的短线规则才轮询);<br>
+              中长线规则按各自周期低频检查(浏览器必须打开)。<br>
               Android 上可配合 Capacitor Local Notifications 推系统通知。
             </div>
             <div class="modal-footer">
@@ -182,6 +311,7 @@
         code: 'funds',
         name: '基金季度再平衡',
         type: rebalanceId,
+        horizon: 'long',
         intervalDays: 90,
         nextCheck: Date.now(),  // 立刻提醒一次 (用户能马上看到通知效果)
         active: true,
@@ -192,6 +322,8 @@
       await Core.Storage.add('alerts', data);
       toastSuccess('已创建: 每 90 天检查基金配置偏离');
       this.render();
+      // 立刻跑一轮中长线检查 (nextCheck=now, 马上给反馈)
+      this._checkLong().catch(e => console.warn('[Alerts] 再平衡首检失败:', e));
     },
 
     _onTypeChange() {
@@ -207,34 +339,38 @@
       // 切换 row 显示
       const isRebalance = t === 'rebalance_quarterly';
       const isEarnings = t === 'earnings_disclosure';  // Phase U
-      // B 阶段 type, 暂无 UI 配置项, 隐藏 value/lead/interval, 由触发逻辑用默认参数
-      const isFutureType = t === 'earnings_warning' || t === 'valuation_drift' || t === 'regime_change';
+      const isGlobal = this._isGlobalType(t);          // 全局规则不绑定个股
       const valRow = document.getElementById('alValueRow');
       const intRow = document.getElementById('alIntervalRow');
       const leadRow = document.getElementById('alLeadDaysRow');  // Phase U
       const hint = document.getElementById('alRebalanceTarget');
-      if (valRow) valRow.style.display = (isRebalance || isEarnings || isFutureType) ? 'none' : '';
+      if (valRow) valRow.style.display = (isGlobal || isEarnings) ? 'none' : '';
       if (intRow) intRow.style.display = isRebalance ? '' : 'none';
       if (leadRow) leadRow.style.display = isEarnings ? '' : 'none';  // Phase U
       if (hint) hint.style.display = isRebalance ? '' : 'none';
 
-      // B 阶段 type 在 _check 里识别后跳过; 保存时给提示避免误以为已生效
-      const futureHint = document.getElementById('alFutureHint');
-      if (!futureHint) {
-        const h = document.createElement('div');
-        h.id = 'alFutureHint';
-        h.style.cssText = 'font-size:11px;color:var(--warn,#d29922);margin-top:8px;line-height:1.6;display:none;';
-        h.innerHTML = '⚠️ 此规则类型在 B 阶段实施, 当前保存后会标记为 pending, 触发逻辑到位后自动激活';
-        const hintAnchor = document.getElementById('alRebalanceTarget');
-        if (hintAnchor && hintAnchor.parentNode) hintAnchor.parentNode.insertBefore(h, hintAnchor.nextSibling);
+      // 期限提示: 短线规则标"适合日内盯盘", 中长线规则说明检查频率/全局唯一
+      const horizonHint = document.getElementById('alHorizonHint');
+      if (horizonHint) {
+        if (this._horizonOf(t) === 'short') {
+          horizonHint.textContent = '⚡ 短线规则, 适合日内盯盘 (1 分钟轮询)';
+        } else {
+          const longHints = {
+            earnings_disclosure: '📅 中长线规则: 日频检查, 披露日前 N 天通知',
+            earnings_warning: '📅 中长线规则: 每周扫全市场业绩预告, 命中实盘持仓的预减/首亏等才通知 (全局只需一条)',
+            regime_change: '📅 中长线规则: 每日比对大盘状态机 (趋势/震荡/下跌), 状态迁移时通知 (全局只需一条)',
+            valuation: '📅 中长线规则: 双周看指数 PE-TTM 近5年分位, 偏贵时提示放缓建仓 (全局只需一条)',
+            rebalance_quarterly: '📅 中长线规则: 按周期检查基金配置偏离'
+          };
+          horizonHint.textContent = longHints[this._normType(t)] || '📅 中长线规则, 低频检查';
+        }
       }
-      if (futureHint) futureHint.style.display = isFutureType ? '' : 'none';
 
-      // 再平衡不需要代码
+      // 全局规则不需要代码
       const codeEl = document.getElementById('alCode');
       if (codeEl) {
-        codeEl.disabled = isRebalance;
-        if (isRebalance) codeEl.value = 'funds';
+        codeEl.disabled = isGlobal;
+        if (isGlobal) codeEl.value = GLOBAL_CODE[this._normType(t)] || 'market';
       }
     },
 
@@ -251,6 +387,7 @@
           id: uuid(),
           code: 'funds', name: '基金季度再平衡',
           type, intervalDays,
+          horizon: 'long',
           nextCheck: Date.now() + intervalDays * 24 * 60 * 60 * 1000,
           active: true,
           hitCount: 0,
@@ -272,6 +409,7 @@
         const data = {
           id: uuid(),
           code, name, type, leadDays,
+          horizon: 'long',
           active: true,
           hitCount: 0,
           triggered: false,
@@ -285,23 +423,43 @@
         return;
       }
 
-      // B 阶段 type (earnings_warning / valuation_drift / regime_change)
-      // 当前阶段触发逻辑未接, 保存为 pending=true, active=false; B 实施后由 _check 自动激活
-      if (type === 'earnings_warning' || type === 'valuation_drift' || type === 'regime_change') {
-        if (!code || !/^\d{6}$/.test(code)) { toastError('代码必须 6 位'); return; }
+      // 中长线全局规则 (业绩预告异动 / 大盘状态切换 / 估值偏离):
+      // 不绑定个股, 每类全局只需一条; 创建后立刻首检 (nextCheck=now) 让用户马上看到效果
+      if (type === 'earnings_warning' || type === 'regime_change' || type === 'valuation' || type === 'valuation_drift') {
+        const canonType = this._normType(type);
+        // 唯一性: 同类型 (含 B 阶段占位名) 只允许一条
+        const dup1 = await Core.Storage.where('alerts', 'type', canonType);
+        const dup2 = canonType === 'valuation' ? await Core.Storage.where('alerts', 'type', 'valuation_drift') : [];
+        if ((dup1 && dup1.length > 0) || (dup2 && dup2.length > 0)) {
+          toastWarning('该规则全局只需一条, 已存在 (删了再建)');
+          return;
+        }
+        const defaultNames = {
+          earnings_warning: '业绩预告异动',
+          regime_change: '大盘状态切换',
+          valuation: '大盘估值偏离'
+        };
         const data = {
           id: uuid(),
-          code, name, type,
-          active: false,        // B 阶段未到, 不轮询
-          pending: true,         // 标记待激活
+          code: GLOBAL_CODE[canonType] || 'market',
+          name: name || defaultNames[canonType],
+          type: canonType,
+          horizon: 'long',
+          nextCheck: Date.now(),       // 立刻首检
+          active: true,
           hitCount: 0,
           triggered: false,
+          lastNotifiedKeys: {},        // earnings_warning: code → `${报告期}_${预告类型}` 去重
+          lastState: null,             // regime_change: 上次大盘状态
+          lastNotifiedKey: null,       // valuation: 上次通知的分位 key
           createdAt: Date.now()
         };
         await Core.Storage.add('alerts', data);
         this.closeModal();
-        toastInfo(`已登记: ${type} (B 阶段实施后自动激活)`);
+        toastSuccess(`已添加: ${data.name} (中长线, 低频检查)`);
         this.render();
+        // 立刻跑一轮中长线检查 (首检反馈)
+        this._checkLong().catch(e => console.warn('[Alerts] 中长线首检失败:', e));
         return;
       }
 
@@ -311,6 +469,7 @@
       const data = {
         id: uuid(),
         code, name, type, value,
+        horizon: 'short',
         active: true,
         hitCount: 0,
         triggered: false,
@@ -338,114 +497,455 @@
       this.render();
     },
 
+    // ==================== 分层轮询 ====================
+    // 短线定时器: 1 分钟, 只在存在启用的短线规则时运行
+    // 中长线定时器: 30 分钟调度 tick, 各规则按 nextCheck + 自身频率决定要不要真跑
+    // 定时器工厂可注入 (测试可断言注册/清除次数)
+    _timers: { short: null, long: null },
+    _setInterval: (fn, ms) => setInterval(fn, ms),
+    _clearInterval: (t) => clearInterval(t),
+
     /**
-     * 启动轮询(每 60 秒)
+     * 启动轮询: 按当前规则表决定起哪些定时器
      */
-    startPolling() {
-      if (this._timer) return;
-      this._timer = setInterval(() => this._check(), 60 * 1000);
+    async startPolling() {
+      await this._syncTimers();
     },
 
     stopPolling() {
-      if (this._timer) { clearInterval(this._timer); this._timer = null; }
+      if (this._timers.short) { this._clearInterval(this._timers.short); this._timers.short = null; }
+      if (this._timers.long) { this._clearInterval(this._timers.long); this._timers.long = null; }
     },
 
-    async _check() {
+    /**
+     * 定时器与规则表对齐 (幂等):
+     *   有启用的短线规则 ↔ short 定时器在跑
+     *   有启用的中长线规则 ↔ long 定时器在跑
+     * save/toggle/remove 后经 render() 自动重同步
+     */
+    async _syncTimers() {
+      let list = [];
+      try {
+        list = await Core.Storage.all('alerts');
+      } catch (e) {
+        console.warn('[Alerts] 读规则表失败, 定时器保持现状:', e);
+        return;
+      }
+      const hasShort = (list || []).some(a => a.active && this._horizonOf(a.type) === 'short');
+      const hasLong = (list || []).some(a => a.active && this._horizonOf(a.type) === 'long');
+
+      if (hasShort && !this._timers.short) {
+        this._timers.short = this._setInterval(
+          () => this._checkShort().catch(e => console.warn('[Alerts] 短线检查失败:', e)),
+          Core.Constants.ALERT_TICK_SHORT_MS
+        );
+      } else if (!hasShort && this._timers.short) {
+        this._clearInterval(this._timers.short);
+        this._timers.short = null;
+      }
+
+      if (hasLong && !this._timers.long) {
+        this._timers.long = this._setInterval(
+          () => this._checkLong().catch(e => console.warn('[Alerts] 中长线检查失败:', e)),
+          Core.Constants.ALERT_TICK_LONG_MS
+        );
+      } else if (!hasLong && this._timers.long) {
+        this._clearInterval(this._timers.long);
+        this._timers.long = null;
+      }
+    },
+
+    /**
+     * 短线检查 (1 分钟轮询): 价格/涨跌幅/成交量, 行为与原 _check 的行情类一致
+     */
+    async _checkShort() {
       const list = await Core.Storage.where('alerts', 'active', true);
-      if (!list.length) return;
+      const stockAlerts = (list || []).filter(a => this._horizonOf(a.type) === 'short');
+      if (!stockAlerts.length) return;
 
-      // 分离: 行情类 / 再平衡类 / 财报日历类
-      const stockAlerts = list.filter(a => a.type !== 'rebalance_quarterly' && a.type !== 'earnings_disclosure');
-      const rebalanceAlerts = list.filter(a => a.type === 'rebalance_quarterly');
-      const earningsAlerts = list.filter(a => a.type === 'earnings_disclosure');
-
-      // 1. 行情类: 一次拉行情
-      if (stockAlerts.length > 0) {
-        let spotMap = {};
-        try {
-          const all = await Core.Data.getStockSpot();
-          all.forEach(s => { spotMap[s.代码] = s; });
-        } catch (e) {
-          console.warn('[Alerts] 行情拉取失败:', e);
-          return;
+      let spotMap = {};
+      try {
+        const all = await Core.Data.getStockSpot();
+        all.forEach(s => { spotMap[s.代码] = s; });
+      } catch (e) {
+        console.warn('[Alerts] 行情拉取失败:', e);
+        return;
+      }
+      for (const a of stockAlerts) {
+        const s = spotMap[a.code];
+        if (!s) continue;
+        const price = parseFloat(s.最新价);
+        const changePct = parseFloat(s.涨跌幅);
+        const volume = parseFloat(s.成交量);
+        let hit = false;
+        switch (a.type) {
+          case 'price_above': hit = price >= a.value; break;
+          case 'price_below': hit = price <= a.value; break;
+          case 'change_above': hit = changePct >= a.value; break;
+          case 'change_below': hit = changePct <= -Math.abs(a.value); break;
+          case 'volume_above': hit = volume >= a.value; break;
         }
-        for (const a of stockAlerts) {
-          const s = spotMap[a.code];
-          if (!s) continue;
-          const price = parseFloat(s.最新价);
-          const changePct = parseFloat(s.涨跌幅);
-          const volume = parseFloat(s.成交量);
-          let hit = false;
-          switch (a.type) {
-            case 'price_above': hit = price >= a.value; break;
-            case 'price_below': hit = price <= a.value; break;
-            case 'change_above': hit = changePct >= a.value; break;
-            case 'change_below': hit = changePct <= -Math.abs(a.value); break;
-            case 'volume_above': hit = volume >= a.value; break;
-          }
-          if (hit && !a.triggered) {
-            a.triggered = true;
-            a.hitCount = (a.hitCount || 0) + 1;
-            a.lastHit = Date.now();
-            await Core.Storage.put('alerts', a);
-            this._notify(a, s);
-          } else if (!hit && a.triggered) {
-            a.triggered = false;
-            await Core.Storage.put('alerts', a);
-          }
+        if (hit && !a.triggered) {
+          a.triggered = true;
+          a.hitCount = (a.hitCount || 0) + 1;
+          a.lastHit = Date.now();
+          await Core.Storage.put('alerts', a);
+          this._notify(a, s);
+        } else if (!hit && a.triggered) {
+          a.triggered = false;
+          await Core.Storage.put('alerts', a);
         }
       }
+    },
 
-      // 2. 财报日历类 (Phase U): 拉单股下次披露日, 距今 ≤ N 天触发
-      for (const a of earningsAlerts) {
+    /**
+     * 中长线调度 (30 分钟 tick): 遍历中长线规则, 到点 (nextCheck) 才真跑, 跑完按自身频率推进
+     */
+    async _checkLong() {
+      const list = await Core.Storage.where('alerts', 'active', true);
+      const longAlerts = (list || []).filter(a => this._horizonOf(a.type) === 'long');
+      if (!longAlerts.length) return;
+
+      for (const a of longAlerts) {
+        if (!this._nextCheckDue(a, Date.now())) continue;
+        const type = this._normType(a.type);
         try {
-          const next = await Core.Data.getStockNextDisclosure(a.code);
-          if (!next || !next.noticeDate) continue;
-          const today = new Date(); today.setHours(0, 0, 0, 0);
-          const notice = new Date(next.noticeDate); notice.setHours(0, 0, 0, 0);
-          const daysLeft = Math.round((notice - today) / 86400000);
-          // 触发条件: 距披露日 <= N 天 (默认 3), 且未触发过这次披露
-          const leadDays = a.leadDays ?? 3;
-          const shouldHit = daysLeft >= 0 && daysLeft <= leadDays;
-          // 用 reportPeriod + noticeDate 做幂等 key, 同一披露周期只触发一次
-          const hitKey = `${next.reportPeriod || ''}_${next.noticeDate}`;
-          if (shouldHit && a._hitKey !== hitKey) {
-            a.triggered = true;
-            a._hitKey = hitKey;
-            a.hitCount = (a.hitCount || 0) + 1;
-            a.lastHit = Date.now();
+          if (type === 'rebalance_quarterly') {
+            await this._runRebalanceCheck(a);
+          } else if (type === 'earnings_disclosure') {
+            await this._runEarningsDisclosureCheck(a);
+            a.nextCheck = Date.now() + this._freqMs(a);
             await Core.Storage.put('alerts', a);
-            this._notifyEarnings(a, next, daysLeft);
-          } else if (!shouldHit && a.triggered) {
-            // 披露日已过, 重置 (等下一季度)
-            a.triggered = false;
-            a._hitKey = null;
-            await Core.Storage.put('alerts', a);
+          } else if (type === 'earnings_warning') {
+            const done = await this._checkEarningsWarning(a);
+            if (done) {
+              a.nextCheck = Date.now() + this._freqMs(a);
+              await Core.Storage.put('alerts', a);
+            }
+          } else if (type === 'regime_change') {
+            const done = await this._checkRegimeChange(a);
+            if (done) {
+              a.nextCheck = Date.now() + this._freqMs(a);
+              await Core.Storage.put('alerts', a);
+            }
+          } else if (type === 'valuation') {
+            const done = await this._checkValuation(a);
+            if (done) {
+              a.nextCheck = Date.now() + this._freqMs(a);
+              await Core.Storage.put('alerts', a);
+            }
           }
         } catch (e) {
-          console.warn('[Alerts] 财报日历检查失败:', a.code, e);
+          console.warn('[Alerts] 中长线规则检查失败:', a.type, e);
         }
       }
+    },
 
-      // 3. 再平衡类: 检查 nextCheck
-      for (const a of rebalanceAlerts) {
-        const nextCheck = a.nextCheck || (a.createdAt + (a.intervalDays || 90) * 86400000);
-        if (Date.now() < nextCheck) continue;
+    /** 到点判定: 无 nextCheck 视为到点 (老数据首跑) */
+    _nextCheckDue(a, now) {
+      if (a.type === 'rebalance_quarterly') {
+        // 再平衡保留原有回退口径: nextCheck 缺失时用 createdAt + intervalDays
+        const nc = a.nextCheck || ((a.createdAt || 0) + (a.intervalDays || 90) * 24 * 60 * 60 * 1000);
+        return now >= nc;
+      }
+      return !a.nextCheck || now >= a.nextCheck;
+    },
 
-        // 计算当前基金配置
-        const drift = await this._computeRebalanceDrift();
-        if (drift) {
-          this._notifyRebalance(a, drift);
-        } else {
-          console.warn('[Alerts] 再平衡: 无基金数据或拉不到净值');
+    /** 规则检查频率: 再平衡用行上 intervalDays, 其余走 Constants.ALERT_LONG_FREQ_MS */
+    _freqMs(a) {
+      if (a.intervalDays) return a.intervalDays * 24 * 60 * 60 * 1000;
+      return Core.Constants.ALERT_LONG_FREQ_MS[this._normType(a.type)] || Core.Constants.ALERT_TICK_LONG_MS;
+    },
+
+    /** 再平衡检查 (原 _check 第 3 段, 逻辑不变: 无论是否触发都推进 nextCheck) */
+    async _runRebalanceCheck(a) {
+      const drift = await this._computeRebalanceDrift();
+      if (drift) {
+        this._notifyRebalance(a, drift);
+      } else {
+        console.warn('[Alerts] 再平衡: 无基金数据或拉不到净值');
+      }
+      a.nextCheck = Date.now() + (a.intervalDays || 90) * 24 * 60 * 60 * 1000;
+      a.hitCount = (a.hitCount || 0) + 1;
+      a.lastHit = Date.now();
+      await Core.Storage.put('alerts', a);
+    },
+
+    /** 财报日历检查 (原 _check 第 2 段, 逻辑不变) */
+    async _runEarningsDisclosureCheck(a) {
+      try {
+        const next = await Core.Data.getStockNextDisclosure(a.code);
+        if (!next || !next.noticeDate) return;
+        const today = new Date(); today.setHours(0, 0, 0, 0);
+        const notice = new Date(next.noticeDate); notice.setHours(0, 0, 0, 0);
+        const daysLeft = Math.round((notice - today) / 86400000);
+        // 触发条件: 距披露日 <= N 天 (默认 3), 且未触发过这次披露
+        const leadDays = a.leadDays ?? 3;
+        const shouldHit = daysLeft >= 0 && daysLeft <= leadDays;
+        // 用 reportPeriod + noticeDate 做幂等 key, 同一披露周期只触发一次
+        const hitKey = `${next.reportPeriod || ''}_${next.noticeDate}`;
+        if (shouldHit && a._hitKey !== hitKey) {
+          a.triggered = true;
+          a._hitKey = hitKey;
+          a.hitCount = (a.hitCount || 0) + 1;
+          a.lastHit = Date.now();
+          await Core.Storage.put('alerts', a);
+          this._notifyEarnings(a, next, daysLeft);
+        } else if (!shouldHit && a.triggered) {
+          // 披露日已过, 重置 (等下一季度)
+          a.triggered = false;
+          a._hitKey = null;
+          await Core.Storage.put('alerts', a);
         }
+      } catch (e) {
+        console.warn('[Alerts] 财报日历检查失败:', a.code, e);
+      }
+    },
 
-        // 推进下次检查时间(无论是否触发都推进,避免重复刷屏)
-        a.nextCheck = Date.now() + (a.intervalDays || 90) * 86400000;
+    // ==================== 中长线规则: 业绩预告异动 (周频) ====================
+
+    /**
+     * 拉全市场最新业绩预告 (stock_yjyg_em, 走 Core.Data.fetch 6h 缓存, cache key 带日期防陈旧),
+     * 过滤出实盘持仓 (!isPaper) 中的负面预告 (预减/略减/首亏/续亏) → 通知。
+     * 去重: a.lastNotifiedKeys[code] = `${报告期}_${预告类型}`, 同 code 同报告期同类型只通知一次。
+     * @returns {Promise<boolean>} true=本轮检查完成 (可推进 nextCheck); false=拉数失败 (下轮重试)
+     */
+    async _checkEarningsWarning(a) {
+      // 实盘持仓代码集合
+      const holdings = await Core.Storage.all('holdings');
+      const codes = new Set(
+        (holdings || [])
+          .filter(h => !h.isPaper)
+          .map(h => this._normalizeCode6(h.code))
+          .filter(Boolean)
+      );
+      if (codes.size === 0) return true;  // 无实盘持仓, 算检查完成
+
+      const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+      let rows;
+      try {
+        rows = await Core.Data.fetch(`alerts_yjyg_${today}`, 'stock_yjyg_em', {}, Core.Constants.ALERT_LONG_CACHE_TTL_MS);
+      } catch (e) {
+        console.warn('[Alerts] 业绩预告拉取失败, 下轮重试:', e);
+        return false;
+      }
+
+      const hits = this._filterEarningsWarnings(rows, codes, Date.now());
+      if (!a.lastNotifiedKeys || typeof a.lastNotifiedKeys !== 'object') a.lastNotifiedKeys = {};
+      let notified = 0;
+      for (const h of hits) {
+        const key = `${h.periodKey}_${h.type}`;
+        // 同 code 同报告期同类型只通知一次 (数组存多 key: 同期"预减→首亏"修正公告是两条独立信号)
+        const seen = a.lastNotifiedKeys[h.code];
+        const seenArr = Array.isArray(seen) ? seen : (seen ? [seen] : []);
+        if (seenArr.includes(key)) continue;
+        seenArr.push(key);
+        a.lastNotifiedKeys[h.code] = seenArr;
+        notified++;
+        this._notifyLong(a, this._earningsWarningMsg(h), h.code);
+      }
+      if (notified > 0) {
+        a.triggered = true;
+        a.hitCount = (a.hitCount || 0) + notified;
+        a.lastHit = Date.now();
+      }
+      return true;
+    },
+
+    /**
+     * 业绩预告过滤 (纯函数, 测试钩子):
+     *   1) 预告类型在负面名单 (预减/略减/首亏/续亏)
+     *   2) 公告日期在新鲜度窗口内 (半年, 防 aktools 历史回填)
+     *   3) 代码命中实盘持仓
+     * @param {Array} rows stock_yjyg_em 返回
+     * @param {Set<string>} codes 实盘持仓 6 位代码
+     * @param {number} nowMs 当前时间 (注入便于测试)
+     * @returns {Array<{code,name,type,summary,periodKey}>}
+     */
+    _filterEarningsWarnings(rows, codes, nowMs) {
+      if (!Array.isArray(rows) || !codes || codes.size === 0) return [];
+      const negTypes = Core.Constants.EARNINGS_WARNING_NEGATIVE_TYPES;
+      const freshCutoff = (nowMs || Date.now()) - Core.Constants.EARNINGS_WARNING_FRESH_MS;
+      const out = [];
+      for (const r of rows) {
+        const type = String(r['业绩预告类型'] || r['预告类型'] || '');
+        if (!negTypes.includes(type)) continue;
+        // 公告日期新鲜度 (多字段名容错, 与 data.js Y1 防御一致; 无日期字段时放行, 由报告期去重兜底)
+        const dStr = r['公告日期'] || r['最新公告日期'] || r['报告日期'] || r['发布日期'];
+        if (dStr) {
+          const ts = Date.parse(dStr);
+          if (!isNaN(ts) && ts < freshCutoff) continue;
+        }
+        const code = this._normalizeCode6(r['股票代码'] || r.code);
+        if (!code || !codes.has(code)) continue;
+        out.push({
+          code,
+          name: String(r['股票简称'] || r.name || code),
+          type,
+          summary: String(r['业绩预告摘要'] || r.summary || ''),
+          periodKey: this._yjygPeriodKey(r)
+        });
+      }
+      return out;
+    },
+
+    /** 报告期 key (纯函数): 优先「报告期」字段, 缺失时退化为公告日期 (保证同批公告不重复) */
+    _yjygPeriodKey(r) {
+      const p = r['报告期'] || r['报告日期'];
+      if (p) return String(p).slice(0, 10);
+      const d = r['公告日期'] || r['最新公告日期'] || r['发布日期'];
+      return d ? String(d).slice(0, 10) : 'unknown';
+    },
+
+    /** 6 位代码归一 (纯函数): 容忍 '600519' / 'SH600519' / '600519.SH' */
+    _normalizeCode6(raw) {
+      const m = String(raw == null ? '' : raw).match(/(\d{6})/);
+      return m ? m[1] : null;
+    },
+
+    /** 业绩预告通知文案: 带归因 ("为什么应该关心") */
+    _earningsWarningMsg(h) {
+      let msg = `⚠️ ${h.name}(${h.code}) 业绩预告: ${h.type}`;
+      if (h.summary) msg += `\n${h.summary.slice(0, 80)}`;
+      msg += '\n💡 中长线持仓遇到业绩下修信号, 建议复核当初买入逻辑(业绩拐点/估值修复)是否仍成立, 再决定加仓/持有/减仓。';
+      return msg;
+    },
+
+    // ==================== 中长线规则: 大盘状态切换 (日频) ====================
+
+    /**
+     * 读 Core.Regime (refresh 内部每日去重), 与 a.lastState 对比, 状态迁移时通知。
+     * 首次运行只记录基线, 不通知。
+     * @returns {Promise<boolean>} true=检查完成; false=Regime 不可用 (下轮重试)
+     */
+    async _checkRegimeChange(a) {
+      if (!window.Core || !Core.Regime) {
+        console.warn('[Alerts] Core.Regime 不可用, 跳过大盘状态检查');
+        return false;
+      }
+      let rec;
+      try {
+        rec = await Core.Regime.refresh();
+      } catch (e) {
+        console.warn('[Alerts] Regime 刷新失败, 下轮重试:', e);
+        return false;
+      }
+      const cur = rec && rec.state;
+      if (!cur) return false;
+
+      if (a.lastState && a.lastState !== cur) {
+        const text = this._regimeNotifyText(a.lastState, cur);
+        if (text) this._notifyLong(a, text, null);
+        a.triggered = true;
         a.hitCount = (a.hitCount || 0) + 1;
         a.lastHit = Date.now();
-        await Core.Storage.put('alerts', a);
       }
+      a.lastState = cur;
+      return true;
+    },
+
+    /**
+     * 大盘状态迁移文案 (纯函数, 测试钩子)
+     * @returns {string|null} 非法状态返 null
+     */
+    _regimeNotifyText(fromState, toState) {
+      const labels = (window.Core && Core.Regime && Core.Regime.GATES)
+        ? Object.fromEntries(Object.entries(Core.Regime.GATES).map(([k, g]) => [k, `${g.label} ${g.icon}`]))
+        : REGIME_LABELS;
+      if (!labels[fromState] || !labels[toState]) return null;
+      let msg = `🌊 大盘状态切换: ${labels[fromState]} → ${labels[toState]}`;
+      if (toState === 'bear') {
+        msg += '\n💡 沪深300 跌破 MA60 且趋势下行: 买入门槛已提高(回测 Sharpe 阈值上调/建议仓位减半), 中长线新建仓建议放缓, 已有持仓按各自止损纪律执行。';
+      } else if (toState === 'bull') {
+        msg += '\n💡 沪深300 站上 MA60 且均线上行: 建仓环境转暖, 可按纪律正常执行买入计划, 仍须过个股层面校验。';
+      } else {
+        msg += '\n💡 市场方向不明: 维持原计划, 不追涨不杀跌, 等趋势明朗再加大动作。';
+      }
+      return msg;
+    },
+
+    // ==================== 中长线规则: 估值偏离 (双周频) ====================
+
+    /**
+     * 指数 PE-TTM 近 5 年分位 ≥ 阈值 → 通知"市场整体偏贵, 与低估值买入逻辑相悖"。
+     * 数据源: stock_market_pe_lg (与 data.js Phase M Tier 1 同一接口, 共享 ai_ctx_pe 缓存)。
+     * 个股 PE 5 年分位无已验证数据源, 不做个股级 (宁缺毋假)。
+     * 分位字段缺失 → 本轮静默跳过 (不通知), 只推进 nextCheck。
+     * 去重: lastNotifiedKey = 超阈指数名列表, 离开阈值区后重新进入会再通知。
+     * @returns {Promise<boolean>} true=检查完成; false=拉数失败 (下轮重试)
+     */
+    async _checkValuation(a) {
+      let rows;
+      try {
+        // 复用 data.js 的 cache key 'ai_ctx_pe', 与 AI 上下文共享 6h 缓存
+        rows = await Core.Data.fetch('ai_ctx_pe', 'stock_market_pe_lg', {}, Core.Constants.ALERT_LONG_CACHE_TTL_MS);
+      } catch (e) {
+        console.warn('[Alerts] 估值数据拉取失败, 下轮重试:', e);
+        return false;
+      }
+
+      const verdict = this._judgeValuation(rows);
+      if (!verdict) {
+        // 分位数据不可用 → 宁缺毋假, 静默跳过
+        console.warn('[Alerts] 估值分位数据不可用 (pe_percentile_5y 缺失), 本轮跳过');
+        a.lastNotifiedKey = null;
+        return true;
+      }
+      const key = verdict.hits.map(h => h.name).sort().join('+');
+      if (verdict.hits.length > 0 && a.lastNotifiedKey !== key) {
+        this._notifyLong(a, this._valuationMsg(verdict), null);
+        a.triggered = true;
+        a.hitCount = (a.hitCount || 0) + 1;
+        a.lastHit = Date.now();
+      }
+      a.lastNotifiedKey = verdict.hits.length > 0 ? key : null;  // 跌回阈值下 → 清空, 下次进入再通知
+      return true;
+    },
+
+    /**
+     * 估值判定 (纯函数, 测试钩子):
+     *   解析 stock_market_pe_lg 行 → 目标指数 → 分位 ≥ VALUATION_PERCENTILE_WARN 的为 hits
+     * @returns {{hits: Array<{name,pe,percentile}>}|null} null=全部指数都拿不到分位 (数据不可用)
+     */
+    _judgeValuation(rows) {
+      if (!Array.isArray(rows)) return null;
+      const wanted = Core.Constants.VALUATION_INDEX_NAMES;
+      const threshold = Core.Constants.VALUATION_PERCENTILE_WARN;
+      const items = [];
+      for (const row of rows) {
+        const name = String(row.index_name || row.name || '').trim();
+        if (!wanted.some(w => name.includes(w))) continue;
+        const pe = parseFloat(row.pe_ttm || row.pe);
+        const pct = parseFloat(row.pe_percentile_5y ?? row.percentile);
+        if (isNaN(pe)) continue;
+        items.push({ name, pe, percentile: isNaN(pct) ? null : pct });
+      }
+      if (items.length === 0) return null;
+      if (items.every(it => it.percentile === null)) return null;  // 分位全缺 → 不可用
+      const hits = items.filter(it => it.percentile !== null && it.percentile >= threshold);
+      return { hits, items };
+    },
+
+    /** 估值偏离通知文案: 带归因 */
+    _valuationMsg(verdict) {
+      const lines = verdict.hits.map(h => `${h.name} PE-TTM ${h.pe.toFixed(1)} (近5年分位 ${Math.round(h.percentile)}%)`);
+      return '📈 大盘估值偏离\n' + lines.join('\n') +
+        `\n💡 分位 ≥ ${Core.Constants.VALUATION_PERCENTILE_WARN}% 说明市场整体偏贵, 与"低估值买入"逻辑相悖: 新建仓建议更挑剔(提高选股标准/缩小仓位), 已有持仓按各自逻辑持有, 不必因指数贵而单独卖出。`;
+    },
+
+    /**
+     * 中长线通知统一入口: 拼大盘快照 + "上次类似情境"复盘上下文 (code 为 null 时跳过复盘)
+     */
+    _notifyLong(a, baseMsg, code) {
+      Promise.all([
+        this._fetchMarketInline(),
+        code ? this._fetchJournalContext(code, a.type) : Promise.resolve(null)
+      ]).then(([marketLine, journalLine]) => {
+        let msg = baseMsg;
+        if (marketLine) msg += `\n📊 ${marketLine}`;
+        if (journalLine) msg += `\n${journalLine}`;
+        this._doNotify(a, null, msg);
+      }).catch(() => this._doNotify(a, null, baseMsg));
     },
 
     /**
@@ -641,7 +1141,10 @@
           'price_below': ['长期持有中', '其他'],  // 跌破: 看是否有"还拿着"的复盘
           'change_above': ['题材催化', '业绩拐点'],
           'change_below': ['恐慌割肉', '计划内止损', '长期持有中'],
-          'volume_above': ['题材催化', '技术突破']
+          'volume_above': ['题材催化', '技术突破'],
+          // 中长线: 业绩预告/财报披露 → 业绩类假设的复盘最有对照价值
+          'earnings_warning': ['业绩拐点', '估值修复'],
+          'earnings_disclosure': ['业绩拐点', '估值修复']
         };
         const wantAssumption = alertTagMap[alertType] || [];
         if (wantAssumption.length > 0) {
@@ -695,8 +1198,8 @@
   window.Alerts = Alerts;
   window._onShow_pageAlerts = function() { Alerts.render(); };
 
-  // 启动轮询
+  // 启动分层轮询 (短线 1 分钟 / 中长线 30 分钟调度, 按需起定时器)
   document.addEventListener('DOMContentLoaded', () => {
-    Alerts.startPolling();
+    Alerts.startPolling().catch(e => console.warn('[Alerts] 启动轮询失败:', e));
   });
 })();
