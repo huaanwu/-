@@ -220,12 +220,28 @@
         return `[${i}] ${s.代码} ${s.名称} | PE=${isNaN(pe) ? '-' : pe.toFixed(1)} | PB=${isNaN(pb) ? '-' : pb.toFixed(2)} | 换手=${isNaN(turn) ? '-' : turn.toFixed(2) + '%'} | 市值=${isNaN(mcap) ? '-' : (mcap / 1e8).toFixed(1) + '亿'} | 涨跌幅=${parseFloat(s.涨跌幅).toFixed(2)}%`;
       }).join('\n');
 
-      // 并行加载宏观 + 新闻
+      // 并行加载宏观 + 新闻 + Phase O: 13 维上下文 + KB
       const macroP = Core.Macro.get().catch(e => ({ data: {} }));
       const newsP = Core.News.get().catch(e => ({ relevant: [] }));
-      const [macro, news] = await Promise.all([macroP, newsP]);
+      const ctxP = Core.Data.getAiContextSnapshot().catch(e => null);
+      const intlP = Core.Data.getIntlSnapshot().catch(e => null);
+      const [macro, news, ctx, intl] = await Promise.all([macroP, newsP, ctxP, intlP]);
       const macroText = macro && macro.data ? Core.Macro.formatForPrompt(macro) : '';
       const newsText = news ? Core.News.formatForPrompt(news, 8) : '';
+      const ctxText = ctx ? Core.Data.formatAiContextForPrompt(ctx) : '(市场上下文不可用)';
+      const intlText = intl ? Core.Data.formatIntlForPrompt(intl) : '(国际形势不可用)';
+
+      // KB 智能匹配 (Phase N+O)
+      let kbText = '';
+      try {
+        const topNames = top.slice(0, 8).map(s => ({ name: s.名称 }));
+        const kbEntries = await Core.KB.pickRelevant({
+          holdings: topNames,
+          context: ctx || {},
+          maxN: 4
+        });
+        kbText = Core.KB.formatForPrompt(kbEntries);
+      } catch (e) { console.warn('[screener] KB 取条失败:', e); }
 
       const condsDesc = [];
       if (conditions.market && conditions.market !== 'all') condsDesc.push(`市场=${conditions.market}`);
@@ -236,7 +252,18 @@
       if (conditions.changeMin !== null) condsDesc.push(`涨跌幅 ≥ ${conditions.changeMin}%`);
       if (conditions.changeMax !== null) condsDesc.push(`涨跌幅 ≤ ${conditions.changeMax}%`);
 
-      const systemPrompt = `你是一个严谨的 A 股投资顾问, 风格保守, 严守数据边界。规则:
+      const systemPrompt = `你是 Phase O 高手版 A 股个股投资顾问, 风格稳健, 严守数据边界。
+
+【投资框架】价值 + 趋势 + 风险平价 混合:
+- 价值: PE/PB/ROE + 历史分位
+- 趋势: 板块轮动、北向方向、行业资金流
+- 风险: 个股波动、行业暴露、相关性
+
+【用户画像】长期稳健型 (年化 3-5%), 不追短期暴利。
+
+【输出风格】先证据后结论, 每条 reason 引用具体数据; 给信心等级 (高/中/低)。
+
+【规则】
 1. **只能从下方候选池挑选**, 严禁编造不存在的股票代码/名称
 2. 输出严格 JSON:
 {
@@ -246,15 +273,19 @@
     {
       "code": "xxx",
       "name": "xxx",
-      "reasons": ["基本面/估值 1 句", "技术面/资金面 1 句", "宏观/政策契合 1 句"],
-      "riskScore": 1-5 (1=极低, 5=高)
+      "reasons": ["基本面/估值 1 句 (引用 PE/PB)", "技术面/资金面 1 句", "宏观/政策契合 1 句", "行业板块契合 1 句 (引用板块涨跌)"],
+      "riskScore": 1-5 (1=极低, 5=高),
+      "confidence": "高" | "中" | "低"
     }
   ],
-  "risks": ["风险点 1", "风险点 2", "..."]
+  "risks": ["风险点 1", "风险点 2", "..."],
+  "kbRefs": ["VAL-001", "POS-002"]  // 引用的 KB 条目号
 }
 3. picks 数量 5-10 只, 按性价比 (低估值 + 高质量) 排序
-4. **多维度分析**: 基本面/技术面/资金面/政策面
-5. 严禁绝对化表述 ("一定涨" 等)`;
+4. **多维度分析**: 基本面/技术面/资金面/政策面/行业面
+5. **KB 引用**: 如有相关条目, 在 reasons 里引用条目号, kbRefs 数组填条目号
+6. **置信度**: 高 (多维数据一致+符合 KB 经典模式) / 中 (数据冲突) / 低 (极端市场/新策略)
+7. 严禁绝对化表述 ("一定涨" 等)`;
 
       const userPrompt = `【用户筛选条件】
 ${condsDesc.length > 0 ? condsDesc.join(', ') : '(无特定条件, 全市场)'}
@@ -267,10 +298,16 @@ ${macroText}
 
 ${newsText}
 
+${ctxText}
+
+${intlText}
+
+${kbText}
+
 【候选池 (按涨跌幅降序, 最多 30 只, 字段: 代码 名称 PE PB 换手率 市值 涨跌幅)】
 ${candidates}
 
-请从候选池中挑出 5-10 只最适合用户偏好的股票, 严格使用候选项, JSON 输出 (按 systemPrompt 格式)。`;
+请从候选池中挑出 5-10 只最适合用户偏好的股票, 严格使用候选项, JSON 输出 (按 systemPrompt 格式)。每条 reason 引用具体数据, 信心等级和 KB 引用必填。`;
 
       try {
         const streamEl = aiResultEl.querySelector('.ai-stream');

@@ -90,6 +90,7 @@
             <span style="font-size:11px;">${r.plPct !== null ? fmtPct(r.plPct) : ''}</span>
           </td>
           <td>
+            <button class="btn btn-sm" title="AI 简评" onclick="StockAdvisor.show('${escapeHtml(r.h.code)}','${escapeHtml(r.h.name || r.s?.名称 || '')}')">💡</button>
             <button class="btn btn-sm" onclick="Holdings.addTxDialog('${escapeHtml(r.h.id)}')">+T</button>
             <button class="btn btn-sm" onclick="Holdings.editDialog('${escapeHtml(r.h.id)}')">✎</button>
             <button class="btn btn-sm" onclick="Holdings.remove('${escapeHtml(r.h.id)}')">✕</button>

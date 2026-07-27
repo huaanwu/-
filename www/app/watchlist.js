@@ -88,7 +88,7 @@
           <td class="${pctClass(changePct)}">${s.涨跌额 ? fmtNum(parseFloat(s.涨跌额), 2) : '-'}</td>
           <td>${s.成交量 || '-'}</td>
           <td>${s.换手率 ? parseFloat(s.换手率).toFixed(2) + '%' : '-'}</td>
-          <td><button class="btn btn-sm" onclick="event.stopPropagation();Watchlist.remove('${escapeHtml(item.code)}')">✕</button></td>
+          <td><button class="btn btn-sm" title="AI 简评" onclick="event.stopPropagation();StockAdvisor.show('${escapeHtml(item.code)}','${escapeHtml(item.name || s.名称 || '')}')">💡</button> <button class="btn btn-sm" onclick="event.stopPropagation();Watchlist.remove('${escapeHtml(item.code)}')">✕</button></td>
         </tr>`;
       }).join('');
 

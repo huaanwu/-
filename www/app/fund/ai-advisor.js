@@ -140,12 +140,15 @@
       return;
     }
 
-    // 加载候选数据 + 宏观 + 财经新闻 (并行)
+    // 加载候选数据 + 宏观 + 财经新闻 (并行) + Phase O: 13 维上下文 + KB
     const seedP = fetch('/fund_ai_seed.json').then(r => r.json());
     const macroP = Core.Macro.get().catch(e => ({ error: e.message, data: {} }));
     const newsP = includeNews ? Core.News.get().catch(e => ({ error: e.message, relevant: [] })) : Promise.resolve(null);
+    const ctxP = Core.Data.getAiContextSnapshot().catch(e => null);
+    const intlP = Core.Data.getIntlSnapshot().catch(e => null);
+    const goldP = Core.Data.getGoldAu9999().catch(e => null);
 
-    const [seed, macro, news] = await Promise.all([seedP, macroP, newsP]);
+    const [seed, macro, news, ctx, intl, gold] = await Promise.all([seedP, macroP, newsP, ctxP, intlP, goldP]);
 
     // 切换到结果视图
     document.getElementById('aiAdvisorForm').style.display = 'none';
@@ -168,8 +171,33 @@
 
     const macroText = macro && macro.data ? Core.Macro.formatForPrompt(macro) : '⚠ 宏观数据拉取失败, AI 将仅基于候选池分析';
     const newsText = news ? Core.News.formatForPrompt(news, 10) : '';
+    const ctxText = ctx ? Core.Data.formatAiContextForPrompt(ctx) : '(市场上下文不可用)';
+    const intlText = intl ? Core.Data.formatIntlForPrompt(intl) : '(国际形势不可用)';
+    const goldText = gold ? Core.Data.formatGoldForPrompt(gold, 30) : '(黄金数据不可用)';
 
-    const systemPrompt = `你是一个严谨的中国 A 股基金投资顾问, 风格保守, 严守数据边界。规则:
+    // KB 智能匹配 (Phase N+O)
+    let kbText = '';
+    try {
+      const kbEntries = await Core.KB.pickRelevant({
+        holdings: seed.candidates.slice(0, 5).map(c => ({ name: c.name, type: c.category })),
+        context: ctx || {},
+        maxN: 4
+      });
+      kbText = Core.KB.formatForPrompt(kbEntries);
+    } catch (e) { console.warn('[ai-advisor] KB 取条失败:', e); }
+
+    const systemPrompt = `你是 Phase O 高手版中国 A 股基金投资顾问, 风格稳健, 严守数据边界。
+
+【投资框架】价值 + 趋势 + 风险平价 混合:
+- 价值: 票息 / 资本利得 / 估值分位
+- 趋势: 利率方向 / 板块轮动 / 北向流向
+- 风险平价: 跨资产相关性 / 组合最大回撤 / 夏普
+
+【用户画像】长期稳健型 (年化 3-5% 跑赢通胀), 不追求暴利。
+
+【输出风格】先证据后结论, 每条 reason 引用具体数据; 给信心等级 (高/中/低)。
+
+【规则】
 1. **只能从下方候选列表中挑选**, 严禁编造不存在的基金代码/名称
 2. 输出格式严格按 JSON:
 {
@@ -183,12 +211,14 @@
       "pct": 数字 (百分比, 整数),
       "category": "short_bond / pure_bond / mixed_bond / wide",
       "reasons": ["收益来源 1 句", "宏观契合 1 句 (引用具体数据)", "政策/新闻契合 1 句 (如提供)", "风险点 1 句"],
-      "riskScore": 1-5 (1=极低风险, 5=高风险)
+      "riskScore": 1-5 (1=极低风险, 5=高风险),
+      "confidence": "高" | "中" | "低"
     }
   ],
   "allocation": "短债/纯债/宽基 配比说明",
   "summary": "整体策略说明 3-4 句 (必须引用具体宏观数据 + 至少 1 条新闻)",
-  "risks": ["风险点 1", "风险点 2", "..."]
+  "risks": ["风险点 1", "风险点 2", "..."],
+  "kbRefs": ["VAL-001", "POS-003"]  // 引用的 KB 条目号
 }
 3. picks 数量 2-3 只, 总 amount 必须等于用户给的总金额
 4. 类别组合建议: 极度保守→短债+纯债; 稳健→纯债为主+少量短债; 平衡→可加 20-30% 宽基
@@ -198,7 +228,9 @@
    - 宏观契合 (与当前利率环境/政策的匹配度, **必须引用具体 LPR/回购/CPI/PMI 数据**)
    - 政策/新闻契合 (**如有新闻必须引用至少 1 条**)
    - 风险点 (利率风险/信用风险/流动性风险/政策风险)
-7. 禁止用"建议投资""一定赚钱"等绝对化表述`;
+7. **KB 引用**: 如有相关条目 (data.kb 字段), 在 reasons 里引用条目号, kbRefs 数组填条目号
+8. **置信度**: confidence = 高 (多维数据一致+符合 KB 经典模式) / 中 (数据冲突或 KB 不明确) / 低 (新策略/极端市场)
+9. 禁止用"建议投资""一定赚钱"等绝对化表述`;
 
     const userPrompt = `【用户画像】
 - 总金额: ${amount} 元
@@ -211,10 +243,18 @@ ${macroText}
 
 ${newsText ? newsText : '## 近期财经新闻: (未启用或拉取失败)'}
 
+${ctxText}
+
+${intlText}
+
+${goldText}
+
+${kbText}
+
 【候选池 (共 ${seed.candidates.length} 只, 已按 tier 严格筛选, 字段: 代码 名称 类别 规模(亿) 1年% 3年% 年化% 回撤% 夏普 tier)】
 ${candidatesText}
 
-请基于【用户画像 + 宏观环境 + 财经新闻 + 候选池】做多维度分析, 严格使用候选项, JSON 输出 (按 systemPrompt 的格式), 总金额 = ${amount} 元。每条 reason 必须引用具体的宏观数据或新闻。`;
+请基于【用户画像 + 宏观环境 + 财经新闻 + 市场上下文(Phase M) + 国际形势(Phase L) + 黄金(Phase J) + KB(Phase N) + 候选池】做多维度分析, 严格使用候选项, JSON 输出 (按 systemPrompt 的格式), 总金额 = ${amount} 元。每条 reason 必须引用具体的宏观数据或新闻, 信心等级和 KB 引用必填。`;
 
     try {
       const fullText = await Core.AI.call({

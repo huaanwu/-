@@ -11,6 +11,7 @@ export default defineConfig({
     rollupOptions: {
       external: [
         '/app/watchlist.js',
+        '/app/stock-advisor.js',
         '/app/holdings.js',
         '/app/journal.js',
         '/app/screener.js',
