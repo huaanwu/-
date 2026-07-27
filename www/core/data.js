@@ -740,6 +740,213 @@
     return lines.join('\n');
   }
 
+  // ===== Phase M (Tier 1): AI 上下文 6 维数据 =====
+  // 1) 大盘 PE-TTM + 5 年分位 (估值温度计)
+  // 2) 业绩预告 + 财报披露日历 (拐点信号)
+  // 3) 北向资金 (外资风向)
+  // 4) 货币供应量 M2/M1/M0 (流动性)
+  // 5) 板块涨跌幅排名 (风格轮动)
+  // 6) 整体快照 getAiContextSnapshot + formatAiContextForPrompt
+
+  const _CTX_CACHE = 'ai_ctx_v1';
+  const _CTX_TTL = 6 * 60 * 60 * 1000;  // 6h
+
+  /**
+   * 1) 大盘估值温度计 - 上证 / 深证 / 创业板 / 科创 50 PE-TTM + 5 年分位
+   * aktools: stock_market_pe_lg  → 字段 (index_name, pe_ttm, pb, pe_percentile_5y)
+   */
+  async function _fetchMarketValuation() {
+    const data = await Core.Data.fetch('ai_ctx_pe', 'stock_market_pe_lg', {}, _CTX_TTL);
+    if (!Array.isArray(data)) return null;
+    const wanted = ['上证', '深证', '创业板', '科创50'];
+    const out = [];
+    for (const row of data) {
+      const name = (row.index_name || row.name || '').trim();
+      if (!wanted.some(w => name.includes(w))) continue;
+      const pe = parseFloat(row.pe_ttm || row.pe);
+      const pb = parseFloat(row.pb);
+      const pct = parseFloat(row.pe_percentile_5y || row.percentile);
+      if (isNaN(pe)) continue;
+      out.push({
+        name,
+        pe_ttm: pe,
+        pb: isNaN(pb) ? null : pb,
+        percentile_5y: isNaN(pct) ? null : pct
+      });
+    }
+    return out.length > 0 ? out : null;
+  }
+
+  /**
+   * 2) 业绩预告 + 财报披露日历
+   * aktools: stock_yjyg_em (业绩预告), stock_report_disclosure (披露日历)
+   */
+  async function _fetchEarningsCalendar() {
+    let upcoming = [], surprise = [];
+    try {
+      const cal = await Core.Data.fetch('ai_ctx_disc', 'stock_report_disclosure', {}, _CTX_TTL);
+      if (Array.isArray(cal)) {
+        upcoming = cal.slice(0, 30).map(r => ({
+          code: r['股票代码'] || r.code,
+          name: r['股票简称'] || r.name,
+          date: r['披露日期'] || r.date,
+          type: r['报告类型'] || r.type || ''
+        })).filter(x => x.code && x.date);
+      }
+    } catch (e) { console.warn('[Ctx] 财报披露日历失败:', e.message); }
+
+    try {
+      const yjyg = await Core.Data.fetch('ai_ctx_yjyg', 'stock_yjyg_em', {}, _CTX_TTL);
+      if (Array.isArray(yjyg)) {
+        surprise = yjyg.slice(0, 50).filter(r => {
+          const t = (r['业绩预告类型'] || r['预告类型'] || '').toString();
+          return /增|减|扭亏|首亏|续亏|续盈/.test(t);
+        }).slice(0, 10).map(r => ({
+          code: r['股票代码'] || r.code,
+          name: r['股票简称'] || r.name,
+          type: r['业绩预告类型'] || r['预告类型'],
+          summary: r['业绩预告摘要'] || r.summary || ''
+        }));
+      }
+    } catch (e) { console.warn('[Ctx] 业绩预告失败:', e.message); }
+
+    return (upcoming.length > 0 || surprise.length > 0)
+      ? { upcoming, surprise }
+      : null;
+  }
+
+  /**
+   * 3) 北向资金 (今日 + 近 5 日)
+   * aktools: stock_hsgt_north_net_flow_in_em → 字段 (date, value)
+   */
+  async function _fetchNorthFlow() {
+    const data = await Core.Data.fetch('ai_ctx_north', 'stock_hsgt_north_net_flow_in_em', {}, _CTX_TTL);
+    if (!Array.isArray(data) || data.length === 0) return null;
+    const last = data[data.length - 1];
+    const todayVal = parseFloat(last.value || last['当日成交净买额'] || last['value']);
+    if (isNaN(todayVal)) return null;
+    const tail = data.slice(-5).map(r => parseFloat(r.value || r['当日成交净买额'])).filter(v => !isNaN(v));
+    return {
+      today: todayVal,
+      history_5d: tail,
+      date: last.date || last['日期'] || ''
+    };
+  }
+
+  /**
+   * 4) 货币供应量 M2/M1/M0 同比
+   * aktools: macro_china_money_supply
+   */
+  async function _fetchMoneySupply() {
+    const data = await Core.Data.fetch('ai_ctx_m2', 'macro_china_money_supply', {}, _CTX_TTL);
+    if (!Array.isArray(data) || data.length === 0) return null;
+    const last = data[data.length - 1];
+    const m2 = parseFloat(last['货币和准货币'] || last['M2'] || last.value);
+    const m1 = parseFloat(last['货币'] || last['M1']);
+    const m0 = parseFloat(last['流通中现金'] || last['M0']);
+    if (isNaN(m2)) return null;
+    return {
+      date: last['月份'] || last.date || '',
+      m2_yoy: m2,
+      m1_yoy: isNaN(m1) ? null : m1,
+      m0_yoy: isNaN(m0) ? null : m0
+    };
+  }
+
+  /**
+   * 5) 申万行业板块涨跌幅 Top 5 涨/跌
+   * aktools: stock_board_industry_name_em → 字段 (板块名称, 涨跌幅)
+   */
+  async function _fetchSectorRotation() {
+    const data = await Core.Data.fetch('ai_ctx_sector', 'stock_board_industry_name_em', {}, _CTX_TTL);
+    if (!Array.isArray(data)) return null;
+    const rows = data.map(r => ({
+      name: r['板块名称'] || r.name,
+      changePct: parseFloat(r['涨跌幅'] || r.change_pct)
+    })).filter(r => r.name && !isNaN(r.changePct));
+    if (rows.length === 0) return null;
+    const sorted = [...rows].sort((a, b) => b.changePct - a.changePct);
+    return {
+      top5_gain: sorted.slice(0, 5).map(s => ({ name: s.name, changePct: s.changePct })),
+      top5_loss: sorted.slice(-5).reverse().map(s => ({ name: s.name, changePct: s.changePct })),
+      total: rows.length
+    };
+  }
+
+  /**
+   * 聚合: 1 次调用拿到 AI 上下文快照
+   * 所有字段都 fail-safe (null), 不阻塞其他维度
+   */
+  async function getAiContextSnapshot() {
+    const cached = await Core.Storage.cacheGet(_CTX_CACHE);
+    if (cached) return cached;
+    const [valuation, earnings, north, money, sectors] = await Promise.all([
+      _safeIntlFetch('valuation', _fetchMarketValuation),
+      _safeIntlFetch('earnings', _fetchEarningsCalendar),
+      _safeIntlFetch('north', _fetchNorthFlow),
+      _safeIntlFetch('money', _fetchMoneySupply),
+      _safeIntlFetch('sectors', _fetchSectorRotation)
+    ]);
+    const snap = {
+      generated: new Date().toISOString(),
+      valuation, earnings, north, money, sectors
+    };
+    await Core.Storage.cacheSet(_CTX_CACHE, snap, _CTX_TTL);
+    return snap;
+  }
+
+  /**
+   * 格式化为 prompt 友好的中文 (拼接到 weekly report 等 AI 上下文)
+   */
+  function formatAiContextForPrompt(snap) {
+    if (!snap) return '⚠ 市场上下文数据不可用';
+    const lines = [];
+    lines.push('## 市场上下文 (生成于 ' + snap.generated.slice(0, 16).replace('T', ' ') + ')');
+
+    if (Array.isArray(snap.valuation) && snap.valuation.length > 0) {
+      const items = snap.valuation.map(v => {
+        const pct = v.percentile_5y !== null ? `, 5 年分位 ${v.percentile_5y.toFixed(0)}%` : '';
+        const pb = v.pb !== null ? `, PB ${v.pb.toFixed(2)}` : '';
+        return `${v.name} PE-TTM ${v.pe_ttm.toFixed(1)}${pct}${pb}`;
+      });
+      lines.push(`- **大盘估值**: ${items.join(' / ')}`);
+    } else {
+      lines.push('- **大盘估值**: 数据拉取失败');
+    }
+
+    if (snap.earnings) {
+      const up = (snap.earnings.upcoming || []).slice(0, 3)
+        .map(e => `${e.name}(${(e.date || '').slice(0, 10)})`).join('、');
+      const sg = (snap.earnings.surprise || []).slice(0, 3)
+        .map(e => `${e.name} ${e.type}`).join('、');
+      if (up) lines.push(`- **近期财报披露**: ${up}`);
+      if (sg) lines.push(`- **业绩预告拐点**: ${sg}`);
+    }
+
+    if (snap.north && typeof snap.north.today === 'number') {
+      const sign = snap.north.today > 0 ? '+' : '';
+      lines.push(`- **北向资金**: 今日净买入 ${sign}${snap.north.today.toFixed(2)} 亿`);
+    } else {
+      lines.push('- **北向资金**: 数据拉取失败');
+    }
+
+    if (snap.money && !isNaN(snap.money.m2_yoy)) {
+      const m1 = snap.money.m1_yoy !== null ? snap.money.m1_yoy.toFixed(2) : 'N/A';
+      lines.push(`- **货币供应量**: M2 同比 ${snap.money.m2_yoy.toFixed(2)}%, M1 同比 ${m1}%`);
+    } else {
+      lines.push('- **货币供应量**: 数据拉取失败');
+    }
+
+    if (snap.sectors && Array.isArray(snap.sectors.top5_gain)) {
+      const fmt = arr => arr.map(s =>
+        `${s.name}(${s.changePct > 0 ? '+' : ''}${s.changePct.toFixed(2)}%)`
+      ).join('、');
+      lines.push(`- **板块涨跌 (申万)**: 领涨 ${fmt(snap.sectors.top5_gain)}; 领跌 ${fmt(snap.sectors.top5_loss)}`);
+    }
+
+    return lines.join('\n');
+  }
+
   // 暴露
   window.Core = window.Core || {};
   window.Core.Data = {
@@ -760,6 +967,9 @@
     formatGoldForPrompt,
     // 国际形势 (Phase L)
     getIntlSnapshot,
-    formatIntlForPrompt
+    formatIntlForPrompt,
+    // AI 上下文快照 (Phase M Tier 1: 估值/财报/北向/M2/板块)
+    getAiContextSnapshot,
+    formatAiContextForPrompt
   };
 })();

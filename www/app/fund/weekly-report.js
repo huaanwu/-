@@ -76,6 +76,11 @@
         const intl = await Core.Data.getIntlSnapshot();
         data.intl = Core.Data.formatIntlForPrompt(intl);
       } catch (e) { console.warn('[weekly] 拉国际形势失败:', e); data.intl = '(国际形势数据不可用)'; }
+      // 市场上下文 (Phase M Tier 1: 估值/财报/北向/M2/板块)
+      try {
+        const ctx = await Core.Data.getAiContextSnapshot();
+        data.context = Core.Data.formatAiContextForPrompt(ctx);
+      } catch (e) { console.warn('[weekly] 拉市场上下文失败:', e); data.context = '(市场上下文数据不可用)'; }
     } catch (e) {
       console.warn('[weekly] 数据拉取失败:', e);
       if (ld) ld.textContent = '❌ 数据拉取失败: ' + e.message;
@@ -90,6 +95,7 @@
       '- 必须引用本周 % 变化数字(从 holdings 数据),不许编造',
       '- 如果数据中有"黄金 Au9999"段, 必须在风险提示里提及金价方向(涨/跌/区间)',
       '- 如果数据中有"国际形势"段, 必须在重要事件或下周关注里提及美股/美元/原油方向',
+      '- 如果数据中有"市场上下文"段, 必须在重要事件或下周关注里综合估值分位/北向方向/板块轮动',
       '- 不要推荐买卖动作,只汇总信息'
     ].join('\n');
     const prompt = `基金周报数据:\n${JSON.stringify(data, null, 2)}\n\n请生成给小白看的本周小结。`;
