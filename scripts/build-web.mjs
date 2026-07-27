@@ -52,37 +52,43 @@ async function main() {
   console.log('▶ build-web: 把 Vite 产物合并回 www/');
 
   // 1) 拷贝 dist/index.html → www/index.html(覆盖,styles.css link 替换)
+  //    FIX-1 后 index.html 引用 /styles.src.css (git 跟踪的源码 link).
+  //    Vite build 时会把 link 转成 hashed path (/assets/style-<hash>.css);
+  //    本脚本反过来把 hashed path 改回 /styles.src.css, 保持 git 跟踪版不变.
+  //    www/styles.css 是兜底 (gitignore), 不再被此步骤覆盖 — 见下方步骤 2 的复制逻辑
   const distIndex = path.join(DIST, 'index.html');
   const wwwIndex = path.join(WWW, 'index.html');
   if (await exists(distIndex)) {
     let distContent = await fs.readFile(distIndex, 'utf-8');
     distContent = distContent.replace(
-      /<link\s+rel="stylesheet"\s+crossorigin\s+href="(?:\/assets\/(?:index|style)-[A-Za-z0-9_-]+\.css|\/styles\.src\.css)"\s*\/?>/g,
-      '<link rel="stylesheet" crossorigin href="/styles.css">'
+      /<link\s+rel="stylesheet"\s+crossorigin\s+href="(?:\/assets\/(?:index|style)-[A-Za-z0-9_-]+\.css|\/styles\.css)"\s*\/?>/g,
+      '<link rel="stylesheet" crossorigin href="/styles.src.css">'
     );
     await fs.writeFile(wwwIndex, distContent);
-    console.log('  [cp] dist/index.html → www/index.html (styles.css link 替换)');
+    console.log('  [cp] dist/index.html → www/index.html (hashed stylesheet → /styles.src.css)');
   } else {
     console.warn('  ⚠ dist/index.html 缺失,跳过');
   }
 
-  // 2) 合并 dist/assets/ → www/assets/, 并把 Vite 优化后的 CSS 复制到 www/styles.css
-  //    (index.html 链接 /styles.css, 不直接用 hashed 路径; 否则加载未压缩源 CSS)
+  // 2) 合并 dist/assets/ → www/assets/ (JS/图片等 hashed 资源)
+  //    CSS 路径由 index.html 决定: index.html link /styles.src.css (git 跟踪),
+  //    dev 时 Vite 实时编译; build 时由本脚本把 www/styles.src.css 原样复制到
+  //    www/styles.css 作为兜底 (APK 也走 /styles.css, Vite 优化版本由 dist 提供)。
+  //    这样 git 始终跟踪 src 版, build 不污染 git 工作树。
   const distAssets = path.join(DIST, 'assets');
   if (await exists(distAssets)) {
     await rimraf(ASSETS);
     await copyDir(distAssets, ASSETS);
     console.log('  [cp] dist/assets/* → www/assets/');
 
-    // 找 dist/assets/style-*.css 复制到 www/styles.css
-    const assetFiles = await fs.readdir(distAssets);
-    const cssFile = assetFiles.find(f => /^style-.*\.css$/.test(f));
-    if (cssFile) {
-      await fs.copyFile(path.join(distAssets, cssFile), path.join(WWW, 'styles.css'));
-      const { size: optimizedSize } = await fs.stat(path.join(WWW, 'styles.css'));
-      console.log(`  [cp] dist/assets/${cssFile} → www/styles.css (${optimizedSize} bytes, Vite 优化版)`);
+    // 复制 src CSS 到 www/styles.css (gitignore, APK 加载路径)
+    const srcCss = path.join(WWW, 'styles.src.css');
+    if (await exists(srcCss)) {
+      await fs.copyFile(srcCss, path.join(WWW, 'styles.css'));
+      const { size: srcSize } = await fs.stat(path.join(WWW, 'styles.css'));
+      console.log(`  [cp] www/styles.src.css → www/styles.css (${srcSize} bytes, 源码版 — 不用 Vite hashed)`);
     } else {
-      console.warn('  ⚠ dist/assets/ 没找到 style-*.css, www/styles.css 保持源文件 (未优化)');
+      console.warn('  ⚠ www/styles.src.css 不存在, www/styles.css 保留旧版本');
     }
   }
 

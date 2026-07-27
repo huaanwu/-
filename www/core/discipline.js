@@ -21,13 +21,13 @@
   const ANCHOR_KEY = 'discipline_month_anchor';         // kv: 实盘月度锚点 { month, startTotal }
   const ANCHOR_KEY_PAPER = 'discipline_month_anchor_paper'; // kv: 模拟盘月度锚点 (独立账本)
 
-  // 默认配置
+  // 默认配置 (出厂设置, 真值在 Core.Constants — 改一处生效全栈)
   const DEFAULT_CONFIG = {
-    maxSingleStockPct: 0.20,     // 单票占总资产上限
-    maxTotalPositionPct: 0.95,   // 股票总仓位上限
-    chaseWarnPct: 5,             // 当日涨幅超过此值视为追高 (警告不拦截)
-    maxMonthlyDrawdownPct: 0.10, // 月度回撤熔断线
-    maxSingleIndustryPct: 0.30,  // 单行业集中度上限 (预留字段: 暂无行业数据源, 待接入后启用)
+    maxSingleStockPct: Core.Constants.MAX_SINGLE_STOCK_PCT,  // 单票占总资产上限
+    maxTotalPositionPct: 0.95,                              // 股票总仓位上限
+    chaseWarnPct: 5,                                        // 当日涨幅超过此值视为追高 (警告不拦截)
+    maxMonthlyDrawdownPct: Core.Constants.MAX_MONTHLY_DRAWDOWN_PCT,  // 月度回撤熔断线
+    maxSingleIndustryPct: Core.Constants.MAX_SINGLE_INDUSTRY_PCT,   // 单行业集中度上限 (预留)
     enabled: true
   };
 

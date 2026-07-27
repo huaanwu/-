@@ -33,6 +33,23 @@ function readFileSafe(p) {
   catch (e) { return null; }
 }
 
+// FIX-2: 在 sandbox 测试里真实加载 constants.js, 让 mock Core 也有 Core.Constants
+let _REAL_CONSTANTS = null;
+function _loadRealConstants() {
+  if (_REAL_CONSTANTS !== null) return _REAL_CONSTANTS;
+  const src = readFileSafe(path.join(WWW, 'core', 'constants.js'));
+  if (!src) { _REAL_CONSTANTS = {}; return _REAL_CONSTANTS; }
+  const cctx = vm.createContext({ window: {}, console });
+  try {
+    vm.runInContext(src, cctx);
+    _REAL_CONSTANTS = cctx.window.Core && cctx.window.Core.Constants
+      ? cctx.window.Core.Constants : {};
+  } catch (e) {
+    _REAL_CONSTANTS = {};
+  }
+  return _REAL_CONSTANTS;
+}
+
 // ========== [1] JS 语法检查 ==========
 section('1] JS 语法检查');
 const syntaxFiles = [
@@ -519,7 +536,8 @@ try {
       window: {
         Core: {
           Storage: { all: async () => [], get: async () => null, add: async () => {}, put: async () => {} },
-          Data: { getFundSpot: async () => [], getIndexSpot: async () => [] }
+          Data: { getFundSpot: async () => [], getIndexSpot: async () => [] },
+          Constants: _loadRealConstants()
         },
         document: { getElementById: () => null }
       },
@@ -541,6 +559,7 @@ try {
     fctx.window.toastError = fctx.toastError;
     fctx.window.toastWarning = fctx.toastWarning;
     fctx.window.uuid = fctx.uuid;
+    fctx.Core = fctx.window.Core;  // FIX-2: 让 IIFE 顶层能直接找到 Core
     vm.createContext(fctx);
     vm.runInContext(fundSrc, fctx);
 
@@ -2642,7 +2661,8 @@ section('23] Paper 模拟盘纯函数实测');
           getStockQuote: async (code) => storageData.quotes[code] || null,
           getIndexSpot: async () => storageData.indexSpot || []
         },
-        Util: { stockCodePrefix: (c) => /^(60|68)/.test(c) ? 'sh' : 'sz' }
+        Util: { stockCodePrefix: (c) => /^(60|68)/.test(c) ? 'sh' : 'sz' },
+        Constants: _loadRealConstants()
       };
       pctx.Core = pctx.window.Core;
       pctx.window.document = { getElementById: () => null };
@@ -2945,8 +2965,10 @@ section('24] Discipline 交易纪律引擎纯函数 + 集成实测');
           getFundSpot: async () => []
         },
         State: { get: (k) => storageData.state[k] ?? null },
-        Util: { escapeHtml: (s) => String(s == null ? '' : s).replace(/</g, '&lt;').replace(/>/g, '&gt;') }
+        Util: { escapeHtml: (s) => String(s == null ? '' : s).replace(/</g, '&lt;').replace(/>/g, '&gt;') },
+        Constants: _loadRealConstants()
       };
+      dctx.Core = dctx.window.Core;
       vm.createContext(dctx);
       vm.runInContext(discSrc, dctx);
       return dctx;
@@ -3488,8 +3510,10 @@ section('27] Phase E 待确认交易: Core.Pending 实测 + 接线检查');
         Util: {
           uuid: () => 'pid-' + (++seq),
           escapeHtml: (s) => String(s == null ? '' : s).replace(/</g, '&lt;').replace(/>/g, '&gt;')
-        }
+        },
+        Constants: _loadRealConstants()
       };
+      pctx.Core = pctx.window.Core;
       vm.createContext(pctx);
       vm.runInContext(pendSrc, pctx);
       return pctx;

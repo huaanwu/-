@@ -117,7 +117,7 @@
         const t = r.f.type || 'other';
         byType[t] = (byType[t] || 0) + r.value;
       }
-      const target = { short_bond: 0.20, pure_bond: 0.80 };
+      const target = { ...Core.Constants.REBALANCE_TARGET_DEFAULT };
       let allocRows = '';
       for (const [type, val] of Object.entries(byType)) {
         const cur = totalValue > 0 ? val / totalValue : 0;
@@ -131,7 +131,7 @@
             <span class="alloc-label">${this._typeLabel(type)}</span>
             <span class="alloc-cur">${curPct}</span>
             <span class="alloc-tgt">目标 ${tgtStr}</span>
-            <span class="alloc-diff ${diff !== null && Math.abs(diff) > 0.05 ? 'alloc-warn' : 'alloc-ok'}">${diff !== null ? diffStr : ''}</span>
+            <span class="alloc-diff ${diff !== null && Math.abs(diff) > Core.Constants.REBALANCE_DRIFT_THRESHOLD ? 'alloc-warn' : 'alloc-ok'}">${diff !== null ? diffStr : ''}</span>
           </div>
         `;
       }
@@ -492,7 +492,7 @@
      *   expectedConfig: [...]  // 调后配置
      * }
      */
-    _computeRebalanceAdvice(holdings, targets, threshold = 0.05, fees = { redeem: 0, buy: 0.001 }) {
+    _computeRebalanceAdvice(holdings, targets, threshold = Core.Constants.REBALANCE_DRIFT_THRESHOLD, fees = { redeem: 0, buy: 0.001 }) {
       // 过滤掉没市值的
       const valid = (holdings || []).filter(h => h.value && h.value > 0);
       if (valid.length === 0) {

@@ -553,7 +553,7 @@ ${candidates}
                   suggestedShares: pos.shares, suggestedAmount: pos.amount,
                   reason: reasons.join('；') || 'AI 选股',
                   assumption: '题材催化',                    // 与模拟盘口径一致: AI 场景固定归"题材催化"
-                  stopLoss: +(price * 0.92).toFixed(2),      // 与模拟盘口径一致: 现价 × 0.92 (-8%)
+                  stopLoss: +(price * Core.Constants.STOP_LOSS_RATIO_AUTO).toFixed(2),      // 与模拟盘口径一致: 现价 × STOP_LOSS_RATIO_AUTO
                   falsifyCondition, invalidation,
                   regime: regimeLabel,
                   source: 'screener'

@@ -37,7 +37,7 @@
     }
 
     // 2. 目标配置 (可调整: 暂用默认 20/80)
-    const targets = { short_bond: 0.20, pure_bond: 0.80 };
+    const targets = { ...Core.Constants.REBALANCE_TARGET_DEFAULT };
     const advice = this._computeRebalanceAdvice(holdings, targets);
     _lastRebalanceAdvice = advice;  // 缓存给 _openRebalanceLinks 用
     _lastRebalanceHoldings = holdings;

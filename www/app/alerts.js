@@ -419,7 +419,7 @@
      * target: { type -> 目标占比 }  默认 { short_bond: 0.2, pure_bond: 0.8 }
      * 偏离阈值 5% 触发提醒
      */
-    async _computeRebalanceDrift(targetRatio = { short_bond: 0.20, pure_bond: 0.80 }) {
+    async _computeRebalanceDrift(targetRatio = { ...Core.Constants.REBALANCE_TARGET_DEFAULT }) {
       try {
         const funds = await Core.Storage.all('funds');
         const valid = funds.filter(f => f.shares > 0 && f.costNav > 0);
@@ -463,7 +463,7 @@
           drift.items.push({ type, target: tgt, current: curPct, diff });
         }
         drift.maxDrift = maxDrift;
-        drift.shouldRebalance = maxDrift > 0.05;  // 偏离 >5% 触发
+        drift.shouldRebalance = maxDrift > Core.Constants.REBALANCE_DRIFT_THRESHOLD;  // 偏离 > 5% 触发
 
         return drift;
       } catch (e) {

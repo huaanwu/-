@@ -21,13 +21,13 @@
   const COMMISSION_RATE = 0.0003;      // 佣金万三
   const COMMISSION_MIN = 5;            // 佣金最低 5 元
   const STAMP_TAX_RATE = 0.0005;       // 印花税万五 (仅卖出)
-  const LOT_SIZE = 100;                // A股一手
+  const LOT_SIZE = Core.Constants.LOT_SIZE;   // A 股一手
   const SNAPSHOT_LIMIT = 365;          // 快照上限
   const EOD_LIMIT = 60;                // 日终小结上限 (kv paper_eod_reports)
   const DISCIPLINE_LOG_LIMIT = 100;    // 纪律拦截日志上限 (kv paper_discipline_log)
   const EOD_MINUTES = 15 * 60 + 30;    // 日终小结生成时间: 工作日 15:30 后
   const DEFAULT_CASH = 100000;         // 默认初始虚拟资金
-  const DEFAULT_POSITION_PCT = 0.10;   // AI 自动成交单次仓位比例
+  const DEFAULT_POSITION_PCT = Core.Constants.SUGGEST_PCT_PAPER;  // AI 自动成交单次仓位比例
 
   const Paper = {
 
@@ -402,7 +402,7 @@
         if (Core.Discipline && Core.Discipline.preBuyCheck) {
           // AI 场景无人工假设: 固定归到"题材催化"; 止损默认 成交价 × 0.92 (-8%)
           const assumption = '题材催化';
-          const stopLoss = +(price * 0.92).toFixed(2);
+          const stopLoss = +(price * Core.Constants.STOP_LOSS_RATIO_AUTO).toFixed(2);
           const chk = await Core.Discipline.preBuyCheck({
             code: pick.code, name: pick.name || '', market: pick.market || '',
             price, shares, amount: shares * price,

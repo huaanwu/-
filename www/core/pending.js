@@ -21,8 +21,8 @@
   const KV_KEY = 'pending_trades';
   const MAX_ITEMS = 50;               // kv 数组上限, 防爆
   const EXPIRE_DAYS = 7;              // 建议有效期: 创建后 7 天, 过期惰性转 ignored
-  const SUGGEST_PCT = 0.05;           // 建议仓位 = 总资产 × 5% (半自动建议取小仓位, 留人工加码空间)
-  const LOT = 100;                    // A 股一手 100 股
+  const SUGGEST_PCT = Core.Constants.SUGGEST_PCT_PENDING;  // 建议仓位 (常量从 Core.Constants 取, 见 constants.js)
+  const LOT = Core.Constants.LOT_SIZE;
   const DAY_MS = 86400000;
 
   window.Core.Pending = {
@@ -61,7 +61,7 @@
       const cfg = config || {};
       const maxSinglePct = parseFloat(cfg.maxSingleStockPct) > 0
         ? parseFloat(cfg.maxSingleStockPct)
-        : 0.20; // 与 Core.Discipline.DEFAULT_CONFIG 默认值一致
+        : Core.Constants.MAX_SINGLE_STOCK_PCT; // 与 Core.Discipline.DEFAULT_CONFIG 默认值一致
       // 大盘状态机: 下跌市仓位系数 0.5; Regime 不可用/异常 → 回退 1.0 (旧行为)
       let scale = 1;
       try {
