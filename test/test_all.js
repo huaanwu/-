@@ -55,7 +55,7 @@ for (const rel of syntaxFiles) {
 section('2] 域脚本接口完备性');
 const DOMAINS = {
   'Watchlist': ['init', 'render', 'addDialog', 'add', 'remove', 'showKLine', 'closeModal', 'closeKLine'],
-  'Holdings':  ['init', 'render', 'addDialog', 'editDialog', 'save', 'remove', 'addTxDialog', 'saveTx', 'closeModal'],
+  'Holdings':  ['init', 'render', 'addDialog', 'editDialog', 'save', 'remove', 'addTxDialog', 'saveTx', 'closeModal', '_renderPending', 'confirmPending', 'ignorePending', '_markPendingConfirmed'],
   'Paper':     ['init', 'buy', 'sell', 'getAccount', 'getPositions', 'resetAccount', 'snapshotIfNeeded', 'autoTradeFromPick', 'renderPage', 'buyFromForm', 'sellFromForm', 'sellAll', '_calcFee', '_roundLot', '_pushSnapshot', '_planAutoTrade', 'maybeGenerateEodReport', '_shouldGenerateEod', '_pushEodReport', '_appendDisciplineLog', '_logDisciplineBlock', '_buildEodReport', '_formatEodReportText', '_pushEodToFeishu', '_renderEodReport'],
   'Journal':   ['init', 'render', 'newDialog', 'editDialog', 'save', 'remove', 'closeModal', '_buildHoldingsContext', '_renderHoldingBadge', '_renderStructuredTags', '_runAiAssistant'],
   'Screener':  ['init', 'run', '_addWatchlistFromPick', '_runPreBacktest'],
@@ -88,6 +88,7 @@ const CORE_MODULES = {
   'core/sync.js':   'Core.Sync',
   'core/agents.js': 'Core.Agents',
   'core/discipline.js': 'Core.Discipline',
+  'core/pending.js':  'Core.Pending',
   'core/news.js':   'Core.News',
   'core/premortem.js': 'Core.Premortem',
   'core/prebacktest.js': 'Core.PreBacktest',
@@ -145,6 +146,14 @@ const PBT_METHODS = ['pickStrategy', 'judgeVerdict', 'formatResult', 'renderResu
 for (const m of PBT_METHODS) {
   if (pbtContent && new RegExp(`\\b${m}\\s*\\(`).test(pbtContent)) ok(`PreBacktest.${m}`);
   else fail(`PreBacktest.${m}`, '缺失');
+}
+
+// 检查 Core.Pending (Phase E 实盘待确认交易) 的方法清单
+const pendContent = readFileSafe(path.join(WWW, 'core/pending.js'));
+const PEND_METHODS = ['add', 'list', 'get', 'confirm', 'ignore', 'purgeExpired', '_suggestPosition', '_setStatus'];
+for (const m of PEND_METHODS) {
+  if (pendContent && new RegExp(`\\b${m}\\s*\\(`).test(pendContent)) ok(`Pending.${m}`);
+  else fail(`Pending.${m}`, '缺失');
 }
 
 // 检查 Core.CrossCheck (Phase D2) 的方法清单
@@ -3320,6 +3329,146 @@ section('26] Phase D2 回测前置 + 双模型交叉验证');
     else fail('app.js D2 接线', '');
   } catch (e) {
     fail('Phase D2 测试', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [27] Phase E: 实盘待确认交易 (Core.Pending) ==========
+section('27] Phase E 待确认交易: Core.Pending 实测 + 接线检查');
+(async () => {
+  try {
+    const pendSrc = readFileSafe(path.join(WWW, 'core', 'pending.js'));
+    if (!pendSrc) throw new Error('pending.js 读不到');
+
+    // vm sandbox: mock window.Core (Storage kv 内存表 + Util.uuid/escapeHtml)
+    const buildPendCtx = (kv) => {
+      const pctx = { window: {}, console };
+      let seq = 0;
+      pctx.window.Core = {
+        Storage: {
+          kvGet: async (k) => (k in kv ? kv[k] : null),
+          kvSet: async (k, v) => { kv[k] = v; }
+        },
+        Util: {
+          uuid: () => 'pid-' + (++seq),
+          escapeHtml: (s) => String(s == null ? '' : s).replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        }
+      };
+      vm.createContext(pctx);
+      vm.runInContext(pendSrc, pctx);
+      return pctx;
+    };
+
+    // ---- add / 去重 ----
+    const kv1 = {};
+    const P1 = buildPendCtx(kv1).window.Core.Pending;
+    if (!P1) throw new Error('Core.Pending 未挂到 window');
+    const id1 = await P1.add({ code: '600519', name: '贵州茅台', suggestedShares: 100, suggestedAmount: 170000, reason: '理由A', source: 'screener' });
+    const l1 = await P1.list('pending');
+    if (id1 && l1.length === 1 && l1[0].code === '600519' && l1[0].status === 'pending'
+      && l1[0].action === 'buy' && l1[0].source === 'screener'
+      && l1[0].expireAt > Date.now()) ok('add: 建卡成功, 字段齐全 (buy/screener/pending/expireAt)');
+    else fail('add 建卡', JSON.stringify(l1));
+    // 同 code 重复 add → 不重复建卡, 刷新 reason, 返回原 id
+    const id1b = await P1.add({ code: '600519', reason: '理由B', suggestedShares: 200, suggestedAmount: 340000 });
+    const l1b = await P1.list('pending');
+    if (id1b === id1 && l1b.length === 1 && l1b[0].reason === '理由B' && l1b[0].suggestedShares === 200) ok('add: 同 code pending 去重 (刷新 reason/仓位, 返回原 id)');
+    else fail('add 去重', JSON.stringify({ id1, id1b, list: l1b }));
+    // confirmed 之后同 code 可再建卡
+    await P1.confirm(id1);
+    const id1c = await P1.add({ code: '600519', reason: '理由C' });
+    if (id1c !== id1 && (await P1.list('pending')).length === 1) ok('add: 原卡已 confirmed → 允许新建同 code 卡');
+    else fail('add confirmed 后重建', '');
+
+    // ---- 上限 50 条: 优先淘汰已完结卡片 ----
+    const kv2 = {};
+    const P2 = buildPendCtx(kv2).window.Core.Pending;
+    const firstId = await P2.add({ code: 'c0', reason: '旧' });
+    const secondId = await P2.add({ code: 'c1', reason: '旧2' });
+    await P2.ignore(firstId);
+    await P2.confirm(secondId);
+    for (let i = 2; i < 52; i++) await P2.add({ code: 'c' + i });
+    const all2 = await P2.list();
+    const pend2 = await P2.list('pending');
+    if (all2.length === 50) ok(`上限: 数组封顶 50 条 (实际 ${all2.length})`);
+    else fail('上限 50', String(all2.length));
+    if (!all2.find(t => t.id === firstId) && !all2.find(t => t.id === secondId)) ok('上限: 优先淘汰最旧的已完结卡片 (confirmed/ignored)');
+    else fail('上限淘汰顺序', '已完结卡片未被优先淘汰');
+
+    // ---- purgeExpired 惰性清理 ----
+    const kv3 = {};
+    const P3 = buildPendCtx(kv3).window.Core.Pending;
+    const id3 = await P3.add({ code: '000001', reason: 'x' });
+    // 直接把 kv 里的 expireAt 改到过去, 模拟过期
+    kv3.pending_trades[0].expireAt = Date.now() - 1000;
+    const l3 = await P3.list('pending');   // list 时惰性执行 purgeExpired
+    const g3 = await P3.get(id3);
+    if (l3.length === 0 && g3 && g3.status === 'ignored') ok('purgeExpired: 过期 pending → 惰性转 ignored');
+    else fail('purgeExpired', JSON.stringify({ l3, g3 }));
+
+    // ---- confirm / ignore 状态机 ----
+    const kv4 = {};
+    const P4 = buildPendCtx(kv4).window.Core.Pending;
+    const id4a = await P4.add({ code: 'a' });
+    const id4b = await P4.add({ code: 'b' });
+    if (await P4.confirm(id4a) && (await P4.get(id4a)).status === 'confirmed') ok('confirm: pending → confirmed');
+    else fail('confirm', '');
+    if (await P4.ignore(id4b) && (await P4.get(id4b)).status === 'ignored') ok('ignore: pending → ignored');
+    else fail('ignore', '');
+    if (await P4.confirm('不存在') === false) ok('confirm: 未知 id → false');
+    else fail('confirm 未知 id', '');
+    if ((await P4.list('pending')).length === 0 && (await P4.list()).length === 2) ok('list: status 过滤正确');
+    else fail('list 过滤', '');
+
+    // ---- _suggestPosition 纯函数 ----
+    const cfg = { maxSingleStockPct: 0.20 };
+    const sp1 = P4._suggestPosition({ totalAssets: 100000, price: 10, config: cfg });
+    if (sp1 && sp1.shares === 500 && sp1.amount === 5000) ok('suggest: 总资产 10 万 × 5% = 5000 → 500 股 @10');
+    else fail('suggest 基本', JSON.stringify(sp1));
+    const sp2 = P4._suggestPosition({ totalAssets: 100000, price: 10, config: cfg, heldValue: 15000 });
+    if (sp2 && sp2.shares === 500) ok('suggest: 已持 1.5 万, 单票剩余额度 5000 → 仍 500 股');
+    else fail('suggest 单票余量', JSON.stringify(sp2));
+    const sp3 = P4._suggestPosition({ totalAssets: 100000, price: 10, config: cfg, heldValue: 19600 });
+    if (sp3 === null) ok('suggest: 单票剩余额度 400, 不足一手 → null');
+    else fail('suggest 额度不足', JSON.stringify(sp3));
+    const sp4 = P4._suggestPosition({ totalAssets: 100000, price: 600, config: cfg });
+    if (sp4 === null) ok('suggest: 5000 元买不起一手 600 元股 → null');
+    else fail('suggest 不足一手', JSON.stringify(sp4));
+    if (P4._suggestPosition({ totalAssets: 0, price: 10, config: cfg }) === null
+      && P4._suggestPosition({ totalAssets: 100000, price: 0, config: cfg }) === null) ok('suggest: 总资产/价格非法 → null');
+    else fail('suggest 非法输入', '');
+    const sp5 = P4._suggestPosition({ totalAssets: 100000, price: 10 });  // 无 config → 默认单票上限 20%
+    if (sp5 && sp5.shares === 500) ok('suggest: 缺 config → 用默认单票上限 20%');
+    else fail('suggest 默认配置', JSON.stringify(sp5));
+
+    // ---- 接线静态检查 ----
+    const scrSrcE = readFileSafe(path.join(WWW, 'app', 'screener.js'));
+    if (scrSrcE.includes('Core.Pending.add') && scrSrcE.includes('Core.Pending._suggestPosition')
+      && scrSrcE.includes("source: 'screener'") && scrSrcE.includes('已生成实盘待确认交易')
+      && scrSrcE.includes('Core.Discipline._getRealAssets')) ok('screener: _addWatchlistFromPick 生成待确认卡片 (口径复用 Discipline)');
+    else fail('screener E 接线', '');
+    const hSrcE = readFileSafe(path.join(WWW, 'app', 'holdings.js'));
+    if (hSrcE.includes('_renderPending') && hSrcE.includes('Core.Pending.confirm')
+      && hSrcE.includes('Core.Pending.ignore') && hSrcE.includes('pendingTrades')
+      && hSrcE.includes('Core.Pending.list')) ok('holdings: 待确认区块渲染 + confirm/ignore 接线');
+    else fail('holdings E 接线', '');
+    // 确认流程不绕过纪律: save/saveTx 里的 preBuyCheck 仍在, 且 confirm 标状态在成交落库之后
+    const saveIdx = hSrcE.indexOf('async save(id)');
+    const preBuyIdx = hSrcE.indexOf('preBuyCheck', saveIdx);
+    const markIdx = hSrcE.indexOf('_markPendingConfirmed()', saveIdx);
+    const addIdx = hSrcE.indexOf("Core.Storage.add('holdings', data)", saveIdx);
+    if (preBuyIdx > saveIdx && addIdx > preBuyIdx && markIdx > addIdx) ok('holdings: 确认流程顺序 = preBuyCheck → 落库 → 标 confirmed (不绕过纪律)');
+    else fail('holdings 确认顺序', JSON.stringify({ saveIdx, preBuyIdx, addIdx, markIdx }));
+    const htmlE = readFileSafe(path.join(WWW, 'index.html'));
+    if (htmlE.includes('/core/pending.js') && htmlE.includes('id="pendingTrades"')) ok('index.html: pending.js 引用 + 卡片容器');
+    else fail('index.html E 接线', '');
+    const viteE = readFileSafe(path.join(ROOT, 'vite.config.js'));
+    if (viteE.includes("'/core/pending.js'")) ok('vite.config: external 含 /core/pending.js');
+    else fail('vite external', '');
+    // script 顺序: pending.js 在 discipline.js 之后 (依赖其实盘口径)
+    if (htmlE.indexOf('/core/pending.js') > htmlE.indexOf('/core/discipline.js')) ok('index.html: pending.js 在 discipline.js 之后加载');
+    else fail('script 顺序', '');
+  } catch (e) {
+    fail('Phase E 测试', e.message + ' / ' + (e.stack || ''));
   }
 })();
 

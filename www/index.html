@@ -44,6 +44,8 @@
       <h2>持仓管理</h2>
       <button class="btn btn-sm" onclick="Holdings.addDialog()">+ 新建</button>
     </div>
+    <!-- Phase E: AI 建议的实盘待确认交易 (持仓列表上方, 无待确认时不渲染) -->
+    <div id="pendingTrades"></div>
     <div id="holdingsSummary" class="summary-cards"></div>
     <div id="holdingsTable" class="data-card"></div>
   </section>
@@ -227,6 +229,7 @@
 <script src="/core/kb.js"></script>
 <script src="/core/state.js"></script>
 <script src="/core/discipline.js"></script>
+<script src="/core/pending.js"></script>
 <script src="/core/premortem.js"></script>
 <script src="/core/prebacktest.js"></script>
 <script src="/core/crosscheck.js"></script>

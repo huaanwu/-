@@ -521,6 +521,41 @@ ${candidates}
         if (window.Paper && typeof window.Paper.autoTradeFromPick === 'function') {
           window.Paper.autoTradeFromPick({ code, name, falsifyCondition, invalidation });
         }
+
+        // 4) Phase E: 生成实盘"待确认交易"卡片 (人确认才成交; 失败只 warn, 不影响加自选主流程)
+        if (window.Core && Core.Pending && typeof Core.Pending.add === 'function') {
+          try {
+            const q = await Core.Data.getStockQuote(code);
+            const price = q ? (parseFloat(q.最新价 ?? q.price ?? 0) || 0) : 0;
+            if (price > 0) {
+              // 总资产/单票已持市值复用 Core.Discipline 的实盘口径 (_getRealAssets), 保证与纪律检查分母一致
+              const assets = await Core.Discipline._getRealAssets();
+              const config = await Core.Discipline.getConfig();
+              const pos = Core.Pending._suggestPosition({
+                totalAssets: assets.totalAssets, price, config,
+                heldValue: (assets.valueByCode && assets.valueByCode[code]) || 0
+              });
+              if (!pos) {
+                console.warn(`[Screener] 待确认交易跳过 ${code}: 建议仓位不足一手或单票额度已满 (价 ${price})`);
+              } else {
+                await Core.Pending.add({
+                  code, name, market: Core.Util.stockCodePrefix(code), action: 'buy',
+                  suggestedShares: pos.shares, suggestedAmount: pos.amount,
+                  reason: reasons.join('；') || 'AI 选股',
+                  assumption: '题材催化',                    // 与模拟盘口径一致: AI 场景固定归"题材催化"
+                  stopLoss: +(price * 0.92).toFixed(2),      // 与模拟盘口径一致: 现价 × 0.92 (-8%)
+                  falsifyCondition, invalidation,
+                  source: 'screener'
+                });
+                toastSuccess('已生成实盘待确认交易, 请到持仓页确认');
+              }
+            } else {
+              console.warn(`[Screener] 待确认交易跳过 ${code}: 现价不可用`);
+            }
+          } catch (e) {
+            console.warn('[Screener] 生成待确认交易失败:', e);
+          }
+        }
       } catch (e) {
         console.error('[Screener] _addWatchlistFromPick 失败:', e);
         toastError('加自选失败: ' + e.message);

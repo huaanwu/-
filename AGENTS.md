@@ -69,7 +69,7 @@ node scripts/daily_summary.mjs --verify-dry-run ./journals.json   # 事后验证
 node scripts/daily_summary.mjs --premarket   # Phase C 盘前简报 (隔夜外盘+日历+财新要闻 → LLM → 飞书; 建议 Windows 计划任务 交易日 08:30)
 ```
 
-`test/test_all.js` 26 节:JS 语法、域脚本接口完备性 (`DOMAINS` 字典)、Core 命名空间导出、index.html script 引用对账、Worker 结构、关键文件存在、Data 层方法签名、回测引擎 vm 沙箱实测、Vite external 对账、journal/market/fund/alerts 纯函数实测、daily_summary 单测 (含 --premarket 盘前简报)、5.1/5.2/5.3 互通闭环实测、数据源限流、Paper 模拟盘纯函数实测 (含 Phase C EOD 日终小结)、Discipline 纪律引擎实测、Phase D1 pre-mortem + 个股公告实测、Phase D2 回测前置 + 双模型实测。**改完域脚本或新增域方法必须先 `npm test`,并同步更新该文件的 `DOMAINS` 字典。**
+`test/test_all.js` 27 节:JS 语法、域脚本接口完备性 (`DOMAINS` 字典)、Core 命名空间导出、index.html script 引用对账、Worker 结构、关键文件存在、Data 层方法签名、回测引擎 vm 沙箱实测、Vite external 对账、journal/market/fund/alerts 纯函数实测、daily_summary 单测 (含 --premarket 盘前简报)、5.1/5.2/5.3 互通闭环实测、数据源限流、Paper 模拟盘纯函数实测 (含 Phase C EOD 日终小结)、Discipline 纪律引擎实测、Phase D1 pre-mortem + 个股公告实测、Phase D2 回测前置 + 双模型实测、Phase E 待确认交易实测 (Pending 去重/上限/过期/状态机/建议仓位 + 接线)。**改完域脚本或新增域方法必须先 `npm test`,并同步更新该文件的 `DOMAINS` 字典。**
 
 `scripts/e2e.mjs` 注意:Chrome 路径硬编码 `C:\Program Files\Google\Chrome\Application\chrome.exe`,需要 Vite 已在 3003 端口跑着。
 
@@ -85,6 +85,7 @@ www/                        # Web 根 (= Capacitor webDir,Vite root)
 │   ├── storage.js          # Dexie 4:9 表 + cacheGet/cacheSet(TTL 默认 5 分钟)+ kv + clearAll
 │   ├── data.js             # Core.Data:fetchWithCache + getStockSpot/getStockQuote/getStockKLine/getFundSpot/getIndexSpot;腾讯财经备用源(GBK 解码)
 │   ├── discipline.js       # Core.Discipline:交易纪律引擎(Phase B),买入前硬校验(假设/止损必填、单票/总仓位、月度回撤熔断、追高/重复错误警告),实盘模拟盘共用
+│   ├── pending.js          # Core.Pending:实盘待确认交易(Phase E),AI 建议卡片 kv 存储 + 状态机(pending/confirmed/ignored) + _suggestPosition 建议仓位,确认走 holdings 原流程不绕过纪律
 │   ├── premortem.js        # Core.Premortem:AI 建议 pre-mortem 工具(Phase D1),PROMPT_SPEC 字段说明 + checkPick/checkPicks 校验 + renderBlock 四象限渲染
 │   ├── prebacktest.js      # Core.PreBacktest:AI 建议"回测前置"(Phase D2),pickStrategy/judgeVerdict 纯函数 + runForPick(近2年日K→worker回测,15s超时,失败返null) + renderResultHtml 徽章
 │   ├── crosscheck.js       # Core.CrossCheck:双模型交叉验证(Phase D2),pickSecondProvider(state.apiKeys.llm map)/resolveSecondOpinion/buildComparePrompt
@@ -231,6 +232,16 @@ vite.config.js              # root=www,域脚本 external 列表,dev proxy
 | D2.4 双模型工具 | `www/core/crosscheck.js` | `Core.CrossCheck.pickSecondProvider` (从 `state.apiKeys.llm` map 按 PROVIDER_ORDER 找第一个 ≠当前且配 key 的 provider, custom 除外) / `resolveSecondOpinion(state)` (勾代理→`/api/llm/{provider}/v1`, 否则 provider 默认 baseURL; 未配置返 null → 调用方 toast) / `buildComparePrompt` (主模型 ≤100 字一致性小结) |
 | D2.5 第二意见调用 | `www/app/stock-advisor.js` | `Core.AI.callWithTimeout` + opts 覆盖 `baseURL/apiKey/model` + `local:false` (强制远程, 防"优先本地"劫持), 第二 provider 重评 (1 次) → 双段并排 → 主模型一致性小结 (1 次); 不改 ai-service.js |
 | D2.6 设置页 | `www/app.js` | "🤝 第二意见"区: provider 下拉 (排除 custom) + per-provider key 输入, 存 `state.apiKeys.llm` map (留空=删除该 provider key); `_secondProviderOptions` / `onSecondProviderChange` |
+
+### Phase E 半自动执行 (实盘待确认交易)
+
+> 设计原则: AI 提建议, 模拟盘自动跑, **实盘必须人确认**。确认流程绝不绕过 `preBuyCheck`。
+
+| 子项 | 实现位置 | 关键方法 |
+|------|----------|----------|
+| E.1 待确认交易存储 | `www/core/pending.js` | `Core.Pending`: kv `pending_trades` 数组 (上限 50, 优先淘汰已完结卡片), 只做 buy; `add` (同 code pending 去重, 刷新 reason/仓位) / `list(status?)` / `get` / `confirm` / `ignore` (只改状态) / `purgeExpired` (7 天过期惰性转 ignored, list 时执行) / `_suggestPosition` 纯函数 (金额=总资产×5%, 整手向下取整, 不超纪律单票上限剩余额度, 不足一手返 null) |
+| E.2 screener 生成入口 | `www/app/screener.js` | `_addWatchlistFromPick` 追加第 4 步: 现价 + `Core.Discipline._getRealAssets()` 实盘口径 → `_suggestPosition` → `Core.Pending.add` (assumption 固定'题材催化', stopLoss=现价×0.92, 与模拟盘口径一致), 失败只 warn 不影响加自选 |
+| E.3 持仓页确认 UI | `www/app/holdings.js` + `index.html` `#pendingTrades` | `_renderPending` (持仓列表上方, 无 pending 不渲染, 理由/pre-mortem 折叠, 全转义) / `confirmPending` (已有同 code 持仓→addTxDialog 加仓, 否则 _formDialog 新建, 预填 code/shares/现价/assumption/stopLoss) / `ignorePending`; **成交落库后**才 `_markPendingConfirmed`, 预填后放弃保存保持 pending |
 
 ### 8 大页面域 + Core 模块
 

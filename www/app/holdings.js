@@ -10,6 +10,8 @@
     async init() {},
 
     async render() {
+      // Phase E: 待确认交易区 (持仓列表上方, 无待确认时不渲染)
+      await this._renderPending();
       // 排除模拟盘 (isPaper) 行, 真实持仓视图不受 Paper 模块污染
       const holdings = (await Core.Storage.all('holdings')).filter(h => !h.isPaper);
       const summaryEl = document.getElementById('holdingsSummary');
@@ -115,12 +117,102 @@
     addDialog() { this._formDialog(null); },
     editDialog(id) { this._formDialog(id); },
 
-    async _formDialog(id) {
+    // ========== Phase E: 实盘"待确认交易" (AI 建议 → 人确认 → 原有买入流程, 不绕过纪律) ==========
+
+    /** 渲染页面顶部"📥 待确认交易"区块; 无 pending 卡片时清空不渲染 */
+    async _renderPending() {
+      const el = document.getElementById('pendingTrades');
+      if (!el) return;
+      if (!window.Core || !Core.Pending) { el.innerHTML = ''; return; }
+      let list = [];
+      try { list = await Core.Pending.list('pending'); }
+      catch (e) { console.warn('[Holdings] 待确认交易读取失败:', e); }
+      if (!list.length) { el.innerHTML = ''; return; }
+      const now = Date.now();
+      const cards = list.map(t => {
+        const daysLeft = Math.max(0, Math.ceil((t.expireAt - now) / 86400000));
+        const pmRows = [];
+        if (t.reason) pmRows.push(`<div><strong>理由</strong>: ${escapeHtml(t.reason)}</div>`);
+        if (t.assumption) pmRows.push(`<div><strong>买入假设</strong>: ${escapeHtml(t.assumption)}${t.stopLoss ? ` · <strong>止损价</strong>: ${escapeHtml(String(t.stopLoss))}` : ''}</div>`);
+        if (t.falsifyCondition) pmRows.push(`<div><strong>证伪条件</strong>: ${escapeHtml(t.falsifyCondition)}</div>`);
+        if (t.invalidation) pmRows.push(`<div><strong>失效条件</strong>: ${escapeHtml(t.invalidation)}</div>`);
+        return `
+          <div class="pending-card" style="border:1px solid var(--border, #30363d);border-radius:6px;padding:10px;margin-bottom:8px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;">
+              <span><strong>${escapeHtml(t.code)} ${escapeHtml(t.name || '')}</strong></span>
+              <span style="font-size:12px;color:var(--text-muted);">
+                建议买入 ${fmtNum(t.suggestedShares, 0)} 股 ≈ ${fmtMoney(t.suggestedAmount)}
+                · 来源: ${escapeHtml(t.source)} · 剩余 ${daysLeft} 天
+              </span>
+            </div>
+            <details style="margin:6px 0;font-size:12px;color:var(--text-muted);">
+              <summary style="cursor:pointer;">理由 / Pre-mortem</summary>
+              <div style="margin-top:4px;line-height:1.6;">${pmRows.join('') || '(无)'}</div>
+            </details>
+            <div>
+              <button class="btn btn-sm btn-primary" onclick="Holdings.confirmPending('${escapeHtml(t.id)}')">✅ 确认买入</button>
+              <button class="btn btn-sm" onclick="Holdings.ignorePending('${escapeHtml(t.id)}')">✖ 忽略</button>
+            </div>
+          </div>
+        `;
+      }).join('');
+      el.innerHTML = `
+        <div class="data-card" style="margin-bottom:12px;">
+          <div style="font-weight:bold;margin-bottom:8px;">📥 待确认交易
+            <span style="font-weight:normal;font-size:12px;color:var(--text-muted);">(AI 建议, 确认后走正常买入流程, 含纪律检查)</span>
+          </div>
+          ${cards}
+        </div>
+      `;
+    },
+
+    /**
+     * ✅ 确认买入: 只打开买入表单并预填, 不直接改卡片状态
+     * 实际成交成功 (save/saveTx 落库) 后才标 confirmed; 用户放弃保存则保持 pending
+     */
+    async confirmPending(id) {
+      const t = await Core.Pending.get(id);
+      if (!t || t.status !== 'pending') { toastWarning('该卡片已处理'); this._renderPending(); return; }
+      // 预填成本价: 拉实时现价, 失败回退建议均价
+      let price = 0;
+      try {
+        const q = await Core.Data.getStockQuote(t.code);
+        price = q ? (parseFloat(q.最新价 ?? q.price) || 0) : 0;
+      } catch (e) { console.warn('[Holdings] 待确认交易拉行情失败:', t.code, e); }
+      if (!price && t.suggestedShares > 0) price = +(t.suggestedAmount / t.suggestedShares).toFixed(2);
+      const prefill = {
+        pendingId: id, code: t.code, name: t.name,
+        shares: t.suggestedShares || '', costPrice: price || '',
+        assumption: t.assumption || '', stopLoss: t.stopLoss || '',
+        reason: t.reason || ''
+      };
+      // 已有同 code 实盘持仓 → 走"添加交易"加仓表单, 否则新建持仓表单
+      const existing = ((await Core.Storage.all('holdings')) || []).find(h => !h.isPaper && h.code === t.code);
+      if (existing) this.addTxDialog(existing.id, prefill);
+      else this._formDialog(null, prefill);
+    },
+
+    /** ✖ 忽略: 只改卡片状态 */
+    async ignorePending(id) {
+      await Core.Pending.ignore(id);
+      toastSuccess('已忽略');
+      this._renderPending();
+    },
+
+    async _formDialog(id, prefill) {
       let h = { code: '', name: '', shares: '', costPrice: '', note: '' };
       if (id) {
         h = await Core.Storage.get('holdings', id);
         if (!h) { toastError('持仓不存在'); return; }
       }
+      // Phase E: 从待确认卡片进入时预填 (仅新建场景), 并记住卡片 id 待成交后标 confirmed
+      this._pendingConfirmId = (!id && prefill && prefill.pendingId) || null;
+      if (!id && prefill) {
+        h = { code: prefill.code || '', name: prefill.name || '', shares: prefill.shares || '',
+              costPrice: prefill.costPrice || '', note: prefill.reason || '' };
+      }
+      const preAssumption = (!id && prefill && prefill.assumption) || '';
+      const preStopLoss = (!id && prefill && prefill.stopLoss) || '';
       const html = `
         <div class="modal-backdrop" onclick="if(event.target===this)Holdings.closeModal()">
           <div class="modal">
@@ -150,12 +242,12 @@
               <label>买入假设</label>
               <select id="hAssumption">
                 <option value="">(必选)</option>
-                ${Core.Discipline.ASSUMPTIONS.map(a => `<option value="${a}">${a}</option>`).join('')}
+                ${Core.Discipline.ASSUMPTIONS.map(a => `<option value="${a}" ${a === preAssumption ? 'selected' : ''}>${a}</option>`).join('')}
               </select>
             </div>
             <div class="form-row">
               <label>止损价</label>
-              <input type="number" id="hStopLoss" step="0.01" min="0" placeholder="必填, 低于成本价">
+              <input type="number" id="hStopLoss" step="0.01" min="0" placeholder="必填, 低于成本价" value="${preStopLoss}">
             </div>
             <div id="hCheckResult"></div>
             ` : ''}
@@ -202,6 +294,7 @@
         data.id = uuid();
         data.createdAt = Date.now();
         await Core.Storage.add('holdings', data);
+        await this._markPendingConfirmed();  // Phase E: 成交成功后才标 confirmed
       }
       this.closeModal();
       toastSuccess('已保存');
@@ -222,10 +315,15 @@
 
     /**
      * 添加交易记录(后续买入/卖出)
+     * @param {string} holdingId
+     * @param {object} [prefill] Phase E: 待确认卡片预填 { pendingId, shares, costPrice, assumption, stopLoss, reason }
      */
-    async addTxDialog(holdingId) {
+    async addTxDialog(holdingId, prefill) {
       const h = await Core.Storage.get('holdings', holdingId);
       if (!h) return;
+      // Phase E: 从待确认卡片进入时记住卡片 id, 成交成功后才标 confirmed
+      this._pendingConfirmId = (prefill && prefill.pendingId) || null;
+      const preAssumption = (prefill && prefill.assumption) || '';
       const html = `
         <div class="modal-backdrop" onclick="if(event.target===this)Holdings.closeModal()">
           <div class="modal">
@@ -244,26 +342,26 @@
             </div>
             <div class="form-row">
               <label>价格</label>
-              <input type="number" id="txPrice" step="0.01" placeholder="1700.50">
+              <input type="number" id="txPrice" step="0.01" placeholder="1700.50" value="${(prefill && prefill.costPrice) || ''}">
             </div>
             <div class="form-row">
               <label>数量</label>
-              <input type="number" id="txShares" step="100" placeholder="100">
+              <input type="number" id="txShares" step="100" placeholder="100" value="${(prefill && prefill.shares) || ''}">
             </div>
             <div class="form-row">
               <label>理由/笔记</label>
-              <textarea id="txNote" placeholder="为什么买/卖?"></textarea>
+              <textarea id="txNote" placeholder="为什么买/卖?">${escapeHtml((prefill && prefill.reason) || '')}</textarea>
             </div>
             <div class="form-row">
               <label>买入假设</label>
               <select id="txAssumption">
                 <option value="">(买入必选)</option>
-                ${Core.Discipline.ASSUMPTIONS.map(a => `<option value="${a}">${a}</option>`).join('')}
+                ${Core.Discipline.ASSUMPTIONS.map(a => `<option value="${a}" ${a === preAssumption ? 'selected' : ''}>${a}</option>`).join('')}
               </select>
             </div>
             <div class="form-row">
               <label>止损价</label>
-              <input type="number" id="txStopLoss" step="0.01" min="0" placeholder="买入必填, 低于价格">
+              <input type="number" id="txStopLoss" step="0.01" min="0" placeholder="买入必填, 低于价格" value="${(prefill && prefill.stopLoss) || ''}">
             </div>
             <div id="txCheckResult"></div>
             <div class="modal-footer">
@@ -327,12 +425,25 @@
       h.updatedAt = Date.now();
       await Core.Storage.put('holdings', h);
 
+      // Phase E: 买入成交成功后才标 confirmed (卖出/分红不关卡片)
+      if (tx.type === 'buy') await this._markPendingConfirmed();
+
       this.closeModal();
       toastSuccess('已记录');
       this.render();
     },
 
+    /** Phase E: 成交成功后把来源待确认卡片标 confirmed (无来源卡片则空转) */
+    async _markPendingConfirmed() {
+      if (!this._pendingConfirmId || !window.Core || !Core.Pending) return;
+      const pid = this._pendingConfirmId;
+      this._pendingConfirmId = null;
+      try { await Core.Pending.confirm(pid); }
+      catch (e) { console.warn('[Holdings] 待确认卡片状态更新失败:', e); }
+    },
+
     closeModal() {
+      this._pendingConfirmId = null;  // 放弃保存: 卡片保持 pending
       document.getElementById('modalRoot').innerHTML = '';
     }
   };
