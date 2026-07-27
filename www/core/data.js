@@ -432,17 +432,12 @@
         return all.filter(s => codes.includes(s.代码) || codes.includes(s.code));
       }
     }
-    // 不传 codes: 优先东方财富全市场 (C 替代), 失败时降级 aktools
+    // 不传 codes: 优先东方财富全市场 (C 替代), 失败时不依赖 aktools (免等后端)
     try {
       return await getStockSpotEfinanceCached();
     } catch (e) {
-      console.warn('[Data] 东方财富失败, 降级 aktools:', e.message);
-      return await fetchWithCache(
-        'stock_spot_all',
-        'stock_zh_a_spot',
-        {},
-        60 * 1000
-      );
+      console.warn('[Data] 东方财富失败, 返回空 (不依赖 aktools):', e.message);
+      return [];
     }
   }
 

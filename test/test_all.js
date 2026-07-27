@@ -2211,10 +2211,12 @@ section('21] c 数据源限流修复 (retry/退避/限流)');
     if (s0.blocked === false && s0.retryIn === 0 && s0.lastError === '' && s0.lastSuccess === 0) ok('getLimitStatus: 默认无限制');
     else fail('getLimitStatus 默认', JSON.stringify(s0));
 
-    // ---- 21.2 HTTP 429 触发限流 ----
+    // ---- 21.2 HTTP 429 触发限流 (codes 路径) ----
+    // 注: 无 codes 走东财全市场, fetch 不返限流错 (静默返空)
+    // 限流能力保留给 codes 路径 (腾讯→aktools 降级)
     DS.fetch = async () => ({ ok: false, status: 429, text: async () => 'Too Many Requests' });
     let r1;
-    try { await D.getStockSpot(); r1 = 'NO_THROW'; }
+    try { await D.getStockSpot(['600519']); r1 = 'NO_THROW'; }
     catch (e) { r1 = e.message; }
     if (r1.includes('数据源限流') && r1.includes('60s')) {
       const s1 = D.getLimitStatus();
@@ -2222,30 +2224,33 @@ section('21] c 数据源限流修复 (retry/退避/限流)');
       else fail('429 限流状态', JSON.stringify(s1));
     } else fail('HTTP 429 未触发限流', r1);
 
-    // ---- 21.3 限流期内 fetch 直接抛 (不真发请求) ----
+    // ---- 21.3 限流期内不发起任何 fetch (走 getStockKLine 限流检查) ----
+    // getStockKLine 在限流期会直接 throw 不发请求, 与 fetchWithCache 行为一致
+    // (因腾讯 fetcher 不受 aktools 限流约束, 不能用 codes 路径测)
     let fetchCalled = false;
-    DS.fetch = async () => { fetchCalled = true; return { ok: true, status: 200, json: async () => ({}) }; };
+    DS.fetch = async () => { fetchCalled = true; return { ok: false, status: 502, text: async () => 'Bad Gateway' }; };
     let r2;
-    try { await D.getStockSpot(); r2 = 'NO_THROW'; }
+    try { await D.getStockKLine('600519'); r2 = 'NO_THROW'; }
     catch (e) { r2 = e.message; }
     if (r2.includes('限流') && r2.includes('后') && !fetchCalled) ok('限流期内 fetch 不发起请求');
     else fail('限流期内行为', JSON.stringify({ msg: r2, fetchCalled }));
 
-    // ---- 21.4 retry: 第一次 fail 4xx (非限流), 第二次 success ----
+    // ---- 21.4 retry: 第一次 fail 4xx (非限流), 第二次 success (codes 路径) ----
     D.resetLimit();  // 清 21.2/21.3 残留的限流状态
     DS.Core.Storage.cacheGet = async () => null;
     let attempt = 0;
     DS.fetch = async () => {
       attempt++;
       if (attempt === 1) return { ok: false, status: 400, text: async () => 'Bad Request - invalid symbol' };
-      return { ok: true, status: 200, json: async () => ({ ret: 'success' }) };
+      // aktools 降级返全市场, 含被请求的 code
+      return { ok: true, status: 200, json: async () => ([{ ret: 'success', 代码: '600519' }]) };
     };
     // 4xx 走重试 (不触发限流)
-    const r3 = await D.getStockSpot();
-    if (r3 && r3.ret === 'success' && attempt === 2) ok('4xx retry 第二次成功');
+    const r3 = await D.getStockSpot(['600519']);
+    if (r3 && Array.isArray(r3) && r3[0] && r3[0].ret === 'success' && attempt === 2) ok('4xx retry 第二次成功');
     else fail('4xx retry', JSON.stringify({ r: r3, attempt }));
 
-    // ---- 21.5 4xx 业务错误: 重试 N 次后抛 ----
+    // ---- 21.5 4xx 业务错误: 重试 N 次后抛 (codes 路径) ----
     D.resetLimit();
     attempt = 0;
     DS.fetch = async () => {
@@ -2253,19 +2258,21 @@ section('21] c 数据源限流修复 (retry/退避/限流)');
       return { ok: false, status: 400, text: async () => 'Bad Request - invalid symbol' };
     };
     let r4;
-    try { await D.getStockSpot(); r4 = 'NO_THROW'; }
+    try { await D.getStockSpot(['600519']); r4 = 'NO_THROW'; }
     catch (e) { r4 = e.message; }
     if (r4.includes('HTTP 400') && attempt === 3) ok('4xx 业务错误重试 3 次后抛错');
     else fail('4xx retry N 次', JSON.stringify({ r: r4, attempt }));
 
-    // ---- 21.6 5xx 触发限流 (无需中文关键字) ----
+    // ---- 21.6 5xx → 限流 (走 codes 路径, aktools 仍保有重试/限流能力) ----
+    // 注: 无 codes 时东财全市场已独立处理 (失败静默 []), 不进全局限流
     D.resetLimit();
     attempt = 0;
     DS.fetch = async () => ({ ok: false, status: 502, text: async () => 'Bad Gateway' });
     let r5;
-    try { await D.getStockSpot(); r5 = 'NO_THROW'; }
+    // codes 路径: 4xx 重试 3 次后抛, 5xx 触发限流
+    try { await D.getStockSpot(['600519']); r5 = 'NO_THROW'; }
     catch (e) { r5 = e.message; }
-    if (r5.includes('数据源限流') && r5.includes('60s')) ok('5xx 触发 60s 限流');
+    if (r5.includes('数据源限流') && r5.includes('60s')) ok('5xx 触发 60s 限流 (codes 路径)');
     else fail('5xx 限流', r5);
 
     // ---- 21.7 缓存命中: 不发请求 (限流期内也用缓存) ----
