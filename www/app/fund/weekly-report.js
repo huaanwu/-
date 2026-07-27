@@ -190,7 +190,8 @@
     } catch (e) {
       console.warn('[weekly] AI 调用失败:', e);
       if (ld) ld.remove();
-      if (el) el.textContent = '❌ AI 调用失败: ' + e.message;
+      // Phase V: 失败时显示重新生成按钮
+      if (el) el.innerHTML = `❌ AI 调用失败: ${escapeHtml(e.message)}<div style="margin-top:10px;"><button class="btn btn-primary" onclick="Fund.weeklyReportDialog()">🔄 重新生成</button></div>`;
       if (window.toastError) toastError('AI 调用失败: ' + e.message);
     }
   };

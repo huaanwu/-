@@ -383,7 +383,7 @@ ${candidates}
           // Phase T: schema 校验失败, 显示原始 + 错误明细
           if (streamEl) {
             const errList = parsed.errors.map(e => `<li>${escapeHtml(e)}</li>`).join('');
-            streamEl.innerHTML = `<div style="color:var(--down);">⚠ JSON 校验失败:</div><ul style="margin:4px 0 8px;font-size:12px;">${errList}</ul><pre style="white-space:pre-wrap;font-size:12px;max-height:240px;overflow:auto;">${escapeHtml(fullText)}</pre>`;
+            streamEl.innerHTML = `<div style="color:var(--down);">⚠ JSON 校验失败:</div><ul style="margin:4px 0 8px;font-size:12px;">${errList}</ul><pre style="white-space:pre-wrap;font-size:12px;max-height:240px;overflow:auto;">${escapeHtml(fullText)}</pre><div style="margin-top:10px;"><button class="btn btn-primary" onclick="Screener.aiInterpret()">🔄 重新生成</button></div>`;
           }
         }
       } catch (e) {
