@@ -176,6 +176,9 @@
     const goldText = gold ? Core.Data.formatGoldForPrompt(gold, 30) : '(黄金数据不可用)';
 
     // KB 智能匹配 (Phase N+O)
+    // Bug J 修复 (调用方): seed 前 5 当 placeholder (AI picks 还没拿到),
+    //   真正匹配靠 KB.tags 兜底; entries 若带 tags 字段, 即使 keywords
+    //   不命中也会被弱匹配拉出来 (例: 短债 type → 命中 entry.tags=["short_bond"])
     let kbText = '';
     try {
       const kbEntries = await Core.KB.pickRelevant({

@@ -108,15 +108,26 @@
 
     const queryStr = queries.join(' ').toLowerCase();
 
-    // 评分: 每条 entry 的 keywords + title 与 queryStr 命中数
+    // 评分: 每条 entry 的 keywords + title + tags 与 queryStr 命中数
     const scored = kb.entries.map(e => {
-      const hay = ((e.title || '') + ' ' + (e.keywords || []).join(' ') + ' ' + (e.category || '')).toLowerCase();
+      const hay = ((e.title || '') + ' ' + (e.keywords || []).join(' ') + ' ' + (e.category || '') + ' ' + (e.tags || []).join(' ')).toLowerCase();
       let score = 0;
       for (const q of queries) {
         const ql = q.toLowerCase();
         if (hay.includes(ql)) score += 1;
         // 部分匹配 (2 字以上)
         if (ql.length >= 2 && hay.includes(ql.slice(0, 2))) score += 0.3;
+      }
+      // Bug J 修复: keywords 无命中时, 尝试 tags 兜底 (type-level 标签)
+      // 例: entry.keywords=["华富吉富30天..."], entry.tags=["short_bond", "纯债"]
+      //     query="短债" → keywords 不命中, tags 命中 → 仍能拉出该条目
+      if (score === 0 && Array.isArray(e.tags)) {
+        for (const t of e.tags) {
+          const tl = (t || '').toLowerCase();
+          if (tl && queries.some(q => (q || '').toLowerCase().includes(tl) || tl.includes((q || '').toLowerCase()))) {
+            score += 0.5;  // tags 命中得分打 0.5 (弱匹配)
+          }
+        }
       }
       return { entry: e, score };
     });

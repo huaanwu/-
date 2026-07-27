@@ -8038,6 +8038,53 @@ function waitForIIFEsDrain() {
   });
 }
 
+// ========== [49] Bug J KB tags 兜底 + ai-advisor 调用方注释 ==========
+section('[49] Bug J KB 匹配: tags 兜底 + ai-advisor 调用方注释');
+(async () => {
+  try {
+    const kbSrc = readFileSafe(path.join(WWW, 'core', 'kb.js'));
+    if (!kbSrc) throw new Error('kb.js 读不到');
+
+    // 49.a 源码对账: pickRelevant 含 tags 兜底逻辑
+    if (/tags[\s\S]{0,200}兜底|score\s*\+=\s*0\.5/.test(kbSrc)) ok('kb.js pickRelevant 加 tags 兜底 (score += 0.5)');
+    else fail('kb.js tags 兜底', '源码未找到 tags 兜底标记');
+
+    // 49.b 源码对账: ai-advisor.js 注释解释 seed 前 5 作 placeholder + tags 兜底
+    const advSrc = readFileSafe(path.join(WWW, 'app', 'fund', 'ai-advisor.js'));
+    if (advSrc && /Bug J 修复[\s\S]{0,300}tags 兜底/.test(advSrc)) ok('ai-advisor.js 调用方注释解释 placeholder + tags 兜底');
+    else fail('ai-advisor.js 注释', '源码未找到 Bug J 注释标记');
+
+    // 49.c 功能实测: pickRelevant 用合成 KB + fetch mock (绕开空 KB fallback)
+    const vmCtx = {
+      console,
+      setTimeout, clearTimeout,
+      // fetch mock: 返 ok + 含 tags 的合成 KB
+      fetch: async () => ({ ok: true, json: async () => ({ _meta: {}, entries: [
+        { id: 'KW-1', category: 'risk', title: '波动率风险', keywords: ['波动', '风险'], tags: ['risk'] },
+        { id: 'KW-2', category: 'fixed_income', title: '华富吉富30天滚动持有短债', keywords: ['华富吉富30天', '短债持有期'], tags: ['short_bond', '纯债'] },
+        { id: 'KW-3', category: 'cycle', title: '美林时钟', keywords: ['美林', '周期'], tags: ['cycle'] }
+      ]}) }),
+      // 顶层 Core (kb.js 引用 Core.Storage 不走 window)
+      Core: { Storage: { cacheGet: async () => null, cacheSet: async () => {} } }
+    };
+    vmCtx.window = { Core: vmCtx.Core };
+    vm.createContext(vmCtx);
+    vm.runInContext(kbSrc, vmCtx);
+
+    // query "短债" → KW-2 tags 命中 (0.5), KW-1/KW-3 都不命中 (0)
+    const r1 = await vmCtx.window.Core.KB.pickRelevant({ holdings: [{ name: '短债', type: 'short_bond' }], maxN: 3 });
+    if (r1.length === 1 && r1[0].id === 'KW-2') ok('tags 兜底: query="短债" → KW-2 命中 (keywords 无, tags 有)');
+    else fail('tags 兜底实测', `r1=${JSON.stringify(r1.map(e => e.id))}`);
+
+    // 49.d 回归: keywords 直接命中仍优先 (score=1 > tags 兜底 score=0.5)
+    const r2 = await vmCtx.window.Core.KB.pickRelevant({ holdings: [{ name: '波动' }], maxN: 3 });
+    if (r2.length > 0 && r2[0].id === 'KW-1') ok('keywords 命中优先 (score=1 > tags 兜底 score=0.5)');
+    else fail('keywords 优先', `r2=${JSON.stringify(r2.map(e => e.id))}`);
+  } catch (e) {
+    fail('Bug J 测试', e.message + ' / ' + e.stack);
+  }
+})();
+
 waitForIIFEsDrain().then(() => {
   console.log(`\n\x1b[1m===== 测试结果 =====\x1b[0m`);
   console.log(`\x1b[32m通过: ${passed}\x1b[0m  |  \x1b[${failed > 0 ? '31' : '32'}]m失败: ${failed}\x1b[0m`);
