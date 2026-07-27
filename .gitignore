@@ -1,6 +1,7 @@
 node_modules/
 www/dist/
 www/assets/
+www/styles.css
 www/public/icons-source/
 www/lib/node_modules/
 *.log
