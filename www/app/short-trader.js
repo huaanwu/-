@@ -320,7 +320,14 @@
         '- 逆风板块 (rank 后 30%) 候选: 必须有强催化才考虑, 否则降权',
         '- 公告三类: 业绩预告(预增→催化, 预减/亏损→风险) / 股东减持(→谨慎, 触发止损从严) / 全市场公告(中性)',
         '- 必须在 reason 引用至少 1 条具体行业排名或公告数字, 不能泛泛"该股近期有异动"',
-        '- 无公告标注的代码: 不代表没公告, 只是近 7 天未抓到, 不要过度解读'
+        '- 无公告标注的代码: 不代表没公告, 只是近 7 天未抓到, 不要过度解读',
+        '',
+        '【量能异动 (Commit 4)】',
+        '- volRatio = 今日量 / 前 20 日均量',
+        '- volRatio > 1.5 (↑放量): 突破 / 急跌信号强, 配合价格方向解读',
+        '- volRatio < 0.7 (↓缩量): 突破确认弱, 谨慎追; 但缩量回调 (below) 是健康信号',
+        '- 决策建议: 突破买入(above) 优先 volRatio>1 + MA5>MA20; 回调买入(below) 优先 volRatio<0.8 (缩量回调, 不是恐慌抛售)',
+        '- 缺 volRatio (K线<21根) → 不强求, 退化为看 vol20 流动性'
       ].join('\n');
     },
 
@@ -375,7 +382,9 @@
             : '@未知';
           const kf = x.klineFeatures;
           const kfPart = kf
-            ? ` [5日${kf.trend5pct >= 0 ? '+' : ''}${kf.trend5pct}%, 振幅${kf.range20}%, MA5=${kf.ma5}/MA20=${kf.ma20}, 量${kf.vol20}]`
+            ? ` [5日${kf.trend5pct >= 0 ? '+' : ''}${kf.trend5pct}%, 振幅${kf.range20}%, MA5=${kf.ma5}/MA20=${kf.ma20}, 量${kf.vol20}` +
+              (kf.volRatio != null ? `, 量比${kf.volRatio}${kf.volRatio > 1.5 ? '↑放量' : (kf.volRatio < 0.7 ? '↓缩量' : '')}` : '') +
+              `]`
             : '';
           const indInfo = ctx.industryChangeByCode && ctx.industryChangeByCode.get(x.code);
           const indPart = indInfo
@@ -581,19 +590,21 @@
       if (!row) return null;
       const open = parseFloat(row.开盘), high = parseFloat(row.最高);
       const low = parseFloat(row.最低), close = parseFloat(row.收盘);
+      const volume = parseFloat(row.成交量) || 0;
       const date = String(row.日期 || '').slice(0, 10);
       if (!(open > 0) || !(high > 0) || !(low > 0) || !(close > 0) || !date) return null;
-      return { open, high, low, close, date };
+      return { open, high, low, close, volume, date };
     },
 
     /**
      * 提取 K 线特征 (纯函数, 可单元测)
      * 输入: 日 K 数组 [{open, high, low, close, date}] (按日期升序)
-     * 输出: { trend5pct, vol20, range20, ma5, ma20, lastClose, lastDate }
+     * 输出: { trend5pct, vol20, range20, ma5, ma20, volRatio, lastClose, lastDate }
      *   - trend5pct: 最近 5 个交易日收盘涨跌幅 (与第 6 交易日收盘比), 反映短线趋势
      *   - vol20: 近 20 日均成交量 (股数), 流动性参考
      *   - range20: 近 20 日振幅均值 ((high-low)/close), 波动率
      *   - ma5/ma20: 5/20 日均线 (按收盘价算术平均)
+     *   - volRatio: 量比 (今日量 / 20 日均量), bars<21 → null
      *   - lastClose/lastDate: 最新一根
      * 数据不足 (< 5 根) → null (不返回垃圾特征)
      */
@@ -601,7 +612,9 @@
       if (!Array.isArray(rows) || rows.length < 5) return null;
       // rows 可能是原始 aktools 格式 (字段中文), 先标准化
       const bars = rows.map(r => this._barOf(r) || {
-        open: +r.open, high: +r.high, low: +r.low, close: +r.close, date: String(r.date || '').slice(0, 10)
+        open: +r.open, high: +r.high, low: +r.low, close: +r.close,
+        volume: +r.volume || 0,
+        date: String(r.date || '').slice(0, 10)
       }).filter(b => b && isFinite(b.close) && b.date);
       if (bars.length < 5) return null;
       const last = bars[bars.length - 1];
@@ -620,6 +633,14 @@
       const range20 = bars.slice(-n).reduce((s, b) => {
         return s + (b.close > 0 ? (b.high - b.low) / b.close : 0);
       }, 0) / n;
+      // 量比 (今日量 / 前 20 日均量); bars<21 → null (无意义)
+      const volRatio = (() => {
+        if (bars.length < 21) return null;
+        const todayVol = Number(bars[bars.length - 1].volume) || 0;
+        const avg20Vol = bars.slice(-21, -1).reduce((s, b) => s + (Number(b.volume) || 0), 0) / 20;
+        if (!(avg20Vol > 0)) return null;
+        return +(todayVol / avg20Vol).toFixed(2);
+      })();
       return {
         lastClose: +lastClose.toFixed(2),
         lastDate: last.date,
@@ -627,7 +648,8 @@
         vol20: +vol20.toFixed(0),
         range20: +(range20 * 100).toFixed(2),  // 转为百分比
         ma5: +window5.toFixed(2),
-        ma20: +window20.toFixed(2)
+        ma20: +window20.toFixed(2),
+        volRatio
       };
     },
 

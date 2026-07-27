@@ -8163,6 +8163,69 @@ section('[45] short-trader.js 公告注入 prompt');
   }
 })();
 
+// ========== [46] 短线两阶段选品 量能异动 + 最终 prompt 模板 (Commit 4) ==========
+section('[46] short-trader.js 量比 (volRatio) 注入');
+(async () => {
+  try {
+    const stSrc = readFileSafe(path.join(WWW, 'app', 'short-trader.js'));
+    if (!stSrc) throw new Error('short-trader.js 读不到');
+
+    // 46.a _barOf 标准化含 volume 字段
+    if (/_barOf\(row\)[\s\S]{0,400}volume = parseFloat\(row\.成交量\)/.test(stSrc))
+      ok('46.a _barOf 含 volume (成交量)');
+    else fail('46.a _barOf volume', '源码未匹配 volume 标准化');
+
+    // 46.b _summarizeKline 计算 volRatio = todayVol / 前 20 日均量 (bars<21 → null)
+    if (/_summarizeKline[\s\S]{0,2500}volRatio = \(\(\) => \{[\s\S]{0,300}bars\.length < 21[\s\S]{0,300}todayVol \/ avg20Vol[\s\S]{0,500}volRatio\r?\n\s+\};/.test(stSrc))
+      ok('46.b _summarizeKline 输出 volRatio (bars<21 → null)');
+    else fail('46.b _summarizeKline volRatio', '源码未匹配 volRatio 计算');
+
+    // 46.c _buildUserPrompt 候选池行含量比渲染 (↑放量/↓缩量)
+    if (/_buildUserPrompt[\s\S]{0,4000}量比\$\{kf\.volRatio\}[\s\S]{0,200}↑放量[\s\S]{0,200}↓缩量/.test(stSrc))
+      ok('46.c _buildUserPrompt 候选池行含量比渲染 (↑放量/↓缩量)');
+    else fail('46.c 量比渲染', 'userPrompt 未含量比渲染');
+
+    // 46.d _buildSystemPrompt 含【量能异动】准则段
+    if (/_buildSystemPrompt[\s\S]{0,6000}【量能异动[\s\S]{0,300}volRatio = 今日量 \/ 前 20 日均量[\s\S]{0,300}volRatio > 1\.5[\s\S]{0,200}volRatio < 0\.7/.test(stSrc))
+      ok('46.d _buildSystemPrompt 含【量能异动】准则段');
+    else fail('46.d systemPrompt 量比准则', '源码未匹配量比准则');
+
+    // 46.e _summarizeKline 沙箱实测: 21 根 → volRatio 正确; 20 根 → volRatio=null
+    const vmCtx = {
+      console, window: {}, document: undefined,
+      Core: { Constants: { SHORT_RULES: {}, SHORT_LESSONS_TEXT_MAX_LEN: 40, SCORECARD_MIN_SAMPLES: 3, BRIER_MIN_SAMPLES: 5 } }
+    };
+    vmCtx.window.Core = vmCtx.Core;
+    const vm = require('vm');
+    vm.createContext(vmCtx);
+    // 抽出 ShortTrader 对象 (整个 IIFE)
+    const iifeMatch = stSrc.match(/\(function\(\) \{[\s\S]*?\n\}\)\(\);?\s*$/);
+    if (!iifeMatch) throw new Error('short-trader IIFE 提取失败');
+    vm.runInContext(iifeMatch[0], vmCtx);
+    const ST = vmCtx.window.ShortTrader;
+    if (!ST || typeof ST._summarizeKline !== 'function') throw new Error('ShortTrader._summarizeKline 未暴露');
+    // 21 根: 最后一根量 2000, 前 20 根每根 1000 → volRatio = 2
+    const bars21 = [];
+    for (let i = 0; i < 21; i++) {
+      bars21.push({ 开盘: 10, 最高: 10.5, 最低: 9.5, 收盘: 10 + i * 0.01, 成交量: i === 20 ? 2000 : 1000, 日期: '2026-07-' + String(i + 1).padStart(2, '0') });
+    }
+    const feats21 = ST._summarizeKline(bars21);
+    if (feats21 && feats21.volRatio === 2) ok('46.e.1 _summarizeKline 21 根 volRatio=2 (沙箱实测)');
+    else fail('46.e.1 volRatio 21 根', `实测=${feats21 && feats21.volRatio}`);
+    // 20 根 → volRatio=null
+    const feats20 = ST._summarizeKline(bars21.slice(1));
+    if (feats20 && feats20.volRatio === null) ok('46.e.2 _summarizeKline 20 根 volRatio=null');
+    else fail('46.e.2 volRatio 20 根', `实测=${feats20 && feats20.volRatio}`);
+    // avg20Vol=0 → volRatio=null
+    const barsZero = bars21.map(b => Object.assign({}, b, { 成交量: 0 }));
+    const featsZero = ST._summarizeKline(barsZero);
+    if (featsZero && featsZero.volRatio === null) ok('46.e.3 _summarizeKline avg20Vol=0 → volRatio=null');
+    else fail('46.e.3 volRatio 零均量', `实测=${featsZero && featsZero.volRatio}`);
+  } catch (e) {
+    fail('46 量比注入', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
 // ========== [50] 短线两阶段选品 资料接口 (Commit 1) ==========
 section('[50] data.js 行业映射 + 公告 + 量比');
 (async () => {
