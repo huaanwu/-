@@ -217,6 +217,13 @@ window._renderSettings = function() {
     <div id="selfCheckList" style="margin-top:8px;"></div>
 
     <div class="form-row">
+      <label>📡 局域网自动发现 dev-proxy (APK 在手机上用)</label>
+      <button class="btn" onclick="discoverDevProxy()">🔍 找 PC 上的 dev-proxy</button>
+      <span id="devProxyDiscoverResult" style="font-size:12px;color:var(--text-muted);margin-left:8px;"></span>
+    </div>
+    <div id="devProxyDiscoverList" style="margin-top:8px;"></div>
+
+    <div class="form-row">
       <label>AKShare 代理地址</label>
       <input type="text" id="settingProxyBase" value="${escapeHtml(state.proxyBase)}"
              placeholder="/api/akshare 或 http://192.168.1.3:8089/api/akshare">
@@ -524,6 +531,96 @@ window.testLocalAI = async function() {
   } catch (e) {
     el.innerHTML = '✗ ' + escapeHtml(e.message);
     el.style.color = 'var(--down)';
+  }
+};
+
+// 局域网自动发现 dev-proxy (给 APK 用) —
+// 步骤: 浏览器 fetch dev-proxy 的 /api/discover/dev-proxy → 拿 serverIPs 列表
+//       → 浏览器挨个 fetch {ip}:8089/health (dev-proxy 已加 CORS: *)
+//       → 命中即填入 settingProxyBase, 一键保存
+window.discoverDevProxy = async function() {
+  const status = document.getElementById('devProxyDiscoverResult');
+  const list = document.getElementById('devProxyDiscoverList');
+  if (status) { status.textContent = '⏳ 探测中...'; status.style.color = 'var(--text-muted)'; }
+  if (list) list.innerHTML = '';
+  window._discoveredDevProxies = [];
+  let info;
+  try {
+    const r = await fetch('/api/discover/dev-proxy', { cache: 'no-store' });
+    if (!r.ok) throw new Error('dev-proxy 返回 HTTP ' + r.status);
+    info = await r.json();
+  } catch (e) {
+    if (status) { status.textContent = '❌ 拿不到候选 IP: ' + e.message + ' (dev-proxy 没在跑?)'; status.style.color = 'var(--down)'; }
+    console.warn('[discoverDevProxy] 拿 serverIPs 失败:', e);
+    return;
+  }
+  // 候选 IP: 1) dev-proxy 报的 serverIPs 2) 当前页 origin 拆出来的 host (说不定是 IP)
+  const candidates = new Set(info.serverIPs || []);
+  try {
+    const cur = new URL(location.href);
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(cur.hostname)) candidates.add(cur.hostname);
+    if (cur.hostname.endsWith('.local')) candidates.add(cur.hostname);
+  } catch (e) { /* ignore */ }
+  if (candidates.size === 0) {
+    if (status) { status.textContent = '❌ dev-proxy 没拿到任何 LAN IP (虚拟网卡? 防火墙?)'; status.style.color = 'var(--down)'; }
+    return;
+  }
+  // 探测每个候选: fetch {ip}:{port}/health (3s timeout)
+  const port = info.port || 8089;
+  const tasks = [...candidates].map(async (ip) => {
+    const start = Date.now();
+    const url = `http://${ip}:${port}/health`;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 3000);
+    try {
+      const resp = await fetch(url, { cache: 'no-store', signal: ctrl.signal });
+      clearTimeout(timer);
+      const j = await resp.json().catch(() => null);
+      return { ip, port, ok: resp.ok && j && j.status === 'ok', latencyMs: Date.now() - start, j };
+    } catch (e) {
+      clearTimeout(timer);
+      return { ip, port, ok: false, latencyMs: Date.now() - start, error: e.message };
+    }
+  });
+  const results = await Promise.all(tasks);
+  const found = results.filter(r => r.ok).sort((a, b) => a.latencyMs - b.latencyMs);
+  window._discoveredDevProxies = found;
+  if (status) {
+    status.textContent = `扫了 ${results.length} 个候选 IP, 命中 ${found.length} 个`;
+    status.style.color = found.length > 0 ? 'var(--up)' : 'var(--down)';
+  }
+  if (!list) return;
+  if (found.length === 0) {
+    list.innerHTML = `<div style="font-size:12px;color:var(--text-muted);padding:8px 0;line-height:1.6;">
+      未发现 dev-proxy。可能: ① dev-proxy 没在跑 (PC 上 gst-dev) ② 手机和 PC 不在同一 WiFi ③ PC 防火墙拦了 8089<br>
+      候选列表: ${[...candidates].map(ip => `<code>${escapeHtml(ip)}:${port}</code>`).join(', ')}
+    </div>`;
+    return;
+  }
+  list.innerHTML = found.map((f, idx) => `
+    <div class="data-card" style="margin-top:8px;padding:10px;">
+      <div style="display:flex;justify-content:space-between;align-items:start;gap:12px;">
+        <div style="flex:1;">
+          <div style="font-weight:600;">📡 ${escapeHtml(f.ip)}:${f.port} <span style="font-size:11px;color:var(--text-muted);font-weight:normal;">(${f.latencyMs}ms)</span></div>
+          <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">将填入 <code>http://${escapeHtml(f.ip)}:${f.port}/api/akshare</code></div>
+        </div>
+        <button class="btn btn-sm btn-primary" onclick="applyDiscoveredDevProxy(${idx})">使用</button>
+      </div>
+    </div>
+  `).join('');
+};
+
+window.applyDiscoveredDevProxy = async function(idx) {
+  const found = window._discoveredDevProxies || [];
+  const f = found[idx];
+  if (!f) return;
+  const newProxy = `http://${f.ip}:${f.port}/api/akshare`;
+  const input = document.getElementById('settingProxyBase');
+  if (input) input.value = newProxy;
+  // saveSettings(true) 持久化 + 静默保存
+  if (window.saveSettings) {
+    window.saveSettings(true);
+    if (window.toastSuccess) toastSuccess('已应用: ' + newProxy);
   }
 };
 

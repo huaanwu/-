@@ -7121,6 +7121,112 @@ section('[40] ShortTrader T4 学习环: _judgeClosedTrade 全分支 / verify 扫
   }
 })();
 
+// ========== [42] 自动发现 dev-proxy (APK 局域网找后端) ==========
+(async () => {
+  section('[42] 自动发现 dev-proxy');
+  try {
+    const appSrc = readFileSafe(path.join(WWW, 'app.js'));
+    const proxySrc = readFileSafe(path.join(ROOT, 'scripts/dev-proxy.mjs'));
+    if (!appSrc) { fail('42.a', 'app.js 缺失'); return; }
+    if (!proxySrc) { fail('42.a', 'dev-proxy.mjs 缺失'); return; }
+
+    // 42.a dev-proxy 注册 /api/discover/dev-proxy 路由
+    if (/app\.get\(['"]\/api\/discover\/dev-proxy['"]/.test(proxySrc)) {
+      ok('42.a dev-proxy 注册 /api/discover/dev-proxy 路由');
+    } else fail('42.a', '路由缺失');
+
+    // 42.b dev-proxy /health 加 CORS 放行 (APK 跨 IP fetch 才能通过)
+    if (/Access-Control-Allow-Origin/.test(proxySrc) && /app\.options\(['"]\/health['"]/.test(proxySrc)) {
+      ok('42.b dev-proxy /health 加 CORS 放行 (ACAO + OPTIONS 预检)');
+    } else fail('42.b', '/health 没 CORS 处理');
+
+    // 42.c app.js 定义 window.discoverDevProxy + applyDiscoveredDevProxy
+    if (/window\.discoverDevProxy\s*=/.test(appSrc) && /window\.applyDiscoveredDevProxy\s*=/.test(appSrc)) {
+      ok('42.c app.js 定义 discoverDevProxy + applyDiscoveredDevProxy');
+    } else fail('42.c', '函数缺失');
+
+    // 42.d settings UI 注入 devProxyDiscoverResult + devProxyDiscoverList
+    if (/id="devProxyDiscoverResult"/.test(appSrc) && /id="devProxyDiscoverList"/.test(appSrc)) {
+      ok('42.d settings UI 注入 devProxyDiscoverResult + devProxyDiscoverList');
+    } else fail('42.d', 'UI 容器缺失');
+
+    // 42.e discoverDevProxy 拿 serverIPs + 挨个 fetch /health
+    if (/\/api\/discover\/dev-proxy/.test(appSrc) && (/\/health/.test(appSrc)) && /AbortController/.test(appSrc)) {
+      ok('42.e discoverDevProxy: 调 /api/discover/dev-proxy + 候选 IP fetch /health + AbortController timeout');
+    } else fail('42.e', '核心探测流程缺失');
+
+    // 42.f applyDiscoveredDevProxy 填 settingProxyBase + saveSettings + toast
+    if (/settingProxyBase/.test(appSrc) && /saveSettings\(true\)/.test(appSrc) && /toastSuccess/.test(appSrc)) {
+      ok('42.f applyDiscoveredDevProxy: 填 settingProxyBase + saveSettings(true) + toast');
+    } else fail('42.f', '应用流程缺失');
+
+    // 42.g runtime: mock fetch 让 discoverDevProxy 跑通
+    const fetchCalls42 = [];
+    const fetchMock42 = async (url, opts = {}) => {
+      fetchCalls42.push(url);
+      if (url.includes('/api/discover/dev-proxy')) {
+        return { ok: true, status: 200, json: async () => ({ port: 8089, serverIPs: ['192.168.1.10', '10.0.0.5'], host: '192.168.1.10', healthPath: '/health', proxyPath: '/api/akshare', timestamp: '2026-07-28T00:00:00Z' }) };
+      }
+      if (url.startsWith('http://192.168.1.10:8089/health')) {
+        return { ok: true, status: 200, json: async () => ({ status: 'ok', akshare_target: 'http://127.0.0.1:8088' }) };
+      }
+      if (url.startsWith('http://10.0.0.5:8089/health')) {
+        return { ok: false, status: 500, json: async () => ({}) };
+      }
+      return { ok: false, status: 500, json: async () => ({}) };
+    };
+    const ctx42 = vm.createContext({
+      window: {}, console,
+      document: {
+        getElementById: (id) => {
+          if (['devProxyDiscoverResult', 'devProxyDiscoverList'].includes(id)) {
+            return { textContent: '', innerHTML: '', style: {} };
+          }
+          if (id === 'settingProxyBase') return { value: '' };
+          return null;
+        },
+        querySelector: () => null,
+        querySelectorAll: () => [],
+        addEventListener: () => {}
+      },
+      localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+      navigator: { clipboard: { writeText: async () => {} } },
+      location: { reload: () => {}, hostname: 'localhost', href: 'http://localhost:3003/' },
+      history: { pushState: () => {} },
+      AbortController: class { constructor() { this.signal = {}; } abort() {} },
+      setTimeout: (fn, ms) => Promise.resolve().then(fn),
+      clearTimeout: () => {},
+      Promise,
+      Date,
+      Math,
+      JSON,
+      URL,
+      console,
+      escapeHtml: (s) => String(s),
+      saveSettings: () => {},
+      toastSuccess: () => {},
+      fetch: fetchMock42,
+      Core: {
+        State: { get: () => ({ proxyBase: '/api/akshare' }), set: () => {} },
+        AI: { discoverLocalLLM: async () => ({ found: [], scanned: 0, host: '127.0.0.1' }) },
+        Router: { switchPage: () => {}, goSettings: () => {} },
+        Util: { escapeHtml: (s) => String(s) },
+        Toast: { success: () => {}, error: () => {} },
+        Storage: { all: async () => [], kvGet: async () => null, kvSet: async () => {} }
+      }
+    });
+    vm.runInContext(appSrc, ctx42);
+    if (typeof ctx42.window.discoverDevProxy !== 'function') { fail('42.g 函数未挂载', ''); return; }
+    await ctx42.window.discoverDevProxy();
+    const callInfo = fetchCalls42.some(u => u.includes('/api/discover/dev-proxy'));
+    const callHealth = fetchCalls42.some(u => u.includes('192.168.1.10:8089/health'));
+    if (callInfo && callHealth) ok('42.g discoverDevProxy 运行时: 拿到 serverIPs + 触发 /health 探测');
+    else fail('42.g runtime', 'fetch 调用不完整: ' + fetchCalls42.join(' | '));
+  } catch (e) {
+    fail('42 自动发现 dev-proxy', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
 // ========== 总结 ==========
 // 同步 section 的 ok() 已经在 console 打印;
 // async IIFE 里的 ok() 还在 microtask / setTimeout 队列里, 旧版本 setImmediate 只给一次机会,
