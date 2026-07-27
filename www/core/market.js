@@ -73,19 +73,42 @@
   }
 
   /**
-   * 拉行业板块 (东方财富申万一级)
+   * 拉行业板块
+   * 主源: 东方财富 push2 clist (m:90+t:2 申万一级);失败时 fallback 到新浪 industry (84 板块)
    * 返回 top 5 涨 + bottom 5 跌
-   * C: 替代 akshare stock_board_industry_em
    */
   async function _fetchIndustry() {
     if (!window.Core || !Core.Data) throw new Error('Core.Data 不可用');
-    // 东方财富 clist: m:90+t:2 是申万一级行业
-    const url = 'https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=100&po=1&fs=m:90+t:2&fields=f12,f14,f2,f3,f4,f8';
+
+    // 尝试 1: 东方财富 clist (m:90+t:2 申万一级)
+    try {
+      return await _fetchIndustryEastmoney();
+    } catch (e1) {
+      console.warn('[Market] 东财行业失败, 尝试新浪 fallback:', e1.message);
+    }
+    // 尝试 2: 新浪行业 fallback (84 板块申万)
+    try {
+      return await _fetchIndustrySina();
+    } catch (e2) {
+      console.warn('[Market] 新浪行业 fallback 也失败:', e2.message);
+      throw new Error('所有行业源都失败: 东财+新浪');
+    }
+  }
+
+  async function _fetchIndustryEastmoney() {
+    const q = 'pn=1&pz=100&po=1&fs=m:90+t:2&fields=f12,f14,f2,f3,f4,f8';
+    const proxyUrl = `/api/eastmoney/api/qt/clist/get?${q}`;
+    const directUrl = `https://push2.eastmoney.com/api/qt/clist/get?${q}`;
     let resp;
     try {
-      resp = await fetch(url);
+      resp = await fetch(proxyUrl);
     } catch (e) {
-      throw new Error('东方财富行业接口网络错误: ' + e.message);
+      console.warn('[Market] 行业 dev-proxy 失败, 尝试直连:', e.message);
+      try {
+        resp = await fetch(directUrl);
+      } catch (e2) {
+        throw new Error('行业接口网络错误: ' + e2.message);
+      }
     }
     if (!resp.ok) throw new Error('东方财富行业 HTTP ' + resp.status);
     const j = await resp.json();
@@ -94,17 +117,76 @@
     const parsed = Object.values(j.data.diff).map(r => ({
       code: r.f12 || '',
       name: r.f14 || '',
-      price: 0,  // 行业无价格, 用 totalAmount 顶替 (UI 不显示)
-      amount: _num(r.f2),  // 总成交额 (万元)
-      change: _num(r.f3) / 100,  // 基点 → %
-      changeAmt: _num(r.f4) / 100,  // 万元
-      turnover: _num(r.f8) / 100  // 基点 → %
+      price: 0,
+      amount: _num(r.f2),
+      change: _num(r.f3) / 100,
+      changeAmt: _num(r.f4) / 100,
+      turnover: _num(r.f8) / 100
     })).filter(x => x.name);
-    // 排序
+    if (parsed.length === 0) throw new Error('东方财富解析后为空');
     parsed.sort((a, b) => b.change - a.change);
     return {
       top: parsed.slice(0, 5),
-      bottom: parsed.slice(-5).reverse()
+      bottom: parsed.slice(-5).reverse(),
+      source: 'eastmoney'
+    };
+  }
+
+  /**
+   * 新浪行业 fallback
+   * 端点: /api/sina/q/view/newFLJK.php?param=industry  (84 板块, GBK 编码)
+   * 数据格式: var S_Finance_bankuai_industry = {"板块代码":"code,名,家数,均价,涨跌额,涨跌幅%,成交量,成交额,领涨代码,领涨%,领涨价,领涨额,领涨名",...}
+   * 注意: 新浪端点只支持 HTTP;https 会返 [];proxy 时强制 changeOrigin:true 让上游认 HTTP
+   */
+  async function _fetchIndustrySina() {
+    const url = '/api/sina/q/view/newFLJK.php?param=industry';
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error('新浪行业 HTTP ' + resp.status);
+    // 上游返回 GBK 编码 (text/html; charset=gbk),浏览器 text() 不会自动转码,需要手动 GBK → UTF-8
+    let text;
+    try {
+      const buf = await resp.arrayBuffer();
+      text = new TextDecoder('gbk', { fatal: false }).decode(buf);
+    } catch (e) {
+      // 兜底: 浏览器不支持 GBK 时退回 text()
+      console.warn('[Market] GBK 解码失败, 退回 text() 兜底:', e.message);
+      text = await resp.text();
+    }
+    // 提取 JSON 对象 (格式: var xxx = {...}; 或直接 {...})
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start < 0 || end < 0) throw new Error('新浪行业无 JSON');
+    let json;
+    try {
+      json = JSON.parse(text.slice(start, end + 1));
+    } catch (e) {
+      throw new Error('新浪行业 JSON 解析失败: ' + e.message);
+    }
+    // 字段顺序: code, name, companyCount, avgPrice, changeAmt, change, volume, amount, leaderCode, leaderPct, leaderPrice, leaderChangeAmt, leaderName
+    const parsed = Object.entries(json).map(([k, v]) => {
+      const f = v.split(',');
+      return {
+        code: f[0] || '',
+        name: (f[1] || '').replace(/\s+/g, '').trim(),
+        companyCount: _num(f[2]),
+        avgPrice: _num(f[3]),
+        changeAmt: _num(f[4]),
+        change: _num(f[5]),  // 已是百分比单位
+        volume: _num(f[6]),
+        amount: _num(f[7]),
+        leaderCode: f[8] || '',
+        leaderPct: _num(f[9]),
+        leaderPrice: _num(f[10]),
+        leaderChangeAmt: _num(f[11]),
+        leaderName: (f[12] || '').trim()
+      };
+    }).filter(x => x.name && x.name.length > 0);
+    if (parsed.length === 0) throw new Error('新浪解析后为空');
+    parsed.sort((a, b) => b.change - a.change);
+    return {
+      top: parsed.slice(0, 5),
+      bottom: parsed.slice(-5).reverse(),
+      source: 'sina'
     };
   }
   function _num(s) { const n = parseFloat(s); return isNaN(n) ? 0 : n; }

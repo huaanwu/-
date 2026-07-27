@@ -73,6 +73,25 @@ export default defineConfig({
       '/api/llm': {
         target: 'http://127.0.0.1:8089',
         changeOrigin: true
+      },
+      // 东方财富代理 (解决浏览器 fetch 行业板块的 CORS)
+      // 浏览器 → /api/eastmoney/api/qt/clist/get?... → dev-proxy → push2.eastmoney.com
+      // vite 默认会剥 /api/eastmoney 前缀, 这里 rewrite 补回, 否则 dev-proxy 路由不匹配
+      '/api/eastmoney': {
+        target: 'http://127.0.0.1:8089',
+        changeOrigin: true,
+        rewrite: (path) => `/api/eastmoney${path}`
+      },
+      // 新浪行业板块代理 (东财限流时的 fallback)
+      // 浏览器 → /api/sina/q/view/newFLJK.php?param=industry → dev-proxy → money.finance.sina.com.cn
+      '/api/sina': {
+        target: 'http://127.0.0.1:8089',
+        changeOrigin: true
+      },
+      // 自动发现本地 LLM (浏览器调用 dev-proxy 服务器端扫描, 绕过 CORS)
+      '/api/discover': {
+        target: 'http://127.0.0.1:8089',
+        changeOrigin: true
       }
     }
   },
