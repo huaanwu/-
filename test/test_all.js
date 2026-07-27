@@ -105,7 +105,7 @@ section('2] 域脚本接口完备性');
 const DOMAINS = {
   'Watchlist': ['init', 'render', 'addDialog', 'add', 'remove', 'showKLine', 'closeModal', 'closeKLine'],
   'Holdings':  ['init', 'render', 'addDialog', 'editDialog', 'save', 'remove', 'addTxDialog', 'saveTx', 'closeModal', '_renderPending', 'confirmPending', 'ignorePending', '_markPendingConfirmed'],
-  'Paper':     ['init', 'buy', 'sell', 'getAccount', 'getPositions', 'resetAccount', 'snapshotIfNeeded', 'autoTradeFromPick', 'renderPage', 'buyFromForm', 'sellFromForm', 'sellAll', 'switchSleeve', '_getAccountRaw', '_saveAccountRaw', '_calcFee', '_roundLot', '_pushSnapshot', '_planAutoTrade', 'maybeGenerateEodReport', '_shouldGenerateEod', '_pushEodReport', '_appendDisciplineLog', '_logDisciplineBlock', '_buildEodReport', '_formatEodReportText', '_pushEodToFeishu', '_renderEodReport'],
+  'Paper':     ['init', 'buy', 'sell', 'getAccount', 'getPositions', 'resetAccount', 'snapshotIfNeeded', 'autoTradeFromPick', 'renderPage', 'buyFromForm', 'sellFromForm', 'sellAll', 'switchSleeve', '_getAccountRaw', '_saveAccountRaw', '_calcFee', '_roundLot', '_pushSnapshot', '_planAutoTrade', 'maybeGenerateEodReport', '_shouldGenerateEod', '_pushEodReport', '_appendDisciplineLog', '_logDisciplineBlock', '_buildEodReport', '_formatEodReportText', '_pushEodToFeishu', '_renderEodReport', 'addCondOrder', 'listCondOrders', 'cancelCondOrder', 'settleCondOrders', '_checkCondOrder', '_barOf', '_lastClosedBar', '_orderEligible', '_tradingDaysAfter', '_isGapDown', '_isGapUp', '_fillCheck', '_exitCheck', '_settleFill', '_settleExit', '_writeCondJournal', '_condPlanLines', 'addCondOrderFromForm', '_renderCondOrders'],
   'Journal':   ['init', 'render', 'newDialog', 'editDialog', 'save', 'remove', 'closeModal', '_buildHoldingsContext', '_renderHoldingBadge', '_renderStructuredTags', '_runAiAssistant'],
   'Screener':  ['init', 'run', '_addWatchlistFromPick', '_runPreBacktest'],
   'Fund':      ['init', 'render', 'addDialog', 'save', 'remove', 'showChart', 'closeModal'],
@@ -5718,6 +5718,465 @@ section('[37] Core.AlertsAgent: 白名单校验 / parseIntent / preview / apply 
     else fail('37.11 interpretAlert', interp);
   } catch (e) {
     fail('37 AlertsAgent', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [38] Phase T3 日线级条件单引擎 (Paper) ==========
+section('[38] Phase T3 日线级条件单引擎 (Paper)');
+(async () => {
+  try {
+    const paperSrc = readFileSafe(path.join(WWW, 'app', 'paper.js'));
+    if (!paperSrc) throw new Error('paper.js 读不到');
+    const K = _loadRealConstants();
+
+    // T3 常量进 Core.Constants
+    if (K.COND_ORDER_LIMIT === 100 && K.COND_ORDER_EXPIRE_DAYS === 3 && K.SHORT_MAX_HOLD_DAYS === 5) {
+      ok('T3 常量: COND_ORDER_LIMIT=100 / COND_ORDER_EXPIRE_DAYS=3 / SHORT_MAX_HOLD_DAYS=5');
+    } else fail('T3 常量', JSON.stringify({ l: K.COND_ORDER_LIMIT, e: K.COND_ORDER_EXPIRE_DAYS, h: K.SHORT_MAX_HOLD_DAYS }));
+
+    const pad2 = (n) => String(n).padStart(2, '0');
+    const realFmtDate = (d) => {
+      d = d instanceof Date ? d : new Date(d);
+      return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+    };
+    // K 线 fixture: data.js 中文键行
+    const krow = (date, open, high, low, close) => ({ 日期: date, 开盘: open, 最高: high, 最低: low, 收盘: close });
+    // 手工拼一条 pending 条件单 (绕过 addCondOrder 的 Date.now, 控制 createdDate)
+    const mkOrder = (over) => Object.assign({
+      id: 'o-' + Math.random().toString(36).slice(2, 8),
+      code: '600519', name: '贵州茅台', market: 'sh', sleeve: 'short',
+      triggerDirection: 'below', triggerPrice: 10, stopLoss: 9, targetPrice: 11,
+      shares: 100, amount: 1000,
+      assumption: '技术突破', falsifyCondition: '跌破 20 日线', invalidation: '', probability: null,
+      source: 'manual', status: 'pending',
+      createdAt: new Date(2026, 6, 24, 10, 0).getTime(),
+      createdDate: '2026-07-24', createdAfterClose: false,
+      expireAt: new Date(2026, 6, 27).getTime(),
+      filledAt: null, fillPrice: null, holdingId: null
+    }, over || {});
+
+    // 与 [23] 同款 vm sandbox (内存 mock storage + getStockKLine mock + Discipline mock)
+    const buildCtx = (storageData, opts = {}) => {
+      const pctx = {
+        window: {},
+        console,
+        escapeHtml: (s) => String(s == null ? '' : s),
+        fmtMoney: (n) => (typeof n === 'number' ? n.toFixed(2) : '0.00'),
+        fmtNum: (n, d) => (typeof n === 'number' ? n.toFixed(d || 0) : '0'),
+        fmtPct: (n) => (typeof n === 'number' ? (n * 100).toFixed(2) + '%' : '-'),
+        pctClass: () => '',
+        fmtDate: realFmtDate,
+        uuid: () => 't3-' + Math.random().toString(36).slice(2, 10),
+        parseStockInput: (t) => {
+          const m = String(t || '').trim().match(/^(\d{6})/);
+          return m ? { code: m[1], name: String(t).slice(6).trim() } : null;
+        },
+        toastSuccess: () => {}, toastError: () => {}, toastWarning: () => {},
+        confirm: () => true
+      };
+      pctx.window.Core = {
+        Storage: {
+          kvGet: async (k) => (k in storageData.kv ? storageData.kv[k] : null),
+          kvSet: async (k, v) => { storageData.kv[k] = v; },
+          all: async (t) => storageData.tables[t] || [],
+          get: async (t, id) => (storageData.tables[t] || []).find(x => x.id === id) || null,
+          add: async (t, obj) => { (storageData.tables[t] = storageData.tables[t] || []).push(obj); },
+          put: async (t, obj) => {
+            const arr = (storageData.tables[t] = storageData.tables[t] || []);
+            const i = arr.findIndex(x => x.id === obj.id);
+            if (i >= 0) arr[i] = obj; else arr.push(obj);
+          },
+          remove: async (t, id) => {
+            storageData.tables[t] = (storageData.tables[t] || []).filter(x => x.id !== id);
+          }
+        },
+        Data: {
+          getStockQuote: async (code) => (storageData.quotes || {})[code] || null,
+          getIndexSpot: async () => [],
+          getStockKLine: async (code) => {
+            if (storageData.klineFail && storageData.klineFail[code]) throw new Error('K线拉取失败(测试注入)');
+            return (storageData.klines || {})[code] || [];
+          }
+        },
+        Util: { stockCodePrefix: (c) => /^(60|68)/.test(c) ? 'sh' : 'sz' },
+        Constants: K,
+        Discipline: opts.noDiscipline ? undefined : {
+          preBuyCheck: async () => ({
+            ok: !(opts.disciplineBlocks && opts.disciplineBlocks.length),
+            blocks: opts.disciplineBlocks || [], warns: [], history: []
+          }),
+          renderCheckResult: () => '',
+          _resultToText: () => ''
+        }
+      };
+      pctx.Core = pctx.window.Core;
+      pctx.window.document = { getElementById: () => null };
+      pctx.document = pctx.window.document;
+      vm.createContext(pctx);
+      vm.runInContext(paperSrc, pctx);
+      return pctx;
+    };
+
+    // ---------- 38.1 纯函数 ----------
+    const ctx0 = buildCtx({ kv: {}, tables: {} });
+    const P = ctx0.window.Paper;
+    if (!P) throw new Error('Paper 未挂到 window');
+
+    // _barOf: 中文键 → bar; 缺字段/非正数 → null
+    const b1 = P._barOf(krow('2026-07-27', 10, 11, 9, 10.5));
+    if (b1 && b1.open === 10 && b1.high === 11 && b1.low === 9 && b1.close === 10.5 && b1.date === '2026-07-27') ok('T3 _barOf: 中文键归一化');
+    else fail('T3 _barOf', JSON.stringify(b1));
+    if (P._barOf(krow('2026-07-27', 10, 11, 0, 10.5)) === null && P._barOf({}) === null && P._barOf(null) === null) ok('T3 _barOf: 坏数据 → null');
+    else fail('T3 _barOf 坏数据', '');
+
+    // _fillCheck below: 开盘已满足 → 开盘价; 盘中穿越 → 触发价; 未触发
+    const ordBelow = { triggerDirection: 'below', triggerPrice: 10 };
+    let fc = P._fillCheck(ordBelow, { open: 9.5, high: 10.5, low: 9, close: 10, date: 'd' });
+    if (fc.fill === true && fc.price === 9.5) ok('T3 _fillCheck below: 开盘 ≤ 触发 → 开盘价成交');
+    else fail('T3 fill below open', JSON.stringify(fc));
+    fc = P._fillCheck(ordBelow, { open: 10.5, high: 11, low: 9.8, close: 10.2, date: 'd' });
+    if (fc.fill === true && fc.price === 10) ok('T3 _fillCheck below: 盘中下穿 → 触发价成交');
+    else fail('T3 fill below touch', JSON.stringify(fc));
+    fc = P._fillCheck(ordBelow, { open: 10.5, high: 11, low: 10.1, close: 10.8, date: 'd' });
+    if (fc.fill === false && fc.price === null) ok('T3 _fillCheck below: 未触发');
+    else fail('T3 fill below none', JSON.stringify(fc));
+
+    // _fillCheck above: 对称三分支
+    const ordAbove = { triggerDirection: 'above', triggerPrice: 10 };
+    fc = P._fillCheck(ordAbove, { open: 10.5, high: 11, low: 10.2, close: 10.8, date: 'd' });
+    if (fc.fill === true && fc.price === 10.5) ok('T3 _fillCheck above: 开盘 ≥ 触发 → 开盘价成交');
+    else fail('T3 fill above open', JSON.stringify(fc));
+    fc = P._fillCheck(ordAbove, { open: 9.5, high: 10.3, low: 9.2, close: 10.1, date: 'd' });
+    if (fc.fill === true && fc.price === 10) ok('T3 _fillCheck above: 盘中上穿 → 触发价成交');
+    else fail('T3 fill above touch', JSON.stringify(fc));
+    fc = P._fillCheck(ordAbove, { open: 9.5, high: 9.9, low: 9.2, close: 9.6, date: 'd' });
+    if (fc.fill === false) ok('T3 _fillCheck above: 未触发');
+    else fail('T3 fill above none', JSON.stringify(fc));
+
+    // _exitCheck: 跳空止损 / 止损 / 跳空止盈 / 止盈 / 同根 K 止损优先 / 未触发
+    const pos1 = { stopLoss: 9, targetPrice: 11 };
+    let ec = P._exitCheck(pos1, { open: 8.5, high: 9.2, low: 8.3, close: 8.8, date: 'd' });
+    if (ec.exit && ec.price === 8.5 && ec.reason === '止损(跳空)') ok('T3 _exitCheck: 跳空止损 → 开盘价卖');
+    else fail('T3 exit gap stop', JSON.stringify(ec));
+    ec = P._exitCheck(pos1, { open: 9.5, high: 9.8, low: 8.9, close: 9.2, date: 'd' });
+    if (ec.exit && ec.price === 9 && ec.reason === '止损') ok('T3 _exitCheck: 盘中触及止损 → 止损价卖');
+    else fail('T3 exit stop', JSON.stringify(ec));
+    ec = P._exitCheck(pos1, { open: 11.5, high: 12, low: 11.2, close: 11.8, date: 'd' });
+    if (ec.exit && ec.price === 11.5 && ec.reason === '止盈(跳空)') ok('T3 _exitCheck: 跳空止盈 → 开盘价卖');
+    else fail('T3 exit gap target', JSON.stringify(ec));
+    ec = P._exitCheck(pos1, { open: 10.5, high: 11.2, low: 10.2, close: 11, date: 'd' });
+    if (ec.exit && ec.price === 11 && ec.reason === '止盈') ok('T3 _exitCheck: 盘中触及目标 → 目标价卖');
+    else fail('T3 exit target', JSON.stringify(ec));
+    // 同根 K low 穿止损 且 high 触目标 → 保守按止损
+    ec = P._exitCheck(pos1, { open: 10, high: 11.5, low: 8.5, close: 10, date: 'd' });
+    if (ec.exit && ec.price === 9 && ec.reason === '止损') ok('T3 _exitCheck: 同根 K 双触及 → 止损优先 (保守原则)');
+    else fail('T3 exit both', JSON.stringify(ec));
+    ec = P._exitCheck(pos1, { open: 10, high: 10.5, low: 9.5, close: 10.2, date: 'd' });
+    if (ec.exit === false && ec.price === null) ok('T3 _exitCheck: 未触发');
+    else fail('T3 exit none', JSON.stringify(ec));
+
+    // _isGapDown / _isGapUp
+    if (P._isGapDown({ open: 8.9 }, 9) === true && P._isGapDown({ open: 9.1 }, 9) === false
+      && P._isGapUp({ open: 11.1 }, 11) === true && P._isGapUp({ open: 10.9 }, 11) === false) ok('T3 _isGapDown/_isGapUp');
+    else fail('T3 gap helpers', '');
+
+    // _lastClosedBar: 盘中不取当日 K; 15:00 后取当日 K; 空 → null
+    const bars2 = [P._barOf(krow('2026-07-24', 10, 10.5, 9.8, 10.2)), P._barOf(krow('2026-07-27', 10.2, 10.8, 10, 10.6))];
+    const lcb1 = P._lastClosedBar(bars2, new Date(2026, 6, 27, 10, 0));
+    if (lcb1 && lcb1.date === '2026-07-24') ok('T3 _lastClosedBar: 盘中 → 上一交易日 K');
+    else fail('T3 lastClosedBar 盘中', JSON.stringify(lcb1));
+    const lcb2 = P._lastClosedBar(bars2, new Date(2026, 6, 27, 15, 30));
+    if (lcb2 && lcb2.date === '2026-07-27') ok('T3 _lastClosedBar: 15:00 后 → 当日 K 已收盘');
+    else fail('T3 lastClosedBar 收盘后', JSON.stringify(lcb2));
+    if (P._lastClosedBar([], new Date()) === null && P._lastClosedBar(null, new Date()) === null) ok('T3 _lastClosedBar: 无数据 → null');
+    else fail('T3 lastClosedBar 空', '');
+
+    // _orderEligible: 收盘后创建不回溯当日 K
+    if (P._orderEligible({ createdDate: '2026-07-27', createdAfterClose: true }, { date: '2026-07-27' }) === false
+      && P._orderEligible({ createdDate: '2026-07-27', createdAfterClose: true }, { date: '2026-07-28' }) === true) ok('T3 _orderEligible: 收盘后创建 → 次日 K 才生效');
+    else fail('T3 eligible afterClose', '');
+    if (P._orderEligible({ createdDate: '2026-07-27', createdAfterClose: false }, { date: '2026-07-27' }) === true
+      && P._orderEligible({ createdDate: '2026-07-27', createdAfterClose: false }, { date: '2026-07-24' }) === false) ok('T3 _orderEligible: 盘中创建 → 当日 K 生效, 历史 K 不生效');
+    else fail('T3 eligible intraday', '');
+
+    // _tradingDaysAfter: 按 K 线数交易日
+    const bars3 = [krow('2026-07-23', 1, 1, 1, 1), krow('2026-07-24', 1, 1, 1, 1), krow('2026-07-27', 1, 1, 1, 1)].map(r => P._barOf(r));
+    if (P._tradingDaysAfter(bars3, '2026-07-22') === 3 && P._tradingDaysAfter(bars3, '2026-07-24') === 1) ok('T3 _tradingDaysAfter: 只数创建日之后的 K');
+    else fail('T3 tradingDaysAfter', '');
+
+    // _checkCondOrder 校验: 价格关系 / 整手 / 现金
+    const goodOrder = { code: '600519', triggerDirection: 'below', triggerPrice: 10, stopLoss: 9, targetPrice: 11, shares: 100 };
+    if (P._checkCondOrder(goodOrder, 30000).length === 0) ok('T3 _checkCondOrder: 合法单通过');
+    else fail('T3 check 合法', JSON.stringify(P._checkCondOrder(goodOrder, 30000)));
+    if (P._checkCondOrder({ ...goodOrder, stopLoss: 10.5 }, 30000).some(e => e.includes('止损价'))) ok('T3 _checkCondOrder: 止损 ≥ 触发 → 拦截');
+    else fail('T3 check 止损关系', '');
+    if (P._checkCondOrder({ ...goodOrder, targetPrice: 9.5 }, 30000).some(e => e.includes('目标价'))) ok('T3 _checkCondOrder: 目标 ≤ 触发 → 拦截');
+    else fail('T3 check 目标关系', '');
+    if (P._checkCondOrder({ ...goodOrder, triggerDirection: 'above' }, 30000).length === 0
+      && P._checkCondOrder({ ...goodOrder, triggerDirection: 'up' }, 30000).some(e => e.includes('方向'))) ok('T3 _checkCondOrder: 方向校验 (above 合法 / 非法值拦截)');
+    else fail('T3 check 方向', '');
+    if (P._checkCondOrder({ ...goodOrder, shares: 150 }, 30000).some(e => e.includes('整手') || e.includes('整数倍'))) ok('T3 _checkCondOrder: 非整手 → 拦截');
+    else fail('T3 check 整手', '');
+    if (P._checkCondOrder({ ...goodOrder, shares: 5000 }, 20000).some(e => e.includes('现金'))) ok('T3 _checkCondOrder: 金额超短线现金 → 拦截');
+    else fail('T3 check 现金', '');
+    if (P._checkCondOrder({ ...goodOrder, code: 'ABC' }, 30000).some(e => e.includes('代码'))) ok('T3 _checkCondOrder: 非法代码 → 拦截');
+    else fail('T3 check 代码', '');
+
+    // ---------- 38.2 addCondOrder / listCondOrders / cancelCondOrder ----------
+    const store1 = {
+      kv: { paper_account_short: { initialCash: 30000, cash: 30000, createdAt: 1, positionPct: 0.20 } },
+      tables: {}
+    };
+    const ctx1 = buildCtx(store1);
+    const P1 = ctx1.window.Paper;
+    const addR1 = await P1.addCondOrder({ code: '600519', name: '贵州茅台', triggerDirection: 'below', triggerPrice: 10, stopLoss: 9, targetPrice: 11, shares: 100, assumption: '技术突破', falsifyCondition: '跌破 20 日线' });
+    const saved1 = (store1.kv.paper_cond_orders || [])[0];
+    if (addR1.ok === true && saved1 && saved1.sleeve === 'short' && saved1.status === 'pending'
+      && saved1.createdDate && saved1.expireAt > saved1.createdAt && saved1.amount === 1000) ok('T3 addCondOrder: 落 kv, sleeve/status/createdDate/expireAt 齐备');
+    else fail('T3 addCondOrder', JSON.stringify({ addR1, saved1 }));
+    const addR2 = await P1.addCondOrder({ code: '600519', triggerDirection: 'below', triggerPrice: 10, stopLoss: 12, targetPrice: 13, shares: 100 });
+    if (addR2.ok === false && addR2.errors.length > 0 && (store1.kv.paper_cond_orders || []).length === 1) ok('T3 addCondOrder: 校验失败不落库');
+    else fail('T3 addCondOrder 校验', JSON.stringify(addR2));
+    const list1 = await P1.listCondOrders('pending');
+    if (list1.length === 1 && (await P1.listCondOrders('filled')).length === 0 && (await P1.listCondOrders()).length === 1) ok('T3 listCondOrders: status 过滤');
+    else fail('T3 listCondOrders', '');
+    const cancelR = await P1.cancelCondOrder(saved1.id);
+    if (cancelR === true && store1.kv.paper_cond_orders[0].status === 'cancelled'
+      && store1.kv.paper_cond_orders[0].cancelReason === '手动取消') ok('T3 cancelCondOrder: 状态转 cancelled + 原因');
+    else fail('T3 cancelCondOrder', JSON.stringify(store1.kv.paper_cond_orders[0]));
+    if (await P1.cancelCondOrder(saved1.id) === false) ok('T3 cancelCondOrder: 非 pending 不可再取消');
+    else fail('T3 cancel 重复', '');
+    // 上限 100 滚动截断
+    const bigOrders = [];
+    for (let i = 0; i < 105; i++) bigOrders.push(mkOrder({ id: 'bulk-' + i }));
+    store1.kv.paper_cond_orders = bigOrders;
+    const addR3 = await P1.addCondOrder({ code: '000001', triggerDirection: 'above', triggerPrice: 10, stopLoss: 9, targetPrice: 11, shares: 100 });
+    if (addR3.ok && store1.kv.paper_cond_orders.length === 100 && store1.kv.paper_cond_orders[0].id === 'bulk-6') ok('T3 addCondOrder: 上限 100 条滚动截断');
+    else fail('T3 上限截断', String(store1.kv.paper_cond_orders.length));
+
+    // ---------- 38.3 结算: pending 买单成交 (盘中下穿 → 触发价) ----------
+    const store2 = {
+      kv: {
+        paper_account_short: { initialCash: 30000, cash: 30000, createdAt: 1, positionPct: 0.20 },
+        paper_cond_orders: [mkOrder()]
+      },
+      tables: {},
+      klines: {
+        '600519': [
+          krow('2026-07-24', 10.5, 10.6, 10.4, 10.5),
+          krow('2026-07-27', 10.2, 10.3, 9.8, 10.0)   // open>trigger, low≤trigger → 按 10 成交
+        ]
+      }
+    };
+    const ctx2 = buildCtx(store2);
+    const P2 = ctx2.window.Paper;
+    const s1 = await P2.settleCondOrders(new Date(2026, 6, 27, 16, 0));
+    const fo1 = store2.kv.paper_cond_orders[0];
+    if (s1 && s1.filled === 1 && fo1.status === 'filled' && fo1.fillPrice === 10 && fo1.holdingId && fo1.filledAt) ok('T3 settle: below 单盘中下穿 → 按触发价 10 成交');
+    else fail('T3 settle fill', JSON.stringify({ s1, fo1 }));
+    const fh1 = (store2.tables.holdings || [])[0];
+    if (fh1 && fh1.isPaper === true && fh1.sleeve === 'short' && fh1.shares === 100 && fh1.costPrice === 10
+      && fh1.stopLoss === 9 && fh1.targetPrice === 11) ok('T3 settle: 持仓行带 sleeve/stopLoss/targetPrice (非索引字段)');
+    else fail('T3 settle 持仓行', JSON.stringify(fh1));
+    const spos1 = (store2.kv.paper_short_positions || [])[0];
+    if (spos1 && spos1.holdingId === fo1.holdingId && spos1.entryDate === '2026-07-27' && spos1.entryPrice === 10
+      && spos1.planOrderId === fo1.id && spos1.holdDays === 0 && spos1.lastSettleBarDate === '2026-07-27' && spos1.closed === false) ok('T3 settle: paper_short_positions 仓位跟踪行');
+    else fail('T3 settle 仓位跟踪', JSON.stringify(spos1));
+    const ftx1 = (store2.tables.transactions || []).find(t => t.type === 'buy');
+    if (ftx1 && ftx1.date === '2026-07-27' && ftx1.price === 10 && ftx1.sleeve === 'short' && ftx1.auto === true) ok('T3 settle: 买入流水用 K 线日期 + auto 标记');
+    else fail('T3 settle 买入流水', JSON.stringify(ftx1));
+    if (Math.abs(store2.kv.paper_account_short.cash - (30000 - 1000 - 5)) < 0.01) ok('T3 settle: 短线现金扣 1005 (=1000+费5, 万三 0.3 < 最低 5)');
+    else fail('T3 settle 现金', JSON.stringify(store2.kv.paper_account_short));
+    const fj1 = (store2.tables.journals || [])[0];
+    if (fj1 && fj1.code === '600519' && fj1.sleeve === 'short' && fj1.auto === true
+      && fj1.content.includes('触发/止损/目标') && fj1.content.includes('技术突破') && fj1.content.includes('跌破 20 日线')
+      && fj1.content.includes('成交价')) ok('T3 settle: 成交 journal 含计划要素 + sleeve/auto 字段');
+    else fail('T3 settle journal', JSON.stringify(fj1 && { s: fj1.sleeve, a: fj1.auto, c: fj1.content.slice(0, 120) }));
+
+    // 当日防重复结算
+    const s1dup = await P2.settleCondOrders(new Date(2026, 6, 27, 18, 0));
+    if (s1dup && s1dup.skipped === true && s1dup.filled === 0 && (store2.tables.transactions || []).length === 1) ok('T3 settle: 当日重复调用 skipped, 不重复成交');
+    else fail('T3 settle 防重复', JSON.stringify(s1dup));
+
+    // ---------- 38.4 结算: 止损卖出 (盘中触及 → 止损价) ----------
+    const store3 = {
+      kv: {
+        paper_account_short: { initialCash: 30000, cash: 20000, createdAt: 1, positionPct: 0.20 },
+        paper_cond_orders: [],
+        paper_short_positions: [{
+          holdingId: 'h-stop', code: '600519', name: '贵州茅台',
+          stopLoss: 9, targetPrice: 11, entryDate: '2026-07-24', entryPrice: 10,
+          planOrderId: 'o-x', shares: 100, holdDays: 0, lastSettleBarDate: '2026-07-24', closed: false
+        }]
+      },
+      tables: {
+        holdings: [{ id: 'h-stop', code: '600519', name: '贵州茅台', market: 'sh', shares: 100, costPrice: 10, isPaper: true, sleeve: 'short', stopLoss: 9, targetPrice: 11 }]
+      },
+      klines: { '600519': [krow('2026-07-24', 10, 10.2, 9.9, 10.1), krow('2026-07-27', 9.5, 9.6, 8.9, 9.1)] }
+    };
+    const ctx3 = buildCtx(store3);
+    const P3 = ctx3.window.Paper;
+    const s2 = await P3.settleCondOrders(new Date(2026, 6, 27, 16, 0));
+    const sp2 = store3.kv.paper_short_positions[0];
+    if (s2 && s2.exited === 1 && sp2.closed === true && sp2.exitReason === '止损' && sp2.exitPrice === 9 && sp2.exitDate === '2026-07-27') ok('T3 settle: 盘中触及止损 → 止损价 9 卖出, 跟踪行关闭');
+    else fail('T3 settle 止损', JSON.stringify({ s2, sp2 }));
+    if ((store3.tables.holdings || []).length === 0) ok('T3 settle: 止损后 holdings 清仓');
+    else fail('T3 settle 止损清仓', JSON.stringify(store3.tables.holdings));
+    const stx2 = (store3.tables.transactions || []).find(t => t.type === 'sell');
+    if (stx2 && stx2.price === 9 && stx2.date === '2026-07-27' && stx2.exitReason === '止损') ok('T3 settle: 卖出流水带 exitReason');
+    else fail('T3 settle 卖出流水', JSON.stringify(stx2));
+    // 卖 100 股 @9 = 900, 费 max(0.27,5)+印花税 0.45 = 5.45 → +894.55
+    if (Math.abs(store3.kv.paper_account_short.cash - (20000 + 894.55)) < 0.01) ok('T3 settle: 卖出回款含佣金+印花税');
+    else fail('T3 settle 回款', JSON.stringify(store3.kv.paper_account_short));
+    const sj2 = (store3.tables.journals || [])[0];
+    if (sj2 && sj2.content.includes('止损') && sj2.content.includes('入场') && sj2.sleeve === 'short' && sj2.auto === true) ok('T3 settle: 止损 journal 含出入场明细');
+    else fail('T3 settle 止损 journal', JSON.stringify(sj2 && sj2.content.slice(0, 120)));
+
+    // ---------- 38.5 结算: holdDays 递增 + 到期强平 ----------
+    const store4 = {
+      kv: {
+        paper_account_short: { initialCash: 30000, cash: 20000, createdAt: 1, positionPct: 0.20 },
+        paper_cond_orders: [],
+        paper_short_positions: [{
+          holdingId: 'h-hold', code: '600519', name: '贵州茅台',
+          stopLoss: 8, targetPrice: 12, entryDate: '2026-07-24', entryPrice: 10,
+          planOrderId: 'o-y', shares: 100, holdDays: 0, lastSettleBarDate: '2026-07-24', closed: false
+        }]
+      },
+      tables: {
+        holdings: [{ id: 'h-hold', code: '600519', name: '贵州茅台', market: 'sh', shares: 100, costPrice: 10, isPaper: true, sleeve: 'short' }]
+      },
+      klines: {
+        '600519': [
+          krow('2026-07-24', 10, 10.2, 9.9, 10.1),
+          krow('2026-07-27', 10, 10.4, 9.6, 10.1),
+          krow('2026-07-28', 10, 10.4, 9.6, 10.0),
+          krow('2026-07-29', 10, 10.4, 9.6, 10.1),
+          krow('2026-07-30', 10, 10.4, 9.6, 10.0),
+          krow('2026-07-31', 10, 10.4, 9.6, 10.3)   // 第 5 个结算日 → 强平 @ close 10.3
+        ]
+      }
+    };
+    const ctx4 = buildCtx(store4);
+    const P4 = ctx4.window.Paper;
+    const days = [27, 28, 29, 30, 31];
+    let lastSummary = null;
+    for (let i = 0; i < days.length; i++) {
+      lastSummary = await P4.settleCondOrders(new Date(2026, 6, days[i], 16, 0));
+      if (i === 0) {
+        const sp4 = store4.kv.paper_short_positions[0];
+        if (sp4.holdDays === 1 && sp4.closed === false && sp4.lastSettleBarDate === '2026-07-27'
+          && (store4.tables.transactions || []).length === 0) ok('T3 settle: 未触发 → holdDays 递增不卖');
+        else fail('T3 holdDays 递增', JSON.stringify(sp4));
+      }
+    }
+    const sp4end = store4.kv.paper_short_positions[0];
+    if (lastSummary && lastSummary.exited === 1 && sp4end.closed === true && sp4end.holdDays === 5
+      && sp4end.exitReason === '到期强平' && sp4end.exitPrice === 10.3) ok('T3 settle: 持满 5 日 → 按收盘价 10.3 强平');
+    else fail('T3 到期强平', JSON.stringify({ lastSummary, sp4end }));
+    const ftx4 = (store4.tables.transactions || []).find(t => t.type === 'sell');
+    if (ftx4 && ftx4.price === 10.3 && ftx4.exitReason === '到期强平') ok('T3 settle: 强平流水价 = 收盘价');
+    else fail('T3 强平流水', JSON.stringify(ftx4));
+
+    // ---------- 38.6 结算: 过期 (3 个交易日未触发) ----------
+    const store5 = {
+      kv: {
+        paper_account_short: { initialCash: 30000, cash: 30000, createdAt: 1, positionPct: 0.20 },
+        // 创建于 07-22 (周三), 之后 07-23/07-24/07-27 三根 K 都未触及 → expired
+        paper_cond_orders: [mkOrder({ createdDate: '2026-07-22', triggerPrice: 9 })]
+      },
+      tables: {},
+      klines: {
+        '600519': [
+          krow('2026-07-22', 10, 10.2, 9.9, 10.1),
+          krow('2026-07-23', 10.1, 10.3, 10.0, 10.2),
+          krow('2026-07-24', 10.2, 10.4, 10.1, 10.3),
+          krow('2026-07-27', 10.3, 10.5, 10.2, 10.4)
+        ]
+      }
+    };
+    const ctx5 = buildCtx(store5);
+    const P5 = ctx5.window.Paper;
+    const s5 = await P5.settleCondOrders(new Date(2026, 6, 27, 16, 0));
+    const eo5 = store5.kv.paper_cond_orders[0];
+    if (s5 && s5.expired === 1 && eo5.status === 'expired' && (store5.tables.holdings || []).length === 0) ok('T3 settle: 3 个交易日未触发 → expired, 不成交');
+    else fail('T3 settle 过期', JSON.stringify({ s5, st: eo5.status }));
+    const ej5 = (store5.tables.journals || [])[0];
+    if (ej5 && ej5.content.includes('过期') && ej5.content.includes('原计划') && ej5.sleeve === 'short') ok('T3 settle: 过期 journal 含原计划要素');
+    else fail('T3 过期 journal', JSON.stringify(ej5 && ej5.content.slice(0, 120)));
+
+    // ---------- 38.7 结算: 纪律 blocks → cancelled ----------
+    const store6 = {
+      kv: {
+        paper_account_short: { initialCash: 30000, cash: 30000, createdAt: 1, positionPct: 0.20 },
+        paper_cond_orders: [mkOrder()]
+      },
+      tables: {},
+      klines: { '600519': [krow('2026-07-24', 10.5, 10.6, 10.4, 10.5), krow('2026-07-27', 10.2, 10.3, 9.8, 10.0)] }
+    };
+    const ctx6 = buildCtx(store6, { disciplineBlocks: ['买入后单票占比超限'] });
+    const P6 = ctx6.window.Paper;
+    const s6 = await P6.settleCondOrders(new Date(2026, 6, 27, 16, 0));
+    const co6 = store6.kv.paper_cond_orders[0];
+    if (s6 && s6.cancelled === 1 && co6.status === 'cancelled' && (co6.cancelReason || '').includes('纪律拦截')
+      && (store6.tables.holdings || []).length === 0) ok('T3 settle: 纪律 blocks → cancelled + cancelReason, 不成交');
+    else fail('T3 settle 纪律拦截', JSON.stringify({ s6, co6 }));
+
+    // ---------- 38.8 结算: 单代码拉 K 失败跳过, 不影响其他代码, 不 throw ----------
+    const store7 = {
+      kv: {
+        paper_account_short: { initialCash: 30000, cash: 30000, createdAt: 1, positionPct: 0.20 },
+        paper_cond_orders: [
+          mkOrder({ id: 'o-fail', code: '600519' }),
+          mkOrder({ id: 'o-good', code: '000001', name: '平安银行', market: 'sz' })
+        ]
+      },
+      tables: {},
+      klines: { '000001': [krow('2026-07-24', 10.5, 10.6, 10.4, 10.5), krow('2026-07-27', 10.2, 10.3, 9.8, 10.0)] },
+      klineFail: { '600519': true }
+    };
+    const ctx7 = buildCtx(store7);
+    const P7 = ctx7.window.Paper;
+    let threw7 = false, s7 = null;
+    try { s7 = await P7.settleCondOrders(new Date(2026, 6, 27, 16, 0)); } catch (e) { threw7 = true; }
+    const oFail = store7.kv.paper_cond_orders.find(o => o.id === 'o-fail');
+    const oGood = store7.kv.paper_cond_orders.find(o => o.id === 'o-good');
+    if (!threw7 && s7 && s7.skippedCodes.includes('600519') && oFail.status === 'pending'
+      && oGood.status === 'filled' && s7.filled === 1) ok('T3 settle: 拉 K 失败代码跳过 pending 不动, 其他代码照常成交, 不 throw');
+    else fail('T3 settle 失败隔离', JSON.stringify({ threw7, s7, fail: oFail.status, good: oGood.status }));
+
+    // 开盘跳空成交 (below: open ≤ trigger → 开盘价, 比触发价更优)
+    const store8 = {
+      kv: {
+        paper_account_short: { initialCash: 30000, cash: 30000, createdAt: 1, positionPct: 0.20 },
+        paper_cond_orders: [mkOrder({ triggerPrice: 10 })]
+      },
+      tables: {},
+      klines: { '600519': [krow('2026-07-24', 10.5, 10.6, 10.4, 10.5), krow('2026-07-27', 9.5, 9.8, 9.2, 9.6)] }
+    };
+    const ctx8 = buildCtx(store8);
+    const P8 = ctx8.window.Paper;
+    const s8 = await P8.settleCondOrders(new Date(2026, 6, 27, 16, 0));
+    if (s8 && s8.filled === 1 && store8.kv.paper_cond_orders[0].fillPrice === 9.5) ok('T3 settle: 开盘已低于触发 → 按开盘价 9.5 成交');
+    else fail('T3 settle 开盘成交', JSON.stringify(s8));
+
+    // 收盘后创建的单不回溯当日 K (createdAfterClose)
+    const store9 = {
+      kv: {
+        paper_account_short: { initialCash: 30000, cash: 30000, createdAt: 1, positionPct: 0.20 },
+        paper_cond_orders: [mkOrder({ createdDate: '2026-07-27', createdAfterClose: true, expireAt: new Date(2026, 6, 30).getTime() })]
+      },
+      tables: {},
+      klines: { '600519': [krow('2026-07-27', 10.2, 10.3, 9.8, 10.0)] }
+    };
+    const ctx9 = buildCtx(store9);
+    const P9 = ctx9.window.Paper;
+    const s9 = await P9.settleCondOrders(new Date(2026, 6, 27, 20, 0));
+    if (s9 && s9.filled === 0 && store9.kv.paper_cond_orders[0].status === 'pending') ok('T3 settle: 收盘后创建 → 当日 K 不回溯成交');
+    else fail('T3 settle 不回溯', JSON.stringify(s9));
+
+  } catch (e) {
+    fail('T3 条件单引擎', e.message + ' / ' + (e.stack || ''));
   }
 })();
 

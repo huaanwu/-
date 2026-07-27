@@ -237,6 +237,21 @@ vite.config.js              # root=www,域脚本 external 列表,dev proxy
 | T1.4 纪律引擎 sleeve | `www/core/discipline.js` + `www/core/portfolio.js` | `preBuyCheck` input.sleeve (默认 long); `Portfolio.getAssets({paper, sleeve})`; 月度锚点: long **沿用存量 key `discipline_month_anchor_paper`** (兼容读取, 不迁移), short 用 `discipline_month_anchor_paper_short`; `DEFAULT_CONFIG.short = {maxDailyTrades: 3, cooldownHours: 48}` 结构预留 (T2 启用, 本期不参与检查) |
 | T1.5 UI 双 tab | `www/index.html` + `www/app/paper.js` | 模拟盘页「📈 长线模拟」/「⚡ AI 短线」tab (`Paper._sleeve` / `switchSleeve`), 短线 tab 占位说明 (T2/T3 上线预告) + 保留手动表单; 曲线加"AI 短线总资产"第二条资产线; EOD 日终小结加 short 段 (合并卡片分段 + 飞书文本 ⚡ 段) |
 
+### Phase T3 日线级条件单引擎 (AI 短线操盘手: 计划落地与结算)
+
+> 全日线级, 不依赖盘中轮询。结算时序语义: 只认**已收盘**日 K (`_lastClosedBar`: bar.date < today 直接用, bar.date == today 需本地 ≥15:00); 当日 K 未收盘不结算; 收盘后创建的单不回溯当日 K (`createdAfterClose` + `_orderEligible`)。
+
+| 子项 | 实现位置 | 关键方法 |
+|------|----------|----------|
+| T3.0 常量 | `www/core/constants.js` | COND_ORDER_LIMIT(100) / COND_ORDER_EXPIRE_DAYS(3, 按交易日数) / SHORT_MAX_HOLD_DAYS(5) |
+| T3.1 条件单存储 | `www/app/paper.js` | kv `paper_cond_orders` (上限 100 滚动截断); `addCondOrder` (`_checkCondOrder` 纯函数校验: stopLoss < trigger < target 双向统一 / 整手 / 金额≤短线现金) / `listCondOrders(status?)` / `cancelCondOrder` (只改状态不删行) |
+| T3.2 每日结算 | `www/app/paper.js` | `settleCondOrders(now?)`: kv `paper_cond_settle.lastSettleDate` 当日防重复; pending 单用最新已收盘日 K 判定 (`_fillCheck`: below 开盘≤触发→开盘价/盘中 low 穿越→触发价, above 对称); 成交走 `buy({sleeve:'short', price, tradeDate, targetPrice})` (buy/sell 新增 price/tradeDate/reason 覆盖参数, 结算不拉实时行情); 现金不足/纪律 blocks → cancelled + cancelReason; `Core.Data.getStockKLine(code,'daily',undefined,undefined,'')` 不复权只读使用, 失败代码本轮跳过不影响其他 |
+| T3.3 在持仓位出场 | `www/app/paper.js` | kv `paper_short_positions` `{holdingId, code, stopLoss, targetPrice, entryDate, entryPrice, planOrderId, shares, holdDays, lastSettleBarDate, closed}`; `_exitCheck` 纯函数: 跳空止损/止盈按开盘价, 盘中触及按止损/目标价, **同根 K 双触及保守按止损**; 未触发 holdDays+1, 满 SHORT_MAX_HOLD_DAYS 按收盘价强平 ('到期强平'); 卖出流水带 exitReason; `lastSettleBarDate` 防同根 K 重复结算 (holdDays 不重复递增) |
+| T3.4 过期判定 | `www/app/paper.js` | `_tradingDaysAfter` 按 K 线数交易日 (非自然日), createdAt 后第 COND_ORDER_EXPIRE_DAYS 个交易日未成交 → expired; `expireAt` 字段仅 UI 展示用 |
+| T3.5 journal 沉淀 | `www/app/paper.js` | `_writeCondJournal` (参照 screener `_addWatchlistFromPick` 模式): 成交/止损/止盈/强平/过期/纪律取消各写一条, 行上 `sleeve:'short'` + `auto:true`, content 含计划原文要素 (`_condPlanLines`: trigger/stop/target/assumption/证伪/失效) + 成交明细 + 原因 |
+| T3.6 UI | `www/index.html` + `www/app/paper.js` | 短线 tab `#paperCondSection`: 手动建条件单表单 (走 `Discipline.preBuyCheck({isPaper:true, sleeve:'short'})`) + `#paperCondOrders` 区块 (pending 单列表含取消按钮 + 近期已结算单状态徽标, 全 escapeHtml); `renderPage` 短线 tab 才显示; 结算有动作自动重渲染 |
+| T3.7 启动钩子 + 重置 | `www/app.js` + `www/app/paper.js` | app init 后 `Paper.settleCondOrders()` 异步不阻塞 (同 EOD 写法); `resetAccount('short')` 连带清 paper_cond_orders/paper_short_positions/paper_cond_settle |
+
 ### Phase D AI 建议"高手化" (D1)
 
 | 子项 | 实现位置 | 关键方法 |

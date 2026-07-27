@@ -96,6 +96,57 @@
       <div id="paperCheckResult"></div>
     </div>
     <div id="paperPositions" class="data-card" style="margin-top:8px;"></div>
+    <!-- T3: 条件单区块 (仅短线 tab 显示, paper.js renderPage 控制) -->
+    <div id="paperCondSection" style="display:none;">
+      <h3 style="margin-top:16px;font-size:14px;color:var(--text-muted);">📋 条件单 (AI 短线, 日线级)</h3>
+      <div class="filter-form" style="margin-top:8px;">
+        <div class="form-row">
+          <label>代码</label>
+          <input type="text" id="pcCode" placeholder="600519 或 600519 贵州茅台">
+        </div>
+        <div class="form-row">
+          <label>方向</label>
+          <select id="pcDirection">
+            <option value="below">回调买入 (跌到触发价)</option>
+            <option value="above">突破买入 (涨到触发价)</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>触发价</label>
+          <input type="number" id="pcTrigger" step="0.01" min="0" placeholder="触发买入价">
+        </div>
+        <div class="form-row">
+          <label>止损价</label>
+          <input type="number" id="pcStopLoss" step="0.01" min="0" placeholder="必填, 低于触发价">
+        </div>
+        <div class="form-row">
+          <label>目标价</label>
+          <input type="number" id="pcTarget" step="0.01" min="0" placeholder="必填, 高于触发价">
+        </div>
+        <div class="form-row">
+          <label>股数</label>
+          <input type="number" id="pcShares" step="100" min="100" placeholder="100 (整手)">
+        </div>
+        <div class="form-row">
+          <label>买入假设</label>
+          <select id="pcAssumption">
+            <option value="">(必选)</option>
+            <option value="业绩拐点">业绩拐点</option>
+            <option value="估值修复">估值修复</option>
+            <option value="题材催化">题材催化</option>
+            <option value="技术突破">技术突破</option>
+            <option value="分红套利">分红套利</option>
+            <option value="其他">其他</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label></label>
+          <button class="btn btn-sm btn-primary" onclick="Paper.addCondOrderFromForm()">创建条件单</button>
+        </div>
+        <div id="paperCondCheckResult"></div>
+      </div>
+      <div id="paperCondOrders" class="data-card" style="margin-top:8px;"></div>
+    </div>
     <h3 style="margin-top:16px;font-size:14px;color:var(--text-muted);">📈 表现对比 (每日快照)</h3>
     <div id="paperChart" class="data-card" style="margin-top:8px;"></div>
     <h3 style="margin-top:16px;font-size:14px;color:var(--text-muted);">📋 日终小结</h3>

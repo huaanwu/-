@@ -48,6 +48,18 @@
    *  比长线 0.10 高: 短线账户本金小, 比例太低会买不起一手 */
   const PAPER_SHORT_POSITION_PCT = 0.20;
 
+  // ==================== AI 短线操盘手 T3: 日线级条件单 ====================
+
+  /** 条件单存储上限 (kv paper_cond_orders, 滚动截断最旧) */
+  const COND_ORDER_LIMIT = 100;
+
+  /** 条件单有效期: createdAt 后第 N 个交易日仍未触发 → expired
+   *  判定走 K 线交易日计数 (paper.js _tradingDaysAfter), 非自然日 */
+  const COND_ORDER_EXPIRE_DAYS = 3;
+
+  /** 短线持仓最长持有交易日数: 止损/止盈都未触发且持满 N 日 → 按当日收盘价强平 */
+  const SHORT_MAX_HOLD_DAYS = 5;
+
   // ==================== 基金再平衡 ====================
 
   /** 默认基金组合再平衡目标配置
@@ -164,6 +176,9 @@
     SUGGEST_PCT_PENDING,
     PAPER_SHORT_CASH,
     PAPER_SHORT_POSITION_PCT,
+    COND_ORDER_LIMIT,
+    COND_ORDER_EXPIRE_DAYS,
+    SHORT_MAX_HOLD_DAYS,
     REBALANCE_TARGET_DEFAULT,
     REBALANCE_DRIFT_THRESHOLD,
     MAX_MONTHLY_DRAWDOWN_PCT,

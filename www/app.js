@@ -105,6 +105,10 @@ function updateMarketStatus() {
     if (window.Paper && Paper.maybeGenerateEodReport) {
       Paper.maybeGenerateEodReport().catch(e => console.warn('[App] EOD 小结生成失败:', e));
     }
+    // Phase T3: 短线条件单每日结算 (异步, 不阻塞启动; 当日已结算自动跳过)
+    if (window.Paper && Paper.settleCondOrders) {
+      Paper.settleCondOrders().catch(e => console.warn('[App] 条件单结算失败:', e));
+    }
     if (window.Journal && Journal.init) Journal.init();
     if (window.Screener && Screener.init) Screener.init();
     if (window.Fund && Fund.init) Fund.init();

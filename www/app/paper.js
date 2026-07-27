@@ -19,6 +19,11 @@
  *   - Phase C: 日终小结 (kv paper_eod_reports, 上限 60 条): 工作日 15:30 后自动生成
  *     (app 启动 + 页面展示时检查); 纪律拦截日志 kv paper_discipline_log (上限 100 条);
  *     kv feishu_webhook 配置后自动推送飞书
+ *   - Phase T3: 日线级条件单引擎 (AI 短线操盘手):
+ *     kv paper_cond_orders (上限 100) 条件单 + kv paper_short_positions 在持仓位跟踪
+ *     + kv paper_cond_settle { lastSettleDate } 当日防重复;
+ *     settleCondOrders() 每日结算 (app 启动 + 模拟盘页展示时异步调), 用最新一根
+ *     已收盘日 K 判定买入触发/止损/止盈/到期强平/过期, 全程不调实时行情
  */
 (function() {
   'use strict';
@@ -35,6 +40,10 @@
   const DEFAULT_POSITION_PCT = Core.Constants.SUGGEST_PCT_PAPER;  // AI 自动成交单次仓位比例
   const SHORT_CASH = Core.Constants.PAPER_SHORT_CASH;             // AI 短线子账户初始资金 (T1)
   const SHORT_POSITION_PCT = Core.Constants.PAPER_SHORT_POSITION_PCT;  // 短线单笔仓位比例 (T1)
+  const COND_ORDER_LIMIT = Core.Constants.COND_ORDER_LIMIT;            // 条件单上限 (T3)
+  const COND_ORDER_EXPIRE_DAYS = Core.Constants.COND_ORDER_EXPIRE_DAYS;  // 条件单有效期 (交易日, T3)
+  const SHORT_MAX_HOLD_DAYS = Core.Constants.SHORT_MAX_HOLD_DAYS;      // 短线最长持有交易日 (T3)
+  const MARKET_CLOSE_MINUTES = 15 * 60;   // A 股 15:00 收盘: 之后当日 K 视为已收盘 (T3 结算语义)
 
   const Paper = {
 
@@ -205,12 +214,15 @@
      * @param {string} name 名称 (可空)
      * @param {string} market sh/sz (可空, 自动按代码前缀推导)
      * @param {number} shares 股数 (自动向下取整到整手)
-     * @param {{ assumption?: string, stopLoss?: number, disciplineWarns?: string[], auto?: boolean,
-     *           falsifyCondition?: string, invalidation?: string, sleeve?: 'long'|'short' }} [opts]
+     * @param {{ assumption?: string, stopLoss?: number, targetPrice?: number, disciplineWarns?: string[], auto?: boolean,
+     *           falsifyCondition?: string, invalidation?: string, sleeve?: 'long'|'short',
+     *           price?: number, tradeDate?: string }} [opts]
      *        Phase B 纪律信息: 非索引字段, 写到 holdings/transactions 行上 (不改 schema);
      *        auto=true 标记 AI 自动成交 (Phase C 日终小结 🤖 标注用);
      *        falsifyCondition/invalidation 为 Phase D1 pre-mortem 沉淀 (只写 transactions 行);
-     *        sleeve 子账户 (T1), 默认 'long' 向后兼容
+     *        sleeve 子账户 (T1), 默认 'long' 向后兼容;
+     *        targetPrice 止盈价 (T3 条件单, 与 stopLoss 同款写 holdings 行);
+     *        price/tradeDate 成交价与成交日期覆盖 (T3 日线结算按 K 线价成交, 缺省 = 实时价/今天)
      * @returns 持仓行 | null (失败 toast + 返回 null)
      */
     async buy(code, name, market, shares, opts = {}) {
@@ -218,8 +230,10 @@
         const sleeve = opts.sleeve === 'short' ? 'short' : 'long';
         shares = this._roundLot(shares);
         if (shares < LOT_SIZE) { toastError(`买入不足一手 (${LOT_SIZE} 股)`); return null; }
-        const q = await Core.Data.getStockQuote(code);
-        const price = q ? (parseFloat(q.最新价 ?? q.price ?? 0) || 0) : 0;
+        // T3: 结算传入 K 线成交价时跳过实时行情 (拉不到价也能成交)
+        const overridePrice = parseFloat(opts.price) || 0;
+        const q = overridePrice > 0 ? null : await Core.Data.getStockQuote(code);
+        const price = overridePrice > 0 ? overridePrice : (q ? (parseFloat(q.最新价 ?? q.price ?? 0) || 0) : 0);
         if (!price) { toastError('拉不到实时价, 无法成交'); return null; }
         const amount = shares * price;
         const fee = this._calcFee(amount, 'buy');
@@ -242,13 +256,14 @@
           // Phase B: 加仓时若调用方给了新的假设/止损, 一并更新 (非索引字段)
           if (opts.assumption) h.assumption = opts.assumption;
           if (opts.stopLoss) h.stopLoss = opts.stopLoss;
+          if (opts.targetPrice) h.targetPrice = opts.targetPrice;  // T3: 止盈价
           h.updatedAt = now;
           await Core.Storage.put('holdings', h);
         } else {
           h = {
             id: uuid(),
             code,
-            name: name || q.名称 || '',
+            name: name || (q && q.名称) || '',
             market: market || Core.Util.stockCodePrefix(code),
             shares,
             costPrice: price,
@@ -259,11 +274,12 @@
           };
           if (opts.assumption) h.assumption = opts.assumption;
           if (opts.stopLoss) h.stopLoss = opts.stopLoss;
+          if (opts.targetPrice) h.targetPrice = opts.targetPrice;  // T3: 止盈价
           await Core.Storage.add('holdings', h);
         }
         const tx = {
           id: uuid(), holdingId: h.id, code,
-          type: 'buy', date: fmtDate(new Date()),
+          type: 'buy', date: opts.tradeDate || fmtDate(new Date()),
           price, shares, fee: fee.total,
           isPaper: true, sleeve, createdAt: now
         };
@@ -291,9 +307,12 @@
      * 模拟卖出 (实时价成交, 计佣金 + 印花税)
      * @param {string} holdingId 模拟持仓行 id
      * @param {number} shares 股数 (卖出不限整手, 但不得超过持仓)
+     * @param {{ price?: number, tradeDate?: string, reason?: string }} [opts]
+     *        T3 日线结算: price 覆盖成交价 (K 线价, 跳过实时行情),
+     *        tradeDate 覆盖交易日期 (K 线日期), reason 卖出原因 (写 transactions 行 exitReason)
      * @returns 持仓行 | null (失败 toast + 返回 null)
      */
-    async sell(holdingId, shares) {
+    async sell(holdingId, shares, opts = {}) {
       try {
         const h = await Core.Storage.get('holdings', holdingId);
         if (!h || !h.isPaper) { toastError('模拟持仓不存在'); return null; }
@@ -302,8 +321,10 @@
         shares = parseFloat(shares) || 0;
         if (shares <= 0) { toastError('卖出股数必须 > 0'); return null; }
         if (shares > h.shares) { toastError(`卖出股数超过持仓 (持有 ${h.shares})`); return null; }
-        const q = await Core.Data.getStockQuote(h.code);
-        const price = q ? (parseFloat(q.最新价 ?? q.price ?? 0) || 0) : 0;
+        // T3: 结算传入 K 线成交价时跳过实时行情
+        const overridePrice = parseFloat(opts.price) || 0;
+        const q = overridePrice > 0 ? null : await Core.Data.getStockQuote(h.code);
+        const price = overridePrice > 0 ? overridePrice : (q ? (parseFloat(q.最新价 ?? q.price ?? 0) || 0) : 0);
         if (!price) { toastError('拉不到实时价, 无法成交'); return null; }
         const amount = shares * price;
         const fee = this._calcFee(amount, 'sell');
@@ -318,9 +339,10 @@
         }
         await Core.Storage.add('transactions', {
           id: uuid(), holdingId: h.id, code: h.code,
-          type: 'sell', date: fmtDate(new Date()),
+          type: 'sell', date: opts.tradeDate || fmtDate(new Date()),
           price, shares, fee: fee.total,
-          isPaper: true, sleeve, createdAt: now
+          isPaper: true, sleeve, createdAt: now,
+          ...(opts.reason ? { exitReason: opts.reason } : {})   // T3: 卖出原因 (止损/止盈/强平)
         });
         const acc = await this._getAccountRaw(sleeve);
         acc.cash = +(acc.cash + amount - fee.total).toFixed(2);
@@ -354,6 +376,12 @@
         // 快照是双账户合并口径 (含 shortTotal), 只在重置长线时清空 (保持历史行为);
         // 短线重置不动曲线, 次日起 shortTotal 自然回到初始资金
         if (sleeve === 'long') await Core.Storage.kvSet('paper_snapshots', []);
+        // T3: 短线重置连带清空条件单/在持仓位跟踪/结算记录 (与持仓同属短线账本)
+        if (sleeve === 'short') {
+          await Core.Storage.kvSet('paper_cond_orders', []);
+          await Core.Storage.kvSet('paper_short_positions', []);
+          await Core.Storage.kvSet('paper_cond_settle', {});
+        }
         toastSuccess(`${label}子账户已重置`);
         this.renderPage();
       } catch (e) {
@@ -727,6 +755,592 @@
       `;
     },
 
+    // ========== Phase T3: 日线级条件单引擎 ==========
+
+    // ---- T3 纯函数 (不依赖 DOM/IndexedDB, Node 沙箱可测) ----
+
+    /**
+     * K 线行 (data.js 中文键) → 结算用 bar { open, high, low, close, date }
+     * 字段缺失/非正数 → null (该根 K 不参与判定, 宁缺毋假)
+     */
+    _barOf(row) {
+      if (!row) return null;
+      const open = parseFloat(row.开盘), high = parseFloat(row.最高);
+      const low = parseFloat(row.最低), close = parseFloat(row.收盘);
+      const date = String(row.日期 || '').slice(0, 10);
+      if (!(open > 0) || !(high > 0) || !(low > 0) || !(close > 0) || !date) return null;
+      return { open, high, low, close, date };
+    },
+
+    /**
+     * 取最新一根"已收盘"日 K:
+     *   - bar.date < today → 已收盘, 直接用
+     *   - bar.date === today → 仅当 now ≥ 15:00 (A 股收盘) 才视为已收盘
+     *   - 其余 (盘中/无数据) → null, 本轮不结算
+     * 时序语义: 结算永远只针对已完成交易日的 K 线, 不碰盘中未走完的 bar
+     */
+    _lastClosedBar(bars, now = new Date()) {
+      if (!Array.isArray(bars) || !bars.length) return null;
+      const today = fmtDate(now);
+      const closed = now.getHours() * 60 + now.getMinutes() >= MARKET_CLOSE_MINUTES;
+      for (let i = bars.length - 1; i >= 0; i--) {
+        const b = bars[i];
+        if (!b || !b.date) continue;
+        if (b.date < today) return b;
+        if (b.date === today && closed) return b;
+      }
+      return null;
+    },
+
+    /**
+     * 条件单对某根 K 是否生效:
+     *   - 创建当天收盘前创建 → 当日 K 可判定 (bar.date >= createdDate)
+     *   - 收盘后 (≥15:00) 或非交易时间创建 → 当日 K 发生在创建之前, 不可回溯成交 (bar.date > createdDate)
+     */
+    _orderEligible(order, bar) {
+      if (!order || !bar || !bar.date) return false;
+      const cd = order.createdDate || '';
+      if (!cd) return true;  // 老数据无字段不拦
+      return order.createdAfterClose ? bar.date > cd : bar.date >= cd;
+    },
+
+    /** 创建日之后的交易日数 (用 K 线数, 不按自然日; 过期判定用) */
+    _tradingDaysAfter(bars, dateStr) {
+      if (!Array.isArray(bars) || !dateStr) return 0;
+      return bars.filter(b => b && b.date && b.date > dateStr).length;
+    },
+
+    /** 跳空低开: 开盘价直接击穿止损价 (卖出按开盘价, 比止损价更真实) */
+    _isGapDown(bar, stop) {
+      return !!bar && stop > 0 && bar.open <= stop;
+    },
+
+    /** 跳空高开: 开盘价直接越过目标价 (止盈按开盘价) */
+    _isGapUp(bar, target) {
+      return !!bar && target > 0 && bar.open >= target;
+    },
+
+    /**
+     * 买入条件单触发判定 (单根已收盘日 K):
+     *   below (回调买入): open ≤ trigger → 开盘价成交; 否则 low ≤ trigger → 触发价成交
+     *   above (突破买入): open ≥ trigger → 开盘价成交; 否则 high ≥ trigger → 触发价成交
+     * @returns {{ fill: boolean, price: number|null }}
+     */
+    _fillCheck(order, bar) {
+      const tp = parseFloat(order && order.triggerPrice);
+      if (!(tp > 0) || !bar) return { fill: false, price: null };
+      if (order.triggerDirection === 'below') {
+        if (bar.open <= tp) return { fill: true, price: bar.open };
+        if (bar.low <= tp) return { fill: true, price: tp };
+      } else {
+        if (bar.open >= tp) return { fill: true, price: bar.open };
+        if (bar.high >= tp) return { fill: true, price: tp };
+      }
+      return { fill: false, price: null };
+    },
+
+    /**
+     * 在持仓位出场判定 (单根已收盘日 K):
+     *   止损: open ≤ stop (跳空) → 开盘价卖; 否则 low ≤ stop → 止损价卖
+     *   止盈: open ≥ target (跳空) → 开盘价卖; 否则 high ≥ target → 目标价卖
+     *   同根 K low/high 都触及 (止损止盈同日) → 保守原则一律按止损算:
+     *     日线数据无法分辨日内先后, 按止损估可以避免高估策略胜率
+     * @returns {{ exit: boolean, price: number|null, reason: string }}
+     */
+    _exitCheck(pos, bar) {
+      const stop = parseFloat(pos && pos.stopLoss), target = parseFloat(pos && pos.targetPrice);
+      if (!bar) return { exit: false, price: null, reason: '' };
+      if (this._isGapDown(bar, stop)) return { exit: true, price: bar.open, reason: '止损(跳空)' };
+      if (stop > 0 && bar.low <= stop) return { exit: true, price: stop, reason: '止损' };
+      if (this._isGapUp(bar, target)) return { exit: true, price: bar.open, reason: '止盈(跳空)' };
+      if (target > 0 && bar.high >= target) return { exit: true, price: target, reason: '止盈' };
+      return { exit: false, price: null, reason: '' };
+    },
+
+    /**
+     * 条件单创建校验 (纯函数)
+     * 价格关系: 两个方向统一要求 stopLoss < triggerPrice < targetPrice
+     *   (brief 对 below 单只硬性要求 stopLoss < triggerPrice, 但回调买入后目标价
+     *    理应高于买入价, 否则止盈判定无意义, 故收紧为同一约束)
+     * @returns string[] 错误文案 (空 = 通过)
+     */
+    _checkCondOrder(order, cash) {
+      const errs = [];
+      order = order || {};
+      if (!/^\d{6}$/.test(String(order.code || ''))) errs.push('代码必须是 6 位数字');
+      if (order.triggerDirection !== 'below' && order.triggerDirection !== 'above') {
+        errs.push('触发方向必须是 below (回调买入) 或 above (突破买入)');
+      }
+      const tp = parseFloat(order.triggerPrice), sl = parseFloat(order.stopLoss), tg = parseFloat(order.targetPrice);
+      if (!(tp > 0)) errs.push('触发价必须 > 0');
+      if (!(sl > 0)) errs.push('止损价必须 > 0');
+      if (!(tg > 0)) errs.push('目标价必须 > 0');
+      if (tp > 0 && sl > 0 && !(sl < tp)) errs.push(`止损价 ${sl} 必须低于触发价 ${tp}`);
+      if (tp > 0 && tg > 0 && !(tg > tp)) errs.push(`目标价 ${tg} 必须高于触发价 ${tp}`);
+      const shares = parseFloat(order.shares) || 0;
+      if (shares < LOT_SIZE || shares % LOT_SIZE !== 0) errs.push(`股数必须是 ${LOT_SIZE} 的整数倍`);
+      if (tp > 0 && shares >= LOT_SIZE) {
+        const amount = shares * tp;
+        if (amount + this._calcFee(amount, 'buy').total > (parseFloat(cash) || 0)) {
+          errs.push(`买入约需 ${fmtMoney(amount)} (含费), 超短线可用现金 ${fmtMoney(parseFloat(cash) || 0)}`);
+        }
+      }
+      return errs;
+    },
+
+    // ---- T3 条件单存储 (kv paper_cond_orders) ----
+
+    /**
+     * 新建条件单 (校验失败 toast + 返回 { ok:false, errors })
+     * @param {{ code, name?, market?, triggerDirection, triggerPrice, stopLoss, targetPrice,
+     *           shares, assumption?, falsifyCondition?, invalidation?, probability?, source? }} order
+     * @returns {Promise<{ ok: boolean, order?: object, errors?: string[] }>}
+     */
+    async addCondOrder(order) {
+      try {
+        const acc = await this._getAccountRaw('short');
+        const errs = this._checkCondOrder(order, acc.cash);
+        if (errs.length) {
+          toastError('条件单校验失败: ' + errs[0]);
+          return { ok: false, errors: errs };
+        }
+        const shares = this._roundLot(order.shares);
+        const now = Date.now();
+        const d = new Date(now);
+        const rec = {
+          id: uuid(),
+          code: String(order.code),
+          name: order.name || '',
+          market: order.market || Core.Util.stockCodePrefix(String(order.code)),
+          sleeve: 'short',
+          triggerDirection: order.triggerDirection,
+          triggerPrice: +parseFloat(order.triggerPrice).toFixed(2),
+          stopLoss: +parseFloat(order.stopLoss).toFixed(2),
+          targetPrice: +parseFloat(order.targetPrice).toFixed(2),
+          shares,
+          amount: +(shares * parseFloat(order.triggerPrice)).toFixed(2),
+          assumption: order.assumption || '',
+          falsifyCondition: order.falsifyCondition || '',
+          invalidation: order.invalidation || '',
+          probability: order.probability ?? null,
+          source: order.source === 'ai' ? 'ai' : 'manual',
+          status: 'pending',
+          createdAt: now,
+          createdDate: fmtDate(d),
+          // 收盘后创建: 当日 K 线已走完, 不可回溯成交, 下一根 K 才生效 (_orderEligible)
+          createdAfterClose: d.getHours() * 60 + d.getMinutes() >= MARKET_CLOSE_MINUTES,
+          // 展示用预计到期时刻 (真实过期按交易日数判定, 见 _tradingDaysAfter)
+          expireAt: now + COND_ORDER_EXPIRE_DAYS * 24 * 60 * 60 * 1000,
+          filledAt: null, fillPrice: null, holdingId: null
+        };
+        const list = (await Core.Storage.kvGet('paper_cond_orders')) || [];
+        list.push(rec);
+        await Core.Storage.kvSet('paper_cond_orders', list.slice(-COND_ORDER_LIMIT));
+        toastSuccess(`条件单已创建: ${rec.code} ${rec.triggerDirection === 'below' ? '回调到' : '突破'} ${rec.triggerPrice} 买入 ${shares} 股`);
+        return { ok: true, order: rec };
+      } catch (e) {
+        console.warn('[Paper] 条件单创建失败:', e);
+        toastError('条件单创建失败: ' + e.message);
+        return { ok: false, errors: [e.message] };
+      }
+    },
+
+    /** 条件单列表 (status 过滤: pending/filled/cancelled/expired, 缺省全部) */
+    async listCondOrders(status) {
+      const list = (await Core.Storage.kvGet('paper_cond_orders')) || [];
+      return status ? list.filter(o => o.status === status) : list;
+    },
+
+    /** 取消条件单 (只改状态, 不删行, 便于回溯) */
+    async cancelCondOrder(id) {
+      try {
+        const list = (await Core.Storage.kvGet('paper_cond_orders')) || [];
+        const o = list.find(x => x.id === id);
+        if (!o) { toastError('条件单不存在'); return false; }
+        if (o.status !== 'pending') { toastWarning('只有待触发单可取消'); return false; }
+        o.status = 'cancelled';
+        o.cancelReason = '手动取消';
+        await Core.Storage.kvSet('paper_cond_orders', list);
+        toastSuccess(`已取消条件单: ${o.code}`);
+        this.renderPage();
+        return true;
+      } catch (e) {
+        console.warn('[Paper] 条件单取消失败:', e);
+        toastError('取消失败: ' + e.message);
+        return false;
+      }
+    },
+
+    // ---- T3 每日结算 ----
+
+    /**
+     * 结算动作统一记复盘 (参照 screener._addWatchlistFromPick 的 journal 模式):
+     * 行上 sleeve:'short' + auto:true (非索引字段), content 含计划原文要素 + 成交明细 + 原因
+     */
+    async _writeCondJournal({ code, name, title, lines }) {
+      try {
+        await Core.Storage.add('journals', {
+          id: uuid(),
+          title,
+          content: lines.join('\n'),
+          code,
+          date: fmtDate(new Date()),
+          tags: ['AI短线', '条件单'],
+          mood: 'neutral',
+          source: 'paper-cond',   // 标记来源, 后续可识别/清理
+          sleeve: 'short',
+          auto: true,
+          createdAt: Date.now(),
+          updatedAt: Date.now()
+        });
+      } catch (e) {
+        console.warn('[Paper] 条件单 journal 写入失败:', e);
+      }
+    },
+
+    /** 计划原文要素行 (成交/过期/取消的 journal 共用) */
+    _condPlanLines(o) {
+      const L = [];
+      L.push(`**方向**: ${o.triggerDirection === 'below' ? '回调买入 (below)' : '突破买入 (above)'}`);
+      L.push(`**触发/止损/目标**: ${o.triggerPrice} / ${o.stopLoss} / ${o.targetPrice}`);
+      L.push(`**股数**: ${o.shares} (约 ${fmtMoney(o.amount || o.shares * o.triggerPrice)})`);
+      if (o.assumption) L.push(`**买入假设**: ${o.assumption}`);
+      if (o.falsifyCondition) L.push(`**证伪条件**: ${o.falsifyCondition}`);
+      if (o.invalidation) L.push(`**失效条件**: ${o.invalidation}`);
+      return L;
+    },
+
+    /**
+     * 每日结算入口: app 启动 (init 后不 await) + 模拟盘页面展示时异步调用
+     * kv paper_cond_settle.lastSettleDate 防当日重复; 整轮异常不外抛, 单代码拉 K 失败跳过
+     * @param {Date} [now] 可注入 (测试用)
+     * @returns 结算汇总 { skipped?, filled, exited, expired, cancelled, skippedCodes } | null
+     */
+    async settleCondOrders(now = new Date()) {
+      try {
+        const today = fmtDate(now);
+        const settleMeta = (await Core.Storage.kvGet('paper_cond_settle')) || {};
+        if (settleMeta.lastSettleDate === today) {
+          return { skipped: true, filled: 0, exited: 0, expired: 0, cancelled: 0, skippedCodes: [] };
+        }
+        const summary = { filled: 0, exited: 0, expired: 0, cancelled: 0, skippedCodes: [] };
+
+        const orders = (await Core.Storage.kvGet('paper_cond_orders')) || [];
+        const positions = (await Core.Storage.kvGet('paper_short_positions')) || [];
+
+        // 需要拉 K 的代码: pending 买单 + 在持仓位
+        const codes = new Set();
+        for (const o of orders) if (o.status === 'pending') codes.add(o.code);
+        for (const p of positions) if (!p.closed) codes.add(p.code);
+
+        if (codes.size === 0) {
+          await Core.Storage.kvSet('paper_cond_settle', { lastSettleDate: today });
+          return summary;
+        }
+
+        // 逐代码拉最近日 K (不复权, 判定真实成交价; 末尾 10 根足够数 3 个交易日有效期)
+        // 失败代码本轮跳过 + warn, 不影响其他代码
+        const barsByCode = {};
+        for (const code of codes) {
+          try {
+            const rows = await Core.Data.getStockKLine(code, 'daily', undefined, undefined, '');
+            const bars = (rows || []).map(r => this._barOf(r)).filter(b => b).slice(-10);
+            if (bars.length) barsByCode[code] = bars;
+          } catch (e) {
+            console.warn(`[Paper] 条件单结算拉 K 失败, 本轮跳过 ${code}:`, e);
+            summary.skippedCodes.push(code);
+          }
+        }
+
+        // 1) pending 买入单: 最新一根已收盘日 K 判定触发; 超期未触发 → expired
+        for (const o of orders) {
+          if (o.status !== 'pending') continue;
+          const bars = barsByCode[o.code];
+          if (!bars) continue;  // 拉 K 失败/无数据, 本轮跳过
+          const bar = this._lastClosedBar(bars, now);
+          if (!bar) continue;   // 盘中无已收盘 K, 不结算
+
+          // 触发判定 (只对生效后的 K 线, 防止回溯成交)
+          if (this._orderEligible(o, bar)) {
+            const chk = this._fillCheck(o, bar);
+            if (chk.fill) {
+              await this._settleFill(o, bar, chk.price, summary);
+              continue;
+            }
+          }
+          // 过期判定: createdAt 后第 COND_ORDER_EXPIRE_DAYS 个交易日仍未成交
+          if (this._tradingDaysAfter(bars, o.createdDate) >= COND_ORDER_EXPIRE_DAYS) {
+            o.status = 'expired';
+            summary.expired++;
+            console.warn(`[Paper] 条件单过期 ${o.code}: ${COND_ORDER_EXPIRE_DAYS} 个交易日未触发`);
+            await this._writeCondJournal({
+              code: o.code, name: o.name,
+              title: `⚡ 短线条件单过期: ${o.code} ${o.name || ''}`,
+              lines: [
+                `## ⚡ 短线条件单过期 - ${o.code} ${o.name || ''}`, '',
+                `**判定 K 线**: ${bar.date}`,
+                `**原因**: ${COND_ORDER_EXPIRE_DAYS} 个交易日内未触发的买单自动过期`, '',
+                '### 📋 原计划',
+                ...this._condPlanLines(o), '',
+                '---',
+                '*本条由 StockMaster 条件单引擎 (T3) 自动记录*'
+              ]
+            });
+          }
+        }
+        await Core.Storage.kvSet('paper_cond_orders', orders);
+
+        // 2) 在持短线仓位: 同一根已收盘日 K 判定止损/止盈/到期强平
+        let posDirty = false;
+        for (const p of positions) {
+          if (p.closed) continue;
+          const bars = barsByCode[p.code];
+          if (!bars) continue;
+          const bar = this._lastClosedBar(bars, now);
+          if (!bar) continue;
+          // 该根 K 已结算过 (同日多次进入/隔夜重复) → 跳过, 防 holdDays 重复递增
+          if (p.lastSettleBarDate && bar.date <= p.lastSettleBarDate) continue;
+
+          let act = this._exitCheck(p, bar);
+          if (!act.exit) {
+            // 未触发止损/止盈 → 持有天数 +1, 满 SHORT_MAX_HOLD_DAYS 按收盘价强平
+            p.holdDays = (p.holdDays || 0) + 1;
+            p.lastSettleBarDate = bar.date;
+            posDirty = true;
+            if (p.holdDays >= SHORT_MAX_HOLD_DAYS) {
+              act = { exit: true, price: bar.close, reason: '到期强平' };
+            } else {
+              continue;
+            }
+          }
+          await this._settleExit(p, bar, act, summary);
+          posDirty = true;
+        }
+        if (posDirty) await Core.Storage.kvSet('paper_short_positions', positions);
+
+        await Core.Storage.kvSet('paper_cond_settle', { lastSettleDate: today });
+        return summary;
+      } catch (e) {
+        console.warn('[Paper] 条件单结算失败:', e);
+        return null;
+      }
+    },
+
+    /** 结算子动作: 条件单成交 (纪律检查 → Paper.buy 落持仓 → 仓位跟踪 + journal) */
+    async _settleFill(o, bar, fillPrice, summary) {
+      const assumption = o.assumption || '技术突破';
+      // 纪律检查: 与手动/AI 自动成交同一套 preBuyCheck (短线子账户口径);
+      // blocks 命中 → cancelled + cancelReason, 不成交
+      if (Core.Discipline && Core.Discipline.preBuyCheck) {
+        const chk = await Core.Discipline.preBuyCheck({
+          code: o.code, name: o.name || '', market: o.market || '',
+          price: fillPrice, shares: o.shares, amount: o.shares * fillPrice,
+          isPaper: true, sleeve: 'short', assumption, stopLoss: o.stopLoss
+        });
+        if (!chk.ok) {
+          o.status = 'cancelled';
+          o.cancelReason = '纪律拦截: ' + chk.blocks.join('；');
+          summary.cancelled++;
+          console.warn(`[Paper] 条件单成交被纪律引擎拦截 ${o.code}:`, chk.blocks.join('；'));
+          await this._writeCondJournal({
+            code: o.code, name: o.name,
+            title: `⚡ 短线条件单取消: ${o.code} ${o.name || ''}`,
+            lines: [
+              `## ⚡ 短线条件单取消 (纪律拦截) - ${o.code} ${o.name || ''}`, '',
+              `**判定 K 线**: ${bar.date} (触发价 ${o.triggerPrice} 已触及, 按 ${fillPrice} 拟成交)`,
+              `**取消原因**: ${o.cancelReason}`, '',
+              '### 📋 原计划',
+              ...this._condPlanLines(o), '',
+              '---',
+              '*本条由 StockMaster 条件单引擎 (T3) 自动记录*'
+            ]
+          });
+          return;
+        }
+      }
+      const h = await this.buy(o.code, o.name, o.market, o.shares, {
+        sleeve: 'short', assumption, stopLoss: o.stopLoss, targetPrice: o.targetPrice,
+        auto: true, price: fillPrice, tradeDate: bar.date,
+        falsifyCondition: o.falsifyCondition, invalidation: o.invalidation
+      });
+      if (!h) {
+        // buy 内部已 toast (现金不足等); 条件单转 cancelled, 原因可查
+        o.status = 'cancelled';
+        o.cancelReason = '成交失败 (现金不足或行情不可用)';
+        summary.cancelled++;
+        console.warn(`[Paper] 条件单成交失败 ${o.code}: buy 返回 null`);
+        return;
+      }
+      o.status = 'filled';
+      o.filledAt = Date.now();
+      o.fillPrice = fillPrice;
+      o.holdingId = h.id;
+      summary.filled++;
+      // 在持仓位跟踪: 止损/止盈/持有天数锚点 (lastSettleBarDate=成交 K, 当日不再重复结算)
+      const positions = (await Core.Storage.kvGet('paper_short_positions')) || [];
+      positions.push({
+        holdingId: h.id, code: o.code, name: o.name || '',
+        stopLoss: o.stopLoss, targetPrice: o.targetPrice,
+        entryDate: bar.date, entryPrice: fillPrice,
+        planOrderId: o.id, shares: o.shares,
+        holdDays: 0, lastSettleBarDate: bar.date, closed: false
+      });
+      await Core.Storage.kvSet('paper_short_positions', positions);
+      await this._writeCondJournal({
+        code: o.code, name: o.name,
+        title: `⚡ 短线条件单成交: ${o.code} ${o.name || ''}`,
+        lines: [
+          `## ⚡ 短线条件单成交 - ${o.code} ${o.name || ''}`, '',
+          `**成交日期**: ${bar.date} (日 K 结算)`,
+          `**成交价**: ${fillPrice} × ${o.shares} 股 = ${fmtMoney(fillPrice * o.shares)}`, '',
+          '### 📋 原计划',
+          ...this._condPlanLines(o), '',
+          '---',
+          '*本条由 StockMaster 条件单引擎 (T3) 自动记录*'
+        ]
+      });
+    },
+
+    /** 结算子动作: 在持仓位卖出 (止损/止盈/强平 → Paper.sell + 仓位关闭 + journal) */
+    async _settleExit(p, bar, act, summary) {
+      const h = await Core.Storage.get('holdings', p.holdingId);
+      if (!h || !h.isPaper) {
+        // 持仓已被手动卖掉/重置 → 跟踪行直接关闭, 不再卖
+        p.closed = true;
+        p.exitDate = bar.date;
+        p.exitReason = '持仓已不存在 (手动卖出或重置)';
+        console.warn(`[Paper] 短线仓位跟踪关闭 ${p.code}: 持仓行不存在`);
+        return;
+      }
+      const shares = Math.min(p.shares || h.shares, h.shares);
+      const r = await this.sell(h.id, shares, { price: act.price, tradeDate: bar.date, reason: act.reason });
+      if (!r) {
+        console.warn(`[Paper] 短线仓位卖出失败 ${p.code} (${act.reason}), 下轮重试`);
+        return;  // 不标 closed, 下个交易日重试
+      }
+      p.closed = true;
+      p.exitDate = bar.date;
+      p.exitPrice = act.price;
+      p.exitReason = act.reason;
+      summary.exited++;
+      const pl = +((act.price - p.entryPrice) * shares).toFixed(2);
+      await this._writeCondJournal({
+        code: p.code, name: p.name,
+        title: `⚡ 短线${act.reason}: ${p.code} ${p.name || ''}`,
+        lines: [
+          `## ⚡ 短线${act.reason} - ${p.code} ${p.name || ''}`, '',
+          `**卖出日期**: ${bar.date} (日 K 结算)`,
+          `**原因**: ${act.reason}`,
+          `**入场**: ${p.entryDate} @ ${p.entryPrice} → **出场**: ${act.price} × ${shares} 股 (浮动盈亏 ${fmtMoney(pl)}, 未扣费)`,
+          `**持有**: ${p.holdDays || 0} 个交易日`,
+          `**止损/目标**: ${p.stopLoss} / ${p.targetPrice}`, '',
+          '---',
+          '*本条由 StockMaster 条件单引擎 (T3) 自动记录*'
+        ]
+      });
+    },
+
+    // ---- T3 UI: 条件单区块 (短线 tab) ----
+
+    /** 手动建条件单表单: 校验 + 纪律检查 → addCondOrder */
+    async addCondOrderFromForm() {
+      const parsed = parseStockInput(document.getElementById('pcCode').value);
+      if (!parsed) { toastError('代码格式不对 (6 位数字开头)'); return; }
+      const order = {
+        code: parsed.code,
+        name: parsed.name || '',
+        triggerDirection: document.getElementById('pcDirection').value,
+        triggerPrice: parseFloat(document.getElementById('pcTrigger').value),
+        stopLoss: parseFloat(document.getElementById('pcStopLoss').value),
+        targetPrice: parseFloat(document.getElementById('pcTarget').value),
+        shares: parseFloat(document.getElementById('pcShares').value),
+        assumption: document.getElementById('pcAssumption').value,
+        source: 'manual'
+      };
+      const resultEl = document.getElementById('paperCondCheckResult');
+      // 先走纪律检查 (短线子账户口径; 价格按触发价估)
+      if (Core.Discipline && Core.Discipline.preBuyCheck) {
+        const acc = await this._getAccountRaw('short');
+        const errs = this._checkCondOrder(order, acc.cash);
+        if (errs.length) {
+          if (resultEl) resultEl.innerHTML = `<div style="color:var(--down);font-size:12px;">⛔ ${escapeHtml(errs.join('；'))}</div>`;
+          toastError('条件单校验失败: ' + errs[0]);
+          return;
+        }
+        const sharesLot = this._roundLot(order.shares);
+        const chk = await Core.Discipline.preBuyCheck({
+          code: order.code, name: order.name, market: '',
+          price: order.triggerPrice, shares: sharesLot, amount: sharesLot * order.triggerPrice,
+          isPaper: true, sleeve: 'short', assumption: order.assumption, stopLoss: order.stopLoss
+        });
+        if (!chk.ok) {
+          if (resultEl) resultEl.innerHTML = Core.Discipline.renderCheckResult(chk);
+          toastError('交易纪律检查未通过, 已拦截');
+          return;
+        }
+        if (chk.warns.length && !confirm(Core.Discipline._resultToText(chk) + '\n\n确认创建条件单?')) return;
+      }
+      const r = await this.addCondOrder(order);
+      if (r.ok) {
+        if (resultEl) resultEl.innerHTML = '';
+        this.renderPage();
+      }
+    },
+
+    /** 条件单区块渲染: pending 单 + 近期已结算单 (全 escapeHtml) */
+    async _renderCondOrders() {
+      const el = document.getElementById('paperCondOrders');
+      if (!el) return;
+      const all = await this.listCondOrders();
+      const pending = all.filter(o => o.status === 'pending');
+      const settled = all.filter(o => o.status !== 'pending').slice(-10).reverse();
+
+      const dirLabel = d => d === 'below' ? '回调买入' : '突破买入';
+      const statusBadge = s => ({
+        filled: '<span style="color:var(--up);">✅ 已成交</span>',
+        expired: '<span style="color:var(--text-muted);">⌛ 已过期</span>',
+        cancelled: '<span style="color:var(--warn, #d29922);">🚫 已取消</span>'
+      }[s] || escapeHtml(s));
+
+      const pendingHtml = pending.length === 0
+        ? '<div class="empty" style="padding:12px;">没有待触发的条件单</div>'
+        : `<table>
+            <thead><tr><th>代码/名称</th><th>方向</th><th>触发价</th><th>止损/目标</th><th>股数</th><th>有效期至</th><th>操作</th></tr></thead>
+            <tbody>${pending.map(o => `
+              <tr>
+                <td><span class="code">${escapeHtml(o.code)}</span><br><span style="color:var(--text-muted);font-size:11px;">${escapeHtml(o.name || '')}${o.source === 'ai' ? ' 🤖' : ''}</span></td>
+                <td>${dirLabel(o.triggerDirection)}</td>
+                <td>${fmtNum(o.triggerPrice, 2)}</td>
+                <td>${fmtNum(o.stopLoss, 2)} / ${fmtNum(o.targetPrice, 2)}</td>
+                <td>${fmtNum(o.shares, 0)}</td>
+                <td>${escapeHtml(fmtDate(new Date(o.expireAt)))}<br><span style="font-size:11px;color:var(--text-muted);">(按交易日计)</span></td>
+                <td><button class="btn btn-sm" onclick="Paper.cancelCondOrder('${escapeHtml(o.id)}')">取消</button></td>
+              </tr>`).join('')}
+            </tbody>
+          </table>`;
+
+      const settledHtml = settled.length === 0
+        ? ''
+        : `<div style="margin-top:10px;font-size:12px;color:var(--text-muted);">近期已结算</div>
+           <table>
+            <thead><tr><th>代码</th><th>状态</th><th>成交价</th><th>原因</th></tr></thead>
+            <tbody>${settled.map(o => `
+              <tr>
+                <td><span class="code">${escapeHtml(o.code)}</span></td>
+                <td>${statusBadge(o.status)}</td>
+                <td>${o.fillPrice ? fmtNum(o.fillPrice, 2) : '-'}</td>
+                <td style="font-size:11px;">${escapeHtml(o.cancelReason || (o.status === 'expired' ? `${COND_ORDER_EXPIRE_DAYS} 个交易日未触发` : ''))}</td>
+              </tr>`).join('')}
+            </tbody>
+          </table>`;
+
+      el.innerHTML = `
+        <div class="card-title">📋 条件单 (日线级, 每日收盘后结算)</div>
+        ${pendingHtml}
+        ${settledHtml}
+      `;
+    },
+
     // ========== 页面 UI ==========
 
     /** 手动交易表单: 买入 (Phase B: 先过 Core.Discipline.preBuyCheck; T1: 走当前 tab 的子账户) */
@@ -817,9 +1431,18 @@
       const noteEl = document.getElementById('paperSleeveNote');
       if (noteEl) {
         noteEl.textContent = sleeve === 'short'
-          ? '⚡ AI 短线操盘手即将上线 (T2/T3), 此账户将由 AI 自动交易; 当前可用手动表单测试'
+          ? '⚡ AI 短线: 条件单日线结算已上线 (T3), 每日按收盘价判定触发/止损/止盈; AI 盘前计划 (T2) 下期接入'
           : '';
       }
+      // T3: 条件单区块只在短线 tab 显示
+      const condSection = document.getElementById('paperCondSection');
+      if (condSection) condSection.style.display = sleeve === 'short' ? '' : 'none';
+      if (sleeve === 'short') await this._renderCondOrders();
+
+      // T3: 页面展示时异步触发每日结算 (当日已结算自动跳过; 有动作则重渲染刷新数据)
+      this.settleCondOrders()
+        .then(r => { if (r && !r.skipped && (r.filled || r.exited || r.expired || r.cancelled)) this.renderPage(); })
+        .catch(e => console.warn('[Paper] 条件单结算失败:', e));
 
       // 页面展示时也尝试记当日快照 (当天已记则跳过)
       this.snapshotIfNeeded().catch(e => console.warn('[Paper] 页面快照失败:', e));
