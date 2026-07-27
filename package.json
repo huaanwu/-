@@ -2,18 +2,58 @@
   "name": "stock-master",
   "version": "0.1.0",
   "description": "自用 A股/基金投资工具 - 行情/持仓/复盘/选股/回测/提醒",
-  "main": "www/index.html",
+  "main": "electron/main.js",
   "scripts": {
     "dev": "concurrently -k -n vite,proxy -c blue,magenta \"npm:dev:vite\" \"npm:dev:proxy\"",
     "dev:vite": "vite",
     "dev:proxy": "node scripts/dev-proxy.mjs",
+    "dev:electron": "electron .",
     "build": "node scripts/copy-libs.mjs && vite build && node scripts/build-web.mjs",
     "build:libs": "node scripts/copy-libs.mjs",
     "build:web": "node scripts/build-web.mjs",
+    "exe:build": "electron-builder --win portable --x64",
     "preview": "vite preview --port 3003",
     "typecheck": "tsc --noEmit",
     "test": "node test/test_runtime.js && node test/test_all.js",
     "sync": "npm run build && npx cap sync android"
+  },
+  "build": {
+    "appId": "com.stockmaster.app",
+    "productName": "StockMaster",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "electron/main.js",
+      "www/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "scripts/dev-proxy.mjs",
+        "to": "dev-proxy.mjs"
+      },
+      {
+        "from": "node_modules/express",
+        "to": "node_modules/express"
+      },
+      {
+        "from": "node_modules/http-proxy-middleware",
+        "to": "node_modules/http-proxy-middleware"
+      },
+      {
+        "from": "node_modules/express/lib",
+        "to": "node_modules/express/lib"
+      }
+    ],
+    "win": {
+      "target": "portable",
+      "icon": "www/icons/icon.ico"
+    },
+    "portable": {
+      "artifactName": "StockMaster-${version}-portable.exe"
+    },
+    "asar": false
   },
   "dependencies": {
     "@capacitor/android": "^8.4.2",
@@ -29,6 +69,8 @@
   },
   "devDependencies": {
     "concurrently": "^9.1.0",
+    "electron": "^43.2.0",
+    "electron-builder": "^26.15.3",
     "express": "^5.2.1",
     "http-proxy-middleware": "^3.0.3",
     "typescript": "^5.9.3",
