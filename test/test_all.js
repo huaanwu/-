@@ -5695,33 +5695,40 @@ section('[37] Core.AlertsAgent: 白名单校验 / parseIntent / preview / apply 
 // ========== 总结 ==========
 // 同步 section 的 ok() 已经在 console 打印;
 // async IIFE 里的 ok() 还在 microtask / setTimeout 队列里, 旧版本 setImmediate 只给一次机会,
-// 36.x 段有 5×50ms=250ms 的 setTimeout wait 链 (vm 跨边界), 旧机制直接掐断 → 假绿。
-// 修法: 每 30ms poll 一次 process._getActiveHandles(), 等 timer/immediate 句柄稳定为 0,
-//      再多等 2 轮确认无遗漏, 最长封顶 5s。
+// 36.x 段有 5×50ms=250ms setTimeout wait 链 (vm 跨边界 fire-and-forget then), 旧机制直接掐断 → 假绿。
+// 修法: 每 30ms poll 一次 process._getActiveHandles(), 把 timer / immediate / pending I/O 句柄
+//      都算成 "active"; 等 active=0 连续 2 轮 (60ms) 才 resolve, 封顶 5s。
+// 注: Node 24 不再把 setTimeout 句柄放在 _getActiveHandles 返回值里, 所以 active=0 主要靠
+//      "process 内部尚未处理完的 I/O / pending handle" 来撑住等待。36.x 段的 setTimeout 链
+//      总长 250ms (5×50ms), 60ms 等不到 → 还会 fail; 因此 MAX_MS 5s 封顶 + 至少 60ms 起步
+//      + 实际依赖 vm 跨边界 promise.resolve 在每 tick 之间被 microtask drain 触发。
 function waitForIIFEsDrain() {
   return new Promise((resolve) => {
     const start = Date.now();
     const MAX_MS = 5000;
-    const INTERVAL = 30;
-    const REQUIRED_QUIET = 2;  // 连续 2 次 (60ms) 无 timer 才认为 drained
+    const INTERVAL_MS = 30;
+    const REQUIRED_QUIET = 8;  // 8 × 30 = 240ms 连续无 active 才认为 drained (36.x setTimeout 链 250ms)
     let quietTicks = 0;
     const tick = () => {
-      // 过滤掉 process 自身 + 我们汇总用的 setInterval
+      if (Date.now() - start > MAX_MS) return resolve();  // 封顶
       const handles = process._getActiveHandles();
-      const activeTimers = handles.filter(h => {
-        // Timer / Immediate / Timeout 都是带 _idleTimeout 或带 [owner]
-        return h && (h._onTimeout || (typeof h.hasRef === 'function' && h._idleStart !== undefined && !(h.constructor && h.constructor.name === 'WriteStream')));
-      }).length;
-      if (activeTimers === 0) {
+      const isTimerLike = (h) => h && (h._onTimeout
+        || (typeof h.hasRef === 'function' && h._idleStart !== undefined && h._idleNext)
+        || (h.constructor && (h.constructor.name === 'WriteStream' || h.constructor.name === 'Socket')));
+      const activeCount = handles.filter(isTimerLike).length;
+      // 注意: 即使 handles 中没有 timer 句柄, Node 24 也可能在底层 event loop 仍持有
+      // pending microtask / setImmediate / I/O; 这里用 setInterval 间隔 (30ms) 给底层
+      // 多次机会处理, REQUIRED_QUIET=2 连续 60ms 稳定才收手。
+      void activeCount;  // 留口子: 若未来需要可观察, 当前 Node 24 不返回 timer
+      if (activeCount === 0) {
         quietTicks++;
         if (quietTicks >= REQUIRED_QUIET) return resolve();
       } else {
         quietTicks = 0;
       }
-      if (Date.now() - start > MAX_MS) return resolve();  // 封顶
-      setTimeout(tick, INTERVAL);
+      setTimeout(tick, INTERVAL_MS);
     };
-    setTimeout(tick, INTERVAL);
+    setTimeout(tick, INTERVAL_MS);
   });
 }
 
