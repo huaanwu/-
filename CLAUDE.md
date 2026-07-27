@@ -17,7 +17,8 @@ npm install                                    # 装依赖
 
 npm run dev:proxy                              # 启动 Node 数据代理 :8089 (需要另一个终端)
                                                 # 前置: pip install aktools
-                                                #        python -m aktools http --host 127.0.0.1 --port 8088
+                                                #        python -m aktools --host 127.0.0.1 --port 8088
+                                                # (aktools 0.0.91+ 移除 'http' 子命令, 直接 --host/--port)
 
 npm run dev:vite                               # 单独启动 Vite :3003
 npm run dev                                    # 一条龙: vite + proxy (concurrently)
