@@ -69,7 +69,11 @@
         change_below: '跌幅 ≥',
         volume_above: '成交 ≥',
         rebalance_quarterly: '季度再平衡',
-        earnings_disclosure: '📅 财报披露'
+        earnings_disclosure: '📅 财报披露',
+        // B 阶段(规则类型登记, 触发逻辑在 Phase B-1/B-2/B-3 实施时接)
+        earnings_warning: '⚠️ 业绩预告异动',
+        valuation_drift: '📈 估值偏离',
+        regime_change: '🌊 大盘状态切换'
       }[t] || t;
     },
 
@@ -95,6 +99,10 @@
         <div class="modal-backdrop" onclick="if(event.target===this)Alerts.closeModal()">
           <div class="modal">
             <h3>新建提醒</h3>
+            <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;line-height:1.6;">
+              💡 中长线持仓(3-12 个月)推荐用上方"基本面/大盘"规则,分钟级轮询已足够覆盖<br>
+              ⚡ 短线场景再选下方的"价格/涨跌幅"
+            </div>
             <div class="form-row">
               <label>股票代码</label>
               <input type="text" id="alCode" placeholder="600519" autofocus>
@@ -106,13 +114,20 @@
             <div class="form-row">
               <label>类型</label>
               <select id="alType" onchange="Alerts._onTypeChange()">
-                <option value="price_above">价格突破(≥)</option>
-                <option value="price_below">价格跌破(≤)</option>
-                <option value="change_above">涨幅达到(≥)</option>
-                <option value="change_below">跌幅达到(≥)</option>
-                <option value="volume_above">成交量异常(≥)</option>
-                <option value="rebalance_quarterly">季度再平衡(基金)</option>
-                <option value="earnings_disclosure">📅 财报披露前 N 天</option>
+                <optgroup label="📅 中长线(基本面/大盘)">
+                  <option value="earnings_disclosure">📅 财报披露前 N 天</option>
+                  <option value="earnings_warning">⚠️ 业绩预告异动(B-1 阶段生效)</option>
+                  <option value="valuation_drift">📈 估值偏离(B-3 阶段生效)</option>
+                  <option value="regime_change">🌊 大盘状态切换(B-2 阶段生效)</option>
+                  <option value="rebalance_quarterly">季度再平衡(基金)</option>
+                </optgroup>
+                <optgroup label="⚡ 短线(价格/涨跌幅)">
+                  <option value="price_above">价格突破(≥)</option>
+                  <option value="price_below">价格跌破(≤)</option>
+                  <option value="change_above">涨幅达到(≥)</option>
+                  <option value="change_below">跌幅达到(≥)</option>
+                  <option value="volume_above">成交量异常(≥)</option>
+                </optgroup>
               </select>
             </div>
             <div class="form-row" id="alValueRow">
@@ -146,6 +161,10 @@
         </div>
       `;
       document.getElementById('modalRoot').innerHTML = html;
+      // 默认选中第一个选项(财报披露) — 中长线优先
+      const sel = document.getElementById('alType');
+      if (sel) sel.value = 'earnings_disclosure';
+      this._onTypeChange();
     },
 
     /**
@@ -188,14 +207,28 @@
       // 切换 row 显示
       const isRebalance = t === 'rebalance_quarterly';
       const isEarnings = t === 'earnings_disclosure';  // Phase U
+      // B 阶段 type, 暂无 UI 配置项, 隐藏 value/lead/interval, 由触发逻辑用默认参数
+      const isFutureType = t === 'earnings_warning' || t === 'valuation_drift' || t === 'regime_change';
       const valRow = document.getElementById('alValueRow');
       const intRow = document.getElementById('alIntervalRow');
       const leadRow = document.getElementById('alLeadDaysRow');  // Phase U
       const hint = document.getElementById('alRebalanceTarget');
-      if (valRow) valRow.style.display = (isRebalance || isEarnings) ? 'none' : '';
+      if (valRow) valRow.style.display = (isRebalance || isEarnings || isFutureType) ? 'none' : '';
       if (intRow) intRow.style.display = isRebalance ? '' : 'none';
       if (leadRow) leadRow.style.display = isEarnings ? '' : 'none';  // Phase U
       if (hint) hint.style.display = isRebalance ? '' : 'none';
+
+      // B 阶段 type 在 _check 里识别后跳过; 保存时给提示避免误以为已生效
+      const futureHint = document.getElementById('alFutureHint');
+      if (!futureHint) {
+        const h = document.createElement('div');
+        h.id = 'alFutureHint';
+        h.style.cssText = 'font-size:11px;color:var(--warn,#d29922);margin-top:8px;line-height:1.6;display:none;';
+        h.innerHTML = '⚠️ 此规则类型在 B 阶段实施, 当前保存后会标记为 pending, 触发逻辑到位后自动激活';
+        const hintAnchor = document.getElementById('alRebalanceTarget');
+        if (hintAnchor && hintAnchor.parentNode) hintAnchor.parentNode.insertBefore(h, hintAnchor.nextSibling);
+      }
+      if (futureHint) futureHint.style.display = isFutureType ? '' : 'none';
 
       // 再平衡不需要代码
       const codeEl = document.getElementById('alCode');
@@ -248,6 +281,26 @@
         await Core.Storage.add('alerts', data);
         this.closeModal();
         toastSuccess(`已添加: ${name || code} 财报披露前 ${leadDays} 天提醒`);
+        this.render();
+        return;
+      }
+
+      // B 阶段 type (earnings_warning / valuation_drift / regime_change)
+      // 当前阶段触发逻辑未接, 保存为 pending=true, active=false; B 实施后由 _check 自动激活
+      if (type === 'earnings_warning' || type === 'valuation_drift' || type === 'regime_change') {
+        if (!code || !/^\d{6}$/.test(code)) { toastError('代码必须 6 位'); return; }
+        const data = {
+          id: uuid(),
+          code, name, type,
+          active: false,        // B 阶段未到, 不轮询
+          pending: true,         // 标记待激活
+          hitCount: 0,
+          triggered: false,
+          createdAt: Date.now()
+        };
+        await Core.Storage.add('alerts', data);
+        this.closeModal();
+        toastInfo(`已登记: ${type} (B 阶段实施后自动激活)`);
         this.render();
         return;
       }
