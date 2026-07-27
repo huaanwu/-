@@ -4470,6 +4470,111 @@ section('[33] Z5 FINCON 风格结构化教训 (情境指纹 + 检索)');
   }
 })();
 
+// ========== [34] Z6 AI call log (trace + audit) ==========
+section('[34] Z6 Core.AICallLog (AI 调用 trace + 审计)');
+
+(async () => {
+  try {
+    const acPath = path.join(WWW, 'core/ai-call-log.js');
+    const acSrc = readFileSafe(acPath);
+    // mock Core.Storage 用内存
+    const memStore = new Map();
+    let idCounter = 0;
+    const ctx = {
+      console,
+      window: {},
+      Core: {
+        Storage: {
+          add: async (table, obj) => {
+            if (!memStore.has(table)) memStore.set(table, []);
+            const arr = memStore.get(table);
+            arr.push({ ...obj });
+            return obj.id;
+          },
+          all: async (table) => {
+            return memStore.get(table) || [];
+          },
+          delete: async (table, id) => {
+            const arr = memStore.get(table) || [];
+            const idx = arr.findIndex(x => x.id === id);
+            if (idx >= 0) arr.splice(idx, 1);
+            return true;
+          }
+        }
+      }
+    };
+    ctx.window = ctx;
+    vm.createContext(ctx);
+    vm.runInContext(acSrc, ctx);
+    const ACL = ctx.window.Core.AICallLog;
+    if (ACL && typeof ACL.record === 'function') ok('Z6.1 Core.AICallLog 已挂载 + record 函数');
+    else fail('Z6.1 挂载', typeof ACL);
+
+    // ---- 34.2 record: 写入字段 + response 截断 200 ----
+    const e1 = await ACL.record({
+      page: 'journal', purpose: 'attr', prompt: 'p1', systemPrompt: 's1',
+      response: 'x'.repeat(500), latencyMs: 1234, model: 'qwen3', baseURL: 'http://l',
+      injected: { width: true }
+    });
+    if (e1 && e1.response.length === 200 && e1.promptLen === 2 && e1.sysLen === 2 && e1.page === 'journal' && e1.injected.width === true) {
+      ok('Z6.2 record: response 截断 200 / 字段完整 / injected.width 保留');
+    } else fail('Z6.2 record', JSON.stringify({ r: e1 && e1.response.length, p: e1 && e1.promptLen, s: e1 && e1.sysLen }));
+
+    // ---- 34.3 promptHash / sysHash 用 FNV-1a (非空) ----
+    const e2 = await ACL.record({ page: 'fund', purpose: 'advisor', prompt: 'test prompt', systemPrompt: 'test sys' });
+    if (e2.promptHash && e2.sysHash && e2.promptHash !== e2.sysHash) ok('Z6.3 hash: FNV-1a 产生不同指纹 (避免存原文)');
+    else fail('Z6.3 hash', JSON.stringify({ ph: e2.promptHash, sh: e2.sysHash }));
+
+    // ---- 34.4 list 倒序 ----
+    const list = await ACL.list({ limit: 10 });
+    if (list.length >= 2 && list[0].ts >= list[1].ts) ok('Z6.4 list: 按 ts 倒序 (最新在前)');
+    else fail('Z6.4 倒序', JSON.stringify(list.map(x => x.ts)));
+
+    // ---- 34.5 list 过滤 page ----
+    const journalOnly = await ACL.list({ page: 'journal' });
+    if (journalOnly.length === 1 && journalOnly[0].page === 'journal') ok('Z6.5 list.page 过滤');
+    else fail('Z6.5 page filter', JSON.stringify(journalOnly.map(x => x.page)));
+
+    // ---- 34.6 list since 时间过滤 ----
+    const recent = await ACL.list({ since: Date.now() - 1000 });
+    if (recent.length >= 2) ok('Z6.6 list.since: 1 秒内的全返');
+    else fail('Z6.6 since', recent.length);
+
+    // ---- 34.7 stats 聚合 ----
+    // 注入 1 条 error
+    await ACL.record({ page: 'journal', purpose: 'x', prompt: 'p', error: 'timeout' });
+    const s = await ACL.stats();
+    if (s.total >= 3 && s.errorCount >= 1 && s.okCount >= 2 && s.byPage.journal && s.byPage.journal.error >= 1) {
+      ok('Z6.7 stats: total/errorCount/byPage.error 都对');
+    } else fail('Z6.7 stats', JSON.stringify(s));
+
+    // ---- 34.8 滚动截断: 写到 201 条 → 删最早的 ----
+    for (let i = 0; i < 200; i++) {
+      await ACL.record({ page: 'p', purpose: 'x', prompt: 'p' + i });
+    }
+    const afterTrunc = await ACL.list({ limit: 1000 });
+    if (afterTrunc.length === 200) ok('Z6.8 滚动截断: 满 200 条不再增长');
+    else fail('Z6.8 截断', afterTrunc.length);
+
+    // ---- 34.9 clear 清空 ----
+    await ACL.clear();
+    const afterClear = await ACL.list();
+    if (afterClear.length === 0) ok('Z6.9 clear: 清空所有 ai_call_log');
+    else fail('Z6.9 clear', afterClear.length);
+
+    // ---- 34.10 record 写入失败不抛 (Core.Storage 抛错时优雅) ----
+    memStore.get('ai_call_log').push = () => { throw new Error('db broken'); };
+    let crashed = false;
+    try {
+      await ACL.record({ page: 'x', purpose: 'y', prompt: 'z' });
+    } catch (e) { crashed = true; }
+    if (!crashed) ok('Z6.10 写入失败 → 吞错不抛 (日志不应阻塞主流程)');
+    else fail('Z6.10 失败容忍', 'crashed');
+  } catch (e) {
+    fail('Z6 ai-call-log', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
 // ========== 总结 ==========
 // 同步 section 的 ok() 已经在 console 打印;
 // async IIFE 里的 ok() 还在 microtask 队列里, 用 setImmediate 给一次机会再读 passed/failed

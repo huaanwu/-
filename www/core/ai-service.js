@@ -152,6 +152,7 @@
    * 返回: 完整文本
    */
   async function call(opts) {
+    const t0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
     const cfg = getConfig();
     // 5.3.3: 解析 endpoint (本地优先 / 远程)
     const ep = resolveEndpoint(opts);
@@ -161,14 +162,34 @@
     const temperature = opts.temperature ?? cfg.temperature;
     const maxTokens = opts.maxTokens ?? cfg.maxTokens;
 
+    // Z6: 准备日志入参 (失败也写, 用于诊断)
+    const logEntry = {
+      page: opts.page || '?',
+      purpose: opts.purpose || '?',
+      prompt: opts.prompt || '',
+      systemPrompt: '',
+      response: '',
+      latencyMs: 0,
+      model,
+      baseURL,
+      injected: { width: false },
+      _t0: t0  // 给 _logAICall 算 latency
+    };
+
     if (!apiKey && cfg.provider !== 'custom' && !ep.isLocal) {
-      throw new Error('未配置 API Key - 请到 ⚙️ 设置页填入');
+      const err = new Error('未配置 API Key - 请到 ⚙️ 设置页填入');
+      _logAICall(logEntry, err);  // 失败也记录
+      throw err;
     }
     if (!baseURL) {
-      throw new Error('未配置 API 地址');
+      const err = new Error('未配置 API 地址');
+      _logAICall(logEntry, err);
+      throw err;
     }
     if (!model) {
-      throw new Error('未配置模型名');
+      const err = new Error('未配置模型名');
+      _logAICall(logEntry, err);
+      throw err;
     }
 
     // Z1c: 默认注入市场宽度信号 (Kimi Regime 之外的 cross-check 维度)
@@ -179,11 +200,13 @@
         const width = await Core.MarketWidth.getMarketWidth();
         if (width && width.status && width.status !== 'unknown') {
           systemPrompt = (systemPrompt ? systemPrompt + '\n\n' : '') + Core.MarketWidth.formatWidthForPrompt(width);
+          logEntry.injected.width = true;
         }
       } catch (e) {
         console.warn('[AI] 注入市场宽度失败, 继续:', e.message);
       }
     }
+    logEntry.systemPrompt = systemPrompt;
 
     const body = {
       model,
@@ -210,6 +233,7 @@
       });
     } catch (e) {
       if (e.name === 'AbortError') throw e;  // 让外层区分超时
+      _logAICall(logEntry, e);
       throw new Error('网络请求失败 (可能是 CORS 或断网): ' + e.message);
     }
 
@@ -228,14 +252,33 @@
       if (resp.status === 401) errMsg = 'API Key 无效或过期';
       if (resp.status === 429) errMsg = '请求太频繁 / 余额不足';
       if (resp.status === 402) errMsg = '余额不足, 请充值';
+      _logAICall(logEntry, new Error(errMsg));
       throw new Error(errMsg);
     }
 
     if (opts.stream) {
-      return await readSSE(resp.body, opts.onChunk, opts.onError);
+      const out = await readSSE(resp.body, opts.onChunk, opts.onError);
+      logEntry.response = (out || '').slice(0, 200);
+      _logAICall(logEntry, null);
+      return out;
     } else {
       const j = await resp.json();
-      return j.choices?.[0]?.message?.content || '';
+      const text = j.choices?.[0]?.message?.content || '';
+      logEntry.response = text.slice(0, 200);
+      _logAICall(logEntry, null);
+      return text;
+    }
+  }
+
+  // Z6: 异步写日志, 不阻塞主路径
+  function _logAICall(entry, err) {
+    const t1 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    entry.latencyMs = Math.round(t1 - (entry._t0 || t1));
+    if (err) entry.error = err.message || String(err);
+    if (window.Core && Core.AICallLog && typeof Core.AICallLog.record === 'function') {
+      Promise.resolve().then(() => Core.AICallLog.record(entry)).catch(e => {
+        console.warn('[AI] 写日志失败:', e.message);
+      });
     }
   }
 
