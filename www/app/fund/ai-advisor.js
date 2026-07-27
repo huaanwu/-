@@ -267,16 +267,15 @@ ${candidatesText}
         }
       });
 
-      // 解析 JSON
-      const jsonMatch = fullText.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        let obj;
-        try {
-          obj = JSON.parse(jsonMatch[0]);
-        } catch (e) {
-          streamEl.innerHTML = `<div style="color:var(--down);">⚠ JSON 解析失败, 原始输出:</div><pre style="white-space:pre-wrap;font-size:12px;">${escapeHtml(fullText)}</pre>`;
-          return;
-        }
+      // Phase T: schema 校验 (picks 必填数组, summary/macroView 必填字符串)
+      const AI_FUND_SCHEMA = {
+        required: ['picks', 'summary', 'macroView', 'risks'],
+        types: { picks: 'array', summary: 'string', macroView: 'string', risks: 'array' },
+        arrayItemTypes: { picks: 'object' }
+      };
+      const parsed = Core.AI.parseJsonOutput(fullText, AI_FUND_SCHEMA);
+      if (parsed.ok) {
+        const obj = parsed.obj;
         const picks = obj.picks || [];
         const macroView = obj.macroView || '';
         const allocation = obj.allocation || '';
@@ -340,7 +339,9 @@ ${candidatesText}
           };
         });
       } else {
-        streamEl.innerHTML = `<pre style="white-space:pre-wrap;font-size:12px;">${escapeHtml(fullText)}</pre><div style="color:var(--down);margin-top:8px;">⚠ 未找到 JSON 输出</div>`;
+        // Phase T: schema 校验失败
+        const errList = parsed.errors.map(e => `<li>${escapeHtml(e)}</li>`).join('');
+        streamEl.innerHTML = `<div style="color:var(--down);">⚠ JSON 校验失败:</div><ul style="margin:4px 0 8px;font-size:12px;">${errList}</ul><pre style="white-space:pre-wrap;font-size:12px;max-height:240px;overflow:auto;">${escapeHtml(fullText)}</pre>`;
       }
     } catch (e) {
       streamEl.innerHTML = `<div style="color:var(--down);">❌ ${escapeHtml(e.message)}</div>`;

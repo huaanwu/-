@@ -433,6 +433,108 @@ if (!fs.existsSync(SA_PATH)) {
   }
 }
 
+// ========== [10] Core.AI.parseJsonOutput (Phase T) ==========
+section('10] Core.AI.parseJsonOutput + schema 校验 (Phase T)');
+const AI_PATH = path.join(ROOT, 'www', 'core', 'ai-service.js');
+if (!fs.existsSync(AI_PATH)) {
+  fail('ai-service load', `文件不存在: ${AI_PATH}`);
+} else {
+  const aiCtx = vm.createContext({
+    window: {},
+    console,
+    setTimeout, clearTimeout,
+    Date, Math, JSON, Object, Array,
+    Promise
+  });
+  try {
+    vm.runInContext(fs.readFileSync(AI_PATH, 'utf-8'), aiCtx, { filename: AI_PATH });
+  } catch (e) {
+    fail('ai-service load', `执行失败: ${e.message}`);
+  }
+  const AI = aiCtx.window.Core && aiCtx.window.Core.AI;
+  if (!AI || typeof AI.parseJsonOutput !== 'function') {
+    fail('Core.AI.parseJsonOutput', '未暴露');
+  } else {
+    ok('Core.AI.parseJsonOutput 已暴露');
+    if (typeof AI.jsonCall === 'function') ok('Core.AI.jsonCall 已暴露');
+    else fail('Core.AI.jsonCall', '未暴露');
+
+    const SCHEMA = {
+      required: ['picks', 'risks'],
+      types: { picks: 'array', risks: 'array' },
+      arrayItemTypes: { picks: 'object' }
+    };
+
+    // 1. 正常 JSON 通过
+    const good = '{"picks":[{"code":"600519"}],"risks":["risk1"]}';
+    const r1 = AI.parseJsonOutput(good, SCHEMA);
+    if (r1.ok && r1.obj && r1.obj.picks.length === 1) ok('合法 JSON + schema 通过');
+    else fail('合法 JSON', JSON.stringify(r1));
+
+    // 2. markdown 围栏容错
+    const fenced = '这是前置说明\n```json\n{"picks":[{"x":1}],"risks":[]}\n```\n后面还有文字';
+    const r2 = AI.parseJsonOutput(fenced, SCHEMA);
+    if (r2.ok && r2.obj.picks[0].x === 1) ok('markdown ```json``` 围栏容错');
+    else fail('围栏', JSON.stringify(r2));
+
+    // 3. 缺必填字段
+    const missing = '{"picks":[{"x":1}]}';
+    const r3 = AI.parseJsonOutput(missing, SCHEMA);
+    if (!r3.ok && r3.errors.some(e => e.includes('risks'))) ok('缺必填字段 → errors 包含字段名');
+    else fail('缺字段', JSON.stringify(r3));
+
+    // 4. 类型不对
+    const wrongType = '{"picks":"not array","risks":[]}';
+    const r4 = AI.parseJsonOutput(wrongType, SCHEMA);
+    if (!r4.ok && r4.errors.some(e => /array/i.test(e))) ok('类型不对 → errors 报错');
+    else fail('类型', JSON.stringify(r4));
+
+    // 5. 数组元素类型不对
+    const badItem = '{"picks":["a","b"],"risks":[]}';
+    const r5 = AI.parseJsonOutput(badItem, SCHEMA);
+    if (!r5.ok && r5.errors.some(e => /picks\[0\]/.test(e))) ok('数组元素类型错 → 报错具体下标');
+    else fail('数组元素', JSON.stringify(r5));
+
+    // 6. 完全没 JSON
+    const noJson = '模型思考了但没输出 JSON';
+    const r6 = AI.parseJsonOutput(noJson, SCHEMA);
+    if (!r6.ok && r6.errors.some(e => /no JSON/i.test(e))) ok('无 JSON → 明确错误');
+    else fail('无 JSON', JSON.stringify(r6));
+
+    // 7. 空字符串
+    const r7 = AI.parseJsonOutput('', SCHEMA);
+    if (!r7.ok && r7.errors.includes('empty output')) ok('空字符串 → empty output 错误');
+    else fail('空字符串', JSON.stringify(r7));
+
+    // 8. null
+    const r8 = AI.parseJsonOutput(null, SCHEMA);
+    if (!r8.ok) ok('null → ok=false');
+    else fail('null', '应返回 ok=false');
+
+    // 9. JSON 解析错误 (截断的 JSON)
+    const truncated = '{"picks":[{"x":1';
+    const r9 = AI.parseJsonOutput(truncated, SCHEMA);
+    if (!r9.ok && r9.errors.some(e => /parse/i.test(e))) ok('截断 JSON → 解析错误');
+    else fail('截断', JSON.stringify(r9));
+
+    // 10. 根不是 object
+    const r10 = AI.parseJsonOutput('[1,2,3]', SCHEMA);
+    if (!r10.ok && r10.errors.some(e => /not an object/i.test(e))) ok('数组根 → not an object');
+    else fail('数组根', JSON.stringify(r10));
+
+    // 11. schema 为空时只校验基本 (root 是 object)
+    const r11 = AI.parseJsonOutput('{"anything":1}', {});
+    if (r11.ok) ok('空 schema → 不做字段校验');
+    else fail('空 schema', JSON.stringify(r11));
+
+    // 12. 多余字段不影响
+    const extra = '{"picks":[{"x":1}],"risks":[],"extra":"ok"}';
+    const r12 = AI.parseJsonOutput(extra, SCHEMA);
+    if (r12.ok && r12.obj.extra === 'ok') ok('多余字段不影响校验');
+    else fail('多余字段', JSON.stringify(r12));
+  }
+}
+
 // ========== 总结 ==========
 console.log('');
 console.log(`\x1b[1m结果:\x1b[0m 通过 ${passed}, 失败 ${failed}`);

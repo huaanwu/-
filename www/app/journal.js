@@ -800,9 +800,16 @@ ${content.slice(0, 800)}
           stream: false,
           maxTokens: 200
         });
-        const m = text.match(/\{[\s\S]*?\}/);
-        if (!m) return;
-        const obj = JSON.parse(m[0]);
+        // Phase T: schema 校验 (3 个字段必填字符串)
+        const parsed = Core.AI.parseJsonOutput(text, {
+          required: ['assumption', 'emotion', 'verify'],
+          types: { assumption: 'string', emotion: 'string', verify: 'string' }
+        });
+        if (!parsed.ok) {
+          console.warn('[Journal] AI JSON 校验失败:', parsed.errors);
+          return;
+        }
+        const obj = parsed.obj;
         // 校验: 必须从候选值里选, 不接受 LLM 自由发挥
         const sugAssumption = ASSUMPTIONS.includes(obj.assumption) ? obj.assumption : '其他';
         const sugEmotion = EMOTIONS.includes(obj.emotion) ? obj.emotion : '其他';

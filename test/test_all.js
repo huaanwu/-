@@ -1313,8 +1313,26 @@ try {
     const fakeNote = { id: 'n1', title: '茅台加仓', code: '600519', content: '今天估值修复, 业绩拐点, 长期持有中', tags: [], mood: 'bullish', date: '2026-07-26', createdAt: Date.now() };
     const putCalls = [];
     jctx.window.Core.Storage.put = async (t, obj) => { putCalls.push({ t, obj }); };
-    // mock AI 返回合法 JSON
-    jctx.window.Core.AI = { getConfig: () => ({ provider: 'deepseek', apiKey: 'test' }), call: async () => '{"assumption":"估值修复","emotion":"长期持有中","verify":"1w"}' };
+    // Phase T: schema 校验 helper (test mock 需要)
+    const _parseJsonOutput = (text, schema) => {
+      if (!text || typeof text !== 'string') return { ok: false, errors: ['empty'] };
+      const m = text.match(/\{[\s\S]*?\}/);
+      if (!m) return { ok: false, errors: ['no JSON'] };
+      try {
+        const obj = JSON.parse(m[0]);
+        if (!obj || typeof obj !== 'object') return { ok: false, errors: ['not object'] };
+        // 简版 required 校验
+        for (const k of (schema?.required || [])) {
+          if (!(k in obj)) return { ok: false, errors: [`missing ${k}`] };
+        }
+        return { ok: true, obj };
+      } catch (e) { return { ok: false, errors: [e.message] }; }
+    };
+    jctx.window.Core.AI = {
+      getConfig: () => ({ provider: 'deepseek', apiKey: 'test' }),
+      call: async () => '{"assumption":"估值修复","emotion":"长期持有中","verify":"1w"}',
+      parseJsonOutput: _parseJsonOutput
+    };
     await Journal._runAiAssistant(fakeNote);
 
     // 1) 校验: LLM 合法值被接受

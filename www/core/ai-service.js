@@ -412,11 +412,111 @@
     }
   }
 
+  /**
+   * parseJsonOutput (Phase T) - 从 AI 输出里抽 JSON 并按 schema 校验
+   * 抽取: 用 match 找第一个 { 到最后一个 }, 容错 markdown ```json 围栏
+   * 校验: schema = { required: ['picks', ...], types: { picks: 'array', ...}, arrayItemTypes: { picks: 'object' } }
+   * 返回: { ok, obj, errors } - errors 为人类可读错误列表
+   */
+  function parseJsonOutput(text, schema = {}) {
+    const result = { ok: false, obj: null, errors: [], raw: text };
+    if (!text || typeof text !== 'string') {
+      result.errors.push('empty output');
+      return result;
+    }
+    // 1. 抽 JSON (容错 markdown 围栏)
+    let jsonText = null;
+    const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (fence && fence[1]) {
+      jsonText = fence[1].trim();
+    } else {
+      // 优先: 完整对象 {...}
+      const objStart = text.indexOf('{');
+      const objEnd = text.lastIndexOf('}');
+      if (objStart >= 0 && objEnd > objStart) {
+        jsonText = text.slice(objStart, objEnd + 1);
+      } else if (objStart >= 0) {
+        // 截断对象: 截到末尾让 JSON.parse 报错
+        jsonText = text.slice(objStart);
+      } else {
+        // 否则找 [ 到 ]
+        const arrStart = text.indexOf('[');
+        const arrEnd = text.lastIndexOf(']');
+        if (arrStart >= 0 && arrEnd > arrStart) jsonText = text.slice(arrStart, arrEnd + 1);
+        else if (arrStart >= 0) jsonText = text.slice(arrStart);
+      }
+    }
+    if (!jsonText) {
+      result.errors.push('no JSON object found');
+      return result;
+    }
+    // 2. parse
+    let obj;
+    try { obj = JSON.parse(jsonText); }
+    catch (e) {
+      result.errors.push('JSON parse error: ' + e.message);
+      return result;
+    }
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+      result.errors.push('JSON root is not an object');
+      return result;
+    }
+    result.obj = obj;
+    // 3. schema 校验
+    const required = Array.isArray(schema.required) ? schema.required : [];
+    const types = schema.types || {};
+    const arrayItemTypes = schema.arrayItemTypes || {};
+    for (const key of required) {
+      if (!(key in obj)) {
+        result.errors.push(`missing required field: "${key}"`);
+        continue;
+      }
+      const v = obj[key];
+      const expectedType = types[key];
+      if (expectedType === 'array' && !Array.isArray(v)) {
+        result.errors.push(`"${key}" should be array, got ${typeof v}`);
+      } else if (expectedType === 'string' && typeof v !== 'string') {
+        result.errors.push(`"${key}" should be string, got ${typeof v}`);
+      } else if (expectedType === 'number' && typeof v !== 'number') {
+        result.errors.push(`"${key}" should be number, got ${typeof v}`);
+      } else if (expectedType === 'object' && (typeof v !== 'object' || Array.isArray(v))) {
+        result.errors.push(`"${key}" should be object, got ${Array.isArray(v) ? 'array' : typeof v}`);
+      }
+      // 数组内部类型 (轻校验)
+      if (Array.isArray(v) && arrayItemTypes[key]) {
+        const wantItemType = arrayItemTypes[key];
+        const bad = v.findIndex(item => {
+          if (wantItemType === 'object') return typeof item !== 'object' || Array.isArray(item);
+          if (wantItemType === 'string') return typeof item !== 'string';
+          return false;
+        });
+        if (bad >= 0) result.errors.push(`"${key}[${bad}]" should be ${wantItemType}, got ${typeof v[bad]}`);
+      }
+    }
+    result.ok = result.errors.length === 0;
+    return result;
+  }
+
+  /**
+   * jsonCall (Phase T) - 流式 AI 调用 + 内置 JSON 抽取 + schema 校验
+   * opts: 同 call(), 额外:
+   *   - schema: { required: [...], types: {...}, arrayItemTypes: {...} }
+   * 返回: { ok, obj, errors, text }
+   */
+  async function jsonCall(opts) {
+    const schema = opts.schema || {};
+    const text = await call(opts);
+    const parsed = parseJsonOutput(text, schema);
+    return { ...parsed, text };
+  }
+
   window.Core = window.Core || {};
   window.Core.AI = {
     call,
     cachedCall,
     callWithTimeout,
+    jsonCall,
+    parseJsonOutput,
     testConnection,
     getConfig,
     getProviderConfig,

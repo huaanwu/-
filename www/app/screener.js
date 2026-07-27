@@ -323,16 +323,15 @@ ${candidates}
           }
         });
 
-        const jsonMatch = fullText.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          let obj;
-          try { obj = JSON.parse(jsonMatch[0]); }
-          catch (e) {
-            if (streamEl) {
-              streamEl.innerHTML = `<div style="color:var(--down);">⚠ JSON 解析失败, 原始输出:</div><pre style="white-space:pre-wrap;font-size:12px;">${escapeHtml(fullText)}</pre>`;
-            }
-            return;
-          }
+        // Phase T: schema 校验 (picks 必填, 数组, 元素对象)
+        const AI_PICK_SCHEMA = {
+          required: ['picks', 'risks'],
+          types: { picks: 'array', risks: 'array' },
+          arrayItemTypes: { picks: 'object' }
+        };
+        const parsed = Core.AI.parseJsonOutput(fullText, AI_PICK_SCHEMA);
+        if (parsed.ok) {
+          const obj = parsed.obj;
           const picks = obj.picks || [];
           // 5.1.3: 把 AI 选股结果 (含 reasons/risks) 暂存, 给"加自选"按钮写入 journal 用
           this._lastAiPicks = picks;
@@ -381,8 +380,10 @@ ${candidates}
             });
           }
         } else {
+          // Phase T: schema 校验失败, 显示原始 + 错误明细
           if (streamEl) {
-            streamEl.innerHTML = `<pre style="white-space:pre-wrap;font-size:12px;">${escapeHtml(fullText)}</pre><div style="color:var(--down);margin-top:8px;">⚠ 未找到 JSON</div>`;
+            const errList = parsed.errors.map(e => `<li>${escapeHtml(e)}</li>`).join('');
+            streamEl.innerHTML = `<div style="color:var(--down);">⚠ JSON 校验失败:</div><ul style="margin:4px 0 8px;font-size:12px;">${errList}</ul><pre style="white-space:pre-wrap;font-size:12px;max-height:240px;overflow:auto;">${escapeHtml(fullText)}</pre>`;
           }
         }
       } catch (e) {
