@@ -26,3 +26,4 @@ e2e_screenshots/
 emu_screenshots/
 *.log.*
 android/
+.claude/
