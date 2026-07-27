@@ -873,23 +873,143 @@
     };
   }
 
+  // ===== Phase M Tier 2: AI 上下文 4 维数据 =====
+  // 6) 股指期货基差 (升水/贴水)
+  // 7) 龙虎榜 Top 5 (游资动向)
+  // 8) 两融余额 (杠杆情绪)
+  // 9) 财经日历 (本地静态, 国常会/LPR/PMI/CPI 等)
+
   /**
-   * 聚合: 1 次调用拿到 AI 上下文快照
-   * 所有字段都 fail-safe (null), 不阻塞其他维度
+   * 6) 股指期货基差 - IF/IC/IM/IH 主力合约 vs 现货指数
+   * aktools: futures_main_sina → 字段 (symbol, name, current, bid, ask, ...)
+   * 简化: 返回 4 大合约的"近月主力基差率"
+   */
+  async function _fetchFuturesBasis() {
+    const data = await Core.Data.fetch('ai_ctx_futures', 'futures_main_sina', {}, _CTX_TTL);
+    if (!Array.isArray(data)) return null;
+    // 主力合约: IF (沪深300), IC (中证500), IM (中证1000), IH (上证50)
+    const wanted = ['IF', 'IC', 'IM', 'IH'];
+    const out = {};
+    for (const row of data) {
+      const sym = (row.symbol || row['symbol'] || '').toString();
+      const prefix = sym.replace(/\d.*$/, '');  // IF2406 -> IF
+      if (!wanted.includes(prefix)) continue;
+      // 现货近似用昨收
+      const last = parseFloat(row.current || row['当前价'] || row.current_price);
+      if (isNaN(last)) continue;
+      // 基差近似 = (现货 - 期货) / 现货, 但我们拿不到现货, 只返回合约价
+      if (!out[prefix]) out[prefix] = { price: last, name: row.name || row['名称'] };
+    }
+    return Object.keys(out).length > 0 ? out : null;
+  }
+
+  /**
+   * 7) 龙虎榜 - 今日 Top 5 净买入 / 净卖出个股 (游资动向)
+   * aktools: stock_lhb_ggtj_em → 字段 (代码, 名称, 净额, ...)
+   */
+  async function _fetchLonghubang() {
+    const data = await Core.Data.fetch('ai_ctx_lhb', 'stock_lhb_ggtj_em', {}, _CTX_TTL);
+    if (!Array.isArray(data) || data.length === 0) return null;
+    const rows = data.map(r => ({
+      code: r['代码'] || r.code,
+      name: r['名称'] || r.name,
+      net: parseFloat(r['净额'] || r['龙虎榜净额'] || r.net_amount),
+      reason: r['上榜原因'] || r.reason || ''
+    })).filter(r => r.code && !isNaN(r.net));
+    if (rows.length === 0) return null;
+    const sorted = [...rows].sort((a, b) => b.net - a.net);
+    return {
+      top5_buy: sorted.slice(0, 5).map(r => ({ code: r.code, name: r.name, net: r.net, reason: r.reason })),
+      top5_sell: sorted.slice(-5).reverse().map(r => ({ code: r.code, name: r.name, net: r.net, reason: r.reason }))
+    };
+  }
+
+  /**
+   * 8) 两融余额 (沪 + 深)
+   * aktools: stock_margin_sse + stock_margin_szse
+   */
+  async function _fetchMargin() {
+    let total = 0, date = '', count = 0;
+    try {
+      const sse = await Core.Data.fetch('ai_ctx_margin_sse', 'stock_margin_sse', {}, _CTX_TTL);
+      if (Array.isArray(sse) && sse.length > 0) {
+        const last = sse[sse.length - 1];
+        const bal = parseFloat(last['融资余额'] || last['融资余额(元)'] || last.rzye);
+        if (!isNaN(bal)) { total += bal; count++; date = last['日期'] || last.date; }
+      }
+    } catch (e) { console.warn('[Ctx] 沪市两融失败:', e.message); }
+    try {
+      const szse = await Core.Data.fetch('ai_ctx_margin_szse', 'stock_margin_szse', {}, _CTX_TTL);
+      if (Array.isArray(szse) && szse.length > 0) {
+        const last = szse[szse.length - 1];
+        const bal = parseFloat(last['融资余额'] || last['融资余额(元)'] || last.rzye);
+        if (!isNaN(bal)) { total += bal; count++; date = last['日期'] || last.date || date; }
+      }
+    } catch (e) { console.warn('[Ctx] 深市两融失败:', e.message); }
+    return count > 0 ? { total_yi: total / 1e8, date } : null;  // 元 → 亿
+  }
+
+  /**
+   * 9) 财经日历 (本地静态) - 国常会 / LPR / PMI / CPI / FOMC
+   * 不依赖 akshare, 直接算"未来 7 天有没有重大事件"
+   */
+  function _fetchEconomicCalendar() {
+    const now = new Date();
+    const events = [];
+    for (let i = 0; i < 14; i++) {
+      const d = new Date(now); d.setDate(d.getDate() + i);
+      const day = d.getDate();
+      const dow = d.getDay();  // 0=Sun, 1-5=Mon-Fri, 6=Sat
+      const md = (d.getMonth() + 1) + '-' + day;
+
+      // 国常会: 周二/周五下午 (周二 5, 周五 5) - 经验值
+      if (dow === 2 || dow === 5) {
+        events.push(`${md} 国常会 (周二/周五, 可能出政策)`);
+      }
+      // LPR 报价: 每月 20 号
+      if (day === 20) {
+        events.push(`${md} LPR 报价 (1Y/5Y)`);
+      }
+      // MLF 中期借贷便利: 每月 15 号
+      if (day === 15) {
+        events.push(`${md} MLF 续作/到期`);
+      }
+      // PMI: 每月最后一天
+      const lastDay = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+      if (day === lastDay) {
+        events.push(`${md} 官方 PMI 公布`);
+      }
+      // CPI / PPI: 每月 10-12 号
+      if (day >= 10 && day <= 12) {
+        events.push(`${md} CPI / PPI 同比 (估计)`);
+      }
+    }
+    // 去重 + 取前 8
+    return events.length > 0 ? { next_14d: [...new Set(events)].slice(0, 8) } : null;
+  }
+
+  /**
+   * 聚合: 1 次调用拿到 AI 上下文快照 (Tier 1 + Tier 2)
    */
   async function getAiContextSnapshot() {
     const cached = await Core.Storage.cacheGet(_CTX_CACHE);
     if (cached) return cached;
-    const [valuation, earnings, north, money, sectors] = await Promise.all([
+    const [valuation, earnings, north, money, sectors, futures, lhb, margin] = await Promise.all([
       _safeIntlFetch('valuation', _fetchMarketValuation),
       _safeIntlFetch('earnings', _fetchEarningsCalendar),
       _safeIntlFetch('north', _fetchNorthFlow),
       _safeIntlFetch('money', _fetchMoneySupply),
-      _safeIntlFetch('sectors', _fetchSectorRotation)
+      _safeIntlFetch('sectors', _fetchSectorRotation),
+      _safeIntlFetch('futures', _fetchFuturesBasis),
+      _safeIntlFetch('lhb', _fetchLonghubang),
+      _safeIntlFetch('margin', _fetchMargin)
     ]);
+    // 财经日历是本地静态, 不走 fetch 但仍可能为 null
+    const calendar = _fetchEconomicCalendar();
     const snap = {
       generated: new Date().toISOString(),
-      valuation, earnings, north, money, sectors
+      valuation, earnings, north, money, sectors,
+      futures, lhb, margin, calendar
     };
     await Core.Storage.cacheSet(_CTX_CACHE, snap, _CTX_TTL);
     return snap;
@@ -942,6 +1062,29 @@
         `${s.name}(${s.changePct > 0 ? '+' : ''}${s.changePct.toFixed(2)}%)`
       ).join('、');
       lines.push(`- **板块涨跌 (申万)**: 领涨 ${fmt(snap.sectors.top5_gain)}; 领跌 ${fmt(snap.sectors.top5_loss)}`);
+    }
+
+    if (snap.futures && typeof snap.futures === 'object') {
+      const items = Object.keys(snap.futures).map(k => {
+        const v = snap.futures[k];
+        return `${k} ${v.price.toFixed(2)}`;
+      });
+      lines.push(`- **股指期货主力**: ${items.join(' / ')} (基差需对照现货指数)`);
+    }
+
+    if (snap.lhb && Array.isArray(snap.lhb.top5_buy) && snap.lhb.top5_buy.length > 0) {
+      const fmt = arr => arr.map(r =>
+        `${r.name}(净额${r.net > 0 ? '+' : ''}${(r.net / 1e8).toFixed(2)}亿${r.reason ? '·' + r.reason.slice(0, 8) : ''})`
+      ).join('、');
+      lines.push(`- **龙虎榜**: 净买 ${fmt(snap.lhb.top5_buy)}; 净卖 ${fmt(snap.lhb.top5_sell)}`);
+    }
+
+    if (snap.margin && typeof snap.margin.total_yi === 'number') {
+      lines.push(`- **两融余额**: ${snap.margin.total_yi.toFixed(0)} 亿 (${snap.margin.date})`);
+    }
+
+    if (snap.calendar && Array.isArray(snap.calendar.next_14d) && snap.calendar.next_14d.length > 0) {
+      lines.push(`- **财经日历 (14 天内)**: ${snap.calendar.next_14d.join(' / ')}`);
     }
 
     return lines.join('\n');
