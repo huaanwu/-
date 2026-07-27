@@ -183,6 +183,8 @@
     }).filter(x => x.name && x.name.length > 0);
     if (parsed.length === 0) throw new Error('新浪解析后为空');
     parsed.sort((a, b) => b.change - a.change);
+    // 兼容 market-bar.js 旧字段名 it.leader
+    parsed.forEach(it => { it.leader = it.leaderName; });
     return {
       top: parsed.slice(0, 5),
       bottom: parsed.slice(-5).reverse(),
@@ -194,12 +196,15 @@
   // 缓存 (内存, + storage 备份)
   const _memCache = { wide: null, style: null, industry: null };
 
-  async function _cacheGet(group) {
-    if (_memCache[group]) return _memCache[group];
+  async function _cacheGet(group, ttl) {
+    // 内存 + IndexedDB 都查,但必须看 ttl,避免 fetch 失败时持久化的 stale 快照一直返 stale:false
+    const checkTs = (entry) => entry && (Date.now() - entry.ts) < ttl;
+    if (_memCache[group] && checkTs(_memCache[group])) return _memCache[group];
+    _memCache[group] = null;  // 内存过期, 先清, 避免下面写入时混淆
     if (window.Core && Core.Storage) {
       try {
         const stored = await Core.Storage.cacheGet(`market_${group}`);
-        if (stored) { _memCache[group] = stored; return stored; }
+        if (checkTs(stored)) { _memCache[group] = stored; return stored; }
       } catch (e) { /* 缓存读失败不算错 */ }
     }
     return null;
@@ -228,9 +233,9 @@
     async get(group) {
       if (!this.GROUPS[group]) throw new Error('未知 group: ' + group);
 
-      // 先查缓存
-      const cached = await _cacheGet(group);
-      if (cached && (Date.now() - cached.ts) < this.GROUPS[group].ttl) {
+      // 先查缓存 (ttl 由 _cacheGet 内部检查)
+      const cached = await _cacheGet(group, this.GROUPS[group].ttl);
+      if (cached) {
         return { ...cached, stale: false };
       }
 
