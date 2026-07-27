@@ -67,6 +67,10 @@
   const LESSON_TEXT_MAX = Core.Constants.SHORT_LESSONS_TEXT_MAX_LEN;           // 每条 ≤40 字
   const SCORECARD_MIN = Core.Constants.SCORECARD_MIN_SAMPLES;                  // 成绩单样本门槛 3
   const BRIER_MIN = Core.Constants.BRIER_MIN_SAMPLES;                          // Brier 样本门槛 5
+  // ---- 阶段 1 选品常量 ----
+  const _POOL_HARD_CAP = 30;       // screener top 拉上限 (防 IO 爆)
+  const _POOL_TARGET = 5;          // 阶段 1 排序后截断目标 (默认)
+  const _STAGE1_WEIGHTS = { trend5pct: 0.4, range20: 0.3, drift20: 0.2, industryRank: 0.1 };
   const RECENT_VERIFIED_UI = 10;                                               // UI 最近已验证交易条数
 
   const ShortTrader = {
@@ -433,10 +437,20 @@
           return `${name} ${price}${pct != null ? ` (${pct}%)` : ''}`;
         }).join('; ');
       } catch (e) { console.warn('[ShortTrader] ctx 指数快照失败:', e); }
-      // 候选池 = watchlist 全部 + short 持仓代码
+      // 候选池 = screener top (阶段 1 扩源) + watchlist 全部 + short 持仓代码
       try {
+        // 阶段 1: 候选池扩源 — 从 screener._lastResults.top 拉前 N (跑过筛才生效)
+        let screenerTop = [];
+        try {
+          if (window.Screener && Screener._lastResults && Array.isArray(Screener._lastResults.top)) {
+            screenerTop = Screener._lastResults.top.slice(0, _POOL_HARD_CAP);
+          }
+        } catch (e) { console.warn('[ShortTrader] screener top 拉取跳过:', e); }
+
         const wl = (await Core.Storage.all('watchlist')) || [];
-        ctx.pool = this._buildCandidatePool(wl, ctx.positions);
+        const basePool = this._buildCandidatePool(wl, ctx.positions);
+        ctx.pool = this._mergeCandPools(basePool, screenerTop);
+        ctx.screenerTopCodes = new Set(screenerTop.map(s => s && (s['代码'] || s.code)).filter(Boolean));
         // Bug B 修复 (资料注入 - 候选池 currentPrice): 异步拉每只的现价注入 ctx.pool,
         //   并组装 ctx.priceByCode (Map) 给 _validatePlans 方向对照用.
         //   - 数据源: Core.Data.getStockQuote (60s 缓存, 失败容错, 单只 5s 超时)
@@ -482,6 +496,42 @@
               }
             }
           }
+        }
+        // 阶段 1: 板块映射注入 (Core.Data.getStockIndustryByCode 24h cache)
+        ctx.industryByCode = new Map();
+        ctx.industryChangeByCode = new Map();
+        try {
+          const mSnap = await Core.Market.get('industry');
+          const allInd = (mSnap.top || []).concat(mSnap.bottom || [])
+            .slice().sort((a, b) => (b.change || 0) - (a.change || 0));
+          const changeByName = {};
+          allInd.forEach((it, i) => {
+            changeByName[it.name] = { change: it.change || 0, rank: i + 1, total: allInd.length };
+          });
+          const indResults = await Promise.allSettled(
+            ctx.pool.map(c => Core.Data.getStockIndustryByCode(c.code).catch(() => null))
+          );
+          for (let i = 0; i < ctx.pool.length; i++) {
+            const code = ctx.pool[i].code;
+            const r = indResults[i];
+            const ind = r && r.status === 'fulfilled' ? r.value : null;
+            if (!ind) continue;
+            ctx.industryByCode.set(code, ind);
+            const ci = changeByName[ind];
+            if (ci) ctx.industryChangeByCode.set(code, { industryName: ind, change: ci.change, rank: ci.rank, total: ci.total });
+          }
+        } catch (e) { console.warn('[ShortTrader] 板块注入失败:', e); }
+        // 阶段 1: 综合分排序 + 截断 (默认 _POOL_TARGET=5; Paper UI 拓展模式开关)
+        try {
+          ctx.expandMode = (await Core.Storage.kvGet('paper_short_expand_mode') === true);
+        } catch (e) { ctx.expandMode = false; }
+        if (!ctx.expandMode && ctx.pool.length > _POOL_TARGET) {
+          const ranked = ctx.pool.map(x => ({ x, score: this._stage1Score(x, ctx) }))
+            .sort((a, b) => b.score - a.score);
+          ctx.pool = ranked.slice(0, _POOL_TARGET).map(r => r.x);
+          ctx.stage1Dropped = ranked.slice(_POOL_TARGET).map(r => r.x.code);
+        } else {
+          ctx.stage1Dropped = [];
         }
       } catch (e) { console.warn('[ShortTrader] ctx 读自选股/注入现价失败:', e); }
       // 同代码 48h 冷却集合 (transactions 表短线卖出)
@@ -550,6 +600,52 @@
         ma5: +window5.toFixed(2),
         ma20: +window20.toFixed(2)
       };
+    },
+
+    /**
+     * 合并 watchlist/持仓 + screener top, 去重保序 (watchlist/持仓优先)
+     * screener 来源标 fromScreener=true 给 UI 标识
+     * @returns {Array<{code,name,currentPrice,changePct,klineFeatures,fromScreener}>}
+     */
+    _mergeCandPools(basePool, screenerTop) {
+      const seen = new Set();
+      const out = [];
+      for (const x of (basePool || [])) {
+        if (!x || !x.code || seen.has(x.code)) continue;
+        seen.add(x.code);
+        out.push(x);
+      }
+      for (const s of (screenerTop || [])) {
+        const code = String(s['代码'] || s.code || '');
+        if (!/^\d{6}$/.test(code) || seen.has(code)) continue;
+        seen.add(code);
+        out.push({
+          code,
+          name: String(s['名称'] || s.name || ''),
+          currentPrice: null,
+          changePct: null,
+          klineFeatures: null,
+          fromScreener: true
+        });
+      }
+      return out;
+    },
+
+    /**
+     * 阶段 1 综合分 (越高越优)
+     * = trend5pct * 0.4 + range20 * 0.3 + (5 - |MA5-MA20|/MA20*100) * 0.2 + (1 - rank/total)*5 * 0.1
+     * 缺 K线 → drift 默认 5 (中性); 缺行业 → indRank 默认 2.5 (中性)
+     */
+    _stage1Score(x, ctx) {
+      const kf = x.klineFeatures || {};
+      const trend5 = +(kf.trend5pct || 0);
+      const range20 = +(kf.range20 || 0);
+      const ma5 = +(kf.ma5 || 0), ma20 = +(kf.ma20 || 0);
+      const drift20 = (ma20 > 0 && ma5 > 0) ? Math.abs((ma5 - ma20) / ma20 * 100) : 5;
+      const indInfo = ctx.industryChangeByCode && ctx.industryChangeByCode.get(x.code);
+      const indRank = indInfo ? (1 - indInfo.rank / indInfo.total) * 5 : 2.5;
+      const w = _STAGE1_WEIGHTS;
+      return +(trend5 * w.trend5pct + range20 * w.range20 + (5 - drift20) * w.drift20 + indRank * w.industryRank).toFixed(3);
     },
 
     /**

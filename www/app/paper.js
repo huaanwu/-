@@ -1482,6 +1482,12 @@
     // T1: 当前展示的子账户 ('long' 长线模拟 / 'short' AI 短线), tab 切换
     _sleeve: 'long',
 
+    /** 短线拓展模式开关 (kv: paper_short_expand_mode); true=不截断, 默认 false=截到 5 只 */
+    async setShortExpandMode(checked) {
+      try { await Core.Storage.kvSet('paper_short_expand_mode', !!checked); }
+      catch (e) { console.warn('[Paper] 保存拓展模式失败:', e); }
+    },
+
     /** 切换 长线/短线 tab 并重渲染 */
     switchSleeve(sleeve) {
       this._sleeve = sleeve === 'short' ? 'short' : 'long';
@@ -1515,6 +1521,14 @@
       // T2-ShortTrader: 今日计划区块只在短线 tab 显示 (渲染逻辑在 ShortTrader.renderTodayPlan)
       const stSection = document.getElementById('shortTraderSection');
       if (stSection) stSection.style.display = sleeve === 'short' ? '' : 'none';
+      // 短线拓展模式 checkbox 状态回填
+      if (sleeve === 'short') {
+        const cb = document.getElementById('paperShortExpandMode');
+        if (cb) {
+          Core.Storage.kvGet('paper_short_expand_mode').then(v => { cb.checked = v === true; })
+            .catch(e => console.warn('[Paper] 读拓展模式失败:', e));
+        }
+      }
       if (sleeve === 'short' && window.ShortTrader && ShortTrader.renderTodayPlan) {
         ShortTrader.renderTodayPlan().catch(e => console.warn('[Paper] ShortTrader 渲染失败:', e));
       }

@@ -107,7 +107,7 @@ const DOMAINS = {
   'Holdings':  ['init', 'render', 'addDialog', 'editDialog', 'save', 'remove', 'addTxDialog', 'saveTx', 'closeModal', '_renderPending', 'confirmPending', 'ignorePending', '_markPendingConfirmed',
     // 券商跳转 + 自动校准
     'brokerDialog', 'reconcileDialog', 'reconcileSave'],
-  'Paper':     ['init', 'buy', 'sell', 'getAccount', 'getPositions', 'resetAccount', 'snapshotIfNeeded', 'autoTradeFromPick', 'renderPage', 'buyFromForm', 'sellFromForm', 'sellAll', 'switchSleeve', '_getAccountRaw', '_saveAccountRaw', '_calcFee', '_roundLot', '_pushSnapshot', '_planAutoTrade', 'maybeGenerateEodReport', '_shouldGenerateEod', '_pushEodReport', '_appendDisciplineLog', '_logDisciplineBlock', '_buildEodReport', '_formatEodReportText', '_pushEodToFeishu', '_renderEodReport', 'addCondOrder', 'listCondOrders', 'cancelCondOrder', 'settleCondOrders', '_checkCondOrder', '_barOf', '_lastClosedBar', '_orderEligible', '_tradingDaysAfter', '_isGapDown', '_isGapUp', '_fillCheck', '_exitCheck', '_settleFill', '_settleExit', '_writeCondJournal', '_condPlanLines', 'addCondOrderFromForm', '_renderCondOrders'],
+  'Paper':     ['init', 'buy', 'sell', 'getAccount', 'getPositions', 'resetAccount', 'snapshotIfNeeded', 'autoTradeFromPick', 'renderPage', 'buyFromForm', 'sellFromForm', 'sellAll', 'switchSleeve', 'setShortExpandMode', '_getAccountRaw', '_saveAccountRaw', '_calcFee', '_roundLot', '_pushSnapshot', '_planAutoTrade', 'maybeGenerateEodReport', '_shouldGenerateEod', '_pushEodReport', '_appendDisciplineLog', '_logDisciplineBlock', '_buildEodReport', '_formatEodReportText', '_pushEodToFeishu', '_renderEodReport', 'addCondOrder', 'listCondOrders', 'cancelCondOrder', 'settleCondOrders', '_checkCondOrder', '_barOf', '_lastClosedBar', '_orderEligible', '_tradingDaysAfter', '_isGapDown', '_isGapUp', '_fillCheck', '_exitCheck', '_settleFill', '_settleExit', '_writeCondJournal', '_condPlanLines', 'addCondOrderFromForm', '_renderCondOrders'],
   'Journal':   ['init', 'render', 'newDialog', 'editDialog', 'save', 'remove', 'closeModal', '_buildHoldingsContext', '_renderHoldingBadge', '_renderStructuredTags', '_runAiAssistant'],
   'Screener':  ['init', 'run', '_addWatchlistFromPick', '_runPreBacktest',
     // Phase Y.2
@@ -8084,6 +8084,51 @@ section('[49] Bug J KB 匹配: tags 兜底 + ai-advisor 调用方注释');
     else fail('keywords 优先', `r2=${JSON.stringify(r2.map(e => e.id))}`);
   } catch (e) {
     fail('Bug J 测试', e.message + ' / ' + e.stack);
+  }
+})();
+
+// ========== [44] 短线两阶段选品 候选池扩展 + 板块注入 + 阶段 1 截断 (Commit 2) ==========
+section('[44] short-trader.js 候选池扩展 + 阶段 1 排序截断');
+(async () => {
+  try {
+    const stSrc = readFileSafe(path.join(WWW, 'app', 'short-trader.js'));
+    if (!stSrc) throw new Error('short-trader.js 读不到');
+
+    // 44.a _mergeCandPools 去重保序
+    if (/_mergeCandPools\(basePool, screenerTop\)[\s\S]{0,600}seen\.has\(x\.code\)[\s\S]{0,400}seen\.add\(code\)[\s\S]{0,400}fromScreener: true/.test(stSrc))
+      ok('44.a _mergeCandPools 去重保序 + fromScreener 标记');
+    else fail('44.a _mergeCandPools', '源码未匹配去重保序实现');
+
+    // 44.b _stage1Score 空特征仍返数字 + 权重引用
+    if (/_stage1Score\(x, ctx\)[\s\S]{0,800}const w = _STAGE1_WEIGHTS[\s\S]{0,200}trend5 \* w\.trend5pct[\s\S]{0,200}range20 \* w\.range20[\s\S]{0,200}indRank \* w\.industryRank/.test(stSrc))
+      ok('44.b _stage1Score 4 维加权 (trend/range/drift/industryRank)');
+    else fail('44.b _stage1Score', '源码未匹配 4 维加权公式');
+
+    // 44.c 阶段 1 截断: expandMode=false + pool > 5 → 截 5 + stage1Dropped
+    if (/expandMode[\s\S]{0,200}paper_short_expand_mode[\s\S]{0,400}_POOL_TARGET[\s\S]{0,300}stage1Dropped[\s\S]{0,200}slice\(_POOL_TARGET\)/.test(stSrc))
+      ok('44.c 阶段 1 截断 (kv expandMode + 5 只 + stage1Dropped)');
+    else fail('44.c 阶段 1 截断', '源码未匹配截断逻辑');
+
+    // 44.d 板块注入: industryByCode + industryChangeByCode Map
+    if (/industryByCode = new Map\(\)[\s\S]{0,300}industryChangeByCode = new Map\(\)[\s\S]{0,800}Core\.Market\.get\('industry'\)[\s\S]{0,800}getStockIndustryByCode/.test(stSrc))
+      ok('44.d 板块注入 (Market.get industry + getStockIndustryByCode 反查)');
+    else fail('44.d 板块注入', '源码未匹配板块 Map 构建');
+
+    // 44.e Paper UI: setShortExpandMode + kv 写
+    const paperSrc = readFileSafe(path.join(WWW, 'app', 'paper.js'));
+    if (!paperSrc) throw new Error('paper.js 读不到');
+    if (/setShortExpandMode\(checked\)[\s\S]{0,200}kvSet\('paper_short_expand_mode'/.test(paperSrc))
+      ok('44.e Paper.setShortExpandMode 写 kv paper_short_expand_mode');
+    else fail('44.e setShortExpandMode', 'paper.js 未匹配 setShortExpandMode 实现');
+
+    // 44.f index.html 含 paperShortExpandMode checkbox
+    const htmlSrc = readFileSafe(path.join(WWW, 'index.html'));
+    if (!htmlSrc) throw new Error('index.html 读不到');
+    if (/id="paperShortExpandMode"[\s\S]{0,200}Paper\.setShortExpandMode\(this\.checked\)/.test(htmlSrc))
+      ok('44.f index.html 含 paperShortExpandMode checkbox + onchange 接线');
+    else fail('44.f index.html checkbox', 'index.html 未含 paperShortExpandMode checkbox');
+  } catch (e) {
+    fail('44 候选池扩展', e.message + ' / ' + (e.stack || ''));
   }
 })();
 

@@ -42,7 +42,10 @@
   <section class="page" id="pageHoldings">
     <div class="page-header">
       <h2>持仓管理</h2>
-      <button class="btn btn-sm" onclick="Holdings.addDialog()">+ 新建</button>
+      <div style="display:flex;gap:6px;">
+        <button class="btn btn-sm" onclick="Holdings.reconcileDialog()" title="手动输入券商 App 总资产, 与 app 自算对比">⚖️ 对账</button>
+        <button class="btn btn-sm" onclick="Holdings.addDialog()">+ 新建</button>
+      </div>
     </div>
     <!-- Phase E: AI 建议的实盘待确认交易 (持仓列表上方, 无待确认时不渲染) -->
     <div id="pendingTrades"></div>
@@ -99,6 +102,10 @@
     <!-- T2-ShortTrader: 今日计划 (自动生成+自动转条件单; 仅短线 tab 显示, paper.js renderPage 控制挂载) -->
     <div id="shortTraderSection" style="display:none;">
       <h3 style="margin-top:16px;font-size:14px;color:var(--text-muted);">🤖 今日计划 (ShortTrader)</h3>
+      <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-muted);margin-top:4px;cursor:pointer;">
+        <input type="checkbox" id="paperShortExpandMode" onchange="Paper.setShortExpandMode(this.checked)">
+        拓展模式 (保留全量候选, 不截断到 5 只)
+      </label>
       <div id="shortTraderPlan" class="data-card" style="margin-top:8px;"></div>
       <!-- T4: 学习曲线 (Brier/校准分桶/已验证对照/我的教训; ShortTrader.renderLearningCurve 渲染) -->
       <h3 style="margin-top:16px;font-size:14px;color:var(--text-muted);">📊 学习曲线</h3>
@@ -202,6 +209,7 @@
       <h2>基金专项</h2>
       <div>
         <button class="btn btn-sm btn-ghost" onclick="Fund.buyDialog()">🛒 申购计划</button>
+        <button class="btn btn-sm btn-ghost" onclick="Fund.reconcileDialog()" title="手动输入第三方 App 基金总资产, 与 app 自算对比">⚖️ 对账</button>
         <button class="btn btn-sm btn-ghost" onclick="Fund.weeklyReportDialog()">📰 本周 AI 小结</button>
         <button class="btn btn-sm btn-ghost" onclick="Fund.aiAdvisorDialog()">🤖 AI 选基</button>
         <button class="btn btn-sm btn-ghost" onclick="Fund.rebalanceDialog()">⚖️ 再平衡</button>
