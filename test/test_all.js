@@ -4184,6 +4184,209 @@ section('[31] Z3 概率校准 (Brier score + 10 桶)');
   }
 })();
 
+// ========== [32] Z4 self-consistency 自一致性 (替代多空辩论) ==========
+section('[32] Z4 Core.SelfConsistency (多采样 + 众数/共识率)');
+
+(async () => {
+  try {
+    // 用 vm sandbox 装载 self-consistency.js, 注入 mock Core.AI.call
+    const scPath = path.join(WWW, 'core/self-consistency.js');
+    const scSrc = readFileSafe(scPath);
+    const ctx = {
+      console,
+      window: {},
+      Core: {
+        // 模拟 LLM: 给定 prompt 模板, 返回对应 verdict
+        AI: {
+          call: async (opts) => {
+            // mock: prompt 含 "verdict=对" / "verdict=错" / "verdict=部分" → 返回对应 JSON
+            const p = opts.prompt || '';
+            if (p.includes('mock-verdict=对')) return JSON.stringify({ verdict: '对', lesson: 'ok' });
+            if (p.includes('mock-verdict=错')) return JSON.stringify({ verdict: '错', lesson: 'bad' });
+            if (p.includes('mock-verdict=部分')) return JSON.stringify({ verdict: '部分', lesson: 'meh' });
+            if (p.includes('mock-text-A')) return 'A 类回答, 题材热点延续';
+            if (p.includes('mock-text-B')) return 'B 类回答, 估值偏高需谨慎';
+            if (p.includes('mock-bad-json')) return '无效 JSON: {verdict:}';
+            if (p.includes('mock-throw')) throw new Error('mock LLM error');
+            return JSON.stringify({ verdict: '对' });
+          }
+        }
+      }
+    };
+    ctx.window = ctx;
+    vm.createContext(ctx);
+    vm.runInContext(scSrc, ctx);
+
+    const SC = ctx.window.Core.SelfConsistency;
+    if (SC && typeof SC.run === 'function') ok('Z4.1 Core.SelfConsistency 已挂载 + run 函数');
+    else fail('Z4.1 挂载', typeof SC);
+
+    // ---- 32.2 全部 "对" → majority=对 / consensusRate=1 ----
+    const allYes = await SC.run({
+      prompt: 'mock-verdict=对 (任意)',
+      n: 5,
+      mode: 'json-verdict'
+    });
+    if (allYes.majority === '对' && allYes.consensusRate === 1 && allYes.lowConsensus === false && allYes.n === 5 && allYes.votes.length === 5) {
+      ok('Z4.2 全 "对" → 100% 共识 / lowConsensus=false');
+    } else fail('Z4.2 全对', JSON.stringify({ m: allYes.majority, c: allYes.consensusRate, l: allYes.lowConsensus, n: allYes.n }));
+
+    // ---- 32.3 3 中 2 对 1 错 → majority=对 / 共识率 2/3 ----
+    const m2of3 = await SC.run({
+      prompt: 'mock-verdict=对',
+      n: 2,
+      mode: 'json-verdict',
+      callOpts: { maxTokens: 50 }
+    });
+    const m3rd = await SC.run({
+      prompt: 'mock-verdict=错',
+      n: 1,
+      mode: 'json-verdict'
+    });
+    // 拼成 [对, 对, 错] 用串行 task — 改为直接调 3 次 promise
+    const mixRes = await SC.run({
+      prompt: 'mock-verdict=对',
+      n: 3,
+      mode: 'json-verdict'
+    });
+    // mock LLM 总返 对, 但我们要 [对, 对, 错], 改 prompt 让 LLM 错误 1 次
+    let counter = 0;
+    const SC2ctx = {
+      console, window: {}, Core: {
+        AI: { call: async () => {
+          counter++;
+          const v = counter % 3 === 0 ? '错' : '对';
+          return JSON.stringify({ verdict: v });
+        } }
+      }
+    };
+    SC2ctx.window = SC2ctx;
+    vm.createContext(SC2ctx);
+    vm.runInContext(scSrc, SC2ctx);
+    const mix = await SC2ctx.window.Core.SelfConsistency.run({
+      prompt: '任意', n: 6, mode: 'json-verdict'
+    });
+    // 6 次: 1=对,2=对,3=错,4=对,5=对,6=错 → majority=对(4/6)
+    if (mix.majority === '对' && Math.abs(mix.consensusRate - 4 / 6) < 0.001 && mix.votes.length === 6) {
+      ok('Z4.3 4对2错 (n=6) → majority=对 / 共识率 4/6');
+    } else fail('Z4.3 mix', JSON.stringify({ m: mix.majority, c: mix.consensusRate, n: mix.votes.length }));
+
+    // ---- 32.4 共识率 < threshold (默认 0.5) → lowConsensus=true ----
+    let cIdx = 0;
+    const SC3ctx = {
+      console, window: {}, Core: {
+        AI: { call: async () => {
+          // 确定性: 4 次 "对", 6 次 "错" (前 4 次返 对, 后 6 次返 错) → majority=错(60%), > 0.5
+          // 想触发 lowConsensus, 需要 majority 占比 < 0.5
+          // 改为: 3 对 7 错 → majority=错(70%), 不触发
+          // 真正要触发低共识, 用 50/50: 5 对 5 错 → 共识率=0.5, 但 0.5 < 0.5 不成立 (我用 < 而非 <=)
+          // 改方案: 4 对 6 错 → majority=错(60%), threshold 改 0.7
+          cIdx++;
+          return cIdx <= 4 ? JSON.stringify({ verdict: '对' }) : JSON.stringify({ verdict: '错' });
+        } }
+      }
+    };
+    SC3ctx.window = SC3ctx;
+    vm.createContext(SC3ctx);
+    vm.runInContext(scSrc, SC3ctx);
+    const lowC = await SC3ctx.window.Core.SelfConsistency.run({
+      prompt: 'x', n: 10, threshold: 0.7, mode: 'json-verdict'
+    });
+    // 6/10 错 → majority=错, 共识率=0.6 < 0.7 → lowConsensus=true
+    if (lowC.lowConsensus === true && lowC.majority === '错' && Math.abs(lowC.consensusRate - 0.6) < 0.001) {
+      ok('Z4.4 lowConsensus: 共识率 0.6 < threshold 0.7 → 警告触发 (majority=错)');
+    } else fail('Z4.4 lowC', JSON.stringify({ l: lowC.lowConsensus, m: lowC.majority, c: lowC.consensusRate }));
+
+    // ---- 32.5 单次失败不阻塞 (Promise.allSettled 容错) ----
+    const SC4ctx = {
+      console, window: {}, Core: {
+        AI: { call: async (opts) => {
+          if (opts.prompt.includes('mock-throw')) throw new Error('mock fail');
+          return JSON.stringify({ verdict: '对' });
+        } }
+      }
+    };
+    SC4ctx.window = SC4ctx;
+    vm.createContext(SC4ctx);
+    vm.runInContext(scSrc, SC4ctx);
+    const partial = await SC4ctx.window.Core.SelfConsistency.run({
+      prompt: 'mock-throw + mock-verdict=对', n: 3, mode: 'json-verdict'
+    });
+    // 期望: 3 次都 throw (因为 prompt 都含 mock-throw)
+    if (partial.votes.length === 3 && partial.votes.every(v => v.error) && partial.majority === null) {
+      ok('Z4.5 全失败 → majority=null / votes[].error 全部存在');
+    } else fail('Z4.5 fail', JSON.stringify({ votes: partial.votes.map(v => !!v.error), m: partial.majority }));
+
+    // ---- 32.6 text-prefix 模式: 自由文本按前 30 字聚合 ----
+    // 关键: self-consistency 对同一 prompt 跑 N 次, mock 必须给不同输出
+    let txtIdx = 0;
+    const txtOutputs = [
+      'A 类回答, 题材热点延续, 短期看多',
+      'A 类回答, 题材热点延续, 短期看多',  // 同 prefix → 同组
+      'B 类回答, 估值偏高需谨慎'
+    ];
+    const SC5ctx = {
+      console, window: {}, Core: {
+        AI: { call: async () => {
+          const out = txtOutputs[txtIdx++ % txtOutputs.length];
+          return out;
+        } }
+      }
+    };
+    SC5ctx.window = SC5ctx;
+    vm.createContext(SC5ctx);
+    vm.runInContext(scSrc, SC5ctx);
+    const txt = await SC5ctx.window.Core.SelfConsistency.run({
+      prompt: 'y', n: 3, mode: 'text-prefix', normalizeLen: 5
+    });
+    // 3 次: 前 5 字 "A 类回" × 2, "B 类回" × 1
+    // majority = "A 类回答..." (count=2), consensusRate=2/3
+    if (txt.majority && txt.majority.startsWith('A 类回答') && Math.abs(txt.consensusRate - 2 / 3) < 0.001) {
+      ok('Z4.6 text-prefix: 2/3 同 prefix → majority=A 类回答 (count=2)');
+    } else fail('Z4.6 text', JSON.stringify({ m: txt.majority && txt.majority.slice(0, 20), c: txt.consensusRate }));
+
+    // ---- 32.7 围栏 JSON 容错: ```json ... ``` 包裹 ----
+    const SC6ctx = {
+      console, window: {}, Core: {
+        AI: { call: async () => '```json\n{"verdict":"错","lesson":"x"}\n```' }
+      }
+    };
+    SC6ctx.window = SC6ctx;
+    vm.createContext(SC6ctx);
+    vm.runInContext(scSrc, SC6ctx);
+    const fenced = await SC6ctx.window.Core.SelfConsistency.run({
+      prompt: 'y', n: 1, mode: 'json-verdict'
+    });
+    if (fenced.majority === '错' && fenced.allParsed.length === 1 && fenced.allParsed[0].lesson === 'x') {
+      ok('Z4.7 围栏 JSON: ```json 包裹可正确抽 verdict');
+    } else fail('Z4.7 围栏', JSON.stringify(fenced));
+
+    // ---- 32.8 烂 JSON → 走 text-prefix 兜底 ----
+    const SC7ctx = {
+      console, window: {}, Core: {
+        AI: { call: async () => '无效 JSON: {verdict:}' }
+      }
+    };
+    SC7ctx.window = SC7ctx;
+    vm.createContext(SC7ctx);
+    vm.runInContext(scSrc, SC7ctx);
+    const junk = await SC7ctx.window.Core.SelfConsistency.run({
+      prompt: 'z', n: 2, mode: 'json-verdict'
+    });
+    if (junk.majority && junk.majority.startsWith('无效 JSON')) {
+      ok('Z4.8 烂 JSON → 兜底 text-prefix (前 30 字聚合)');
+    } else fail('Z4.8 junk', JSON.stringify(junk));
+
+    // ---- 32.9 默认 n=3 + threshold=0.5 ----
+    const def = await SC.run({ prompt: 'mock-verdict=对' });
+    if (def.n === 3 && def.lowConsensus === false && def.consensusRate === 1) {
+      ok('Z4.9 默认 n=3 / threshold=0.5 (符合 Wang 2022 推荐)');
+    } else fail('Z4.9 默认', JSON.stringify({ n: def.n, l: def.lowConsensus, c: def.consensusRate }));
+  } catch (e) {
+    fail('Z4 self-consistency', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
 // ========== 总结 ==========
 // 同步 section 的 ok() 已经在 console 打印;
 // async IIFE 里的 ok() 还在 microtask 队列里, 用 setImmediate 给一次机会再读 passed/failed

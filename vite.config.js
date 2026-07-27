@@ -31,6 +31,7 @@ export default defineConfig({
         '/app/account.js',
         '/app/market-bar.js',
         '/core/ai-service.js',
+        '/core/self-consistency.js',
         '/core/agents.js',
         '/core/macro.js',
         '/core/news.js',
