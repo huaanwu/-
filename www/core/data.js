@@ -409,6 +409,22 @@
   }
 
   /**
+   * 个股近 N 期财务指标对比 (Phase R)
+   * 数据源: stock_zh_a_financial_indicator (返回近 4-8 期, 我们取前 4)
+   * 字段: 营收/净利/毛利率/ROE/ROA/资产负债率/经营现金流/EPS
+   * 用途: stock-advisor.js 的"📊 财报深度读"tab
+   * 缓存: 7 天 (财报季才会更新, 缓存长一些省 IO)
+   */
+  async function getStockFinancialHistory(code) {
+    return await fetchWithCache(
+      `financial_hist_${code}`,
+      'stock_zh_a_financial_indicator',
+      { symbol: code },
+      7 * 24 * 60 * 60 * 1000  // 7 天
+    );
+  }
+
+  /**
    * A股全市场列表(用于选股筛选)
    */
   async function getStockList() {
@@ -1101,6 +1117,7 @@
     getStockSpot, getStockQuote, getStockKLine, getStockFinancial, getStockList,
     getStockSpotTencent,    // C: 腾讯 fetcher (codes 参数, 实时)
     getStockSpotEfinance,  // C: 东方财富 fetcher (全市场, screener 用)
+    getStockFinancialHistory,  // Phase R: 近 N 期财报对比
     // 基金
     getFundSpot, getFundHistory, getFundPortfolio,
     // 指数

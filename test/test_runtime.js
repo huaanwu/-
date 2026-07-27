@@ -271,6 +271,93 @@ if (!fs.existsSync(TOAST_PATH)) {
   }
 }
 
+// ========== [9] StockAdvisor 模块加载 + API 完备 (Phase R) ==========
+section('9] StockAdvisor 模块加载 (Phase R)');
+const SA_PATH = path.join(ROOT, 'www', 'app', 'stock-advisor.js');
+if (!fs.existsSync(SA_PATH)) {
+  fail('stock-advisor load', `文件不存在: ${SA_PATH}`);
+} else {
+  // 模拟 document + 全局函数(toastError / escapeHtml / Fund.closeModal)
+  const saMockEls = {};
+  const saCtx = vm.createContext({
+    window: ctx.window,
+    console,
+    setTimeout, clearTimeout,
+    Date,
+    Math,
+    JSON,
+    parseFloat, parseInt, isNaN,
+    navigator: {},
+    document: {
+      getElementById(id) {
+        if (!saMockEls[id]) {
+          saMockEls[id] = {
+            innerHTML: '',
+            textContent: '',
+            appendChild(c) { return c; },
+            querySelectorAll() { return []; },
+            remove() {},
+            parentElement: saMockEls[id]
+          };
+        }
+        return saMockEls[id];
+      },
+      createElement(tag) {
+        return {
+          tagName: tag,
+          className: '',
+          style: {},
+          dataset: {},
+          appendChild(c) { return c; },
+          remove() {},
+          parentElement: { appendChild(c) { return c; }, querySelectorAll() { return []; } }
+        };
+      }
+    },
+    Core: {
+      Util: ctx.window.Core.Util,
+      Data: {
+        getStockFinancial: () => Promise.resolve({}),
+        getStockFinancialHistory: () => Promise.resolve([]),
+        getAiContextSnapshot: () => Promise.resolve({}),
+        getIntlSnapshot: () => Promise.resolve({}),
+        getStockQuote: () => Promise.resolve({}),
+        formatAiContextForPrompt: () => '',
+        formatIntlForPrompt: () => ''
+      },
+      AI: {
+        call: () => Promise.resolve(''),
+        selfCheck: () => Promise.resolve('✓ self-check 通过')
+      },
+      KB: {
+        pickRelevant: () => Promise.resolve([]),
+        formatForPrompt: () => ''
+      },
+      Storage: { all: () => Promise.resolve([]) }
+    },
+    toastError: () => {},
+    toastSuccess: () => {},
+    Fund: { closeModal: () => {} },
+    Promise
+  });
+  try {
+    vm.runInContext(fs.readFileSync(SA_PATH, 'utf-8'), saCtx, { filename: SA_PATH });
+  } catch (e) {
+    fail('stock-advisor load', `执行失败: ${e.message}`);
+  }
+  const SA = saCtx.window.StockAdvisor;
+  if (!SA) {
+    fail('StockAdvisor', 'window.StockAdvisor 未挂载');
+  } else {
+    ok('stock-advisor.js loaded → window.StockAdvisor 已挂载');
+    // 必备 API
+    ['show', 'switchTab', 'refresh'].forEach(fn => {
+      if (typeof SA[fn] === 'function') ok(`StockAdvisor.${fn} 是函数`);
+      else fail(`StockAdvisor.${fn}`, '类型应为 function');
+    });
+  }
+}
+
 // ========== 总结 ==========
 console.log('');
 console.log(`\x1b[1m结果:\x1b[0m 通过 ${passed}, 失败 ${failed}`);
