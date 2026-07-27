@@ -355,6 +355,81 @@ if (!fs.existsSync(SA_PATH)) {
       if (typeof SA[fn] === 'function') ok(`StockAdvisor.${fn} 是函数`);
       else fail(`StockAdvisor.${fn}`, '类型应为 function');
     });
+
+    // _test_extractHistory 字段容错 (Phase R)
+    if (typeof SA._test_extractHistory !== 'function') {
+      fail('StockAdvisor._test_extractHistory', '未暴露');
+    } else {
+      const realAkshare = [
+        { REPORT_DATE: '2026-03-31', REPORT_TYPE: '一季报',
+          TOTALOPERATEREVE: 54702912385.23, TOTALOPERATEREVETZ: 6.34,
+          PARENTNETPROFIT: 27242512886.45, PARENTNETPROFITTZ: 1.47,
+          KCFJCXSYJLR: 27239985194.41,
+          XSMLL: 89.76, XSJLL: 52.22, ROEJQ: 10.57, ZZCJLL: 9.03,
+          ZCFZL: 12.12, XJLLB: 0.70, EPSJB: 21.76, BPS: 216.32 },
+        { REPORT_DATE: '2025-12-31', REPORT_TYPE: '年报',
+          TOTALOPERATEREVE: 188802570000, PARENTNETPROFIT: 89000000000,
+          XSMLL: 88.5, ROEJQ: 24.5, ZCFZL: 13.0, EPSJB: 70.0 }
+      ];
+      const hist = SA._test_extractHistory(realAkshare);
+      if (!Array.isArray(hist) || hist.length !== 2) {
+        fail('extractHistory', `返回长度异常: ${hist && hist.length}`);
+      } else {
+        ok('extractHistory: 返回 2 期');
+        // 第一期: 大写缩写字段提取
+        const r0 = hist[0];
+        if (r0.period === '2026-03-31') ok('extractHistory: period=REPORT_DATE 提取正确');
+        else fail('extractHistory.period', `实际=${r0.period}`);
+        if (r0.revenue === 54702912385.23) ok('extractHistory: revenue=TOTALOPERATEREVE 提取正确');
+        else fail('extractHistory.revenue', `实际=${r0.revenue}`);
+        if (r0.revenueYoY === 6.34) ok('extractHistory: revenueYoY=TOTALOPERATEREVETZ 提取正确');
+        else fail('extractHistory.revenueYoY', `实际=${r0.revenueYoY}`);
+        if (r0.netProfit === 27242512886.45) ok('extractHistory: netProfit=PARENTNETPROFIT 提取正确');
+        else fail('extractHistory.netProfit', `实际=${r0.netProfit}`);
+        if (r0.grossMargin === 89.76) ok('extractHistory: grossMargin=XSMLL 提取正确');
+        else fail('extractHistory.grossMargin', `实际=${r0.grossMargin}`);
+        if (r0.roe === 10.57) ok('extractHistory: roe=ROEJQ 提取正确');
+        else fail('extractHistory.roe', `实际=${r0.roe}`);
+        if (r0.debtRatio === 12.12) ok('extractHistory: debtRatio=ZCFZL 提取正确');
+        else fail('extractHistory.debtRatio', `实际=${r0.debtRatio}`);
+        if (r0.eps === 21.76) ok('extractHistory: eps=EPSJB 提取正确');
+        else fail('extractHistory.eps', `实际=${r0.eps}`);
+        if (r0.bps === 216.32) ok('extractHistory: bps=BPS 提取正确');
+        else fail('extractHistory.bps', `实际=${r0.bps}`);
+        if (r0.cashflowRatio === 0.70) ok('extractHistory: cashflowRatio=XJLLB 提取正确');
+        else fail('extractHistory.cashflowRatio', `实际=${r0.cashflowRatio}`);
+
+        // 兼容旧中文键名 (新浪 stock_financial_abstract 等)
+        const legacyRaw = [
+          { 报告日期: '2025-12-31', 营业总收入: 100000000, 净利润: 50000000,
+            销售毛利率: 30, ROE: 15, 资产负债率: 50, EPS: 1.5 }
+        ];
+        const histLegacy = SA._test_extractHistory(legacyRaw);
+        if (histLegacy && histLegacy[0] && histLegacy[0].revenue === 100000000) {
+          ok('extractHistory: 兼容中文键名 (新浪版)');
+        } else {
+          fail('extractHistory legacy', `中文键名 fallback 失败: ${JSON.stringify(histLegacy)}`);
+        }
+
+        // 空数组返回 null
+        if (SA._test_extractHistory([]) === null) ok('extractHistory: 空数组 → null');
+        else fail('extractHistory empty', '应返回 null');
+
+        // 非数组返回 null
+        if (SA._test_extractHistory(null) === null && SA._test_extractHistory({}) === null) {
+          ok('extractHistory: 非数组 → null');
+        } else {
+          fail('extractHistory non-array', '应返回 null');
+        }
+
+        // 只取最近 4 期
+        const six = SA._test_extractHistory(Array.from({length: 6}, (_, i) => ({
+          REPORT_DATE: `2025-${String(i+1).padStart(2,'0')}-01`, TOTALOPERATEREVE: i * 1000
+        })));
+        if (six && six.length === 4) ok('extractHistory: 超过 4 期只取前 4');
+        else fail('extractHistory cap', `应=4, 实际=${six && six.length}`);
+      }
+    }
   }
 }
 

@@ -410,18 +410,39 @@
 
   /**
    * 个股近 N 期财务指标对比 (Phase R)
-   * 数据源: stock_zh_a_financial_indicator (返回近 4-8 期, 我们取前 4)
-   * 字段: 营收/净利/毛利率/ROE/ROA/资产负债率/经营现金流/EPS
+   * 数据源: stock_financial_analysis_indicator_em (东方财富, AKShare 1.13+ 替换 stock_zh_a_financial_indicator)
+   *   - symbol 必须带市场后缀: '600519.SH' / '301389.SZ'
+   *   - 返回结构: {result: {data: [...]}}, 数组按 REPORT_DATE DESC
+   *   - 字段名: 大写英文缩写 (TOTALOPERATEREVE 营收 / PARENTNETPROFIT 净利 / XSMLL 毛利率 ...)
    * 用途: stock-advisor.js 的"📊 财报深度读"tab
    * 缓存: 7 天 (财报季才会更新, 缓存长一些省 IO)
    */
   async function getStockFinancialHistory(code) {
-    return await fetchWithCache(
-      `financial_hist_${code}`,
-      'stock_zh_a_financial_indicator',
-      { symbol: code },
+    const symbolWithSuffix = _addExchangeSuffix(code);
+    const raw = await fetchWithCache(
+      `financial_hist_${symbolWithSuffix}`,
+      'stock_financial_analysis_indicator_em',
+      { symbol: symbolWithSuffix, indicator: '按报告期' },
       7 * 24 * 60 * 60 * 1000  // 7 天
     );
+    // 解开 {result: {data: [...]}}, 返回数组
+    if (raw && raw.result && Array.isArray(raw.result.data)) return raw.result.data;
+    return Array.isArray(raw) ? raw : [];
+  }
+
+  /**
+   * 给 6 位代码补市场后缀 (Phase R)
+   * 6/9: SH (沪市主板 + B 股)
+   * 0/3: SZ (深市主板 + 创业板)
+   * 4/8: BJ (北交所)
+   */
+  function _addExchangeSuffix(code) {
+    const c = String(code || '').padStart(6, '0');
+    if (/\.(SH|SZ|BJ)$/i.test(c)) return c.toUpperCase();
+    if (c.startsWith('6') || c.startsWith('9')) return c + '.SH';
+    if (c.startsWith('0') || c.startsWith('3')) return c + '.SZ';
+    if (c.startsWith('4') || c.startsWith('8')) return c + '.BJ';
+    return c + '.SH';
   }
 
   /**

@@ -338,49 +338,55 @@
   }
 
   /**
-   * 从 stock_zh_a_financial_indicator 提取近 4 期 (Phase R)
-   * 容错: 字段名 AKShare 偶有变化
+   * 从 stock_financial_analysis_indicator_em 提取近 4 期 (Phase R)
+   * 字段名: AKShare 1.13+ 的大写英文缩写 (见 data.js getStockFinancialHistory)
    */
   function _extractHistory(raw) {
     if (!Array.isArray(raw) || raw.length === 0) return null;
     const keyMap = {
-      period: ['日期', '报告期', 'period', '报告日期'],
-      revenue: ['营业总收入', '营业收入', 'revenue', '营业总收入(元)'],
-      revenueYoY: ['营业总收入同比', '营收同比', 'revenue_yoy'],
-      netProfit: ['净利润', '净利润(元)', 'net_profit'],
-      netProfitYoY: ['净利润同比', '净利同比', 'net_profit_yoy'],
-      grossMargin: ['销售毛利率', '毛利率', 'gross_margin'],
-      netMargin: ['销售净利率', '净利率', 'net_margin'],
-      roe: ['加权平均净资产收益率', '净资产收益率', 'ROE', 'roe'],
-      roa: ['总资产报酬率', 'ROA', 'roa'],
-      debtRatio: ['资产负债率', 'debt_ratio'],
-      eps: ['基本每股收益', '每股收益', 'EPS', 'eps'],
-      operatingCashflow: ['经营活动现金流量净额', '经营现金流', 'operating_cashflow']
+      period: ['REPORT_DATE', 'REPORT_DATE_NAME', '报告日期'],
+      reportType: ['REPORT_TYPE', '报告类型'],
+      revenue: ['TOTALOPERATEREVE', '营业总收入', '营业收入'],
+      revenueYoY: ['TOTALOPERATEREVETZ', '营业总收入同比增长', '营收同比'],
+      netProfit: ['PARENTNETPROFIT', '归母净利润', '净利润'],
+      netProfitYoY: ['PARENTNETPROFITTZ', '归母净利润同比增长', '净利润同比'],
+      deductedProfit: ['KCFJCXSYJLR', '扣非净利润'],
+      grossMargin: ['XSMLL', '销售毛利率', '毛利率'],
+      netMargin: ['XSJLL', '销售净利率', '净利率'],
+      roe: ['ROEJQ', 'ROEKCJQ', '加权平均净资产收益率', 'ROE'],
+      roa: ['ZZCJLL', '总资产报酬率', 'ROA'],
+      debtRatio: ['ZCFZL', '资产负债率'],
+      eps: ['EPSJB', 'EPSKCJB', '基本每股收益', 'EPS'],
+      bps: ['BPS', '每股净资产'],
+      operatingCashflow: ['MGJYXJJE', '每股经营性现金流', '经营现金流'],
+      cashflowRatio: ['XJLLB', '经营现金流/营业收入']
     };
-    const look = (obj, keys) => {
+    const look = (obj, keys, isString = false) => {
       for (const k of keys) {
         if (obj[k] != null && obj[k] !== '') {
+          if (isString) return String(obj[k]);
           const v = parseFloat(obj[k]);
           if (!isNaN(v)) return v;
         }
       }
       return null;
     };
-    // 取最近 4 期 (假设 raw 已有顺序; 若没有倒序)
+    // 取最近 4 期 (raw 已按 REPORT_DATE DESC 倒序)
     const list = raw.slice(0, 4).map(row => {
       const out = {};
       for (const [k, keys] of Object.entries(keyMap)) {
-        if (k === 'period') {
-          for (const kk of keys) {
-            if (row[kk]) { out[k] = String(row[kk]); break; }
-          }
-        } else {
-          const v = look(row, keys);
-          if (v !== null) out[k] = v;
-        }
+        const v = (k === 'period' || k === 'reportType')
+          ? look(row, keys, true)
+          : look(row, keys, false);
+        if (v !== null) out[k] = v;
       }
       return out;
     }).filter(r => r.period || r.revenue != null);
     return list.length > 0 ? list : null;
+  }
+
+  // 测试钩子 (Phase R): 不影响业务, 仅供 test_runtime.js 调用
+  if (typeof window !== 'undefined') {
+    window.StockAdvisor._test_extractHistory = _extractHistory;
   }
 })();
