@@ -147,6 +147,7 @@
    *   stream, onChunk, onDone, onError,
    *   temperature, model, apiKey, baseURL  // 覆盖默认
    *   local: true|false   // 5.3.3: 强制本地/远程
+   *   injectContext: true|false  // Z1c: 默认 true, 自动注入 Core.MarketWidth 市场宽度信号
    * }
    * 返回: 完整文本
    */
@@ -170,10 +171,24 @@
       throw new Error('未配置模型名');
     }
 
+    // Z1c: 默认注入市场宽度信号 (Kimi Regime 之外的 cross-check 维度)
+    // injectContext=false 可关, 默认 true
+    let systemPrompt = opts.systemPrompt || '';
+    if (opts.injectContext !== false && window.Core && Core.MarketWidth) {
+      try {
+        const width = await Core.MarketWidth.getMarketWidth();
+        if (width && width.status && width.status !== 'unknown') {
+          systemPrompt = (systemPrompt ? systemPrompt + '\n\n' : '') + Core.MarketWidth.formatWidthForPrompt(width);
+        }
+      } catch (e) {
+        console.warn('[AI] 注入市场宽度失败, 继续:', e.message);
+      }
+    }
+
     const body = {
       model,
       messages: [
-        ...(opts.systemPrompt ? [{ role: 'system', content: opts.systemPrompt }] : []),
+        ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
         { role: 'user', content: opts.prompt }
       ],
       temperature,

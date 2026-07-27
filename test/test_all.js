@@ -3818,6 +3818,83 @@ section('[28.5] Z1 Phase A: 接管 Kimi 的 Core.Regime (HS300 + MA60 + bear 迟
   }
 })();
 
+// ========== [29] Z1c ai-service 自动注入市场宽度 ==========
+section('[29] Z1c ai-service.call() 自动注入 Core.MarketWidth (Z1b 配套)');
+(async () => {
+  try {
+    const { TextDecoder: NodeTextDecoder } = require('util');
+    // mock ai-service: 拦截 fetch, 检查 body.messages[0].content 是否含宽度信号
+    const captured = { body: null };
+    const AI = {
+      console, setTimeout, clearTimeout,
+      TextDecoder: NodeTextDecoder,
+      Core: {
+        State: { get: () => ({
+          ai: { provider: 'deepseek', apiKey: 'k1', model: 'deepseek-v4-flash', useProxy: false }
+        }) },
+        Storage: { cacheGet: async () => null, cacheSet: async () => {}, kvGet: async () => null, kvSet: async () => {} },
+        // 模拟 MarketWidth: 弱市, advancePct=30
+        MarketWidth: {
+          getMarketWidth: async () => ({ advance: 1500, decline: 3000, flat: 500, total: 5000, advancePct: 30, status: 'weak', partial: '', ts: 'now' }),
+          formatWidthForPrompt: (sig) => `[宽度: ${sig.advancePct}% / ${sig.status}]`
+        }
+      },
+      fetch: async (url, init) => {
+        captured.body = JSON.parse(init.body);
+        return { ok: true, json: async () => ({ choices: [{ message: { content: 'ok' } }] }) };
+      }
+    };
+    AI.window = AI;
+    vm.createContext(AI);
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/ai-service.js')), AI);
+    const A = AI.Core.AI;
+
+    // ---- 29.1 默认 injectContext=true → system 自动拼接宽度 ----
+    await A.call({ systemPrompt: '你是顾问', prompt: '该买吗' });
+    const sys = captured.body.messages[0].content;
+    if (sys.startsWith('你是顾问') && sys.includes('宽度: 30%')) ok('Z1c: 默认注入宽度信号 (前置 systemPrompt + 宽度)');
+    else fail('Z1c 默认注入', sys);
+
+    // ---- 29.2 无 systemPrompt 时, 宽度独占 system ----
+    captured.body = null;
+    await A.call({ prompt: '直接问题' });
+    const sys2 = captured.body.messages[0].content;
+    if (sys2 === '[宽度: 30% / weak]') ok('Z1c: 无 systemPrompt 时宽度独占 system 消息');
+    else fail('Z1c 独占 system', sys2);
+
+    // ---- 29.3 injectContext=false → 不注入 ----
+    captured.body = null;
+    await A.call({ systemPrompt: '纯净', prompt: 'x', injectContext: false });
+    const sys3 = captured.body.messages[0].content;
+    if (sys3 === '纯净') ok('Z1c: injectContext=false → 不注入');
+    else fail('Z1c 不注入', sys3);
+
+    // ---- 29.4 MarketWidth 异常时不抛, 继续 (降级) ----
+    const AIBad = { ...AI, Core: { ...AI.Core, MarketWidth: { getMarketWidth: async () => { throw new Error('boom'); }, formatWidthForPrompt: () => '' } } };
+    AIBad.window = AIBad;
+    vm.createContext(AIBad);
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/ai-service.js')), AIBad);
+    captured.body = null;
+    await AIBad.Core.AI.call({ systemPrompt: '应当正常', prompt: 'y' });
+    const sysBad = captured.body.messages[0].content;
+    if (sysBad === '应当正常') ok('Z1c: MarketWidth 异常 → 降级, 原始 systemPrompt 不变');
+    else fail('Z1c 降级', sysBad);
+
+    // ---- 29.5 MarketWidth status=unknown → 不注入 (避免污染) ----
+    const AIUnk = { ...AI, Core: { ...AI.Core, MarketWidth: { getMarketWidth: async () => ({ status: 'unknown', partial: 'no data' }), formatWidthForPrompt: () => '[不应该出现]' } } };
+    AIUnk.window = AIUnk;
+    vm.createContext(AIUnk);
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/ai-service.js')), AIUnk);
+    captured.body = null;
+    await AIUnk.Core.AI.call({ systemPrompt: '原始', prompt: 'z' });
+    const sysUnk = captured.body.messages[0].content;
+    if (sysUnk === '原始' && !sysUnk.includes('不应该出现')) ok('Z1c: status=unknown → 不注入 (不污染 system)');
+    else fail('Z1c unknown 过滤', sysUnk);
+  } catch (e) {
+    fail('Z1c ai-service 注入', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
 // ========== 总结 ==========
 // 同步 section 的 ok() 已经在 console 打印;
 // async IIFE 里的 ok() 还在 microtask 队列里, 用 setImmediate 给一次机会再读 passed/failed
