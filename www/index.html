@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#0d1117">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>StockMaster</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/icons/icon-192.png">
+  <link rel="stylesheet" crossorigin href="/styles.css">
+</head>
+<body>
+
+<!-- ========== 顶部 Header ========== -->
+<header class="app-header">
+  <div class="header-left">
+    <div class="app-logo">📈</div>
+    <div class="app-title">StockMaster</div>
+  </div>
+  <div class="header-right">
+    <span class="market-status" id="marketStatus" title="市场状态">●</span>
+    <button class="icon-btn" onclick="goSettings()" title="设置">⚙️</button>
+  </div>
+</header>
+
+<!-- ========== 主内容区 ========== -->
+<main class="app-main">
+
+  <!-- 行情看板 -->
+  <section class="page" id="pageWatchlist">
+    <div class="page-header">
+      <h2>行情看板</h2>
+      <button class="btn btn-sm" onclick="Watchlist.addDialog()">+ 添加</button>
+    </div>
+    <div id="watchlistSummary" class="summary-cards"></div>
+    <div id="watchlistTable" class="data-card"></div>
+  </section>
+
+  <!-- 持仓管理 -->
+  <section class="page" id="pageHoldings">
+    <div class="page-header">
+      <h2>持仓管理</h2>
+      <button class="btn btn-sm" onclick="Holdings.addDialog()">+ 新建</button>
+    </div>
+    <div id="holdingsSummary" class="summary-cards"></div>
+    <div id="holdingsTable" class="data-card"></div>
+  </section>
+
+  <!-- 复盘笔记 -->
+  <section class="page" id="pageJournal">
+    <div class="page-header">
+      <h2>复盘笔记</h2>
+      <div>
+        <button class="btn btn-sm btn-ghost" onclick="Journal.aiColleagueDialog()" title="5.3.1 多智能体 + 5.3.2 AI 记忆同步">🤖 AI 同事</button>
+        <button class="btn btn-sm" onclick="Journal.newDialog()">+ 新建</button>
+      </div>
+    </div>
+    <div id="journalList" class="data-card"></div>
+  </section>
+
+  <!-- 选股筛选 -->
+  <section class="page" id="pageScreener">
+    <div class="page-header">
+      <h2>选股筛选</h2>
+      <button class="btn btn-sm" onclick="Screener.run()">▶ 运行</button>
+    </div>
+    <div id="screenerForm" class="filter-form"></div>
+    <div id="screenerResult" class="data-card"></div>
+  </section>
+
+  <!-- 资金账户 -->
+  <section class="page" id="pageAccount">
+    <div class="page-header">
+      <h2>资金账户</h2>
+    </div>
+    <div id="accountSummary" class="summary-cards"></div>
+    <div id="accountBreakdown"></div>
+    <div id="accountFlow" style="margin-top:8px;"></div>
+    <div id="accountHistory" class="data-card" style="margin-top:8px;"></div>
+    <h3 style="margin-top:16px;font-size:14px;color:var(--text-muted);">📜 资金流水 (近 20 条)</h3>
+    <div id="accountFlowList" class="data-card"></div>
+  </section>
+
+  <!-- 基金专项 -->
+  <section class="page" id="pageFund">
+    <div class="page-header">
+      <h2>基金专项</h2>
+      <div>
+        <button class="btn btn-sm btn-ghost" onclick="Fund.buyDialog()">🛒 申购计划</button>
+        <button class="btn btn-sm btn-ghost" onclick="Fund.aiAdvisorDialog()">🤖 AI 选基</button>
+        <button class="btn btn-sm btn-ghost" onclick="Fund.rebalanceDialog()">⚖️ 再平衡</button>
+        <button class="btn btn-sm btn-ghost" onclick="Fund.portfolioRiskDialog()">📊 组合风险</button>
+        <button class="btn btn-sm btn-ghost" onclick="Fund.newsImpactDialog()">📰 新闻→持仓</button>
+        <button class="btn btn-sm btn-ghost" onclick="Fund.seedRecommended()">📥 导入推荐</button>
+        <button class="btn btn-sm" onclick="Fund.addDialog()">+ 添加</button>
+      </div>
+    </div>
+    <div id="fundSummary" class="summary-cards"></div>
+    <div id="fundTable" class="data-card"></div>
+  </section>
+
+  <!-- 策略回测 -->
+  <section class="page" id="pageBacktest">
+    <div class="page-header">
+      <h2>策略回测</h2>
+      <button class="btn btn-sm" onclick="Backtest.run()">▶ 运行</button>
+    </div>
+    <div id="backtestForm" class="filter-form"></div>
+    <div id="backtestResult" class="data-card"></div>
+  </section>
+
+  <!-- 提醒/监控 -->
+  <section class="page" id="pageAlerts">
+    <div class="page-header">
+      <h2>提醒/监控</h2>
+      <div>
+        <button class="btn btn-sm btn-ghost" onclick="Alerts.createRebalanceQuick()">📅 季度再平衡</button>
+        <button class="btn btn-sm" onclick="Alerts.addDialog()">+ 新建</button>
+      </div>
+    </div>
+    <div id="alertsList" class="data-card"></div>
+  </section>
+
+  <!-- 设置 -->
+  <section class="page" id="pageSettings">
+    <div class="page-header"><h2>设置</h2></div>
+    <div id="settingsForm" class="filter-form"></div>
+  </section>
+
+</main>
+
+<!-- ========== 底部导航 ========== -->
+<nav class="app-nav">
+  <button class="nav-item active" data-page="pageWatchlist" onclick="switchPage('pageWatchlist')">
+    <span class="nav-icon">📊</span><span class="nav-label">行情</span>
+  </button>
+  <button class="nav-item" data-page="pageAccount" onclick="switchPage('pageAccount')">
+    <span class="nav-icon">💰</span><span class="nav-label">资金</span>
+  </button>
+  <button class="nav-item" data-page="pageHoldings" onclick="switchPage('pageHoldings')">
+    <span class="nav-icon">💼</span><span class="nav-label">持仓</span>
+  </button>
+  <button class="nav-item" data-page="pageJournal" onclick="switchPage('pageJournal')">
+    <span class="nav-icon">📝</span><span class="nav-label">复盘</span>
+  </button>
+  <button class="nav-item" data-page="pageScreener" onclick="switchPage('pageScreener')">
+    <span class="nav-icon">🔍</span><span class="nav-label">选股</span>
+  </button>
+  <button class="nav-item" data-page="pageFund" onclick="switchPage('pageFund')">
+    <span class="nav-icon">🏦</span><span class="nav-label">基金</span>
+  </button>
+  <button class="nav-item" data-page="pageBacktest" onclick="switchPage('pageBacktest')">
+    <span class="nav-icon">📈</span><span class="nav-label">回测</span>
+  </button>
+  <button class="nav-item" data-page="pageAlerts" onclick="switchPage('pageAlerts')">
+    <span class="nav-icon">🔔</span><span class="nav-label">提醒</span>
+  </button>
+</nav>
+
+<!-- ========== 弹窗容器 ========== -->
+<div id="modalRoot"></div>
+
+<!-- ========== Toast 容器 ========== -->
+<div id="toastRoot" class="toast-root"></div>
+
+<!-- ========== 第三方 UMD 库 (本地化,不走 Vite bundle) ========== -->
+<script src="/lib/echarts.min.js"></script>
+<script src="/lib/dexie.min.js"></script>
+
+<!-- ========== Core 模块 (按依赖顺序) ========== -->
+<script src="/core/util.js"></script>
+<script src="/core/storage.js"></script>
+<script src="/core/data.js"></script>
+<script src="/core/state.js"></script>
+<script src="/core/toast.js"></script>
+<script src="/core/ai-service.js"></script>
+<script src="/core/macro.js"></script>
+<script src="/core/news.js"></script>
+<script src="/core/market.js"></script>
+<script src="/core/sync.js"></script>
+<script src="/core/agents.js"></script>
+<script src="/core/router.js"></script>
+
+<!-- ========== 域脚本 (按域拆分) ========== -->
+<script src="/app/watchlist.js"></script>
+<script src="/app/holdings.js"></script>
+<script src="/app/journal.js"></script>
+<script src="/app/screener.js"></script>
+<script src="/app/fund.js"></script>
+<script src="/app/backtest.js"></script>
+<script src="/app/alerts.js"></script>
+<script src="/app/account.js"></script>
+<script src="/app/market-bar.js"></script>
+
+<!-- ========== 主入口 ========== -->
+<script src="/app.js"></script>
+
+</body>
+</html>

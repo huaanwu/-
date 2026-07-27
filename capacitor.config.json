@@ -1,0 +1,8 @@
+{
+  "appId": "com.stock.master",
+  "appName": "StockMaster",
+  "webDir": "www",
+  "server": {
+    "androidScheme": "http"
+  }
+}

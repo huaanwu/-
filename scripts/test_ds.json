@@ -1,0 +1,7 @@
+{
+  "model": "deepseek-v4-flash",
+  "messages": [{"role": "user", "content": "用一句话介绍你自己, 不要推理, 直接给答案"}],
+  "max_tokens": 2000,
+  "stream": false,
+  "temperature": 0.3
+}
