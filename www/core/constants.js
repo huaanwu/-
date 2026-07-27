@@ -101,11 +101,17 @@
   /** 业绩预告/估值的新鲜度窗口: 公告日期超过半年视为陈旧回填数据, 丢弃 (与 data.js Y1 防御一致) */
   const EARNINGS_WARNING_FRESH_MS = 180 * 24 * 60 * 60 * 1000;
 
-  /** 估值偏离: 指数 PE-TTM 近 5 年分位 ≥ 此值视为"偏贵", 与低估值买入逻辑相悖 */
+  /** 估值偏离: 单只指数当前 PE 在近 N 个月历史序列里的分位 ≥ 此值视为"偏贵", 与低估值买入逻辑相悖 */
   const VALUATION_PERCENTILE_WARN = 80;
 
-  /** 估值偏离监控的指数 (stock_market_pe_lg 的 index_name 关键词, 与 data.js _fetchMarketValuation 一致) */
-  const VALUATION_INDEX_NAMES = ['上证', '深证', '创业板', '科创50'];
+  /** 估值偏离监控的指数 (stock_market_pe_lg 接口为单只指数月度 PE 历史,
+   *  akshare 0.0.91 实测返回深证综指 1997-2026 的 {日期, 指数, 平均市盈率} 时序,
+   *  不返回指数名/快照字段, 因此这里只盯单只深证综指, 不列表多只)
+   *  若 akshare 后续接口扩展多指数快照, 再扩成数组逐个检查 */
+  const VALUATION_INDEX_NAMES = ['深证'];
+
+  /** 估值偏离: 计算分位时取近 N 个月的 PE 序列 (默认 60 ≈ 5 年月度数据) */
+  const VALUATION_PE_LOOKBACK_MO = 60;
 
   // ==================== AI 历史成绩单 + 概率校准 (Scorecard) ====================
 
@@ -161,6 +167,7 @@
     EARNINGS_WARNING_FRESH_MS,
     VALUATION_PERCENTILE_WARN,
     VALUATION_INDEX_NAMES,
+    VALUATION_PE_LOOKBACK_MO,
     VERIFY_OUTCOMES,
     VERIFY_FAILURE_REASONS,
     SCORECARD_MIN_SAMPLES,

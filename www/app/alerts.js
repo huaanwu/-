@@ -1003,26 +1003,42 @@
 
     /**
      * 估值判定 (纯函数, 测试钩子):
-     *   解析 stock_market_pe_lg 行 → 目标指数 → 分位 ≥ VALUATION_PERCENTILE_WARN 的为 hits
-     * @returns {{hits: Array<{name,pe,percentile}>}|null} null=全部指数都拿不到分位 (数据不可用)
+     *   stock_market_pe_lg 真实返回是**月度时序** ({日期, 指数, 平均市盈率}[]),
+     *   不含指数名/分位字段; 客户端自算"当前 PE 在近 N 个月序列里的分位"。
+     *   单只指数 (默认深证综指) 时序 → 取末尾 N 个月 PE → 末值在序列里的 rank/(N-1) = 分位。
+     *   分位 ≥ VALUATION_PERCENTILE_WARN 的指数为 hits。
+     * @returns {{hits: Array<{name,pe,percentile,historyLen}>}|null} null=历史序列不可用 (返回 < N+1 或 PE 全 NaN)
      */
     _judgeValuation(rows) {
-      if (!Array.isArray(rows)) return null;
-      const wanted = Core.Constants.VALUATION_INDEX_NAMES;
+      if (!Array.isArray(rows) || rows.length === 0) return null;
+      const lookback = Core.Constants.VALUATION_PE_LOOKBACK_MO || 60;
       const threshold = Core.Constants.VALUATION_PERCENTILE_WARN;
-      const items = [];
-      for (const row of rows) {
-        const name = String(row.index_name || row.name || '').trim();
-        if (!wanted.some(w => name.includes(w))) continue;
-        const pe = parseFloat(row.pe_ttm || row.pe);
-        const pct = parseFloat(row.pe_percentile_5y ?? row.percentile);
+
+      // 把 {日期, 平均市盈率} 行解析成 PE 序列 (按日期升序, 接口原始顺序一般是旧→新, 保险起见显式排序)
+      const series = [];
+      for (const r of rows) {
+        const pe = parseFloat(r['平均市盈率'] || r.pe_ttm || r.pe);
+        const d = r['日期'] || r.date;
+        const ts = d ? Date.parse(d) : NaN;
         if (isNaN(pe)) continue;
-        items.push({ name, pe, percentile: isNaN(pct) ? null : pct });
+        series.push({ ts: isNaN(ts) ? series.length : ts, pe });
       }
-      if (items.length === 0) return null;
-      if (items.every(it => it.percentile === null)) return null;  // 分位全缺 → 不可用
-      const hits = items.filter(it => it.percentile !== null && it.percentile >= threshold);
-      return { hits, items };
+      series.sort((a, b) => a.ts - b.ts);
+      if (series.length < lookback + 1) return null;  // 历史太短 (接口刚上线或缓存不全) → 不通知
+
+      const tail = series.slice(-lookback);
+      const current = tail[tail.length - 1].pe;
+      // 分位 = (历史样本中 ≤ current 的个数 - 1) / (样本数 - 1)
+      let leCount = 0;
+      for (let i = 0; i < tail.length - 1; i++) {
+        if (tail[i].pe <= current) leCount++;
+      }
+      const percentile = (leCount / (tail.length - 1)) * 100;
+
+      const hits = percentile >= threshold
+        ? [{ name: (Core.Constants.VALUATION_INDEX_NAMES || ['目标指数'])[0] || '深证', pe: current, percentile, historyLen: tail.length }]
+        : [];
+      return { hits, items: [{ name: hits[0]?.name || '目标', pe: current, percentile, historyLen: tail.length }] };
     },
 
     /** 估值偏离通知文案: 带归因 */

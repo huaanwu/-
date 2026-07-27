@@ -110,7 +110,7 @@ const DOMAINS = {
   'Screener':  ['init', 'run', '_addWatchlistFromPick', '_runPreBacktest'],
   'Fund':      ['init', 'render', 'addDialog', 'save', 'remove', 'showChart', 'closeModal'],
   'Backtest':  ['init', 'run'],
-  'Alerts':    ['init', 'render', 'addDialog', 'save', 'toggle', 'remove', 'closeModal', 'startPolling', 'stopPolling', '_fetchJournalContext', '_horizonOf', '_syncTimers', '_checkShort', '_checkLong', '_filterEarningsWarnings', '_regimeNotifyText', '_judgeValuation', '_notifyLong']
+  'Alerts':    ['init', 'render', 'addDialog', 'save', 'toggle', 'remove', 'closeModal', 'startPolling', 'stopPolling', 'runLongChecks', '_isTradingTime', '_fetchJournalContext', '_horizonOf', '_syncTimers', '_checkShort', '_checkLong', '_filterEarningsWarnings', '_regimeNotifyText', '_judgeValuation', '_notifyLong']
 };
 for (const [name, methods] of Object.entries(DOMAINS)) {
   const file = path.join(WWW, 'app', name.toLowerCase() + '.js');
@@ -4759,7 +4759,7 @@ section('[35] Z7 月度复盘报告 (汇总所有 Z2/Z3/Z5 信号)');
 })();
 
 // ========== [36] 中长线盯盘改造: horizon 打标 + 分层轮询 + 3 条中长线规则 ==========
-section('36] 中长线盯盘: horizon 打标 / 分层轮询 / 业绩预告去重 / regime 迁移 / 估值判定');
+section('36] 中长线盯盘: horizon 打标 / 分层轮询(短线定时器+中长线事件驱动) / 交易时段守卫 / 通知冷却 / 业绩预告去重 / regime 迁移 / 估值判定');
 (async () => {
   try {
     const alertsSrc = readFileSafe(path.join(WWW, 'app', 'alerts.js'));
@@ -4872,6 +4872,108 @@ section('36] 中长线盯盘: horizon 打标 / 分层轮询 / 业绩预告去重
     if (!Alerts._timers.short && !Alerts._timers.long && cleared.length === 1) {
       ok('36.2e 规则清空 → 全部定时器停止 (短线历史遗留也清)');
     } else fail('36.2e 全部停止', JSON.stringify({ cleared, timers: Alerts._timers }));
+
+    // ---- 36.P0/P1/P2 盯盘轮询加固 ----
+    // 注意: 本块必须放在 36.3g 的 setTimeout 等待之前 — 测试总结用 setImmediate + process.exit,
+    // 第一个 macrotask 等待之后的断言会被直接掐掉, 这里全是微任务 await, 同 tick 内可跑完
+
+    // ---- 36.P0a _isTradingTime 边界 (2026-07-27 周一 / 2026-07-25 周六) ----
+    const mkT = (d, h, mi) => new Date(2026, 6, d, h, mi);  // 本地时间, 与实现口径一致
+    const tCases = [
+      ['周一 09:29', mkT(27, 9, 29), false],
+      ['周一 09:30', mkT(27, 9, 30), true],
+      ['周一 11:30', mkT(27, 11, 30), true],
+      ['周一 11:31', mkT(27, 11, 31), false],
+      ['周一 12:00 午间休市', mkT(27, 12, 0), false],
+      ['周一 13:00', mkT(27, 13, 0), true],
+      ['周一 15:00', mkT(27, 15, 0), true],
+      ['周一 15:01', mkT(27, 15, 1), false],
+      ['周六 10:00', mkT(25, 10, 0), false]
+    ];
+    const badT = tCases.filter(([, t, want]) => Alerts._isTradingTime(t) !== want);
+    if (badT.length === 0) ok('36.P0a _isTradingTime: 9 组边界全对 (9:29/9:30/11:30/11:31/12:00/13:00/15:00/15:01/周六)');
+    else fail('36.P0a 交易时段边界', badT.map(c => c[0]).join(','));
+
+    // ---- 36.P0b 守卫: 非交易时段 _checkShort 不发请求 (注入 spy) ----
+    let spotCalls = 0;
+    const origSpot = actx.Core.Data.getStockSpot;
+    actx.Core.Data.getStockSpot = async () => { spotCalls++; return []; };
+    const origIsTrading = Alerts._isTradingTime;
+    Alerts._isTradingTime = () => false;  // 模拟非交易时段
+    db.alerts = [{ id: 'g1', type: 'price_above', active: true, value: 100, code: '600519', triggered: false }];
+    await Alerts._checkShort();
+    Alerts._isTradingTime = origIsTrading;
+    if (spotCalls === 0) ok('36.P0b 守卫: 非交易时段 _checkShort 入口直接 return, 不拉行情');
+    else fail('36.P0b 守卫', 'spotCalls=' + spotCalls);
+
+    // ---- 36.P2 通知冷却 (防 flapping) ----
+    Alerts._isTradingTime = () => true;  // 模拟交易时段
+    const shortNotices = [];
+    const origNotify = Alerts._notify;
+    Alerts._notify = (a) => shortNotices.push(a.id);
+    actx.Core.Data.getStockSpot = async () => [{ 代码: '600519', 名称: '茅台', 最新价: '1800', 涨跌幅: '1.5', 成交量: '1000' }];
+
+    // 冷却期内 (lastHit 10 分钟前) 命中 → 只落 triggered, 不发通知
+    db.alerts = [{ id: 'f1', type: 'price_above', active: true, value: 1700, code: '600519', triggered: false, hitCount: 3, lastHit: Date.now() - 10 * 60 * 1000 }];
+    await Alerts._checkShort();
+    const f1 = db.alerts.find(a => a.id === 'f1');
+    if (shortNotices.length === 0 && f1.triggered === true && f1.hitCount === 3) {
+      ok('36.P2a 冷却期内命中: triggered 落库但不发通知 (防振荡价反复打扰)');
+    } else fail('36.P2a 冷却期', JSON.stringify({ n: shortNotices.length, triggered: f1.triggered, hitCount: f1.hitCount }));
+
+    // 超过冷却期 (lastHit 40 分钟前) 命中 → 正常通知 + hitCount/lastHit 更新
+    db.alerts = [{ id: 'f2', type: 'price_above', active: true, value: 1700, code: '600519', triggered: false, hitCount: 3, lastHit: Date.now() - 40 * 60 * 1000 }];
+    shortNotices.length = 0;
+    await Alerts._checkShort();
+    const f2 = db.alerts.find(a => a.id === 'f2');
+    if (shortNotices.length === 1 && shortNotices[0] === 'f2' && f2.triggered === true && f2.hitCount === 4 && f2.lastHit > Date.now() - 5000) {
+      ok('36.P2b 超过冷却期: 正常通知 + hitCount/lastHit 更新');
+    } else fail('36.P2b 冷却期外', JSON.stringify({ n: shortNotices.length, hitCount: f2.hitCount }));
+
+    // 无 lastHit (从未触发) 命中 → 正常通知
+    db.alerts = [{ id: 'f3', type: 'price_above', active: true, value: 1700, code: '600519', triggered: false, hitCount: 0 }];
+    shortNotices.length = 0;
+    await Alerts._checkShort();
+    if (shortNotices.length === 1 && db.alerts.find(a => a.id === 'f3').triggered === true) {
+      ok('36.P2c 首次命中 (无 lastHit): 正常通知');
+    } else fail('36.P2c 首次命中', JSON.stringify({ n: shortNotices.length }));
+
+    // 复位分支不受冷却期影响: 未命中且 triggered → 正常复位
+    db.alerts = [{ id: 'f4', type: 'price_above', active: true, value: 9999, code: '600519', triggered: true, hitCount: 1, lastHit: Date.now() - 10 * 60 * 1000 }];
+    await Alerts._checkShort();
+    if (db.alerts.find(a => a.id === 'f4').triggered === false) {
+      ok('36.P2d 价格回落: triggered 正常复位 (冷却期不影响复位)');
+    } else fail('36.P2d 复位', 'triggered 未复位');
+    Alerts._notify = origNotify;
+    Alerts._isTradingTime = origIsTrading;
+    actx.Core.Data.getStockSpot = origSpot;
+
+    // ---- 36.P1 runLongChecks 安全包装 + 事件触发点接线 ----
+    const origCheckLong = Alerts._checkLong;
+    Alerts._checkLong = async () => { throw new Error('模拟中长线检查爆炸'); };
+    let threw = false;
+    try { await Alerts.runLongChecks(); } catch (e) { threw = true; }
+    Alerts._checkLong = origCheckLong;
+    if (!threw) ok('36.P1a runLongChecks: _checkLong 异常不外抛');
+    else fail('36.P1a runLongChecks', '异常外抛');
+
+    const appSrc = readFileSafe(path.join(WWW, 'app.js'));
+    if (appSrc && /Alerts\.runLongChecks\(\)/.test(appSrc)) {
+      ok('36.P1b app.js init 序列已接线 Alerts.runLongChecks()');
+    } else fail('36.P1b app.js 接线', '未找到 runLongChecks 调用');
+    if (/window\._onShow_pageAlerts\s*=\s*function\s*\(\)\s*\{[^}]*runLongChecks/.test(alertsSrc)) {
+      ok('36.P1c _onShow_pageAlerts 已接线 runLongChecks');
+    } else fail('36.P1c _onShow 接线', '页面展示钩子未调 runLongChecks');
+    if (!/this\._timers\.long\s*=\s*this\._setInterval/.test(alertsSrc) && !/ALERT_TICK_LONG_MS\s*\)/.test(alertsSrc)) {
+      ok('36.P1d 中长线 30 分钟 setInterval 已从 _syncTimers 移除');
+    } else fail('36.P1d 定时器残留', 'long 分支仍存在');
+
+    // ---- 36.P3 _freqMs 防御: intervalDays 只对 rebalance_quarterly 生效 ----
+    const fqReb = Alerts._freqMs({ type: 'rebalance_quarterly', intervalDays: 90 });
+    const fqOther = Alerts._freqMs({ type: 'regime_change', intervalDays: 90 });  // 串字段陷阱: 应忽略
+    if (fqReb === 90 * 24 * 60 * 60 * 1000 && fqOther === C.ALERT_LONG_FREQ_MS.regime_change) {
+      ok('36.P3 _freqMs: 再平衡用行上 intervalDays, 其他类型忽略该字段 (防串字段)');
+    } else fail('36.P3 _freqMs 防御', JSON.stringify({ fqReb, fqOther }));
 
     // ---- 36.3 业绩预告: filter 纯函数 + lastNotifiedKeys 去重 ----
     const nowMs = Date.parse('2026-07-27T10:00:00');
@@ -4997,27 +5099,36 @@ section('36] 中长线盯盘: horizon 打标 / 分层轮询 / 业绩预告去重
     if (rgDone === false) ok('36.4f Regime 失败 → false (下轮重试)');
     else fail('36.4f 失败', rgDone);
 
-    // ---- 36.5 估值偏离: 判定纯函数 + 进/出阈值区去重 ----
-    valuationRows = [
-      { index_name: '上证指数', pe_ttm: 15.2, pb: 1.3, pe_percentile_5y: 85 },
-      { index_name: '深证成指', pe_ttm: 25.1, pb: 2.1, pe_percentile_5y: 50 },
-      { index_name: '创业板指', pe_ttm: 40.5, pb: 3.8, pe_percentile_5y: 82 },
-      { index_name: '道琼斯', pe_ttm: 20, pe_percentile_5y: 90 }  // 非目标指数 → 排除
-    ];
+    // ---- 36.5 估值偏离: 时序 + 客户端自算分位 + 进/出阈值区去重 ----
+    // stock_market_pe_lg 真实返回是月度时序 {日期, 平均市盈率} (深证综指 1997-2026, 344 行)
+    // _judgeValuation 客户端自算: 取末尾 60 个月 PE 序列, 末值在序列里的分位
+    function makePeSeries(currentPe, baseline = 20) {
+      const out = [];
+      const start = new Date('2018-01-31');
+      for (let i = 0; i < 60; i++) {
+        const d = new Date(start.getTime() + i * 30 * 86400000);
+        out.push({ '日期': d.toISOString(), '平均市盈率': baseline + (i % 10) * 0.3 });
+      }
+      // 末值 = currentPe
+      out[out.length - 1] = { '日期': new Date().toISOString(), '平均市盈率': currentPe };
+      return out;
+    }
+    valuationRows = makePeSeries(30);   // 当前 PE=30, 历史 baseline=20 ± 3, 末值远超历史 → 高分位
     const verdict = Alerts._judgeValuation(valuationRows);
-    if (verdict && verdict.hits.length === 2 && verdict.hits.some(h => h.name === '上证指数') && verdict.hits.some(h => h.name === '创业板指')) {
-      ok('36.5a 估值判定: 分位≥80% 命中 2 个目标指数, 非目标排除');
+    if (verdict && verdict.hits.length === 1 && verdict.hits[0].percentile >= 80) {
+      ok('36.5a 估值判定: 时序末值远超历史 → 分位≥80% 命中');
     } else fail('36.5a 判定', JSON.stringify(verdict));
 
-    if (Alerts._judgeValuation([{ index_name: '上证指数', pe_ttm: 15 }]) === null &&
-        Alerts._judgeValuation('not-array') === null) {
-      ok('36.5b 分位全缺/非法输入 → null (宁缺毋假, 不通知)');
+    if (Alerts._judgeValuation([]) === null &&
+        Alerts._judgeValuation('not-array') === null &&
+        Alerts._judgeValuation(makePeSeries(30).slice(0, 10)) === null) {  // 序列太短 → null
+      ok('36.5b 序列空/非数组/太短(<60) → null (宁缺毋假, 不通知)');
     } else fail('36.5b 不可用', '未返 null');
 
     notices.length = 0;
     const va = { id: 'v1', type: 'valuation', active: true, hitCount: 0, lastNotifiedKey: null };
     await Alerts._checkValuation(va);
-    if (notices.length === 1 && notices[0].msg.includes('估值偏离') && notices[0].msg.includes('85%') && va.lastNotifiedKey) {
+    if (notices.length === 1 && notices[0].msg.includes('估值偏离') && notices[0].msg.includes('%') && va.lastNotifiedKey) {
       ok('36.5c 估值首检: 通知带分位 + 归因, lastNotifiedKey 落行');
     } else fail('36.5c 首检', JSON.stringify({ n: notices.length, key: va.lastNotifiedKey }));
 
@@ -5025,13 +5136,13 @@ section('36] 中长线盯盘: horizon 打标 / 分层轮询 / 业绩预告去重
     if (notices.length === 1) ok('36.5d 同一阈值区 → 不重复通知');
     else fail('36.5d 去重', 'notices=' + notices.length);
 
-    valuationRows = valuationRows.map(r => ({ ...r, pe_percentile_5y: 50 }));  // 跌回阈值下
+    valuationRows = makePeSeries(15);   // 末值跌入 baseline 区间 → 低分位
     await Alerts._checkValuation(va);
     if (notices.length === 1 && va.lastNotifiedKey === null) {
       ok('36.5e 跌出阈值区 → 静默 + key 清空');
     } else fail('36.5e 出区', JSON.stringify({ n: notices.length, key: va.lastNotifiedKey }));
 
-    valuationRows = valuationRows.map(r => ({ ...r, pe_percentile_5y: 90 }));  // 重新进入
+    valuationRows = makePeSeries(35);   // 重新进入高分位
     await Alerts._checkValuation(va);
     if (notices.length === 2) ok('36.5f 重新进入阈值区 → 再次通知');
     else fail('36.5f 重进', 'notices=' + notices.length);
