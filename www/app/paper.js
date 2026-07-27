@@ -180,9 +180,10 @@
      * @param {string} name 名称 (可空)
      * @param {string} market sh/sz (可空, 自动按代码前缀推导)
      * @param {number} shares 股数 (自动向下取整到整手)
-     * @param {{ assumption?: string, stopLoss?: number, disciplineWarns?: string[], auto?: boolean }} [opts]
+     * @param {{ assumption?: string, stopLoss?: number, disciplineWarns?: string[], auto?: boolean, falsifyCondition?: string, invalidation?: string }} [opts]
      *        Phase B 纪律信息: 非索引字段, 写到 holdings/transactions 行上 (不改 schema);
-     *        auto=true 标记 AI 自动成交 (Phase C 日终小结 🤖 标注用)
+     *        auto=true 标记 AI 自动成交 (Phase C 日终小结 🤖 标注用);
+     *        falsifyCondition/invalidation 为 Phase D1 pre-mortem 沉淀 (只写 transactions 行)
      * @returns 持仓行 | null (失败 toast + 返回 null)
      */
     async buy(code, name, market, shares, opts = {}) {
@@ -241,6 +242,9 @@
         if (opts.stopLoss) tx.stopLoss = opts.stopLoss;
         if (opts.disciplineWarns && opts.disciplineWarns.length) tx.disciplineWarns = opts.disciplineWarns;
         if (opts.auto) tx.auto = true;  // Phase C: AI 自动成交标记 (日终小结 🤖)
+        // Phase D1: pre-mortem 证伪/失效条件 (非索引字段, 事后验证对照用)
+        if (opts.falsifyCondition) tx.falsifyCondition = opts.falsifyCondition;
+        if (opts.invalidation) tx.invalidation = opts.invalidation;
         await Core.Storage.add('transactions', tx);
         acc.cash = +(acc.cash - amount - fee.total).toFixed(2);
         await Core.Storage.kvSet('paper_account', acc);
@@ -378,7 +382,8 @@
 
     /**
      * AI 选股自动成交 (screener._addWatchlistFromPick 加自选成功后调用)
-     * @param {{ code: string, name?: string, market?: string }} pick
+     * @param {{ code: string, name?: string, market?: string, falsifyCondition?: string, invalidation?: string }} pick
+     *        falsifyCondition/invalidation: Phase D1 pre-mortem 沉淀, 透传到 transactions 行
      * 买入金额 = 模拟现金 × positionPct; 现金不足/不足一手/任何失败 → console.warn 跳过, 不 throw
      */
     async autoTradeFromPick(pick) {
@@ -410,9 +415,11 @@
             return null;
           }
           return await this.buy(pick.code, pick.name || '', pick.market || '', shares,
-            { assumption, stopLoss, disciplineWarns: chk.warns, auto: true });
+            { assumption, stopLoss, disciplineWarns: chk.warns, auto: true,
+              falsifyCondition: pick.falsifyCondition, invalidation: pick.invalidation });
         }
-        return await this.buy(pick.code, pick.name || '', pick.market || '', shares, { auto: true });
+        return await this.buy(pick.code, pick.name || '', pick.market || '', shares,
+          { auto: true, falsifyCondition: pick.falsifyCondition, invalidation: pick.invalidation });
       } catch (e) {
         console.warn('[Paper] 自动成交失败:', e);
         return null;

@@ -14,6 +14,10 @@
   // 当前 tab 状态 (Phase R)
   let _currentTab = 'brief';
 
+  // Phase D2: 最近一次 💡 简评的上下文 ({ code, name, systemPrompt, prompt, text })
+  // 供 "🤝 第二意见" 用同一份上下文换 provider 重跑
+  let _lastBrief = null;
+
   /**
    * 单股 AI 简评 (弹窗 + 流式)
    * @param {string} code - 股票代码 (6 位)
@@ -34,9 +38,12 @@
           </div>
           <div id="saLoading" style="padding:12px;color:var(--text-muted);">⏳ 拉取基本面 + 市场上下文 + KB...</div>
           <div id="saResult" style="background:var(--bg-base);border-radius:6px;padding:14px;line-height:1.7;white-space:pre-wrap;font-size:13px;min-height:200px;"></div>
+          <div id="saExtra" style="margin-top:10px;"></div>
           <div class="modal-footer">
             <button class="btn btn-ghost" onclick="Fund.closeModal()">关闭</button>
             <button class="btn btn-ghost" id="saRefreshBtn" onclick="StockAdvisor.refresh()">🔄 重评</button>
+            <button class="btn btn-ghost" id="saPreBtBtn" onclick="StockAdvisor.runPreBacktest()">📊 历史验证</button>
+            <button class="btn btn-ghost" id="saSecondBtn" onclick="StockAdvisor.runSecondOpinion()">🤝 第二意见</button>
           </div>
         </div>
       </div>`;
@@ -52,6 +59,10 @@
     if (tab === _currentTab) return;
     _currentTab = tab;
     _highlightTab();
+    // Phase D2: tab 切换清掉旧的历史验证/第二意见结果
+    const extraEl = document.getElementById('saExtra');
+    if (extraEl) extraEl.innerHTML = '';
+    if (tab !== 'brief') _lastBrief = null;
     // 从 modalRoot 提取当前 code/name
     const root = document.getElementById('modalRoot');
     if (!root) return;
@@ -77,9 +88,112 @@
     const code = titleEl ? titleEl.textContent.trim() : '';
     const nameEl = root.querySelector('h3');
     const name = nameEl ? nameEl.firstChild.textContent.trim() : code;
+    // Phase D2: 重评清掉旧的历史验证/第二意见结果
+    const extraEl = document.getElementById('saExtra');
+    if (extraEl) extraEl.innerHTML = '';
     if (_currentTab === 'brief') await _runBrief(code, name);
     else if (_currentTab === 'report') await _runReport(code, name);
   };
+
+  /**
+   * Phase D2: 📊 历史验证 (回测前置, 按需触发)
+   * 对当前弹窗个股拉近 2 年日 K 跑策略回测, 结果渲染到 #saExtra
+   */
+  window.StockAdvisor.runPreBacktest = async function() {
+    const btn = document.getElementById('saPreBtBtn');
+    const extra = document.getElementById('saExtra');
+    const root = document.getElementById('modalRoot');
+    const titleEl = root && root.querySelector('h3 span');
+    const code = titleEl ? titleEl.textContent.trim() : '';
+    if (!code || !extra || !window.Core.PreBacktest) return;
+    if (btn) btn.disabled = true;
+    extra.innerHTML = '<div style="padding:8px 12px;color:var(--text-muted);font-size:12px;">⏳ 拉取近 2 年 K 线 + 回测中 (约 5-15 秒)...</div>';
+    // 假设文本用简评全文 (含多方/空方/动作建议), 供策略映射
+    const assumption = (_lastBrief && _lastBrief.code === code) ? _lastBrief.text : '';
+    const r = await Core.PreBacktest.runForPick({ code, assumption });
+    if (btn) btn.disabled = false;
+    extra.innerHTML = r
+      ? Core.PreBacktest.renderResultHtml(r)
+      : Core.PreBacktest.renderUnavailableHtml();
+  };
+
+  /**
+   * Phase D2: 🤝 第二意见 (双模型交叉验证, 按需触发)
+   * 流程: 第二个已配置 provider 对同一份上下文再跑一次简评 (1 次调用)
+   *       → 两段并排展示 → 主模型做 ≤100 字一致性小结 (1 次调用)
+   * 第二 provider 的 key 在设置页"第二意见"区配置 (state.apiKeys.llm)
+   */
+  window.StockAdvisor.runSecondOpinion = async function() {
+    const extra = document.getElementById('saExtra');
+    if (!extra || !window.Core.CrossCheck) return;
+    if (_currentTab !== 'brief' || !_lastBrief || !_lastBrief.text) {
+      toastError('请先在 💡 AI 简评 tab 跑一次简评, 再来要第二意见');
+      return;
+    }
+    const second = Core.CrossCheck.resolveSecondOpinion(Core.State.get());
+    if (!second) {
+      toastError('请先在设置里配置第二个 LLM 的 API Key (⚙️ 设置 → 🤝 第二意见)');
+      return;
+    }
+    const mainCfg = Core.AI.getConfig();
+    const mainLabel = `${Core.AI.getProviderConfig(mainCfg.provider).name || mainCfg.provider} / ${mainCfg.model}`;
+    const secondLabel = `${second.label} / ${second.model}`;
+
+    const btn = document.getElementById('saSecondBtn');
+    if (btn) btn.disabled = true;
+    extra.innerHTML = `<div style="padding:8px 12px;color:var(--text-muted);font-size:12px;">⏳ 第二意见 (${escapeHtml(secondLabel)}) 生成中, 大约 10-20 秒...</div>`;
+
+    try {
+      // 第 1 次调用: 第二 provider 重跑同一上下文
+      // local:false 强制远程, 防止"优先本地"把 baseURL 覆盖劫持到本地 LLM
+      const textB = await Core.AI.callWithTimeout({
+        systemPrompt: _lastBrief.systemPrompt,
+        prompt: _lastBrief.prompt,
+        baseURL: second.baseURL,
+        apiKey: second.apiKey,
+        model: second.model,
+        local: false,
+        maxTokens: 1000,
+        timeout: 90000
+      });
+      if (!textB || !textB.trim()) throw new Error('第二意见返回为空');
+
+      extra.innerHTML = _renderSecondOpinion(_lastBrief.text, textB, mainLabel, secondLabel, null);
+
+      // 第 2 次调用: 主模型对两份输出做一致性小结 (走默认配置, 尊重优先本地)
+      try {
+        const summary = await Core.AI.callWithTimeout({
+          prompt: Core.CrossCheck.buildComparePrompt(_lastBrief.text, textB, mainLabel, secondLabel),
+          maxTokens: 300,
+          timeout: 60000
+        });
+        extra.innerHTML = _renderSecondOpinion(_lastBrief.text, textB, mainLabel, secondLabel, summary);
+      } catch (e) {
+        console.warn('[sa] 一致性小结失败:', e);
+        extra.innerHTML = _renderSecondOpinion(_lastBrief.text, textB, mainLabel, secondLabel, '⚠ 一致性小结失败: ' + e.message);
+      }
+    } catch (e) {
+      console.warn('[sa] 第二意见失败:', e);
+      extra.innerHTML = `<div style="padding:8px 12px;font-size:12px;color:var(--down);">❌ 第二意见失败: ${escapeHtml(e.message)}</div>`;
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  };
+
+  /**
+   * Phase D2: 第二意见并排渲染 (全转义)
+   * summary 为 null 时显示"对比中"占位
+   */
+  function _renderSecondOpinion(textA, textB, labelA, labelB, summary) {
+    const panel = (label, text, border) =>
+      `<div style="flex:1;min-width:220px;padding:10px 12px;background:var(--bg-base);border-radius:6px;border-left:3px solid ${border};">` +
+      `<div style="font-size:11px;color:var(--text-muted);margin-bottom:6px;">${escapeHtml(label)}</div>` +
+      `<div style="white-space:pre-wrap;font-size:12px;line-height:1.6;">${escapeHtml(text)}</div></div>`;
+    const summaryHtml = summary === null
+      ? '<div style="margin-top:8px;font-size:12px;color:var(--text-muted);">⏳ 主模型一致性对比中...</div>'
+      : `<div style="margin-top:8px;padding:8px 12px;background:var(--bg-base);border-radius:6px;font-size:12px;line-height:1.6;border-left:3px solid var(--accent);"><strong>🤝 结论一致性</strong><br>${escapeHtml(summary)}</div>`;
+    return `<div style="display:flex;gap:8px;flex-wrap:wrap;">${panel('主模型 · ' + labelA, textA, 'var(--accent)')}${panel('第二意见 · ' + labelB, textB, 'var(--up)')}</div>${summaryHtml}`;
+  }
 
   function _highlightTab() {
     document.querySelectorAll('.sa-tab').forEach(b => {
@@ -118,6 +232,14 @@
       data.context = ctx ? Core.Data.formatAiContextForPrompt(ctx) : '(市场上下文不可用)';
       data.kb = Core.KB.formatForPrompt(kbEntries);
       data.intl = await Core.Data.getIntlSnapshot().then(s => Core.Data.formatIntlForPrompt(s)).catch(e => '(国际形势不可用)');
+      // Phase D1: 近期公告上下文 (最近 5 条标题+日期; null=拉取失败 → "公告数据不可用")
+      if (window.Core.News && typeof Core.News.getStockNotices === 'function') {
+        const notices = await Core.News.getStockNotices(code, 5)
+          .catch(e => { console.warn('[sa] 公告拉取失败:', e); return null; });
+        data.notices = Core.News.formatNoticesForPrompt(notices, 5);
+      } else {
+        data.notices = '(公告数据不可用)';
+      }
     } catch (e) {
       console.warn('[sa] 数据拉取失败:', e);
       if (ld) ld.textContent = '❌ 数据拉取失败: ' + e.message;
@@ -145,12 +267,20 @@
       '',
       '【KB 引用】如有相关条目, 引用条目号: "..., 参考 KB-VAL-002 PB-ROE 匹配"',
       '',
-      '【硬性】不许编造数字; 没有的数据说"无"; 总长度 250-450 字',
+      '【硬性】不许编造数字; 没有的数据说"无"; 总长度 300-550 字',
       '',
       '【Phase P 多视角辩论】在 📌 动作建议 之前, 增加:',
       '  📈 多方观点 (80 字): 看多的依据 (估值/资金/政策)',
       '  📉 空方观点 (80 字): 看空的依据 (估值/行业/技术)',
-      '  ⚖️ 综合判断 (40 字): 权衡后倾向'
+      '  ⚖️ 综合判断 (40 字): 权衡后倾向',
+      '',
+      '【Phase D1 pre-mortem 强制】在 ⚖️ 综合判断 之后, 必须逐行输出 4 行 (标签照抄):',
+      '  看多: ≤2 条看多理由 (引用具体数据)',
+      '  看空: ≤2 条看空理由 (必填, 禁止"无明显风险/暂无风险"这类空话, 写具体风险)',
+      '  证伪条件: 出现什么情况说明以上判断错了 (具体可观测, 如"跌破 20 日线且放量"/"季报净利润增速 <10%")',
+      '  失效条件: 建议多久没兑现就该放弃 (如"2 周内未突破 X 元")',
+      '',
+      '【近期公告】数据里有 notices 字段 ("近期无公告"/"公告数据不可用" 也有可能), 风险点和证伪条件须结合公告 (如减持/增发/诉讼)'
     ].join('\n');
 
     const prompt = `单股简评请求:\n${JSON.stringify(data, null, 2)}\n\n请按上面 4 段结构输出。`;
@@ -182,7 +312,7 @@
           systemPrompt,
           prompt,
           stream: true,
-          maxTokens: 800,
+          maxTokens: 1000,
           onChunk: (delta, full) => {
             if (ld) ld.remove();
             if (el) el.textContent = full;
@@ -196,6 +326,18 @@
         }
       }
       if (el) el.innerHTML = window.Core.Util.renderWithSources(finalText);
+
+      // Phase D2: 缓存本次简评上下文, 供 "🤝 第二意见" 换 provider 重跑同一份输入
+      _lastBrief = { code, name, systemPrompt, prompt, text: finalText };
+
+      // Phase D1: pre-mortem 软校验 (free-text 无 JSON schema, 缺字段只警告不拦截, 不崩 UI)
+      if (el && el.parentElement && finalText && !(finalText.includes('证伪') && finalText.includes('失效'))) {
+        const pmWarn = document.createElement('div');
+        pmWarn.className = 'sa-premortem-warn';
+        pmWarn.style.cssText = 'margin-top:12px;padding:8px 12px;background:var(--bg-base);border-radius:6px;font-size:12px;border-left:3px solid var(--down);';
+        pmWarn.textContent = '⚠ 本次输出缺少 pre-mortem 字段 (看多/看空/证伪条件/失效条件), 可点 🔄 重评重新生成';
+        el.parentElement.appendChild(pmWarn);
+      }
 
       // Phase P 反向 self-check (后台)
       const checkEl = document.createElement('div');
@@ -428,6 +570,7 @@
    * 不入键:
    *   - 基本面 (PE/PB/ROE): 日级别变化, 24h 缓存期内应可复用
    *   - KB 条目: 本地静态, 不影响输出
+   *   - 近期公告 (Phase D1): 6h 级数据, 24h 缓存期内复用可接受 (重评按钮可强制刷新)
    */
   function _briefCacheKey(code, context, intl) {
     const data = `brief_${code}_${(context || '').slice(0, 50)}_${(intl || '').slice(0, 50)}`;

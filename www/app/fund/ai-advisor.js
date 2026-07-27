@@ -212,7 +212,8 @@
       "category": "short_bond / pure_bond / mixed_bond / wide",
       "reasons": ["收益来源 1 句", "宏观契合 1 句 (引用具体数据)", "政策/新闻契合 1 句 (如提供)", "风险点 1 句"],
       "riskScore": 1-5 (1=极低风险, 5=高风险),
-      "confidence": "高" | "中" | "低"
+      "confidence": "高" | "中" | "低",
+      ${Core.Premortem.PROMPT_SPEC}
     }
   ],
   "allocation": "短债/纯债/宽基 配比说明",
@@ -230,7 +231,8 @@
    - 风险点 (利率风险/信用风险/流动性风险/政策风险)
 7. **KB 引用**: 如有相关条目 (data.kb 字段), 在 reasons 里引用条目号, kbRefs 数组填条目号
 8. **置信度**: confidence = 高 (多维数据一致+符合 KB 经典模式) / 中 (数据冲突或 KB 不明确) / 低 (新策略/极端市场)
-9. 禁止用"建议投资""一定赚钱"等绝对化表述`;
+9. **pre-mortem 必填**: 每只 pick 必须给 bullCase/bearCase/falsifyCondition/invalidation 四字段; bearCase 禁止"无明显风险/暂无风险"空话 (利率/信用/流动性/政策风险至少写一条具体的), falsifyCondition 必须具体可观测 (如"10 年期国债收益率上行超 X bp"/"单月回撤 >X%")
+10. 禁止用"建议投资""一定赚钱"等绝对化表述`;
 
     const userPrompt = `【用户画像】
 - 总金额: ${amount} 元
@@ -274,6 +276,14 @@ ${candidatesText}
         arrayItemTypes: { picks: 'object' }
       };
       const parsed = Core.AI.parseJsonOutput(fullText, AI_FUND_SCHEMA);
+      // Phase D1: pre-mortem 四字段并入必填校验 (缺字段 → 走同一套降级模式)
+      if (parsed.ok) {
+        const pmErrs = Core.Premortem.checkPicks(parsed.obj.picks || []);
+        if (pmErrs.length > 0) {
+          parsed.ok = false;
+          parsed.errors = parsed.errors.concat(pmErrs);
+        }
+      }
       if (parsed.ok) {
         const obj = parsed.obj;
         const picks = obj.picks || [];
@@ -308,6 +318,7 @@ ${candidatesText}
                 <span class="ai-risk-score" style="color:${riskColor};">风险 ${p.riskScore || '?'}/5</span>
               </div>
               <ul class="ai-pick-reasons">${reasons}</ul>
+              ${Core.Premortem.renderBlock(p)}
             </div>
           `;
         }).join('');

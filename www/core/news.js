@@ -117,6 +117,88 @@
   }
 
   /**
+   * 东财公告列表按个股过滤 (纯函数, 测试钩子)
+   * @param {Array} list 东财 API 返回的 data.list
+   * @param {string} code 6 位股票代码
+   * @param {number} limit 最多取几条
+   */
+  function _filterNoticesByCode(list, code, limit = 5) {
+    if (!Array.isArray(list)) return [];
+    return list
+      .filter(d => Array.isArray(d.codes) && d.codes.some(c => String(c.stock_code) === String(code)))
+      .slice(0, limit)
+      .map(d => ({
+        code: String(code),
+        title: d.title || '',
+        date: (d.notice_date || '').slice(0, 10),
+        url: d.art_code ? `https://data.eastmoney.com/notices/detail/${d.art_code}.html` : ''
+      }));
+  }
+
+  /**
+   * 拉单只股票近期公告 (Phase D1)
+   * 主路径: 东财公告 API 支持 stock_list={code} 按个股查询 (已验证)
+   * 兜底: stock_list 请求失败时拉全量 page_size=100 后按 codes[].stock_code 本地过滤
+   * 缓存: 6h, 走 Core.Storage.cacheGet/cacheSet
+   * @param {string} code 6 位股票代码
+   * @param {number} [limit=5]
+   * @returns {Array|null} 公告数组; null = 拉取失败 (调用方降级"公告数据不可用")
+   */
+  async function getStockNotices(code, limit = 5) {
+    if (!code) return null;
+    const cacheKey = `notices_${code}`;
+    try {
+      const cached = await Core.Storage.cacheGet(cacheKey);
+      if (cached) return cached;
+    } catch (e) { console.warn('[News] 公告缓存读取失败:', e); }
+
+    const headers = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Referer': 'https://data.eastmoney.com/'
+    };
+    let notices = null;
+    try {
+      const url = `https://np-anotice-stock.eastmoney.com/api/security/ann?sr=-1&page_size=${limit}&page_index=1&ann_type=A&client_source=web&stock_list=${encodeURIComponent(code)}&f_node=0&s_node=0`;
+      const resp = await fetch(url, { method: 'GET', headers });
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const j = await resp.json();
+      if (!j || !j.data || !Array.isArray(j.data.list)) throw new Error('返空');
+      // stock_list 已按个股过滤, 再走一遍纯函数统一字段格式 (limit 已由接口保证)
+      notices = _filterNoticesByCode(j.data.list, code, limit);
+    } catch (e) {
+      console.warn('[News] 个股公告 stock_list 拉取失败, 尝试全量过滤:', e.message);
+      try {
+        // 兜底: 全量拉 100 条, 本地按 codes[].stock_code 过滤 (接口不支持时的降级路径)
+        const url = 'https://np-anotice-stock.eastmoney.com/api/security/ann?sr=-1&page_size=100&page_index=1&ann_type=A&client_source=web&f_node=0&s_node=0';
+        const resp = await fetch(url, { method: 'GET', headers });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const j = await resp.json();
+        if (!j || !j.data || !Array.isArray(j.data.list)) throw new Error('返空');
+        notices = _filterNoticesByCode(j.data.list, code, limit);
+      } catch (e2) {
+        console.warn('[News] 个股公告全量兜底也失败:', e2.message);
+        return null;
+      }
+    }
+
+    try { await Core.Storage.cacheSet(cacheKey, notices, TTL_6H); } catch (e) { console.warn('[News] 公告缓存写入失败:', e); }
+    return notices;
+  }
+
+  /**
+   * 公告列表格式化为 prompt 文本 (纯函数)
+   * @param {Array|null} notices null=拉取失败, []=无公告
+   * @param {number} [maxItems=5]
+   */
+  function formatNoticesForPrompt(notices, maxItems = 5) {
+    if (notices === null || notices === undefined) return '## 近期公告\n(公告数据不可用)';
+    if (!Array.isArray(notices) || notices.length === 0) return '## 近期公告\n近期无公告';
+    const items = notices.slice(0, maxItems);
+    return '## 近期公告 (最近 ' + items.length + ' 条)\n' +
+      items.map((n, i) => `[${i + 1}] ${n.date || '-'} ${n.title}`).join('\n');
+  }
+
+  /**
    * 百度经济新闻 (aktools) → 当作政策密度补充源
    * URL: stock_news_economic_baidu / news_economic_baidu
    * 字段 (akshare 0.10+): { title, url,ptime }
@@ -232,6 +314,9 @@
   window.Core.News = {
     get: _fetch,
     formatForPrompt,
-    refresh
+    refresh,
+    getStockNotices,
+    formatNoticesForPrompt,
+    _filterNoticesByCode
   };
 })();

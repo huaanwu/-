@@ -42,6 +42,9 @@ export default defineConfig({
         '/core/storage.js',
         '/core/data.js',
         '/core/discipline.js',
+        '/core/premortem.js',
+        '/core/prebacktest.js',
+        '/core/crosscheck.js',
         '/core/kb.js',
         '/core/util.js'
       ]

@@ -275,7 +275,8 @@
       "name": "xxx",
       "reasons": ["基本面/估值 1 句 (引用 PE/PB)", "技术面/资金面 1 句", "宏观/政策契合 1 句", "行业板块契合 1 句 (引用板块涨跌)"],
       "riskScore": 1-5 (1=极低, 5=高),
-      "confidence": "高" | "中" | "低"
+      "confidence": "高" | "中" | "低",
+      ${Core.Premortem.PROMPT_SPEC}
     }
   ],
   "risks": ["风险点 1", "风险点 2", "..."],
@@ -285,7 +286,8 @@
 4. **多维度分析**: 基本面/技术面/资金面/政策面/行业面
 5. **KB 引用**: 如有相关条目, 在 reasons 里引用条目号, kbRefs 数组填条目号
 6. **置信度**: 高 (多维数据一致+符合 KB 经典模式) / 中 (数据冲突) / 低 (极端市场/新策略)
-7. 严禁绝对化表述 ("一定涨" 等)`;
+7. **pre-mortem 必填**: 每只 pick 必须给 bullCase/bearCase/falsifyCondition/invalidation 四字段; bearCase 禁止"无明显风险/暂无风险"空话, falsifyCondition 必须具体可观测 (价格/指标/财报数字)
+8. 严禁绝对化表述 ("一定涨" 等)`;
 
       const userPrompt = `【用户筛选条件】
 ${condsDesc.length > 0 ? condsDesc.join(', ') : '(无特定条件, 全市场)'}
@@ -330,6 +332,14 @@ ${candidates}
           arrayItemTypes: { picks: 'object' }
         };
         const parsed = Core.AI.parseJsonOutput(fullText, AI_PICK_SCHEMA);
+        // Phase D1: pre-mortem 四字段并入必填校验 (缺字段 → 走同一套降级模式)
+        if (parsed.ok) {
+          const pmErrs = Core.Premortem.checkPicks(parsed.obj.picks || []);
+          if (pmErrs.length > 0) {
+            parsed.ok = false;
+            parsed.errors = parsed.errors.concat(pmErrs);
+          }
+        }
         if (parsed.ok) {
           const obj = parsed.obj;
           const picks = obj.picks || [];
@@ -344,7 +354,11 @@ ${candidates}
             const riskColor = p.riskScore >= 4 ? 'var(--down)' : (p.riskScore <= 2 ? 'var(--up)' : 'var(--text-muted)');
             const reasons = (p.reasons || []).map(r => `<li>${escapeHtml(r)}</li>`).join('');
             // 5.1.3: data-reasons / data-riskscore 让 addWatchlistFromPick 能拿到 AI 选股理由
+            // Phase D1: data-falsify / data-invalidation 一并沉淀到 journal + 模拟盘交易行
             const reasonsJson = JSON.stringify(p.reasons || []).replace(/"/g, '&quot;');
+            // Phase D2: 回测前置的"假设"文本 = 理由 + bullCase, 供策略映射 (技术突破→突破策略等)
+            const bullTxt = Array.isArray(p.bullCase) ? p.bullCase.join(' ') : (p.bullCase || '');
+            const assumptionTxt = escapeHtml((p.reasons || []).join(' ') + ' ' + bullTxt);
             return `
               <div class="ai-pick">
                 <div class="ai-pick-head">
@@ -352,10 +366,13 @@ ${candidates}
                   <span class="ai-risk-score" style="color:${riskColor};">风险 ${p.riskScore || '?'}/5</span>
                 </div>
                 <ul class="ai-pick-reasons">${reasons}</ul>
+                ${Core.Premortem.renderBlock(p)}
                 <div style="margin-top:6px;">
-                  <button class="btn btn-sm btn-primary" data-code="${escapeHtml(p.code)}" data-name="${escapeHtml(p.name || '')}" data-riskscore="${p.riskScore || ''}" data-reasons="${reasonsJson}" data-action="add">📌 加入自选</button>
+                  <button class="btn btn-sm btn-primary" data-code="${escapeHtml(p.code)}" data-name="${escapeHtml(p.name || '')}" data-riskscore="${p.riskScore || ''}" data-reasons="${reasonsJson}" data-falsify="${escapeHtml(p.falsifyCondition || '')}" data-invalidation="${escapeHtml(p.invalidation || '')}" data-action="add">📌 加入自选</button>
                   <button class="btn btn-sm" data-code="${escapeHtml(p.code)}" data-name="${escapeHtml(p.name || '')}" data-action="kline">📈 K线</button>
+                  <button class="btn btn-sm" data-code="${escapeHtml(p.code)}" data-assumption="${assumptionTxt}" data-action="backtest">📊 历史验证</button>
                 </div>
+                <div class="pb-result"></div>
               </div>
             `;
           }).join('');
@@ -376,6 +393,9 @@ ${candidates}
                 btn.onclick = () => this._addWatchlistFromPick(btn, code, name);
               } else if (action === 'kline') {
                 btn.onclick = () => Watchlist.showKLine(code, name);
+              } else if (action === 'backtest') {
+                // Phase D2: 回测前置 (按需, 用户点击才跑)
+                btn.onclick = () => this._runPreBacktest(btn, code);
               }
             });
           }
@@ -392,6 +412,25 @@ ${candidates}
         }
         toastError('AI 调用失败: ' + e.message);
       }
+    },
+
+    /**
+     * Phase D2: 单条 pick 的"📊 历史验证" (回测前置, 按需触发)
+     * 结果渲染在该卡片 .pb-result 里; 失败降级"回测不可用", 不影响建议展示
+     */
+    async _runPreBacktest(btn, code) {
+      const card = btn.closest('.ai-pick');
+      const box = card && card.querySelector('.pb-result');
+      if (!box || !window.Core.PreBacktest) return;
+      btn.disabled = true;
+      btn.textContent = '⏳ 回测中...';
+      const assumption = btn.dataset.assumption || '';
+      const r = await Core.PreBacktest.runForPick({ code, assumption });
+      btn.disabled = false;
+      btn.textContent = '📊 历史验证';
+      box.innerHTML = r
+        ? Core.PreBacktest.renderResultHtml(r)
+        : Core.PreBacktest.renderUnavailableHtml();
     },
 
     /**
@@ -413,6 +452,9 @@ ${candidates}
         let reasons = [];
         try { reasons = JSON.parse(btn.dataset.reasons || '[]'); } catch (e) { /* ignore */ }
         const riskScore = btn.dataset.riskscore || '';
+        // Phase D1: pre-mortem 证伪/失效条件, 供 --verify 事后验证对照
+        const falsifyCondition = (btn.dataset.falsify || '').trim();
+        const invalidation = (btn.dataset.invalidation || '').trim();
 
         const conds = (this._lastAiContext && this._lastAiContext.conditions) || {};
         const condsDesc = [];
@@ -446,6 +488,13 @@ ${candidates}
         if (this._lastAiContext && this._lastAiContext.marketView) {
           lines.push(`### 📈 大盘视角\n${this._lastAiContext.marketView}\n`);
         }
+        // Phase D1: pre-mortem 证伪/失效条件 (事后验证对照锚点)
+        if (falsifyCondition || invalidation) {
+          lines.push('### 🔬 Pre-mortem');
+          if (falsifyCondition) lines.push(`- **证伪条件**: ${falsifyCondition}`);
+          if (invalidation) lines.push(`- **失效条件**: ${invalidation}`);
+          lines.push('');
+        }
         lines.push('---');
         lines.push('*本条由 StockMaster 选股页 [📌 加入自选] 自动生成, 用于后续复盘追溯*');
 
@@ -461,12 +510,16 @@ ${candidates}
           createdAt: Date.now(),
           updatedAt: Date.now()
         };
+        // Phase D1: 非索引字段, 供 --verify 事后验证对照 (不改 DB schema)
+        if (falsifyCondition) journal.falsifyCondition = falsifyCondition;
+        if (invalidation) journal.invalidation = invalidation;
         await Core.Storage.add('journals', journal);
         toastSuccess(`已记入复盘: ${code} 选股理由`);
 
         // 3) 模拟盘自动成交 (Phase A: AI 建议按真实行情在模拟盘成交; Paper 不存在则跳过, 不硬依赖)
+        // Phase D1: 证伪/失效条件随 pick 传给模拟盘, 写入 transactions 行
         if (window.Paper && typeof window.Paper.autoTradeFromPick === 'function') {
-          window.Paper.autoTradeFromPick({ code, name });
+          window.Paper.autoTradeFromPick({ code, name, falsifyCondition, invalidation });
         }
       } catch (e) {
         console.error('[Screener] _addWatchlistFromPick 失败:', e);

@@ -62,14 +62,14 @@ cd android && ./gradlew assembleDebug   # 产物: android/app/build/outputs/apk/
 ### 测试与类型检查
 
 ```bash
-npm test                    # = node test/test_runtime.js && node test/test_all.js,纯 Node 无浏览器,24 节 560+ 断言
+npm test                    # = node test/test_runtime.js && node test/test_all.js,纯 Node 无浏览器,26 节 600+ 断言
 npm run typecheck           # tsc --noEmit
 node scripts/e2e.mjs        # 端到端冒烟:Chrome headless + CDP(不依赖 puppeteer),9 项断言 + 截图到 e2e_screenshots/
 node scripts/daily_summary.mjs --verify-dry-run ./journals.json   # 事后验证 dry-run
 node scripts/daily_summary.mjs --premarket   # Phase C 盘前简报 (隔夜外盘+日历+财新要闻 → LLM → 飞书; 建议 Windows 计划任务 交易日 08:30)
 ```
 
-`test/test_all.js` 24 节:JS 语法、域脚本接口完备性 (`DOMAINS` 字典)、Core 命名空间导出、index.html script 引用对账、Worker 结构、关键文件存在、Data 层方法签名、回测引擎 vm 沙箱实测、Vite external 对账、journal/market/fund/alerts 纯函数实测、daily_summary 单测 (含 --premarket 盘前简报)、5.1/5.2/5.3 互通闭环实测、数据源限流、Paper 模拟盘纯函数实测 (含 Phase C EOD 日终小结)、Discipline 纪律引擎实测。**改完域脚本或新增域方法必须先 `npm test`,并同步更新该文件的 `DOMAINS` 字典。**
+`test/test_all.js` 26 节:JS 语法、域脚本接口完备性 (`DOMAINS` 字典)、Core 命名空间导出、index.html script 引用对账、Worker 结构、关键文件存在、Data 层方法签名、回测引擎 vm 沙箱实测、Vite external 对账、journal/market/fund/alerts 纯函数实测、daily_summary 单测 (含 --premarket 盘前简报)、5.1/5.2/5.3 互通闭环实测、数据源限流、Paper 模拟盘纯函数实测 (含 Phase C EOD 日终小结)、Discipline 纪律引擎实测、Phase D1 pre-mortem + 个股公告实测、Phase D2 回测前置 + 双模型实测。**改完域脚本或新增域方法必须先 `npm test`,并同步更新该文件的 `DOMAINS` 字典。**
 
 `scripts/e2e.mjs` 注意:Chrome 路径硬编码 `C:\Program Files\Google\Chrome\Application\chrome.exe`,需要 Vite 已在 3003 端口跑着。
 
@@ -85,6 +85,9 @@ www/                        # Web 根 (= Capacitor webDir,Vite root)
 │   ├── storage.js          # Dexie 4:9 表 + cacheGet/cacheSet(TTL 默认 5 分钟)+ kv + clearAll
 │   ├── data.js             # Core.Data:fetchWithCache + getStockSpot/getStockQuote/getStockKLine/getFundSpot/getIndexSpot;腾讯财经备用源(GBK 解码)
 │   ├── discipline.js       # Core.Discipline:交易纪律引擎(Phase B),买入前硬校验(假设/止损必填、单票/总仓位、月度回撤熔断、追高/重复错误警告),实盘模拟盘共用
+│   ├── premortem.js        # Core.Premortem:AI 建议 pre-mortem 工具(Phase D1),PROMPT_SPEC 字段说明 + checkPick/checkPicks 校验 + renderBlock 四象限渲染
+│   ├── prebacktest.js      # Core.PreBacktest:AI 建议"回测前置"(Phase D2),pickStrategy/judgeVerdict 纯函数 + runForPick(近2年日K→worker回测,15s超时,失败返null) + renderResultHtml 徽章
+│   ├── crosscheck.js       # Core.CrossCheck:双模型交叉验证(Phase D2),pickSecondProvider(state.apiKeys.llm map)/resolveSecondOpinion/buildComparePrompt
 │   ├── state.js            # 持久化全局状态(proxyBase/apiKeys/ai/sync/currentPage/marketOpen)
 │   ├── toast.js / router.js# 吐司提示;hash 路由(switchPage 触发 window._onShow_{pageId})
 │   ├── ai-service.js       # Core.AI:6 provider + resolveEndpoint({local}) 本地 LLM 优先降级
@@ -199,12 +202,35 @@ vite.config.js              # root=www,域脚本 external 列表,dev proxy
 | 模拟盘接入 | `www/app/paper.js` | `buyFromForm` 同款校验; `autoTradeFromPick` blocks 命中 console.warn 跳过, warns 写交易行 `disciplineWarns` (AI 场景假设固定'题材催化', 止损=成交价×0.92) |
 
 ### Phase C 决策自动化流水线 (瘦身版)
-
 | 子项 | 实现位置 | 关键方法 |
 |------|----------|----------|
 | C.1 盘前简报 (Node 侧) | `scripts/daily_summary.mjs` | `--premarket` CLI; `runPremarket(deps)` / `fetchUsIndices` (index_us_stock_sina) / `buildEconomicCalendar` (本地公开日期规则: LPR/MLF/PMI/CPI/季报密集期, 无事件不编造) / `fetchCaixinNews` (stock_news_main_cx) / `formatPremarketRaw` / `buildPremarketPrompt`; 每块失败独立降级"本节数据不可用", LLM 失败降级原始罗列版; 不含持仓数据 (Node 读不到 IndexedDB) |
 | C.2 模拟盘日终小结 (浏览器侧) | `www/app/paper.js` | `Paper.maybeGenerateEodReport(now)` (工作日 ≥15:30 且当日无记录才生成, `_shouldGenerateEod` 纯函数可注入时间) / `_buildEodReport` (现金/市值/总资产/当日盈亏对照昨日快照 + 当日成交 🤖=AI 自动 + 纪律拦截 + 持仓 Top/Bottom) / `_pushEodToFeishu` (kv `feishu_webhook`, 失败只 warn) / `_renderEodReport` (页面"日终小结"区块); kv `paper_eod_reports` 上限 60, kv `paper_discipline_log` 上限 100 (`_logDisciplineBlock`, autoTradeFromPick 被 blocks 时 append); AI 自动成交交易行带 `auto: true` 标记 |
 | C.3 启动钩子 | `www/app.js` | init 里 `Paper.init()` 后 `Paper.maybeGenerateEodReport().catch(...)` (不 await 不阻塞) |
+
+### Phase D AI 建议"高手化" (D1)
+
+| 子项 | 实现位置 | 关键方法 |
+|------|----------|----------|
+| D1.1 pre-mortem 工具 | `www/core/premortem.js` | `Core.Premortem.PROMPT_SPEC` (四字段 prompt 说明, bullCase/bearCase/falsifyCondition/invalidation, 禁"无明显风险"空话) / `checkPick`/`checkPicks` (校验, bearCase 空话黑名单) / `renderBlock` (四象限小区块, 全转义) |
+| D1.2 screener 接入 | `www/app/screener.js` | systemPrompt 拼 PROMPT_SPEC; parseJsonOutput 后再跑 checkPicks, 缺字段走 Phase T 同一降级 (警告+原始输出+重生成); picks 卡片渲染 renderBlock; `_addWatchlistFromPick` 把 falsifyCondition/invalidation 写入 journal 行 (非索引字段) + content Pre-mortem 段, 并透传 `Paper.autoTradeFromPick` |
+| D1.3 ai-advisor 接入 | `www/app/fund/ai-advisor.js` | 同款 prompt/校验/渲染三处接线 |
+| D1.4 单股 💡 接入 | `www/app/stock-advisor.js` | free-text 无 schema: prompt 强制 4 行 pre-mortem (看多/看空/证伪条件/失效条件), 输出后软校验 (缺"证伪/失效"只警告不拦截); maxTokens 800→1000 |
+| D1.5 模拟盘沉淀 | `www/app/paper.js` | `buy` opts 增加 falsifyCondition/invalidation → transactions 行 (非索引字段); autoTradeFromPick 透传 |
+| D1.6 个股公告上下文 | `www/core/news.js` | `Core.News.getStockNotices(code, limit)` (东财 ann API `stock_list` 按个股查询, 失败兜底全量+本地 `_filterNoticesByCode` 过滤, 6h 缓存, 双路径失败返 null) / `formatNoticesForPrompt` (null→"公告数据不可用", 空→"近期无公告"); 注入单股 💡 简评 prompt `data.notices` (最近 5 条标题+日期); ai-advisor/weekly-report 标的是基金非个股, 未注入 |
+
+### Phase D2 回测前置 + 双模型交叉验证
+
+> 全部为**按需触发** (按钮), 不接任何自动流程。
+
+| 子项 | 实现位置 | 关键方法 |
+|------|----------|----------|
+| D2.1 回测前置工具 | `www/core/prebacktest.js` | `Core.PreBacktest.runForPick({ code, assumption })` (近 2 年日 K → 策略映射 → worker 回测, 15s 超时, 任何失败返 null 降级) / `pickStrategy` (技术突破词→breakout, 业绩拐点/估值修复→ma_cross, 默认 ma_cross) / `judgeVerdict` (sharpe<0→'历史无效', 0~0.5→'历史表现一般', ≥0.5→'历史有效', 阈值常量 THRESHOLDS) / `formatResult` / `renderResultHtml` (徽章+Sharpe/最大回撤/年化/胜率/笔数, 全转义) / `renderUnavailableHtml` |
+| D2.2 screener 接入 | `www/app/screener.js` | picks 卡片加"📊 历史验证"按钮 (`data-action="backtest"`, `data-assumption`=理由+bullCase), `_runPreBacktest` 跑完渲染到卡片 `.pb-result` |
+| D2.3 单股 💡 接入 | `www/app/stock-advisor.js` | 弹窗 footer 加"📊 历史验证"(`runPreBacktest`, 假设=简评全文) 和"🤝 第二意见"(`runSecondOpinion`); `_lastBrief` 缓存本次简评上下文; 结果渲染 `#saExtra` |
+| D2.4 双模型工具 | `www/core/crosscheck.js` | `Core.CrossCheck.pickSecondProvider` (从 `state.apiKeys.llm` map 按 PROVIDER_ORDER 找第一个 ≠当前且配 key 的 provider, custom 除外) / `resolveSecondOpinion(state)` (勾代理→`/api/llm/{provider}/v1`, 否则 provider 默认 baseURL; 未配置返 null → 调用方 toast) / `buildComparePrompt` (主模型 ≤100 字一致性小结) |
+| D2.5 第二意见调用 | `www/app/stock-advisor.js` | `Core.AI.callWithTimeout` + opts 覆盖 `baseURL/apiKey/model` + `local:false` (强制远程, 防"优先本地"劫持), 第二 provider 重评 (1 次) → 双段并排 → 主模型一致性小结 (1 次); 不改 ai-service.js |
+| D2.6 设置页 | `www/app.js` | "🤝 第二意见"区: provider 下拉 (排除 custom) + per-provider key 输入, 存 `state.apiKeys.llm` map (留空=删除该 provider key); `_secondProviderOptions` / `onSecondProviderChange` |
 
 ### 8 大页面域 + Core 模块
 
@@ -228,6 +254,6 @@ vite.config.js              # root=www,域脚本 external 列表,dev proxy
 
 ### 测试与验收
 
-- `npm test` — 500+ 项单元 + 沙箱测试 (`test/test_runtime.js` + `test/test_all.js`, 24 节)
+- `npm test` — 500+ 项单元 + 沙箱测试 (`test/test_runtime.js` + `test/test_all.js`, 26 节)
 - `node scripts/e2e.mjs` — Chrome headless 端到端 (9 项 + 截图到 `e2e_screenshots/`)
 - `node scripts/daily_summary.mjs --verify-dry-run ./journals.json` — 事后验证 dry-run

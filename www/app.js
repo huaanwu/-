@@ -142,8 +142,8 @@ window._renderSettings = function() {
     ? `当前已设: ${escapeHtml(ai.model)} (留空用默认 ${currentPcfg.defaultModel}; 其他可填: ${currentPcfg.models.join(', ')})`
     : `默认: ${currentPcfg.defaultModel}; 可填: ${currentPcfg.models.join(', ')}`;
 
-  // 渲染后异步更新 sync auth area
-  setTimeout(() => _renderSyncAuth(), 0);
+  // 渲染后异步更新 sync auth area + 第二意见 key 带出
+  setTimeout(() => { _renderSyncAuth(); onSecondProviderChange(); }, 0);
   root.innerHTML = `
     <div class="form-row" style="border-top:1px solid var(--border);padding-top:12px;margin-top:12px;">
       <label style="font-size:14px;font-weight:600;">📊 数据源路由 (c v0.2)</label>
@@ -249,6 +249,26 @@ window._renderSettings = function() {
       <span id="aiLocalTestResult" style="font-size:12px;color:var(--text-muted);margin-left:8px;"></span>
     </div>
 
+    <div class="form-row" style="border-top:1px solid var(--border);padding-top:12px;margin-top:12px;">
+      <label style="font-size:14px;font-weight:600;">🤝 第二意见 (双模型交叉验证, Phase D2)</label>
+      <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;line-height:1.5;">
+        给 💡 单股简评配第二个 LLM: 选一个 ≠ 主 Provider 的厂商, 填它的 API Key, 保存。<br>
+        之后在 💡 简评弹窗点 "🤝 第二意见", 两个模型对同一份上下文各评一次 + 主模型出一致性小结。<br>
+        已配置 Key 的 Provider: <b>${_secondOpinionConfiguredList()}</b>
+      </div>
+    </div>
+    <div class="form-row">
+      <label>第二意见 Provider</label>
+      <select id="settingSecondProvider" onchange="onSecondProviderChange()">
+        ${_secondProviderOptions(ai.provider || 'deepseek')}
+      </select>
+    </div>
+    <div class="form-row">
+      <label>第二意见 API Key</label>
+      <input type="password" id="settingSecondApiKey" value="" placeholder="sk-...  (留空 = 删除该 Provider 的 Key)" autocomplete="off">
+      <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">Key 按 Provider 分别保存, 切换上面的下拉会带出已存的 Key。</div>
+    </div>
+
     <div class="form-row">
       <label>健康检查</label>
       <button class="btn" onclick="checkHealth()">🔗 检查代理连接</button>
@@ -309,6 +329,36 @@ window._renderSettings = function() {
       <span style="font-size:11px;color:var(--text-muted);margin-left:8px;">填完所有改动后点这个一次保存</span>
     </div>
   `;
+};
+
+// ===== Phase D2: 第二意见 (双模型交叉验证) 设置辅助 =====
+// key 存 Core.State.apiKeys.llm = { [provider]: key }, 与主 AI 配置的单一 apiKey 互不干扰
+// custom 不走 dev-proxy, 不作为第二意见候选
+
+function _secondOpinionLlmKeys() {
+  const apiKeys = Core.State.get('apiKeys') || {};
+  return apiKeys.llm || {};
+}
+
+function _secondOpinionConfiguredList() {
+  const configured = Object.keys(_secondOpinionLlmKeys()).filter(p => _secondOpinionLlmKeys()[p]);
+  return configured.length > 0 ? configured.join(', ') : '无';
+}
+
+function _secondProviderOptions(currentProvider) {
+  const keys = _secondOpinionLlmKeys();
+  const candidates = Object.keys(Core.AI.PROVIDERS).filter(p => p !== 'custom');
+  // 默认选中: 第一个 ≠ 主 provider 且已配 key 的; 否则第一个 ≠ 主 provider 的
+  const def = candidates.find(p => p !== currentProvider && keys[p]) || candidates.find(p => p !== currentProvider) || candidates[0];
+  return candidates.map(p =>
+    `<option value="${p}" ${p === def ? 'selected' : ''}>${escapeHtml(Core.AI.PROVIDERS[p].name)}${keys[p] ? ' ✓' : ''}</option>`
+  ).join('');
+}
+
+window.onSecondProviderChange = function() {
+  const p = document.getElementById('settingSecondProvider')?.value;
+  const input = document.getElementById('settingSecondApiKey');
+  if (input) input.value = (_secondOpinionLlmKeys()[p]) || '';
 };
 
 window.onAIProviderChange = function() {
@@ -404,8 +454,16 @@ window.checkHealth = async function() {
 window.saveSettings = function(silent) {
   const proxyBase = document.getElementById('settingProxyBase').value.trim() || '/api/akshare';
   const tushareToken = document.getElementById('settingTushareToken').value.trim();
+  // Phase D2: 第二意见的 per-provider key (map), 只更新当前选中的那个 provider, 其余保留
+  const llmKeys = { ...(Core.State.get('apiKeys').llm || {}) };
+  const secondProvider = document.getElementById('settingSecondProvider')?.value || '';
+  const secondKey = document.getElementById('settingSecondApiKey')?.value.trim() || '';
+  if (secondProvider) {
+    if (secondKey) llmKeys[secondProvider] = secondKey;
+    else delete llmKeys[secondProvider];
+  }
   Core.State.set('proxyBase', proxyBase);
-  Core.State.set('apiKeys', { ...Core.State.get('apiKeys'), tushare: tushareToken });
+  Core.State.set('apiKeys', { ...Core.State.get('apiKeys'), tushare: tushareToken, llm: llmKeys });
 
   // AI 配置
   const aiProvider = document.getElementById('settingAIProvider')?.value || 'deepseek';

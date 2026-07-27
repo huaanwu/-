@@ -58,7 +58,7 @@ const DOMAINS = {
   'Holdings':  ['init', 'render', 'addDialog', 'editDialog', 'save', 'remove', 'addTxDialog', 'saveTx', 'closeModal'],
   'Paper':     ['init', 'buy', 'sell', 'getAccount', 'getPositions', 'resetAccount', 'snapshotIfNeeded', 'autoTradeFromPick', 'renderPage', 'buyFromForm', 'sellFromForm', 'sellAll', '_calcFee', '_roundLot', '_pushSnapshot', '_planAutoTrade', 'maybeGenerateEodReport', '_shouldGenerateEod', '_pushEodReport', '_appendDisciplineLog', '_logDisciplineBlock', '_buildEodReport', '_formatEodReportText', '_pushEodToFeishu', '_renderEodReport'],
   'Journal':   ['init', 'render', 'newDialog', 'editDialog', 'save', 'remove', 'closeModal', '_buildHoldingsContext', '_renderHoldingBadge', '_renderStructuredTags', '_runAiAssistant'],
-  'Screener':  ['init', 'run', '_addWatchlistFromPick'],
+  'Screener':  ['init', 'run', '_addWatchlistFromPick', '_runPreBacktest'],
   'Fund':      ['init', 'render', 'addDialog', 'save', 'remove', 'showChart', 'closeModal'],
   'Backtest':  ['init', 'run'],
   'Alerts':    ['init', 'render', 'addDialog', 'save', 'toggle', 'remove', 'closeModal', 'startPolling', 'stopPolling', '_fetchJournalContext']
@@ -87,7 +87,11 @@ const CORE_MODULES = {
   'core/ai-service.js': 'Core.AI',
   'core/sync.js':   'Core.Sync',
   'core/agents.js': 'Core.Agents',
-  'core/discipline.js': 'Core.Discipline'
+  'core/discipline.js': 'Core.Discipline',
+  'core/news.js':   'Core.News',
+  'core/premortem.js': 'Core.Premortem',
+  'core/prebacktest.js': 'Core.PreBacktest',
+  'core/crosscheck.js': 'Core.CrossCheck'
 };
 for (const [file, ns] of Object.entries(CORE_MODULES)) {
   const content = readFileSafe(path.join(WWW, file));
@@ -115,6 +119,40 @@ const DISC_METHODS = ['getConfig', 'setConfig', 'preBuyCheck', 'renderCheckResul
 for (const m of DISC_METHODS) {
   if (discContent && new RegExp(`\\b${m}\\s*\\(`).test(discContent)) ok(`Discipline.${m}`);
   else fail(`Discipline.${m}`, '缺失');
+}
+
+// 检查 Core.News 的方法清单 (Phase D1 新增 getStockNotices 等)
+const newsContent = readFileSafe(path.join(WWW, 'core/news.js'));
+const NEWS_METHODS = ['get', 'formatForPrompt', 'refresh', 'getStockNotices', 'formatNoticesForPrompt', '_filterNoticesByCode'];
+for (const m of NEWS_METHODS) {
+  if (newsContent && new RegExp(`\\b${m}\\s*\\(`).test(newsContent)) ok(`News.${m}`);
+  else fail(`News.${m}`, '缺失');
+}
+
+// 检查 Core.Premortem (Phase D1) 的方法清单
+const pmContent = readFileSafe(path.join(WWW, 'core/premortem.js'));
+const PM_METHODS = ['checkPick', 'checkPicks', 'renderBlock'];
+for (const m of PM_METHODS) {
+  if (pmContent && new RegExp(`\\b${m}\\s*\\(`).test(pmContent)) ok(`Premortem.${m}`);
+  else fail(`Premortem.${m}`, '缺失');
+}
+if (pmContent && pmContent.includes('PROMPT_SPEC') && pmContent.includes('falsifyCondition') && pmContent.includes('invalidation')) ok('Premortem.PROMPT_SPEC 字段说明');
+else fail('Premortem.PROMPT_SPEC', '缺字段说明');
+
+// 检查 Core.PreBacktest (Phase D2) 的方法清单
+const pbtContent = readFileSafe(path.join(WWW, 'core/prebacktest.js'));
+const PBT_METHODS = ['pickStrategy', 'judgeVerdict', 'formatResult', 'renderResultHtml', 'renderUnavailableHtml', 'runForPick'];
+for (const m of PBT_METHODS) {
+  if (pbtContent && new RegExp(`\\b${m}\\s*\\(`).test(pbtContent)) ok(`PreBacktest.${m}`);
+  else fail(`PreBacktest.${m}`, '缺失');
+}
+
+// 检查 Core.CrossCheck (Phase D2) 的方法清单
+const ccContent = readFileSafe(path.join(WWW, 'core/crosscheck.js'));
+const CC_METHODS = ['pickSecondProvider', 'resolveSecondOpinion', 'buildComparePrompt'];
+for (const m of CC_METHODS) {
+  if (ccContent && new RegExp(`\\b${m}\\s*\\(`).test(ccContent)) ok(`CrossCheck.${m}`);
+  else fail(`CrossCheck.${m}`, '缺失');
 }
 
 // ========== [4] index.html script 引用对得上 ==========
@@ -1182,6 +1220,9 @@ try {
   sctx.window.uuid = sctx.uuid;
   sctx.window.document = { getElementById: () => null };
   sctx.document = sctx.window.document;
+  // Phase D1: 捕获模拟盘自动成交参数 (pre-mortem 透传断言用)
+  const paperCalls = [];
+  sctx.window.Paper = { autoTradeFromPick: (pick) => { paperCalls.push(pick); } };
   vm.createContext(sctx);
   vm.runInContext(screenerSrc, sctx);
   const Screener = sctx.window.Screener;
@@ -1199,7 +1240,9 @@ try {
         code: '600519',
         name: '贵州茅台',
         riskscore: '2',
-        reasons: JSON.stringify(['估值修复', '业绩拐点', '宏观契合'])
+        reasons: JSON.stringify(['估值修复', '业绩拐点', '宏观契合']),
+        falsify: '跌破 20 日线且放量',
+        invalidation: '2 周内未突破 1800 元'
       },
       disabled: false,
       textContent: ''
@@ -1236,6 +1279,15 @@ try {
     await Screener._addWatchlistFromPick(fakeBtn, '600519', '贵州茅台');
     if (storageMock.watchlist.length === 1 && storageMock.journals.length === 1) ok('screener: 重复点击不重复写入');
     else fail('screener 重复点击', `watchlist=${storageMock.watchlist.length} journal=${storageMock.journals.length}`);
+
+    // 10) Phase D1: journal 行带 falsifyCondition/invalidation 非索引字段 + content 含 Pre-mortem 段
+    if (j.falsifyCondition === '跌破 20 日线且放量' && j.invalidation === '2 周内未突破 1800 元') ok('screener: journal 行沉淀 falsifyCondition/invalidation');
+    else fail('screener premortem 字段', JSON.stringify({ f: j.falsifyCondition, i: j.invalidation }));
+    if (j.content && j.content.includes('### 🔬 Pre-mortem') && j.content.includes('跌破 20 日线且放量') && j.content.includes('2 周内未突破 1800 元')) ok('screener: journal content 含 Pre-mortem 段');
+    else fail('screener premortem content', (j.content || '').slice(-300));
+    // 11) Phase D1: 模拟盘 autoTradeFromPick 收到 falsifyCondition/invalidation
+    if (paperCalls.length === 1 && paperCalls[0].falsifyCondition === '跌破 20 日线且放量' && paperCalls[0].invalidation === '2 周内未突破 1800 元') ok('screener: autoTradeFromPick 透传 pre-mortem 字段');
+    else fail('screener autoTrade 透传', JSON.stringify(paperCalls));
   })();
 } catch (e) {
   fail('5.1.3 screener↔watchlist+journal', e.message + ' / ' + (e.stack || ''));
@@ -2600,6 +2652,14 @@ section('23] Paper 模拟盘纯函数实测');
     if (txAuto.length === 1) ok('autoTradeFromPick: 交易行带 auto=true 标记');
     else fail('auto 标记', JSON.stringify(store2.tables.transactions));
 
+    // Phase D1: autoTradeFromPick 带 falsifyCondition/invalidation → 写入 transactions 行 (非索引字段)
+    store2.kv.paper_account.cash = 100000;
+    store2.quotes['600111'] = { 代码: '600111', 名称: '北方稀土', 最新价: 20 };
+    const r3 = await P2.autoTradeFromPick({ code: '600111', name: '北方稀土', falsifyCondition: '跌破 20 日线且放量', invalidation: '2 周内未突破 25 元' });
+    const txPm = (store2.tables.transactions || []).find(t => t.code === '600111');
+    if (r3 && txPm && txPm.falsifyCondition === '跌破 20 日线且放量' && txPm.invalidation === '2 周内未突破 25 元') ok('autoTradeFromPick: transactions 行沉淀 pre-mortem 字段');
+    else fail('auto premortem 沉淀', JSON.stringify(txPm || r3));
+
     // ---- Phase C: EOD 日终小结 ----
     // _shouldGenerateEod 纯函数: 工作日 ≥15:30 且今日无记录 (fmtDate mock 恒返 '2026-07-27', 2026-07-27 是周一)
     if (Paper._shouldGenerateEod(new Date(2026, 6, 27, 16, 0), []) === true) ok('eod: 周一 16:00 无记录 → 生成');
@@ -2916,6 +2976,350 @@ section('24] Discipline 交易纪律引擎纯函数 + 集成实测');
     else fail('renderCheckResult 空', '');
   } catch (e) {
     fail('Discipline 测试', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [25] Phase D1: pre-mortem 强制输出 + 持仓股公告上下文 ==========
+section('25] Phase D1 pre-mortem + 个股公告');
+(async () => {
+  try {
+    // ---- 25.1 Core.Premortem 纯函数 (vm sandbox) ----
+    const pmSrc = readFileSafe(path.join(WWW, 'core', 'premortem.js'));
+    if (!pmSrc) throw new Error('premortem.js 读不到');
+    const pmCtx = { window: {}, console };
+    vm.createContext(pmCtx);
+    vm.runInContext(pmSrc, pmCtx);
+    const PM = pmCtx.window.Core.Premortem;
+
+    // checkPick: 全字段 → 通过
+    const goodPick = {
+      code: '600519', bullCase: ['估值修复'], bearCase: ['批价下行风险'],
+      falsifyCondition: '跌破 20 日线且放量', invalidation: '2 周内未突破 1800 元'
+    };
+    if (PM.checkPick(goodPick, 0).length === 0) ok('pm.checkPick: 全字段通过');
+    else fail('pm.checkPick 全字段', JSON.stringify(PM.checkPick(goodPick, 0)));
+
+    // checkPick: 缺 4 字段 → 4 条错误
+    const missErrs = PM.checkPick({ code: '600519' }, 1);
+    if (missErrs.length === 4 && missErrs.every(e => e.includes('picks[1]'))) ok('pm.checkPick: 缺 4 字段 → 4 条带下标错误');
+    else fail('pm.checkPick 缺字段', JSON.stringify(missErrs));
+
+    // checkPick: bearCase 空话黑名单
+    const emptyTalk = PM.checkPick({ ...goodPick, bearCase: ['无明显风险'] }, 0);
+    if (emptyTalk.length === 1 && emptyTalk[0].includes('空话')) ok('pm.checkPick: bearCase "无明显风险" → 空话拦截');
+    else fail('pm.checkPick 空话', JSON.stringify(emptyTalk));
+
+    // checkPick: 字符串形式的 bullCase/bearCase 也接受 (LLM 容错)
+    if (PM.checkPick({ ...goodPick, bullCase: '估值低', bearCase: '商誉减值风险' }, 0).length === 0) ok('pm.checkPick: 字符串形式字段容错');
+    else fail('pm.checkPick 字符串容错', '');
+
+    // checkPicks: 聚合多 pick 错误
+    const agg = PM.checkPicks([goodPick, { code: '000001' }]);
+    if (agg.length === 4 && agg[0].includes('picks[1](000001)')) ok('pm.checkPicks: 聚合错误含 picks[1](code)');
+    else fail('pm.checkPicks 聚合', JSON.stringify(agg));
+
+    // renderBlock: 四象限 + XSS 转义
+    const html = PM.renderBlock({ ...goodPick, falsifyCondition: '<script>alert(1)</script>' });
+    if (html.includes('📈') && html.includes('📉') && html.includes('证伪条件') && html.includes('失效条件')
+      && html.includes('&lt;script&gt;') && !html.includes('<script>')) ok('pm.renderBlock: 四象限 + escapeHtml');
+    else fail('pm.renderBlock', html.slice(0, 200));
+    if (PM.renderBlock({}) === '' && PM.renderBlock(null) === '') ok('pm.renderBlock: 无字段 → 空字符串');
+    else fail('pm.renderBlock 空', '');
+
+    // PROMPT_SPEC 含四字段 + 禁空话说明
+    if (PM.PROMPT_SPEC.includes('bullCase') && PM.PROMPT_SPEC.includes('bearCase')
+      && PM.PROMPT_SPEC.includes('falsifyCondition') && PM.PROMPT_SPEC.includes('invalidation')
+      && PM.PROMPT_SPEC.includes('禁止')) ok('pm.PROMPT_SPEC: 四字段 + 禁空话说明');
+    else fail('pm.PROMPT_SPEC', PM.PROMPT_SPEC);
+
+    // ---- 25.2 Core.News.getStockNotices (vm sandbox, mock fetch + cache) ----
+    const newsSrc = readFileSafe(path.join(WWW, 'core', 'news.js'));
+    if (!newsSrc) throw new Error('news.js 读不到');
+    const emList = [
+      { art_code: 'AN1', title: '贵州茅台:2025年年度权益分派实施公告', notice_date: '2026-06-22 00:00:00', codes: [{ stock_code: '600519', short_name: '贵州茅台' }] },
+      { art_code: 'AN2', title: '五粮液:股东大会决议公告', notice_date: '2026-06-20 00:00:00', codes: [{ stock_code: '000858', short_name: '五粮液' }] },
+      { art_code: 'AN3', title: '贵州茅台:重大事项公告', notice_date: '2026-07-18 00:00:00', codes: [{ stock_code: '600519', short_name: '贵州茅台' }] }
+    ];
+    const buildNewsCtx = (fetchImpl) => {
+      const cache = {};
+      const nctx = {
+        window: {}, console,
+        fetch: fetchImpl
+      };
+      nctx.window.Core = {
+        Storage: {
+          cacheGet: async (k) => (k in cache ? cache[k] : null),
+          cacheSet: async (k, v) => { cache[k] = v; }
+        },
+        State: { get: () => null },
+        Data: { fetch: async () => [] }
+      };
+      nctx.Core = nctx.window.Core;
+      nctx._cache = cache;
+      vm.createContext(nctx);
+      vm.runInContext(newsSrc, nctx);
+      return nctx;
+    };
+
+    // 主路径: stock_list 按个股查询 + 6h 缓存 (第二次调用不再 fetch)
+    let fetchCount = 0, lastUrl = '';
+    const nc1 = buildNewsCtx(async (url) => {
+      fetchCount++; lastUrl = url;
+      return { ok: true, json: async () => ({ data: { list: emList } }) };
+    });
+    const News1 = nc1.window.Core.News;
+    const n1 = await News1.getStockNotices('600519', 5);
+    if (fetchCount === 1 && lastUrl.includes('stock_list=600519')) ok('news.getStockNotices: 主路径走 stock_list 按个股查询');
+    else fail('news stock_list 主路径', lastUrl);
+    if (Array.isArray(n1) && n1.length === 2 && n1.every(x => x.code === '600519')
+      && n1[0].title.includes('权益分派') && n1[0].date === '2026-06-22'
+      && n1[0].url.includes('AN1')) ok('news.getStockNotices: 按代码过滤 + 字段格式化 (title/date/url)');
+    else fail('news 过滤格式化', JSON.stringify(n1));
+    const n1b = await News1.getStockNotices('600519', 5);
+    if (fetchCount === 1 && Array.isArray(n1b) && n1b.length === 2) ok('news.getStockNotices: 第二次命中 6h 缓存 (不再 fetch)');
+    else fail('news 缓存', `fetchCount=${fetchCount}`);
+
+    // 兜底路径: stock_list 请求失败 → 全量拉取后本地按 codes[].stock_code 过滤
+    const urls2 = [];
+    const nc2 = buildNewsCtx(async (url) => {
+      urls2.push(url);
+      if (url.includes('stock_list=')) throw new Error('network down');
+      return { ok: true, json: async () => ({ data: { list: emList } }) };
+    });
+    const News2 = nc2.window.Core.News;
+    const n2 = await News2.getStockNotices('600519', 5);
+    if (urls2.length === 2 && !urls2[1].includes('stock_list=')
+      && Array.isArray(n2) && n2.length === 2 && n2.every(x => x.code === '600519')) ok('news.getStockNotices: 主路径失败 → 全量兜底 + 本地过滤');
+    else fail('news 兜底', JSON.stringify({ urls: urls2, n2 }));
+
+    // 双路径都失败 → null (调用方降级"公告数据不可用", 不污染 prompt)
+    const nc3 = buildNewsCtx(async () => { throw new Error('down'); });
+    const n3 = await nc3.window.Core.News.getStockNotices('600519', 5);
+    if (n3 === null) ok('news.getStockNotices: 双路径失败 → null (降级)');
+    else fail('news 降级 null', JSON.stringify(n3));
+
+    // formatNoticesForPrompt 三态
+    const fmt = News1.formatNoticesForPrompt;
+    if (fmt(null) === '## 近期公告\n(公告数据不可用)') ok('news.formatNotices: null → 公告数据不可用');
+    else fail('news fmt null', fmt(null));
+    if (fmt([]) === '## 近期公告\n近期无公告') ok('news.formatNotices: 空 → 近期无公告');
+    else fail('news fmt 空', fmt([]));
+    const fmtList = fmt(n1, 5);
+    if (fmtList.includes('## 近期公告 (最近 2 条)') && fmtList.includes('[1] 2026-06-22 贵州茅台:2025年年度权益分派实施公告')) ok('news.formatNotices: 列表 → 标题+日期');
+    else fail('news fmt 列表', fmtList);
+
+    // ---- 25.3 三个入口接线静态检查 ----
+    const scrSrc = readFileSafe(path.join(WWW, 'app', 'screener.js'));
+    if (scrSrc.includes('Core.Premortem.PROMPT_SPEC') && scrSrc.includes('Core.Premortem.checkPicks')
+      && scrSrc.includes('Core.Premortem.renderBlock') && scrSrc.includes('journal.falsifyCondition')
+      && scrSrc.includes('data-falsify')) ok('screener: prompt+校验+渲染+沉淀 四处接线');
+    else fail('screener 接线', '');
+    const advSrc = readFileSafe(path.join(WWW, 'app', 'fund', 'ai-advisor.js'));
+    if (advSrc.includes('Core.Premortem.PROMPT_SPEC') && advSrc.includes('Core.Premortem.checkPicks')
+      && advSrc.includes('Core.Premortem.renderBlock')) ok('ai-advisor: prompt+校验+渲染 三处接线');
+    else fail('ai-advisor 接线', '');
+    const saSrc = readFileSafe(path.join(WWW, 'app', 'stock-advisor.js'));
+    if (saSrc.includes('getStockNotices') && saSrc.includes('formatNoticesForPrompt')
+      && saSrc.includes('证伪条件') && saSrc.includes('失效条件')) ok('stock-advisor: 公告注入 + pre-mortem 段落');
+    else fail('stock-advisor 接线', '');
+    const paperSrc = readFileSafe(path.join(WWW, 'app', 'paper.js'));
+    if (paperSrc.includes('tx.falsifyCondition') && paperSrc.includes('pick.falsifyCondition')) ok('paper: autoTradeFromPick → buy → transactions 沉淀');
+    else fail('paper 接线', '');
+  } catch (e) {
+    fail('Phase D1 测试', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [26] Phase D2 回测前置 + 双模型交叉验证 ==========
+section('26] Phase D2 回测前置 + 双模型交叉验证');
+(async () => {
+  try {
+    // ---- 26.1 Core.PreBacktest 纯函数 (vm sandbox) ----
+    const pbtSrc = readFileSafe(path.join(WWW, 'core', 'prebacktest.js'));
+    if (!pbtSrc) throw new Error('prebacktest.js 读不到');
+
+    const buildPbtCtx = (extra) => {
+      const ctx = { window: {}, console, setTimeout, clearTimeout, ...extra };
+      vm.createContext(ctx);
+      vm.runInContext(pbtSrc, ctx);
+      return ctx;
+    };
+
+    const c1 = buildPbtCtx({});
+    const PBT = c1.window.Core.PreBacktest;
+
+    // pickStrategy 映射: 技术突破 → breakout
+    if (PBT.pickStrategy('技术突破放量创阶段新高') === 'breakout') ok('pbt.pickStrategy: 技术突破 → breakout');
+    else fail('pbt.pickStrategy 突破', PBT.pickStrategy('技术突破放量创阶段新高'));
+    // 业绩拐点 / 估值修复 → ma_cross
+    if (PBT.pickStrategy('业绩拐点确认') === 'ma_cross' && PBT.pickStrategy('估值修复空间大') === 'ma_cross') ok('pbt.pickStrategy: 业绩拐点/估值修复 → ma_cross');
+    else fail('pbt.pickStrategy 业绩/估值', '');
+    // 其他/空 → 默认 ma_cross
+    if (PBT.pickStrategy('题材催化') === 'ma_cross' && PBT.pickStrategy('') === 'ma_cross' && PBT.pickStrategy(null) === 'ma_cross') ok('pbt.pickStrategy: 其他/空 → 默认 ma_cross');
+    else fail('pbt.pickStrategy 默认', '');
+
+    // judgeVerdict 三档
+    const jv = PBT.judgeVerdict;
+    if (jv(-0.3) === '历史无效' && jv(-0.001) === '历史无效') ok('pbt.judgeVerdict: sharpe<0 → 历史无效');
+    else fail('pbt.judgeVerdict 无效', jv(-0.3));
+    if (jv(0) === '历史表现一般' && jv(0.49) === '历史表现一般') ok('pbt.judgeVerdict: 0~0.5 → 历史表现一般');
+    else fail('pbt.judgeVerdict 一般', jv(0.3));
+    if (jv(0.5) === '历史有效' && jv(1.2) === '历史有效') ok('pbt.judgeVerdict: ≥0.5 → 历史有效');
+    else fail('pbt.judgeVerdict 有效', jv(0.5));
+    if (jv(NaN) === null && jv('x') === null && jv(undefined) === null) ok('pbt.judgeVerdict: 非数值 → null');
+    else fail('pbt.judgeVerdict 非数值', '');
+
+    // formatResult: worker 返回 → 展示字段 (trades 数组 → 笔数)
+    const fr = PBT.formatResult({ sharpe: 0.8, maxDrawdown: -0.12, annualReturn: 0.15, winRate: 0.6, trades: [{}, {}, {}] });
+    if (fr.trades === 3 && fr.verdict === '历史有效' && fr.sharpe === 0.8 && fr.winRate === 0.6) ok('pbt.formatResult: trades 数组→笔数 + verdict');
+    else fail('pbt.formatResult', JSON.stringify(fr));
+    const frBad = PBT.formatResult({});
+    if (frBad.trades === 0 && frBad.verdict === null && Number.isNaN(frBad.sharpe)) ok('pbt.formatResult: 空输入容错');
+    else fail('pbt.formatResult 容错', JSON.stringify(frBad));
+
+    // renderResultHtml: 徽章 + 三指标 + 日期转义
+    const html1 = PBT.renderResultHtml({ ...fr, strategy: 'ma_cross', startDate: '2024-01-01<script>', endDate: '2026-01-01' });
+    if (html1.includes('历史有效') && html1.includes('Sharpe') && html1.includes('最大回撤') && html1.includes('年化')
+      && html1.includes('&lt;script&gt;') && !html1.includes('<script>')) ok('pbt.renderResultHtml: 徽章+三指标+转义');
+    else fail('pbt.renderResultHtml', html1.slice(0, 200));
+    const htmlBad = PBT.renderResultHtml({ ...fr, sharpe: -0.5, verdict: '历史无效', strategy: 'breakout' });
+    if (htmlBad.includes('⚠') && htmlBad.includes('历史无效') && htmlBad.includes('var(--down)')) ok('pbt.renderResultHtml: 历史无效 → ⚠ 红色徽章');
+    else fail('pbt.renderResultHtml 无效', htmlBad.slice(0, 200));
+    if (PBT.renderUnavailableHtml().includes('不可用') && PBT.renderResultHtml(null).includes('不可用')) ok('pbt.renderUnavailableHtml: 降级文案');
+    else fail('pbt.renderUnavailableHtml', '');
+
+    // ---- 26.2 PreBacktest.runForPick 降级/超时 (vm sandbox + 依赖注入) ----
+    const kline100 = [];
+    for (let i = 0; i < 100; i++) {
+      const close = 10 + Math.sin(i / 8) * 2;
+      kline100.push({ 日期: `2025-02-${String((i % 28) + 1).padStart(2, '0')}`, 开盘: close * 0.99, 最高: close * 1.02, 最低: close * 0.98, 收盘: close });
+    }
+    class FakeWorkerOK {
+      postMessage() {
+        this.onmessage && this.onmessage({ data: { sharpe: 0.8, maxDrawdown: -0.12, annualReturn: 0.15, winRate: 0.6, trades: [{}, {}, {}], startDate: '2024-01-01', endDate: '2026-01-01' } });
+      }
+      terminate() {}
+    }
+    class FakeWorkerHang { postMessage() {} terminate() {} }
+
+    // 正常路径: K线足够 + worker 返回指标
+    const c2 = buildPbtCtx({
+      Core: { Data: { getStockKLine: async () => kline100 } },
+      Worker: FakeWorkerOK
+    });
+    const r2 = await c2.window.Core.PreBacktest.runForPick({ code: '600519', assumption: '业绩拐点' });
+    if (r2 && r2.verdict === '历史有效' && r2.trades === 3 && r2.strategy === 'ma_cross'
+      && r2.startDate === '2024-01-01' && r2.sharpe === 0.8) ok('pbt.runForPick: 正常路径返回指标+策略+区间');
+    else fail('pbt.runForPick 正常', JSON.stringify(r2));
+
+    // 策略映射接线: 技术突破假设 → breakout
+    const r2b = await c2.window.Core.PreBacktest.runForPick({ code: '600519', assumption: '放量突破平台' });
+    if (r2b && r2b.strategy === 'breakout') ok('pbt.runForPick: 突破假设 → breakout 策略');
+    else fail('pbt.runForPick 策略映射', JSON.stringify(r2b));
+
+    // K线拉取失败 → null (不抛)
+    const c3 = buildPbtCtx({
+      Core: { Data: { getStockKLine: async () => { throw new Error('限流'); } } },
+      Worker: FakeWorkerOK
+    });
+    const r3 = await c3.window.Core.PreBacktest.runForPick({ code: '600519', assumption: 'x' });
+    if (r3 === null) ok('pbt.runForPick: K线拉取失败 → null 降级');
+    else fail('pbt.runForPick 失败降级', JSON.stringify(r3));
+
+    // K线不足 (<60) → null
+    const c4 = buildPbtCtx({
+      Core: { Data: { getStockKLine: async () => kline100.slice(0, 30) } },
+      Worker: FakeWorkerOK
+    });
+    const r4 = await c4.window.Core.PreBacktest.runForPick({ code: '600519', assumption: 'x' });
+    if (r4 === null) ok('pbt.runForPick: K线不足 → null 降级');
+    else fail('pbt.runForPick K线不足', JSON.stringify(r4));
+
+    // 无 Worker 环境 → null
+    const c5 = buildPbtCtx({ Core: { Data: { getStockKLine: async () => kline100 } } });
+    const r5 = await c5.window.Core.PreBacktest.runForPick({ code: '600519', assumption: 'x' });
+    if (r5 === null) ok('pbt.runForPick: 无 Worker → null 降级');
+    else fail('pbt.runForPick 无Worker', JSON.stringify(r5));
+
+    // worker 挂起 → 超时 → null (注入可控定时器, 纯 microtask 手动触发, 不真实等待)
+    let timerCb = null;
+    const c6 = buildPbtCtx({
+      Core: { Data: { getStockKLine: async () => kline100 } },
+      Worker: FakeWorkerHang,
+      setTimeout: (fn) => { timerCb = fn; return 1; },
+      clearTimeout: () => {}
+    });
+    const p6 = c6.window.Core.PreBacktest.runForPick({ code: '600519', assumption: 'x', timeoutMs: 50 });
+    for (let i = 0; i < 10; i++) await Promise.resolve();  // 等 kline mock + _runWorker 注册 timer (全 microtask)
+    if (typeof timerCb === 'function') timerCb();  // 手动触发超时
+    const r6 = await p6;
+    if (r6 === null) ok('pbt.runForPick: worker 超时 → null 降级');
+    else fail('pbt.runForPick 超时', JSON.stringify(r6));
+
+    // ---- 26.3 Core.CrossCheck (vm sandbox) ----
+    const ccSrc = readFileSafe(path.join(WWW, 'core', 'crosscheck.js'));
+    if (!ccSrc) throw new Error('crosscheck.js 读不到');
+    const buildCcCtx = (aiStub) => {
+      const ctx = { window: {}, console };
+      if (aiStub) ctx.Core = { AI: aiStub };
+      vm.createContext(ctx);
+      vm.runInContext(ccSrc, ctx);
+      return ctx;
+    };
+    const CC = buildCcCtx(null).window.Core.CrossCheck;
+
+    // pickSecondProvider 选择逻辑
+    const psp = CC.pickSecondProvider;
+    if (psp('deepseek', { qwen: 'sk-1' }) === 'qwen') ok('cc.pickSecondProvider: 选第一个 ≠当前 且配 key 的');
+    else fail('cc.pickSecondProvider 基本', psp('deepseek', { qwen: 'sk-1' }));
+    if (psp('deepseek', { moonshot: 'a', qwen: 'b' }) === 'moonshot') ok('cc.pickSecondProvider: 按 PROVIDER_ORDER 顺序');
+    else fail('cc.pickSecondProvider 顺序', psp('deepseek', { moonshot: 'a', qwen: 'b' }));
+    if (psp('deepseek', { deepseek: 'x' }) === null && psp('deepseek', {}) === null && psp('deepseek', null) === null) ok('cc.pickSecondProvider: 无其他已配 provider → null');
+    else fail('cc.pickSecondProvider 空', '');
+    if (psp('deepseek', { qwen: '   ' }) === null) ok('cc.pickSecondProvider: 空白 key 不算已配');
+    else fail('cc.pickSecondProvider 空白key', '');
+    if (psp('qwen', { deepseek: 'k', qwen: 'x' }) === 'deepseek') ok('cc.pickSecondProvider: 跳过当前 provider 自己');
+    else fail('cc.pickSecondProvider 跳过自己', '');
+
+    // resolveSecondOpinion: state → 调用配置
+    const PROVIDERS_STUB = {
+      qwen: { name: '通义千问', baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1', defaultModel: 'qwen-plus' }
+    };
+    const cc2 = buildCcCtx({ getProviderConfig: (p) => PROVIDERS_STUB[p] || { name: p, baseURL: '', defaultModel: '' } });
+    const CC2 = cc2.window.Core.CrossCheck;
+    const so1 = CC2.resolveSecondOpinion({ ai: { provider: 'deepseek', useProxy: true }, apiKeys: { llm: { qwen: 'sk-2' } } });
+    if (so1 && so1.provider === 'qwen' && so1.baseURL === '/api/llm/qwen/v1' && so1.apiKey === 'sk-2'
+      && so1.model === 'qwen-plus' && so1.label === '通义千问') ok('cc.resolveSecondOpinion: 走代理 → /api/llm/{provider}/v1');
+    else fail('cc.resolveSecondOpinion 代理', JSON.stringify(so1));
+    const so2 = CC2.resolveSecondOpinion({ ai: { provider: 'deepseek', useProxy: false }, apiKeys: { llm: { qwen: 'sk-2' } } });
+    if (so2 && so2.baseURL === 'https://dashscope.aliyuncs.com/compatible-mode/v1') ok('cc.resolveSecondOpinion: 不走代理 → provider 默认 baseURL');
+    else fail('cc.resolveSecondOpinion 直连', JSON.stringify(so2));
+    if (CC2.resolveSecondOpinion({ ai: { provider: 'deepseek' }, apiKeys: {} }) === null
+      && CC2.resolveSecondOpinion(null) === null) ok('cc.resolveSecondOpinion: 未配置 → null (调用方 toast)');
+    else fail('cc.resolveSecondOpinion 空', '');
+
+    // buildComparePrompt: 双文本 + 标签 + 一致性要求
+    const cp = CC.buildComparePrompt('文本A', '文本B', 'DeepSeek/v4', 'Qwen/plus');
+    if (cp.includes('文本A') && cp.includes('文本B') && cp.includes('DeepSeek/v4') && cp.includes('Qwen/plus')
+      && cp.includes('一致') && cp.includes('100')) ok('cc.buildComparePrompt: 双文本+标签+≤100字一致性');
+    else fail('cc.buildComparePrompt', cp.slice(0, 120));
+
+    // ---- 26.4 接线静态检查 ----
+    const scrSrc = readFileSafe(path.join(WWW, 'app', 'screener.js'));
+    if (scrSrc.includes('Core.PreBacktest.runForPick') && scrSrc.includes('data-action="backtest"')
+      && scrSrc.includes('pb-result') && scrSrc.includes('data-assumption')) ok('screener: 📊 历史验证按钮+卡片结果区+假设透传');
+    else fail('screener D2 接线', '');
+    const saSrc = readFileSafe(path.join(WWW, 'app', 'stock-advisor.js'));
+    if (saSrc.includes('Core.PreBacktest.runForPick') && saSrc.includes('Core.CrossCheck.resolveSecondOpinion')
+      && saSrc.includes('Core.CrossCheck.buildComparePrompt') && saSrc.includes('callWithTimeout')
+      && saSrc.includes('saSecondBtn') && saSrc.includes('saPreBtBtn') && saSrc.includes('local: false')) ok('stock-advisor: 历史验证+第二意见+强制远程三处接线');
+    else fail('stock-advisor D2 接线', '');
+    const appSrc = readFileSafe(path.join(WWW, 'app.js'));
+    if (appSrc.includes('settingSecondProvider') && appSrc.includes('onSecondProviderChange')
+      && appSrc.includes('llm')) ok('app.js: 设置页第二意见 provider+key 配置区');
+    else fail('app.js D2 接线', '');
+  } catch (e) {
+    fail('Phase D2 测试', e.message + ' / ' + (e.stack || ''));
   }
 })();
 
