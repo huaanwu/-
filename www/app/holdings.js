@@ -10,7 +10,8 @@
     async init() {},
 
     async render() {
-      const holdings = await Core.Storage.all('holdings');
+      // 排除模拟盘 (isPaper) 行, 真实持仓视图不受 Paper 模块污染
+      const holdings = (await Core.Storage.all('holdings')).filter(h => !h.isPaper);
       const summaryEl = document.getElementById('holdingsSummary');
       const tableEl = document.getElementById('holdingsTable');
 
@@ -144,6 +145,20 @@
               <label>备注</label>
               <input type="text" id="hNote" value="${escapeHtml(h.note || '')}" placeholder="可选">
             </div>
+            ${!id ? `
+            <div class="form-row">
+              <label>买入假设</label>
+              <select id="hAssumption">
+                <option value="">(必选)</option>
+                ${Core.Discipline.ASSUMPTIONS.map(a => `<option value="${a}">${a}</option>`).join('')}
+              </select>
+            </div>
+            <div class="form-row">
+              <label>止损价</label>
+              <input type="number" id="hStopLoss" step="0.01" min="0" placeholder="必填, 低于成本价">
+            </div>
+            <div id="hCheckResult"></div>
+            ` : ''}
             <div class="modal-footer">
               <button class="btn btn-ghost" onclick="Holdings.closeModal()">取消</button>
               <button class="btn btn-primary" onclick="Holdings.save('${id || ''}')">保存</button>
@@ -168,6 +183,22 @@
         data.id = id;
         await Core.Storage.put('holdings', data);
       } else {
+        // Phase B 交易纪律: 新建持仓 = 一笔买入, 先过硬校验 (blocks 拦截 / warns 确认放行)
+        const assumption = document.getElementById('hAssumption').value;
+        const stopLoss = parseFloat(document.getElementById('hStopLoss').value);
+        const chk = await Core.Discipline.preBuyCheck({
+          code, name, market: Core.Util.stockCodePrefix(code),
+          price: costPrice, shares, amount: shares * costPrice,
+          isPaper: false, assumption, stopLoss
+        });
+        if (!chk.ok) {
+          document.getElementById('hCheckResult').innerHTML = Core.Discipline.renderCheckResult(chk);
+          toastError('交易纪律检查未通过, 已拦截');
+          return;
+        }
+        if (chk.warns.length && !confirm(Core.Discipline._resultToText(chk) + '\n\n确认继续买入?')) return;
+        data.assumption = assumption;  // 非索引字段, 不改 schema
+        data.stopLoss = stopLoss;
         data.id = uuid();
         data.createdAt = Date.now();
         await Core.Storage.add('holdings', data);
@@ -223,6 +254,18 @@
               <label>理由/笔记</label>
               <textarea id="txNote" placeholder="为什么买/卖?"></textarea>
             </div>
+            <div class="form-row">
+              <label>买入假设</label>
+              <select id="txAssumption">
+                <option value="">(买入必选)</option>
+                ${Core.Discipline.ASSUMPTIONS.map(a => `<option value="${a}">${a}</option>`).join('')}
+              </select>
+            </div>
+            <div class="form-row">
+              <label>止损价</label>
+              <input type="number" id="txStopLoss" step="0.01" min="0" placeholder="买入必填, 低于价格">
+            </div>
+            <div id="txCheckResult"></div>
             <div class="modal-footer">
               <button class="btn btn-ghost" onclick="Holdings.closeModal()">取消</button>
               <button class="btn btn-primary" onclick="Holdings.saveTx('${holdingId}')">保存</button>
@@ -248,6 +291,27 @@
         createdAt: Date.now()
       };
       if (!tx.price || !tx.shares) { toastError('价格和数量必填'); return; }
+
+      // Phase B 交易纪律: 买入先过硬校验 (卖出永远放行)
+      if (tx.type === 'buy') {
+        const assumption = document.getElementById('txAssumption').value;
+        const stopLoss = parseFloat(document.getElementById('txStopLoss').value);
+        const chk = await Core.Discipline.preBuyCheck({
+          code: h.code, name: h.name || '', market: h.market || '',
+          price: tx.price, shares: tx.shares, amount: tx.price * tx.shares,
+          isPaper: false, assumption, stopLoss
+        });
+        if (!chk.ok) {
+          document.getElementById('txCheckResult').innerHTML = Core.Discipline.renderCheckResult(chk);
+          toastError('交易纪律检查未通过, 已拦截');
+          return;
+        }
+        if (chk.warns.length && !confirm(Core.Discipline._resultToText(chk) + '\n\n确认继续买入?')) return;
+        tx.assumption = assumption;  // 非索引字段, 不改 schema
+        tx.stopLoss = stopLoss;
+        h.assumption = assumption;   // 同步到持仓行
+        h.stopLoss = stopLoss;
+      }
       await Core.Storage.add('transactions', tx);
 
       // 简化:更新持仓的 shares/costPrice(加权平均)

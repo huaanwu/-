@@ -62,13 +62,13 @@ cd android && ./gradlew assembleDebug   # 产物: android/app/build/outputs/apk/
 ### 测试与类型检查
 
 ```bash
-npm test                    # = node test/test_all.js,纯 Node 无浏览器,21 节 300+ 断言
+npm test                    # = node test/test_runtime.js && node test/test_all.js,纯 Node 无浏览器,24 节 500+ 断言
 npm run typecheck           # tsc --noEmit
 node scripts/e2e.mjs        # 端到端冒烟:Chrome headless + CDP(不依赖 puppeteer),9 项断言 + 截图到 e2e_screenshots/
 node scripts/daily_summary.mjs --verify-dry-run ./journals.json   # 事后验证 dry-run
 ```
 
-`test/test_all.js` 21 节:JS 语法、域脚本接口完备性 (`DOMAINS` 字典)、Core 命名空间导出、index.html script 引用对账、Worker 结构、关键文件存在、Data 层方法签名、回测引擎 vm 沙箱实测、Vite external 对账、journal/market/fund/alerts 纯函数实测、daily_summary 单测、5.1/5.2/5.3 互通闭环实测、数据源限流。**改完域脚本或新增域方法必须先 `npm test`,并同步更新该文件的 `DOMAINS` 字典。**
+`test/test_all.js` 24 节:JS 语法、域脚本接口完备性 (`DOMAINS` 字典)、Core 命名空间导出、index.html script 引用对账、Worker 结构、关键文件存在、Data 层方法签名、回测引擎 vm 沙箱实测、Vite external 对账、journal/market/fund/alerts 纯函数实测、daily_summary 单测、5.1/5.2/5.3 互通闭环实测、数据源限流、Paper 模拟盘纯函数实测、Discipline 纪律引擎实测。**改完域脚本或新增域方法必须先 `npm test`,并同步更新该文件的 `DOMAINS` 字典。**
 
 `scripts/e2e.mjs` 注意:Chrome 路径硬编码 `C:\Program Files\Google\Chrome\Application\chrome.exe`,需要 Vite 已在 3003 端口跑着。
 
@@ -83,6 +83,7 @@ www/                        # Web 根 (= Capacitor webDir,Vite root)
 │   ├── util.js             # escapeHtml/safeHTML、fmtNum/fmtPct/fmtMoney/pctClass/fmtDate/parseStockInput/uuid/debounce
 │   ├── storage.js          # Dexie 4:9 表 + cacheGet/cacheSet(TTL 默认 5 分钟)+ kv + clearAll
 │   ├── data.js             # Core.Data:fetchWithCache + getStockSpot/getStockQuote/getStockKLine/getFundSpot/getIndexSpot;腾讯财经备用源(GBK 解码)
+│   ├── discipline.js       # Core.Discipline:交易纪律引擎(Phase B),买入前硬校验(假设/止损必填、单票/总仓位、月度回撤熔断、追高/重复错误警告),实盘模拟盘共用
 │   ├── state.js            # 持久化全局状态(proxyBase/apiKeys/ai/sync/currentPage/marketOpen)
 │   ├── toast.js / router.js# 吐司提示;hash 路由(switchPage 触发 window._onShow_{pageId})
 │   ├── ai-service.js       # Core.AI:6 provider + resolveEndpoint({local}) 本地 LLM 优先降级
@@ -92,6 +93,7 @@ www/                        # Web 根 (= Capacitor webDir,Vite root)
 ├── app/                    # 按域拆分的页面脚本,每个挂 window.{Domain}(首字母大写)
 │   ├── watchlist.js        # 行情看板:自选股 + K线 + 行情
 │   ├── holdings.js         # 持仓管理:持仓 + 交易流水 + 持仓天数/浮盈
+│   ├── paper.js            # 模拟盘:虚拟资金 + isPaper 隔离持仓 + AI 自动成交 + 每日快照曲线
 │   ├── journal.js          # 复盘笔记:结构化标签 + 持仓上下文 + AI 助手 (874 行)
 │   ├── screener.js         # 选股筛选:条件筛选 + AI 选股 + 一键加自选
 │   ├── fund.js             # 基金专项:7 按钮(申购/AI 选基/再平衡/组合风险/新闻影响/导入推荐/添加),最大文件 ~1740 行
@@ -187,12 +189,21 @@ vite.config.js              # root=www,域脚本 external 列表,dev proxy
 | 5.3.2 AI 记忆同步 | `www/core/sync.js` | `Core.Sync.pushAIMemory` / `pullAIMemory` (走 kv 表, 只同步有 AI 痕迹的 journals + alerts) |
 | 5.3.3 本地 LLM 优先 | `www/core/ai-service.js` | `Core.AI.resolveEndpoint({ local })` (三态: true/false/未指定, 本地未启用降级) |
 
+### Phase B 交易纪律引擎
+
+| 子项 | 实现位置 | 关键方法 |
+|------|----------|----------|
+| 纪律检查核心 | `www/core/discipline.js` | `Core.Discipline.preBuyCheck` → `{ ok, blocks, warns, history }`; blocks 硬拦截(假设/止损必填、单票集中度、总仓位、月度回撤熔断), warns 确认放行(追高、重复错误历史); 配置 kv `discipline_config`, 月度锚点 kv `discipline_month_anchor`(_paper 后缀为模拟盘独立锚定); 检查失败降级 warn 不拦交易; 卖出不拦截 |
+| 实盘接入 | `www/app/holdings.js` | 新建持仓/买入交易表单加假设+止损价, `save`/`saveTx` 买入前 await preBuyCheck, assumption/stopLoss 写 holdings+transactions 行(非索引字段) |
+| 模拟盘接入 | `www/app/paper.js` | `buyFromForm` 同款校验; `autoTradeFromPick` blocks 命中 console.warn 跳过, warns 写交易行 `disciplineWarns` (AI 场景假设固定'题材催化', 止损=成交价×0.92) |
+
 ### 8 大页面域 + Core 模块
 
 | 模块 | 域脚本 | 核心功能 |
 |------|--------|----------|
 | 行情看板 | `www/app/watchlist.js` | 自选股 + K 线 + 行情 |
 | 持仓管理 | `www/app/holdings.js` | 持仓 + 交易流水 + 持仓天数/浮盈 |
+| 模拟盘 | `www/app/paper.js` | 虚拟资金 + isPaper 隔离持仓 + AI 选股自动成交 + 每日快照 (kv: `paper_account` / `paper_snapshots`) |
 | 复盘笔记 | `www/app/journal.js` | 结构化复盘 + 持仓上下文 + AI 助手 |
 | 选股筛选 | `www/app/screener.js` | 条件筛选 + AI 选股 + 一键加自选 |
 | 资金账户 | `www/app/account.js` | 现金 + 资金流水 + 账户总览 |
@@ -204,9 +215,10 @@ vite.config.js              # root=www,域脚本 external 列表,dev proxy
 ### Dexie 数据表 (`stockmaster`, DB_VERSION 1)
 
 `watchlist` / `holdings` / `transactions` / `journals` / `alerts` / `funds` / `cashflow` / `cache` / `kv` — schema 定义在 `www/core/storage.js` 的 `db.version(1).stores({...})`。
+模拟盘复用 `holdings` / `transactions`,行上加 `isPaper: true` 标记 (非索引字段,无 schema 变更);真实视图读取时 `.filter(h => !h.isPaper)` 隔离。
 
 ### 测试与验收
 
-- `npm test` — 300+ 项单元 + 沙箱测试 (`test/test_all.js`, 21 节)
+- `npm test` — 500+ 项单元 + 沙箱测试 (`test/test_runtime.js` + `test/test_all.js`, 24 节)
 - `node scripts/e2e.mjs` — Chrome headless 端到端 (9 项 + 截图到 `e2e_screenshots/`)
 - `node scripts/daily_summary.mjs --verify-dry-run ./journals.json` — 事后验证 dry-run

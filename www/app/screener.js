@@ -463,6 +463,11 @@ ${candidates}
         };
         await Core.Storage.add('journals', journal);
         toastSuccess(`已记入复盘: ${code} 选股理由`);
+
+        // 3) 模拟盘自动成交 (Phase A: AI 建议按真实行情在模拟盘成交; Paper 不存在则跳过, 不硬依赖)
+        if (window.Paper && typeof window.Paper.autoTradeFromPick === 'function') {
+          window.Paper.autoTradeFromPick({ code, name });
+        }
       } catch (e) {
         console.error('[Screener] _addWatchlistFromPick 失败:', e);
         toastError('加自选失败: ' + e.message);

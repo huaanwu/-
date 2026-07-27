@@ -44,9 +44,9 @@
       // 现金 (从 state 读, 默认 0)
       const cash = parseFloat(Core.State.get('accountCash')) || 0;
 
-      // 拉所有持仓/基金, 并行拉实时价
+      // 拉所有持仓/基金, 并行拉实时价 (holdings 排除模拟盘 isPaper 行)
       const [holdings, funds, flow] = await Promise.all([
-        Core.Storage.all('holdings'),
+        Core.Storage.all('holdings').then(list => (list || []).filter(h => !h.isPaper)),
         Core.Storage.all('funds'),
         Core.Storage.all('cashflow')
       ]);

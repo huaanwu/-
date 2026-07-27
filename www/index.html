@@ -48,6 +48,51 @@
     <div id="holdingsTable" class="data-card"></div>
   </section>
 
+  <!-- 模拟盘 (Paper Trading): 验证 AI 建议的真实表现, 与真实持仓完全隔离 -->
+  <section class="page" id="pagePaper">
+    <div class="page-header">
+      <h2>模拟盘</h2>
+      <button class="btn btn-sm btn-danger" onclick="Paper.resetAccount()">🔄 重置模拟盘</button>
+    </div>
+    <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">模拟盘用于验证 AI 建议的真实表现, 与真实持仓完全隔离</div>
+    <div id="paperSummary" class="summary-cards"></div>
+    <div class="filter-form" style="margin-top:8px;">
+      <div class="form-row">
+        <label>代码</label>
+        <input type="text" id="paperCode" placeholder="600519 或 600519 贵州茅台">
+      </div>
+      <div class="form-row">
+        <label>股数</label>
+        <input type="number" id="paperShares" step="100" min="100" placeholder="100 (整手)">
+      </div>
+      <div class="form-row">
+        <label>买入假设</label>
+        <select id="paperAssumption">
+          <option value="">(必选)</option>
+          <option value="业绩拐点">业绩拐点</option>
+          <option value="估值修复">估值修复</option>
+          <option value="题材催化">题材催化</option>
+          <option value="技术突破">技术突破</option>
+          <option value="分红套利">分红套利</option>
+          <option value="其他">其他</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>止损价</label>
+        <input type="number" id="paperStopLoss" step="0.01" min="0" placeholder="必填, 低于买入价">
+      </div>
+      <div class="form-row">
+        <label></label>
+        <button class="btn btn-sm btn-primary" onclick="Paper.buyFromForm()">买入</button>
+        <button class="btn btn-sm" onclick="Paper.sellFromForm()">卖出</button>
+      </div>
+      <div id="paperCheckResult"></div>
+    </div>
+    <div id="paperPositions" class="data-card" style="margin-top:8px;"></div>
+    <h3 style="margin-top:16px;font-size:14px;color:var(--text-muted);">📈 表现对比 (每日快照)</h3>
+    <div id="paperChart" class="data-card" style="margin-top:8px;"></div>
+  </section>
+
   <!-- 复盘笔记 -->
   <section class="page" id="pageJournal">
     <div class="page-header">
@@ -143,6 +188,9 @@
   <button class="nav-item" data-page="pageHoldings" onclick="switchPage('pageHoldings')">
     <span class="nav-icon">💼</span><span class="nav-label">持仓</span>
   </button>
+  <button class="nav-item" data-page="pagePaper" onclick="switchPage('pagePaper')">
+    <span class="nav-icon">📋</span><span class="nav-label">模拟盘</span>
+  </button>
   <button class="nav-item" data-page="pageJournal" onclick="switchPage('pageJournal')">
     <span class="nav-icon">📝</span><span class="nav-label">复盘</span>
   </button>
@@ -176,6 +224,7 @@
 <script src="/core/data.js"></script>
 <script src="/core/kb.js"></script>
 <script src="/core/state.js"></script>
+<script src="/core/discipline.js"></script>
 <script src="/core/toast.js"></script>
 <script src="/core/ai-service.js"></script>
 <script src="/core/macro.js"></script>
@@ -189,6 +238,7 @@
 <script src="/app/watchlist.js"></script>
 <script src="/app/stock-advisor.js"></script>
 <script src="/app/holdings.js"></script>
+<script src="/app/paper.js"></script>
 <script src="/app/journal.js"></script>
 <script src="/app/screener.js"></script>
 <script src="/app/fund.js"></script>

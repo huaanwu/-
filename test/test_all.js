@@ -56,6 +56,7 @@ section('2] 域脚本接口完备性');
 const DOMAINS = {
   'Watchlist': ['init', 'render', 'addDialog', 'add', 'remove', 'showKLine', 'closeModal', 'closeKLine'],
   'Holdings':  ['init', 'render', 'addDialog', 'editDialog', 'save', 'remove', 'addTxDialog', 'saveTx', 'closeModal'],
+  'Paper':     ['init', 'buy', 'sell', 'getAccount', 'getPositions', 'resetAccount', 'snapshotIfNeeded', 'autoTradeFromPick', 'renderPage', 'buyFromForm', 'sellFromForm', 'sellAll', '_calcFee', '_roundLot', '_pushSnapshot', '_planAutoTrade'],
   'Journal':   ['init', 'render', 'newDialog', 'editDialog', 'save', 'remove', 'closeModal', '_buildHoldingsContext', '_renderHoldingBadge', '_renderStructuredTags', '_runAiAssistant'],
   'Screener':  ['init', 'run', '_addWatchlistFromPick'],
   'Fund':      ['init', 'render', 'addDialog', 'save', 'remove', 'showChart', 'closeModal'],
@@ -85,7 +86,8 @@ const CORE_MODULES = {
   'core/router.js':  'Core.Router',
   'core/ai-service.js': 'Core.AI',
   'core/sync.js':   'Core.Sync',
-  'core/agents.js': 'Core.Agents'
+  'core/agents.js': 'Core.Agents',
+  'core/discipline.js': 'Core.Discipline'
 };
 for (const [file, ns] of Object.entries(CORE_MODULES)) {
   const content = readFileSafe(path.join(WWW, file));
@@ -105,6 +107,16 @@ for (const fn of utilFns) {
   else fail(`Util.${fn}`, '缺失');
 }
 
+// 检查 Core.Discipline (Phase B 交易纪律引擎) 的方法清单
+const discContent = readFileSafe(path.join(WWW, 'core/discipline.js'));
+const DISC_METHODS = ['getConfig', 'setConfig', 'preBuyCheck', 'renderCheckResult', '_resultToText',
+  '_checkInputs', '_checkConcentration', '_checkTotalPosition', '_checkDrawdown', '_monthAnchorNext',
+  '_checkChase', '_summarizeHistory', '_getRealAssets', '_getPaperAssets', '_currentMonth'];
+for (const m of DISC_METHODS) {
+  if (discContent && new RegExp(`\\b${m}\\s*\\(`).test(discContent)) ok(`Discipline.${m}`);
+  else fail(`Discipline.${m}`, '缺失');
+}
+
 // ========== [4] index.html script 引用对得上 ==========
 section('4] index.html script 引用检查');
 const html = readFileSafe(path.join(WWW, 'index.html'));
@@ -119,7 +131,7 @@ else {
   }
   // 关键 onclick 引用 — 只检查"基名"在不在已知全局(支持 XX.YY 形式,如 Watchlist.addDialog)
   const onclicks = [...html.matchAll(/onclick="([^(]+)\(/g)].map(m => m[1].trim());
-  const knownGlobals = new Set(['switchPage', 'goSettings', 'showToast', 'saveSettings', 'checkHealth', 'exportData', 'importData', 'clearAllData', 'Watchlist', 'Holdings', 'Journal', 'Screener', 'Fund', 'Backtest', 'Alerts']);
+  const knownGlobals = new Set(['switchPage', 'goSettings', 'showToast', 'saveSettings', 'checkHealth', 'exportData', 'importData', 'clearAllData', 'Watchlist', 'Holdings', 'Paper', 'Journal', 'Screener', 'Fund', 'Backtest', 'Alerts']);
   for (const fn of new Set(onclicks)) {
     const baseName = fn.split('.')[0];
     if (knownGlobals.has(baseName)) ok(`onclick: ${fn}`);
@@ -2318,6 +2330,416 @@ section('21] c 数据源限流修复 (retry/退避/限流)');
     D.resetLimit();
   } catch (e) {
     fail('Y12 腾讯 K 线 fetcher', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [23] Paper 模拟盘 (费用/整手/快照/自动成交/买卖集成) ==========
+section('23] Paper 模拟盘纯函数实测');
+(async () => {
+  try {
+    const paperSrc = readFileSafe(path.join(WWW, 'app', 'paper.js'));
+    if (!paperSrc) throw new Error('paper.js 读不到');
+
+    // vm sandbox: mock Core.Storage (内存表) + Core.Data + 全局工具函数
+    const buildCtx = (storageData) => {
+      const pctx = {
+        window: {},
+        console,
+        escapeHtml: (s) => String(s == null ? '' : s),
+        fmtMoney: (n) => (typeof n === 'number' ? n.toFixed(2) : '0.00'),
+        fmtNum: (n, d) => (typeof n === 'number' ? n.toFixed(d || 0) : '0'),
+        fmtPct: (n) => (typeof n === 'number' ? (n * 100).toFixed(2) + '%' : '-'),
+        pctClass: () => '',
+        fmtDate: () => '2026-07-27',
+        uuid: () => 'paper-test-' + Math.random().toString(36).slice(2, 8),
+        parseStockInput: (t) => {
+          const m = String(t || '').trim().match(/^(\d{6})/);
+          return m ? { code: m[1], name: String(t).slice(6).trim() } : null;
+        },
+        toastSuccess: () => {}, toastError: () => {}, toastWarning: () => {},
+        confirm: () => true
+      };
+      pctx.window.Core = {
+        Storage: {
+          kvGet: async (k) => (k in storageData.kv ? storageData.kv[k] : null),
+          kvSet: async (k, v) => { storageData.kv[k] = v; },
+          all: async (t) => storageData.tables[t] || [],
+          get: async (t, id) => (storageData.tables[t] || []).find(x => x.id === id) || null,
+          add: async (t, obj) => { (storageData.tables[t] = storageData.tables[t] || []).push(obj); },
+          put: async (t, obj) => {
+            const arr = (storageData.tables[t] = storageData.tables[t] || []);
+            const i = arr.findIndex(x => x.id === obj.id);
+            if (i >= 0) arr[i] = obj; else arr.push(obj);
+          },
+          remove: async (t, id) => {
+            storageData.tables[t] = (storageData.tables[t] || []).filter(x => x.id !== id);
+          }
+        },
+        Data: {
+          getStockQuote: async (code) => storageData.quotes[code] || null,
+          getIndexSpot: async () => storageData.indexSpot || []
+        },
+        Util: { stockCodePrefix: (c) => /^(60|68)/.test(c) ? 'sh' : 'sz' }
+      };
+      pctx.Core = pctx.window.Core;
+      pctx.window.document = { getElementById: () => null };
+      pctx.document = pctx.window.document;
+      vm.createContext(pctx);
+      vm.runInContext(paperSrc, pctx);
+      return pctx;
+    };
+
+    // ---- 纯函数 (不需要 storage 数据) ----
+    const ctx0 = buildCtx({ kv: {}, tables: {}, quotes: {}, indexSpot: [] });
+    const Paper = ctx0.window.Paper;
+    if (!Paper) throw new Error('Paper 未挂到 window');
+
+    // _calcFee: 佣金万三 min 5, 卖出加印花税万五
+    const f1 = Paper._calcFee(10000, 'buy');
+    if (f1.commission === 5 && f1.stampTax === 0 && f1.total === 5) ok('fee: 买入 1 万 → 佣金 5 (万三 < 最低 5)');
+    else fail('fee buy 1w', JSON.stringify(f1));
+    const f2 = Paper._calcFee(100000, 'buy');
+    if (f2.commission === 30 && f2.stampTax === 0 && f2.total === 30) ok('fee: 买入 10 万 → 佣金 30');
+    else fail('fee buy 10w', JSON.stringify(f2));
+    const f3 = Paper._calcFee(100000, 'sell');
+    if (f3.commission === 30 && f3.stampTax === 50 && f3.total === 80) ok('fee: 卖出 10 万 → 佣金 30 + 印花税 50');
+    else fail('fee sell 10w', JSON.stringify(f3));
+    const f4 = Paper._calcFee(10000, 'sell');
+    if (f4.commission === 5 && f4.stampTax === 5 && f4.total === 10) ok('fee: 卖出 1 万 → 5 + 5');
+    else fail('fee sell 1w', JSON.stringify(f4));
+
+    // _roundLot: 整手取整
+    if (Paper._roundLot(250) === 200 && Paper._roundLot(99) === 0
+      && Paper._roundLot(100) === 100 && Paper._roundLot(0) === 0) ok('lot: 250→200 / 99→0 / 100→100');
+    else fail('lot', '');
+
+    // _pushSnapshot: 同日去重 + 不同日 append + 上限 365
+    let snaps = Paper._pushSnapshot([], { date: '2026-07-27', paperTotal: 100000, realTotal: 0, csi300: 3900 });
+    snaps = Paper._pushSnapshot(snaps, { date: '2026-07-27', paperTotal: 100100, realTotal: 0, csi300: 3901 });
+    if (snaps.length === 1 && snaps[0].paperTotal === 100000) ok('snapshot: 同日不重复 push');
+    else fail('snapshot 去重', JSON.stringify(snaps));
+    snaps = Paper._pushSnapshot(snaps, { date: '2026-07-28', paperTotal: 100100, realTotal: 0, csi300: 3901 });
+    if (snaps.length === 2 && snaps[1].paperTotal === 100100) ok('snapshot: 不同日 append');
+    else fail('snapshot append', JSON.stringify(snaps));
+    let big = [];
+    for (let i = 0; i < 400; i++) big = Paper._pushSnapshot(big, { date: `2026-d${String(i).padStart(3, '0')}`, paperTotal: i });
+    if (big.length === 365 && big[0].paperTotal === 35 && big[364].paperTotal === 399) ok('snapshot: 上限 365 条滚动截断');
+    else fail('snapshot 上限', `${big.length}`);
+
+    // _planAutoTrade: 现金 × positionPct → 整手; 不足一手/含费超现金 → null
+    if (Paper._planAutoTrade(100000, 0.10, 10) === 1000) ok('auto: 10 万 × 10% / 10 元 → 1000 股');
+    else fail('auto 正常', String(Paper._planAutoTrade(100000, 0.10, 10)));
+    if (Paper._planAutoTrade(500, 0.10, 10) === null) ok('auto: 预算 50 元不足一手 → null (跳过)');
+    else fail('auto 不足一手', '');
+    if (Paper._planAutoTrade(1004, 1.0, 10) === null) ok('auto: 100 股需 1005 (含费) > 现金 1004 → null');
+    else fail('auto 含费不足', String(Paper._planAutoTrade(1004, 1.0, 10)));
+    if (Paper._planAutoTrade(1005, 1.0, 10) === 100) ok('auto: 现金 1005 刚好够 100 股 + 费 5');
+    else fail('auto 刚好够', '');
+    if (Paper._planAutoTrade(100000, 0.10, 0) === null) ok('auto: 无行情价 → null');
+    else fail('auto 无价', '');
+
+    // ---- init / buy / sell 集成 (内存 mock storage) ----
+    const store = {
+      kv: {}, tables: {},
+      quotes: { '600519': { 代码: '600519', 名称: '贵州茅台', 最新价: 10 } },
+      indexSpot: []
+    };
+    const ctx1 = buildCtx(store);
+    const P1 = ctx1.window.Paper;
+    await P1.init();
+    const acc0 = await P1.getAccount();
+    if (acc0.cash === 100000 && acc0.initialCash === 100000 && acc0.positionPct === 0.10) ok('init: 默认账户 10 万 + 10% 仓位');
+    else fail('init 默认账户', JSON.stringify(acc0));
+    store.kv.paper_account.cash = 12345;
+    await P1.init();
+    if ((await P1.getAccount()).cash === 12345) ok('init: 已存在不覆盖');
+    else fail('init 覆盖', '');
+
+    // buy: 250 股 → 整手 200 @10 = 2000 + 费 5 (万三 0.6 < 5) = 2005
+    const h1 = await P1.buy('600519', '贵州茅台', '', 250);
+    if (h1 && h1.isPaper === true && h1.shares === 200 && h1.costPrice === 10 && h1.market === 'sh') ok('buy: 250→整手 200, isPaper 标记');
+    else fail('buy 整手', JSON.stringify(h1));
+    const accBuy = await P1.getAccount();
+    if (Math.abs(accBuy.cash - (12345 - 2005)) < 0.01) ok(`buy: 现金扣 2005 (=2000+费5), 余 ${accBuy.cash}`);
+    else fail('buy 现金', JSON.stringify(accBuy));
+    const txsBuy = (store.tables.transactions || []).filter(t => t.isPaper && t.type === 'buy');
+    if (txsBuy.length === 1 && txsBuy[0].shares === 200 && txsBuy[0].fee === 5) ok('buy: transactions 含 isPaper + fee');
+    else fail('buy tx', JSON.stringify(txsBuy));
+
+    // 加仓: 移动加权成本 (200×10 + 100×20) / 300 = 13.333
+    store.quotes['600519'] = { 代码: '600519', 名称: '贵州茅台', 最新价: 20 };
+    const h2 = await P1.buy('600519', '', '', 100);
+    if (h2 && h2.shares === 300 && Math.abs(h2.costPrice - (200 * 10 + 100 * 20) / 300) < 1e-9) ok('buy: 加仓移动加权成本 13.333');
+    else fail('buy 加权', JSON.stringify(h2));
+
+    // buy: 现金不足 → null
+    const h3 = await P1.buy('600519', '', '', 1000000);
+    if (h3 === null && (await P1._getPaperHoldings()).length === 1) ok('buy: 现金不足 → null, 持仓不变');
+    else fail('buy 现金不足', '');
+
+    // sell: 300 股 @20 = 6000, 费 = max(1.8,5)=5 + 印花税 3 = 8 → +5992
+    const cashBeforeSell = (await P1.getAccount()).cash;
+    const s1 = await P1.sell(h2.id, 300);
+    const cashAfterSell = (await P1.getAccount()).cash;
+    if (s1 && Math.abs(cashAfterSell - (cashBeforeSell + 5992)) < 0.01) ok(`sell: 300 股 @20 → +5992 (佣金 5 + 印花税 3)`);
+    else fail('sell 现金', JSON.stringify({ cashBeforeSell, cashAfterSell }));
+    if ((await P1._getPaperHoldings()).length === 0) ok('sell: 清仓后 holdings 行删除');
+    else fail('sell 清仓', '');
+    const txsSell = (store.tables.transactions || []).filter(t => t.isPaper && t.type === 'sell');
+    if (txsSell.length === 1 && txsSell[0].fee === 8) ok('sell: transactions 费 8 (5+3)');
+    else fail('sell tx', JSON.stringify(txsSell));
+
+    // sell: 超过持仓 → null
+    const h4 = await P1.buy('600519', '', '', 100);
+    const s2 = await P1.sell(h4.id, 200);
+    if (s2 === null && (await P1._getPaperHoldings()).length === 1) ok('sell: 超持仓拒绝, 持仓不变');
+    else fail('sell 超持仓', '');
+
+    // ---- snapshotIfNeeded: 写一条 + 当天不重复 ----
+    // (init 时已写过一条当天快照, 先清掉再测显式调用)
+    store.kv.paper_snapshots = [];
+    store.indexSpot = [{ 代码: '000300', 名称: '沪深300', 最新价: 3900 }];
+    const snaps1 = await P1.snapshotIfNeeded();
+    const snaps2 = await P1.snapshotIfNeeded();
+    if (snaps1.length === 1 && snaps2.length === 1 && snaps1[0].date === '2026-07-27' && snaps1[0].csi300 === 3900) ok('snapshotIfNeeded: 写一条 + 当天跳过');
+    else fail('snapshotIfNeeded', JSON.stringify(snaps2));
+    if (snaps1[0].paperTotal > 0 && typeof snaps1[0].realTotal === 'number') ok(`snapshotIfNeeded: paperTotal ${snaps1[0].paperTotal} / realTotal ${snaps1[0].realTotal}`);
+    else fail('snapshot 内容', JSON.stringify(snaps1[0]));
+
+    // ---- autoTradeFromPick: 现金不足跳过 (不 throw, 不写表) ----
+    const store2 = {
+      kv: { paper_account: { initialCash: 100000, cash: 50, createdAt: 1, positionPct: 0.10 } },
+      tables: {},
+      quotes: { '600519': { 代码: '600519', 名称: '贵州茅台', 最新价: 1700 } },
+      indexSpot: []
+    };
+    const ctx2 = buildCtx(store2);
+    const P2 = ctx2.window.Paper;
+    let threw = false, r1 = 'unset';
+    try { r1 = await P2.autoTradeFromPick({ code: '600519', name: '贵州茅台' }); } catch (e) { threw = true; }
+    if (!threw && r1 === null && (store2.tables.holdings || []).length === 0) ok('autoTradeFromPick: 现金 50 不足一手 → warn 跳过, 不 throw 不写表');
+    else fail('autoTradeFromPick 跳过', JSON.stringify({ threw, r1 }));
+
+    // 现金够 → 自动成交: 100000 × 10% = 10000 / 20 = 500 股 = 10000 + 费 5
+    store2.kv.paper_account.cash = 100000;
+    store2.quotes['600519'] = { 代码: '600519', 名称: '贵州茅台', 最新价: 20 };
+    const r2 = await P2.autoTradeFromPick({ code: '600519', name: '贵州茅台' });
+    if (r2 && r2.shares === 500 && r2.isPaper === true) ok('autoTradeFromPick: 10% 仓位自动成交 500 股');
+    else fail('autoTradeFromPick 成交', JSON.stringify(r2));
+    const accAuto = await P2.getAccount();
+    if (Math.abs(accAuto.cash - (100000 - 10005)) < 0.01) ok(`autoTradeFromPick: 现金扣 10005 (=10000+费5)`);
+    else fail('autoTradeFromPick 现金', JSON.stringify(accAuto));
+
+  } catch (e) {
+    fail('Paper 模拟盘', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [24] Discipline 交易纪律引擎 (Phase B) ==========
+section('24] Discipline 交易纪律引擎纯函数 + 集成实测');
+(async () => {
+  try {
+    const discSrc = readFileSafe(path.join(WWW, 'core', 'discipline.js'));
+    if (!discSrc) throw new Error('discipline.js 读不到');
+
+    // vm sandbox: mock window.Core (Storage 内存表 + Data + State + Util)
+    const buildCtx = (storageData) => {
+      const dctx = { window: {}, console };
+      dctx.window.Core = {
+        Storage: {
+          kvGet: async (k) => (k in storageData.kv ? storageData.kv[k] : null),
+          kvSet: async (k, v) => { storageData.kv[k] = v; },
+          all: async (t) => {
+            if (storageData.throwOnAll) throw new Error('storage down');
+            return storageData.tables[t] || [];
+          },
+          where: async (t, idx, v) => (storageData.tables[t] || []).filter(x => x[idx] === v)
+        },
+        Data: {
+          getStockQuote: async (code) => {
+            if (storageData.throwOnQuote) throw new Error('quote down');
+            return storageData.quotes[code] || null;
+          },
+          getFundSpot: async () => []
+        },
+        State: { get: (k) => storageData.state[k] ?? null },
+        Util: { escapeHtml: (s) => String(s == null ? '' : s).replace(/</g, '&lt;').replace(/>/g, '&gt;') }
+      };
+      vm.createContext(dctx);
+      vm.runInContext(discSrc, dctx);
+      return dctx;
+    };
+    const curMonth = (() => {
+      const d = new Date();
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    })();
+
+    // ---- 纯函数 ----
+    const ctx0 = buildCtx({ kv: {}, tables: {}, quotes: {}, state: {} });
+    const D0 = ctx0.window.Core.Discipline;
+    if (!D0) throw new Error('Core.Discipline 未挂到 window');
+
+    // _checkInputs: 假设/止损缺失与非法
+    let b = D0._checkInputs({ assumption: '', stopLoss: 9, price: 10 });
+    if (b.length === 1 && /买入假设必填/.test(b[0])) ok('inputs: 缺假设 → block');
+    else fail('inputs 缺假设', JSON.stringify(b));
+    b = D0._checkInputs({ assumption: '编造的理由', stopLoss: 9, price: 10 });
+    if (b.length === 1 && /买入假设必填/.test(b[0])) ok('inputs: 假设不在枚举 → block');
+    else fail('inputs 假设枚举', JSON.stringify(b));
+    b = D0._checkInputs({ assumption: '业绩拐点', stopLoss: NaN, price: 10 });
+    if (b.length === 1 && /止损价必填/.test(b[0])) ok('inputs: 缺止损 → block');
+    else fail('inputs 缺止损', JSON.stringify(b));
+    b = D0._checkInputs({ assumption: '业绩拐点', stopLoss: 10.5, price: 10 });
+    if (b.length === 1 && /必须低于买入价/.test(b[0])) ok('inputs: 止损 ≥ 价格 → block');
+    else fail('inputs 止损方向', JSON.stringify(b));
+    b = D0._checkInputs({ assumption: '业绩拐点', stopLoss: 9, price: 10 });
+    if (b.length === 0) ok('inputs: 合法输入 → 0 block');
+    else fail('inputs 合法', JSON.stringify(b));
+
+    // _checkConcentration: 23.5% > 20% → block 带具体数值
+    const cfg = D0.DEFAULT_CONFIG;
+    const cb = D0._checkConcentration({ positionValue: 23500, totalAssets: 100000, config: cfg });
+    if (cb && cb.includes('23.5%') && cb.includes('20%')) ok(`concentration: "${cb}"`);
+    else fail('concentration block', String(cb));
+    if (D0._checkConcentration({ positionValue: 15000, totalAssets: 100000, config: cfg }) === null) ok('concentration: 15% → 通过');
+    else fail('concentration 通过', '');
+    if (D0._checkConcentration({ positionValue: 100, totalAssets: 0, config: cfg }) === null) ok('concentration: 总资产 0 → 不拦');
+    else fail('concentration 0 资产', '');
+
+    // _checkTotalPosition: 96% > 95% → block
+    const tb = D0._checkTotalPosition({ stockValue: 96000, totalAssets: 100000, config: cfg });
+    if (tb && tb.includes('96.0%') && tb.includes('95%')) ok(`totalPosition: "${tb}"`);
+    else fail('totalPosition block', String(tb));
+    if (D0._checkTotalPosition({ stockValue: 90000, totalAssets: 100000, config: cfg }) === null) ok('totalPosition: 90% → 通过');
+    else fail('totalPosition 通过', '');
+
+    // _monthAnchorNext: 无锚点 → 新锚点; 同月 → 原引用; 跨月 → 重置
+    const a1 = D0._monthAnchorNext(null, '2026-07', 100000);
+    if (a1 && a1.month === '2026-07' && a1.startTotal === 100000) ok('anchor: 无锚点 → 写入新锚点');
+    else fail('anchor 新建', JSON.stringify(a1));
+    const a2 = D0._monthAnchorNext(a1, '2026-07', 90000);
+    if (a2 === a1) ok('anchor: 同月 → 不重置 (引用相等)');
+    else fail('anchor 同月', JSON.stringify(a2));
+    const a3 = D0._monthAnchorNext(a1, '2026-08', 90000);
+    if (a3 !== a1 && a3.month === '2026-08' && a3.startTotal === 90000) ok('anchor: 跨月 → 以当前总资产重置');
+    else fail('anchor 跨月', JSON.stringify(a3));
+
+    // _checkDrawdown: 月初 10 万, 现 8.9 万 → 熔断 block; 9.5 万 → 通过
+    const dd = D0._checkDrawdown({ currentTotal: 89000, anchor: { month: '2026-07', startTotal: 100000 }, config: cfg });
+    if (dd && dd.includes('熔断') && dd.includes('10%') && dd.includes('只准减仓')) ok(`drawdown: "${dd}"`);
+    else fail('drawdown block', String(dd));
+    if (D0._checkDrawdown({ currentTotal: 95000, anchor: { month: '2026-07', startTotal: 100000 }, config: cfg }) === null) ok('drawdown: 回撤 5% → 通过');
+    else fail('drawdown 通过', '');
+    if (D0._checkDrawdown({ currentTotal: 1000, anchor: null, config: cfg }) === null) ok('drawdown: 无锚点 → 不拦');
+    else fail('drawdown 无锚点', '');
+
+    // _checkChase: 7% > 5% → warn; 3% → null; 无行情 → null
+    const cw = D0._checkChase({ changePct: 7.23, config: cfg });
+    if (cw && cw.includes('7.23%') && cw.includes('追高')) ok(`chase: "${cw}"`);
+    else fail('chase warn', String(cw));
+    if (D0._checkChase({ changePct: 3, config: cfg }) === null) ok('chase: 3% → 不警告');
+    else fail('chase 通过', '');
+    if (D0._checkChase({ changePct: NaN, config: cfg }) === null) ok('chase: 无涨跌幅 → 不警告');
+    else fail('chase NaN', '');
+
+    // _summarizeHistory: 同代码 2 次复盘 1 次验证不成立; 同假设 5 次
+    const codeJs = [
+      { code: '600519', assumption: '业绩拐点', content: '看多\n### 🔁 AI 事后验证 (2026-07-01)\n结论: 不成立' },
+      { code: '600519', assumption: '其他', content: '再看看' }
+    ];
+    const sameAs = new Array(5).fill(0).map((_, i) => ({ code: 'x' + i, assumption: '业绩拐点', content: i === 0 ? '### 🔁 AI 事后验证\n不成立' : '笔记' }));
+    const hist = D0._summarizeHistory(codeJs, sameAs, '业绩拐点');
+    if (hist.length === 2 && hist[0].includes('2 次历史复盘') && hist[0].includes('1 次验证不成立')
+      && hist[1].includes('业绩拐点') && hist[1].includes('5 次')) ok(`history: ${hist.join(' / ')}`);
+    else fail('history 汇总', JSON.stringify(hist));
+    if (D0._summarizeHistory([], [], '业绩拐点').length === 0) ok('history: 无历史 → 空数组');
+    else fail('history 空', '');
+
+    // getConfig/setConfig: 默认值 + 合并写回
+    const c1 = await D0.getConfig();
+    if (c1.enabled === true && c1.maxSingleStockPct === 0.20 && c1.maxMonthlyDrawdownPct === 0.10 && c1.maxSingleIndustryPct === 0.30) ok('config: 默认值 (含预留 maxSingleIndustryPct)');
+    else fail('config 默认', JSON.stringify(c1));
+    const c2 = await D0.setConfig({ maxSingleStockPct: 0.15 });
+    if (c2.maxSingleStockPct === 0.15 && c2.maxTotalPositionPct === 0.95) ok('config: setConfig 合并写回');
+    else fail('config 合并', JSON.stringify(c2));
+
+    // ---- preBuyCheck 集成 (内存 mock storage) ----
+    // 场景 A: 现金 9 万 + 600519 持仓 1000 股 @10 = 总资产 10 万; 再买 1500 股 @10 → 单票 25% > 20% block
+    const storeA = {
+      kv: {}, state: { accountCash: 90000 },
+      tables: {
+        holdings: [{ id: 'h1', code: '600519', name: '贵州茅台', shares: 1000, costPrice: 10 }],
+        journals: codeJs
+      },
+      quotes: { '600519': { 代码: '600519', 名称: '贵州茅台', 最新价: 10, 涨跌幅: 1 } }
+    };
+    const DA = buildCtx(storeA).window.Core.Discipline;
+    const rA = await DA.preBuyCheck({ code: '600519', name: '贵州茅台', price: 10, shares: 1500, amount: 15000, isPaper: false, assumption: '业绩拐点', stopLoss: 9 });
+    if (!rA.ok && rA.blocks.some(x => x.includes('25.0%') && x.includes('20%'))) ok('preBuy: 单票超限 → block');
+    else fail('preBuy 单票', JSON.stringify(rA.blocks));
+    if (rA.history.length === 2 && rA.warns.some(w => w.includes('该代码 2 次历史复盘'))) ok('preBuy: 历史复盘折叠进 warns');
+    else fail('preBuy history', JSON.stringify({ h: rA.history, w: rA.warns }));
+    // 月初锚点已写入 (首次检查)
+    if (storeA.kv.discipline_month_anchor && storeA.kv.discipline_month_anchor.month === curMonth
+      && storeA.kv.discipline_month_anchor.startTotal === 100000) ok('preBuy: 月初锚点写入 (startTotal=100000)');
+    else fail('preBuy 锚点', JSON.stringify(storeA.kv.discipline_month_anchor));
+
+    // 场景 B: 小额买入 → 通过; 但涨跌幅 7% → 追高 warn
+    storeA.quotes['600519'].涨跌幅 = 7;
+    const rB = await DA.preBuyCheck({ code: '600519', price: 10, shares: 100, amount: 1000, isPaper: false, assumption: '估值修复', stopLoss: 9 });
+    if (rB.ok && rB.blocks.length === 0) ok('preBuy: 合规买入 → ok');
+    else fail('preBuy 合规', JSON.stringify(rB.blocks));
+    if (rB.warns.some(w => w.includes('追高'))) ok('preBuy: 涨幅 7% → 追高 warn');
+    else fail('preBuy 追高', JSON.stringify(rB.warns));
+
+    // 场景 C: 缺假设/止损 → block (不依赖任何外部数据)
+    const rC = await DA.preBuyCheck({ code: '600519', price: 10, shares: 100, isPaper: false });
+    if (!rC.ok && rC.blocks.some(x => /买入假设必填/.test(x)) && rC.blocks.some(x => /止损价必填/.test(x))) ok('preBuy: 缺假设+止损 → 2 blocks');
+    else fail('preBuy 输入缺失', JSON.stringify(rC.blocks));
+
+    // 场景 D: 月度回撤熔断 (锚点 20 万, 现 10 万 → 回撤 50% > 10%)
+    storeA.kv.discipline_month_anchor = { month: curMonth, startTotal: 200000 };
+    const rD = await DA.preBuyCheck({ code: '600519', price: 10, shares: 100, amount: 1000, isPaper: false, assumption: '其他', stopLoss: 9 });
+    if (!rD.ok && rD.blocks.some(x => x.includes('熔断') && x.includes('只准减仓'))) ok('preBuy: 回撤熔断 → block');
+    else fail('preBuy 熔断', JSON.stringify(rD.blocks));
+
+    // 场景 E: 检查本身失败 (storage 抛错) → 不 block, 降级 warn
+    const storeE = { kv: {}, state: { accountCash: 100000 }, tables: {}, quotes: {}, throwOnAll: true };
+    const DE = buildCtx(storeE).window.Core.Discipline;
+    const rE = await DE.preBuyCheck({ code: '600519', price: 10, shares: 100, isPaper: false, assumption: '其他', stopLoss: 9 });
+    if (rE.ok && rE.warns.some(w => w.includes('部分检查跳过'))) ok('preBuy: 存储故障 → 降级 warn, 不拦交易');
+    else fail('preBuy 降级', JSON.stringify(rE));
+
+    // 场景 F: 引擎关闭 → 全部放行
+    const storeF = { kv: { discipline_config: { enabled: false } }, state: {}, tables: {}, quotes: {} };
+    const DF = buildCtx(storeF).window.Core.Discipline;
+    const rF = await DF.preBuyCheck({ code: '600519' });
+    if (rF.ok && rF.blocks.length === 0 && rF.warns.length === 0) ok('preBuy: enabled=false → 直接放行');
+    else fail('preBuy 关闭', JSON.stringify(rF));
+
+    // 场景 G: 模拟盘独立口径 (paper 现金 5 万 + 模拟持仓 5 万, 独立锚点 key)
+    const storeG = {
+      kv: { paper_account: { initialCash: 100000, cash: 50000 } }, state: {},
+      tables: { holdings: [{ id: 'p1', code: '000001', shares: 5000, costPrice: 10, isPaper: true }] },
+      quotes: { '000001': { 代码: '000001', 最新价: 10, 涨跌幅: 0 } }
+    };
+    const DG = buildCtx(storeG).window.Core.Discipline;
+    const rG = await DG.preBuyCheck({ code: '000001', price: 10, shares: 1000, amount: 10000, isPaper: true, assumption: '技术突破', stopLoss: 9 });
+    // 单票 (50000+10000)/100000 = 60% > 20% → block; 锚点写到 _paper 后缀 key
+    if (!rG.ok && rG.blocks.some(x => x.includes('60.0%'))) ok('preBuy: 模拟盘口径独立计算 (60% 单票 block)');
+    else fail('preBuy 模拟盘', JSON.stringify(rG.blocks));
+    if (storeG.kv.discipline_month_anchor_paper && storeG.kv.discipline_month_anchor_paper.startTotal === 100000
+      && !storeG.kv.discipline_month_anchor) ok('preBuy: 模拟盘锚点独立 key (_paper 后缀)');
+    else fail('preBuy 模拟锚点', JSON.stringify(storeG.kv));
+
+    // renderCheckResult: escapeHtml + blocks/warns 分区
+    const html = D0.renderCheckResult({ ok: false, blocks: ['<b>block</b>'], warns: ['warn1'], history: [] });
+    if (html.includes('&lt;b&gt;block&lt;/b&gt;') && !html.includes('<b>block</b>') && html.includes('⛔') && html.includes('⚠️')) ok('renderCheckResult: XSS 转义 + 分区图标');
+    else fail('renderCheckResult', html.slice(0, 200));
+    if (D0.renderCheckResult({ ok: true, blocks: [], warns: [], history: [] }) === '') ok('renderCheckResult: 全通过 → 空字符串');
+    else fail('renderCheckResult 空', '');
+  } catch (e) {
+    fail('Discipline 测试', e.message + ' / ' + (e.stack || ''));
   }
 })();
 

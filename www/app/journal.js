@@ -69,7 +69,8 @@
     async _buildHoldingsContext() {
       const map = {};
       try {
-        const holdings = await Core.Storage.all('holdings');
+        // 排除模拟盘 (isPaper) 行
+        const holdings = ((await Core.Storage.all('holdings')) || []).filter(h => !h.isPaper);
         if (!holdings || holdings.length === 0) return map;
 
         // 一次性拉行情 (失败则单只价格为空)
@@ -83,7 +84,7 @@
 
         // 一次性拉所有交易, 按 holdingId 分组
         let txs = [];
-        try { txs = await Core.Storage.all('transactions'); } catch (e) { console.warn('[Journal] _buildHoldingsContext 拉 tx 失败:', e); }
+        try { txs = ((await Core.Storage.all('transactions')) || []).filter(t => !t.isPaper); } catch (e) { console.warn('[Journal] _buildHoldingsContext 拉 tx 失败:', e); }
         const buyByHolding = {};
         for (const t of (txs || [])) {
           if (t.type === 'buy') {
@@ -222,7 +223,7 @@
       out.innerHTML = '<span style="color:var(--text-muted);">⏳ 拉事实 → 调 LLM → 输出...</span>';
       try {
         // 收集事实: 持仓 + 告警 + 近期复盘
-        const holdings = (await Core.Storage.all('holdings')) || [];
+        const holdings = ((await Core.Storage.all('holdings')) || []).filter(h => !h.isPaper);  // 排除模拟盘
         const alerts = (await Core.Storage.all('alerts')) || [];
         const allJ = (await Core.Storage.all('journals')) || [];
         // 近期 7 天
@@ -498,11 +499,11 @@
 
       // 2. 持仓当日盈亏 (按代码并行拉 quote)
       try {
-        const holdings = await Core.Storage.all('holdings');
+        const holdings = ((await Core.Storage.all('holdings')) || []).filter(h => !h.isPaper);  // 排除模拟盘
         // 5.1.1: 拉所有 buy 交易, 找每只的最早买入日
         let buyTxByHolding = {};
         try {
-          const txs = await Core.Storage.all('transactions');
+          const txs = ((await Core.Storage.all('transactions')) || []).filter(t => !t.isPaper);
           for (const t of (txs || [])) {
             if (t.type === 'buy') {
               const cur = buyTxByHolding[t.holdingId];

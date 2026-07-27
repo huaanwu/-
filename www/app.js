@@ -92,6 +92,7 @@ function updateMarketStatus() {
     // 5. 初始化各域
     if (window.Watchlist && Watchlist.init) Watchlist.init();
     if (window.Holdings && Holdings.init) Holdings.init();
+    if (window.Paper && Paper.init) Paper.init();
     if (window.Journal && Journal.init) Journal.init();
     if (window.Screener && Screener.init) Screener.init();
     if (window.Fund && Fund.init) Fund.init();
@@ -584,7 +585,8 @@ window.exportTodaySnapshot = async function() {
   const cash = parseFloat(Core.State.get('accountCash')) || 0;
 
   const [holdings, funds, flow] = await Promise.all([
-    Core.Storage.all('holdings'),
+    // 排除模拟盘 (isPaper) 行, 快照总资产只算真实持仓
+    Core.Storage.all('holdings').then(list => (list || []).filter(h => !h.isPaper)),
     Core.Storage.all('funds'),
     Core.Storage.all('cashflow')
   ]);
