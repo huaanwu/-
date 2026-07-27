@@ -95,6 +95,7 @@
           <td>
             <button class="btn btn-sm" title="AI 简评" onclick="StockAdvisor.show('${escapeHtml(r.h.code)}','${escapeHtml(r.h.name || r.s?.名称 || '')}')">💡</button>
             <button class="btn btn-sm" title="让 AI 给这只持仓设盯盘规则" onclick="Holdings._aiSuggestForOne('${escapeHtml(r.h.id)}')">🪄</button>
+            <button class="btn btn-sm" title="跳券商 App 查看 / 交易" onclick="Holdings.brokerDialog('${escapeHtml(r.h.code)}','${escapeHtml(r.h.name || r.s?.名称 || '')}')">📱</button>
             <button class="btn btn-sm" onclick="Holdings.addTxDialog('${escapeHtml(r.h.id)}')">+T</button>
             <button class="btn btn-sm" onclick="Holdings.editDialog('${escapeHtml(r.h.id)}')">✎</button>
             <button class="btn btn-sm" onclick="Holdings.remove('${escapeHtml(r.h.id)}')">✕</button>
@@ -465,6 +466,234 @@
     closeModal() {
       this._pendingConfirmId = null;  // 放弃保存: 卡片保持 pending
       document.getElementById('modalRoot').innerHTML = '';
+    },
+
+    /**
+     * 券商 App 跳转弹窗
+     * 4 个常用券商: 同花顺 / 华泰 / 东方财富 / 雪球
+     * 自动识别代码前缀: sh6/sz0/sz3 → 不同券商深度链接格式略不同, 这里全部用 web 详情页, 跨平台可用
+     */
+    brokerDialog(code, name) {
+      const codeFull = code;
+      const market = code.startsWith('6') ? 'SH' : code.startsWith('0') || code.startsWith('3') ? 'SZ' : '';
+      const codeWithPrefix = market ? `${codeFull}.${market}` : codeFull;
+
+      const links = [
+        {
+          name: '同花顺',
+          icon: '📊',
+          desc: 'A股老牌, 散户最爱',
+          url: `https://stockpage.10jqka.com.cn/${codeFull}/`,
+          mobile: `thsapp://stock/quote?code=${codeWithPrefix}`
+        },
+        {
+          name: '东方财富',
+          icon: '📈',
+          desc: '行情 + 资讯最全',
+          url: `https://quote.eastmoney.com/${codeFull}.html`,
+          mobile: `emstock://quote?code=${codeWithPrefix}`
+        },
+        {
+          name: '雪球',
+          icon: '❄️',
+          desc: '社区 + 大 V 分析',
+          url: `https://xueqiu.com/S/${codeFull}`,
+          mobile: `xueqiu://stock/${codeWithPrefix}`
+        },
+        {
+          name: '华泰证券',
+          icon: '🦁',
+          desc: '涨乐财富通, 大券商',
+          url: `https://www.htsc.com.cn`,
+          mobile: `zlsgphapp://stock?code=${codeWithPrefix}`
+        }
+      ];
+
+      const html = `
+        <div class="modal-backdrop" onclick="if(event.target===this)Holdings.closeModal()">
+          <div class="modal" style="max-width:520px;width:100%;">
+            <h3>📱 跳券商 App - ${escapeHtml(code)} ${escapeHtml(name || '')}</h3>
+            <div style="font-size:12px;color:var(--text-muted);margin-bottom:12px;line-height:1.6;">
+              ⚠ app <b>不能</b>直接交易 (合规要求)。<br>
+              点下方链接 → 新窗口打开券商详情页 → 用户手动买卖 → 回来点 <b>+T</b> 录入实际成交
+            </div>
+            <div style="display:flex;flex-direction:column;gap:8px;">
+              ${links.map(l => `
+                <a href="${escapeHtml(l.url)}" rel="noopener noreferrer" class="btn" style="justify-content:flex-start;text-align:left;" onclick="(function(u){if(window.Fund&&Fund._openExternal){Fund._openExternal(u);return false;}window.open(u,'_blank','noopener,noreferrer');return false;})('${escapeHtml(l.url)}')">
+                  <span style="font-size:20px;margin-right:8px;">${l.icon}</span>
+                  <span style="flex:1;">
+                    <strong>${escapeHtml(l.name)}</strong>
+                    <div style="font-size:11px;color:var(--text-muted);">${escapeHtml(l.desc)}</div>
+                  </span>
+                  <span style="font-size:14px;color:var(--text-muted);">↗</span>
+                </a>
+              `).join('')}
+            </div>
+            <div style="font-size:11px;color:var(--text-muted);margin-top:12px;line-height:1.6;">
+              💡 <b>提示</b>:<br>
+              • 移动端优先安装券商 App, 用 <code>zlsgphapp://</code> 这种深度链接直接打开那只股<br>
+              • 桌面浏览器打开的是 web 详情页, 需登录券商账号才能交易<br>
+              • 买/卖完务必回 app 点 <b>+T</b> 录入, 否则持仓对不上
+            </div>
+            <div class="modal-footer">
+              <button class="btn btn-ghost" onclick="Holdings.closeModal()">关闭</button>
+            </div>
+          </div>
+        </div>
+      `;
+      document.getElementById('modalRoot').innerHTML = html;
+    },
+
+    /**
+     * 账户余额对账
+     * 用户手动输入券商 App 显示的"总资产"或"持仓市值+现金"
+     * app 跟自身计算的"总市值(持仓按现价)+现金"对比
+     * 偏差 > 50 元 → 提示"可能有漏录交易"
+     */
+    async reconcileDialog() {
+      // 拉所有 holdings + cashflow
+      const holdings = (await Core.Storage.all('holdings')).filter(h => !h.isPaper);
+      const cashflows = await Core.Storage.all('cashflow');
+
+      // app 自身计算: 总市值 + 现金
+      let appValue = 0, appCash = 0;
+      try {
+        const spot = await Core.Data.getStockSpot();
+        const spotMap = {};
+        spot.forEach(s => { spotMap[s.代码] = s; });
+        holdings.forEach(h => {
+          const s = spotMap[h.code];
+          const price = s ? parseFloat(s.最新价) : null;
+          const shares = parseFloat(h.shares) || 0;
+          if (price) appValue += shares * price;
+        });
+      } catch (e) { console.warn('[Holdings] 行情拉取失败:', e); }
+      // 现金 = 所有 cashflow 净额(正=收入,负=支出)
+      cashflows.forEach(f => { appCash += parseFloat(f.amount) || 0; });
+      const appTotal = appValue + appCash;
+
+      // 上次校准时间 + 上次校准值
+      const last = await Core.Storage.kvGet('holdings_last_reconcile') || {};
+
+      const html = `
+        <div class="modal-backdrop" onclick="if(event.target===this)Holdings.closeModal()">
+          <div class="modal" style="max-width:480px;">
+            <h3>⚖️ 账户对账</h3>
+            <div style="font-size:12px;color:var(--text-muted);margin-bottom:12px;line-height:1.6;">
+              把券商 App 显示的 <b>总资产</b> 数字输进来, app 自动对比自算值<br>
+              偏差大 → 提示可能有漏录交易<br>
+              <span style="font-size:11px;">💡 合规要求, 不能直连券商, 所以每天手动输一次, 1 分钟搞定</span>
+            </div>
+
+            <div style="background:var(--bg-base);padding:10px;border-radius:6px;margin-bottom:12px;font-size:13px;line-height:1.7;">
+              <div>📊 <b>app 自算</b>: ${fmtMoney(appValue)} (持仓市值)</div>
+              <div>💵 <b>现金</b>: ${fmtMoney(appCash)} (cashflow 净额)</div>
+              <div style="border-top:1px solid var(--border);margin-top:6px;padding-top:6px;">
+                <b>总计</b>: <span style="color:var(--accent);font-size:15px;">${fmtMoney(appTotal)}</span>
+              </div>
+            </div>
+
+            <div class="form-row">
+              <label>券商 App 总资产 (元)</label>
+              <input type="number" id="reconcileBrokerTotal" step="0.01" placeholder="例: 51823.56">
+              <div style="font-size:11px;color:var(--text-muted);">打开券商 App → 资产总览 → 复制数字</div>
+            </div>
+            <div class="form-row">
+              <label>对账日期</label>
+              <input type="date" id="reconcileDate" value="${new Date().toISOString().slice(0,10)}">
+            </div>
+            <div class="form-row">
+              <label>备注 (可选)</label>
+              <input type="text" id="reconcileNote" placeholder="例: 今天有笔国债逆回购到账">
+            </div>
+
+            <div id="reconcilePreview" style="background:var(--bg-base);padding:10px;border-radius:4px;margin:8px 0;font-size:12px;line-height:1.6;">
+              填完数字自动算偏差
+            </div>
+
+            ${last.date ? `
+              <div style="font-size:11px;color:var(--text-muted);margin-top:8px;">
+                上次对账: ${escapeHtml(last.date)} · 当时偏差 ${fmtMoney(last.diff || 0)}
+              </div>
+            ` : ''}
+
+            <div class="modal-footer">
+              <button class="btn btn-ghost" onclick="Holdings.closeModal()">取消</button>
+              <button class="btn btn-primary" onclick="Holdings.reconcileSave()">✓ 保存对账</button>
+            </div>
+          </div>
+        </div>
+      `;
+      document.getElementById('modalRoot').innerHTML = html;
+      this._reconcileAppTotal = appTotal;
+      this._bindReconcileCalc();
+    },
+
+    _bindReconcileCalc() {
+      const upd = () => {
+        const broker = parseFloat(document.getElementById('reconcileBrokerTotal')?.value);
+        const el = document.getElementById('reconcilePreview');
+        if (!el) return;
+        if (isNaN(broker)) { el.textContent = '填完数字自动算偏差'; return; }
+        const diff = broker - this._reconcileAppTotal;
+        const absDiff = Math.abs(diff);
+        let status, color;
+        if (absDiff < 50) {
+          status = '✅ 完全对得上 (偏差 < 50 元, 可能是取整)';
+          color = 'var(--up)';
+        } else if (absDiff < 500) {
+          status = '⚠️ 轻微偏差, 检查今日是否有手续费/分红漏录';
+          color = 'var(--text-muted)';
+        } else if (diff > 0) {
+          status = `❌ 券商比 app 多 ${fmtMoney(diff)}, 可能漏录了 ${fmtMoney(diff)} 的买入或漏算资金到账`;
+          color = 'var(--down)';
+        } else {
+          status = `❌ 券商比 app 少 ${fmtMoney(-diff)}, 可能多录了 ${fmtMoney(-diff)} 或漏算卖出`;
+          color = 'var(--down)';
+        }
+        el.innerHTML = `
+          <b>偏差</b>: <span style="color:${color};font-size:15px;">${fmtMoney(diff)}</span><br>
+          <span style="color:${color};">${status}</span>
+        `;
+      };
+      const input = document.getElementById('reconcileBrokerTotal');
+      if (input) input.addEventListener('input', upd);
+      upd();
+    },
+
+    async reconcileSave() {
+      const broker = parseFloat(document.getElementById('reconcileBrokerTotal').value);
+      const date = document.getElementById('reconcileDate').value;
+      const note = document.getElementById('reconcileNote').value.trim();
+      if (isNaN(broker)) { toastError('填券商总资产数字'); return; }
+      if (!date) { toastError('填日期'); return; }
+      const diff = broker - this._reconcileAppTotal;
+
+      const rec = {
+        date,
+        brokerTotal: broker,
+        appTotal: this._reconcileAppTotal,
+        diff,
+        note,
+        createdAt: Date.now()
+      };
+      // 存进 kv (kvSet), 滚动保留最近 30 条
+      const list = (await Core.Storage.kvGet('holdings_reconcile_log')) || [];
+      list.push(rec);
+      if (list.length > 30) list.shift();
+      await Core.Storage.kvSet('holdings_reconcile_log', list);
+      await Core.Storage.kvSet('holdings_last_reconcile', { date, diff });
+
+      this.closeModal();
+      const abs = Math.abs(diff);
+      if (abs < 50) {
+        toastSuccess(`✅ 对账通过, 偏差 ${fmtMoney(diff)}`);
+      } else if (abs < 500) {
+        toastSuccess(`对账已记录, 偏差 ${fmtMoney(diff)}, 请检查手续费/分红`);
+      } else {
+        toastError(`偏差 ${fmtMoney(diff)} 较大, 已记录. 请检查今日交易是否漏录`);
+      }
+      this.render();
     }
   };
 
