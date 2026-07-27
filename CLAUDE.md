@@ -46,7 +46,7 @@ npm test                                       # = node test/test_all.js — 纯
 npm run typecheck                              # tsc --noEmit
 ```
 
-`test/test_all.js` 跑 8 组检查:JS 语法、域脚本接口完备性、Core 命名空间导出、index.html script 引用对账、Worker 文件结构、关键文件存在、Data 层方法签名、回测引擎纯函数实测。**改完域脚本或新增域脚本必须先 `npm test`**,要新增/删除的域方法同步更新该文件的 `DOMAINS` 字典。
+`test/test_all.js` 跑 8 组检查:JS 语法、域脚本接口完备性、Core 命名空间导出、index.html script 引用对账、Worker 文件结构、关键文件存在、Data 层方法签名、回测引擎纯函数实测。`test/test_runtime.js` 用 vm sandbox 加载 `www/core/util.js`,覆盖 `escapeHtml` XSS 边界、`parseStockInput` 格式解析、`fmtNum`/`fmtPct`/`fmtMoney`/`pctClass`/`uuid` 边界值。**改完域脚本或新增域脚本必须先 `npm test`**,要新增/删除的域方法同步更新该文件的 `DOMAINS` 字典。
 
 更新依赖:
 
@@ -97,7 +97,9 @@ scripts/
 ├── copy-libs.mjs           # node_modules/{echarts,dexie} → www/lib/
 ├── build-web.mjs           # dist/ → www/ (替换 styles.css link)
 ├── supabase_schema.sql     # 可选云同步的 Postgres schema
-└── daily_summary.mjs, fund_*.py  # 离线数据采集/AI seed 工具
+├── powershell-profile.ps1  # PowerShell 7.x profile 片段(UTF-8 + gst 快捷命令)
+├── daily_summary.mjs, e2e*.mjs, emu_e2e.mjs  # 离线数据采集 / e2e 测试 runner
+└── archive/                # 探索期临时脚本(fund_filter*.py、explore_*.py、fund_deep_research*.py 等)
 ```
 
 ### 关键约定
