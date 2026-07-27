@@ -390,20 +390,26 @@ function pickJournalsForVerify(journals, now = Date.now()) {
 }
 
 /**
- * 5.2 c: 给单条 note 拼对照报告的 prompt
+ * 5.2 c: 给单条 note 拼对照报告的 prompt (Z2: 升级为强制 JSON 输出)
  * 返回 { systemPrompt, userPrompt } — 让 LLM 注入即可
+ *
+ * Z2 改动: 不再是自由文本, 强制 LLM 输出结构化 JSON:
+ *   { verdict: "对"|"错"|"部分", attribution: 枚举, lesson: 一句话 }
+ * 同时仍要 narrative (≤ 200 字, 人类可读), 写进 note.content
  */
 function buildVerifyPrompt(note, currentData) {
   const cd = currentData || {};
   const systemPrompt = `你是一个严谨的 A 股个人投资复盘助理, 任务是基于"用户当时的判断"和"当前市场数据"生成一份对照报告。规则:
 1. 严禁编造数据, 只能引用下方提供的 "当前市场反馈" 数字
 2. 客观描述 "当时判断" 与 "当前市场反馈" 的一致/偏差
-3. 3 段简短结构 (≤ 200 字):
-   - 当时判断: 引用 assumption + emotion
-   - 当前市场反馈: 列出 code/价格/涨跌幅/相关新闻
-   - 自我反思: 1-2 句 (是否验证, 偏差原因)
+3. 输出严格 JSON (会被 schema 校验), 字段:
+   - verdict: 必填, 三个值之一: "对" (假设被市场证实) / "错" (假设被证伪) / "部分" (方向对但程度/时点有偏)
+   - attribution: 必填, 错/部分时填写 (对的时候填 "无"), 候选值:
+     追高 (情绪化入场点位差) / 假设错 (逻辑本身不成立) / 时机早 (逻辑对但市场未到) / 大盘拖累 (个股 OK 但系统性下跌) / 黑天鹅 (突发不可控事件) / 其他
+   - lesson: 必填, 1 句话 ≤ 30 字, 总结下次遇到类似情境该怎么调整
+   - narrative: 必填, ≤ 200 字 markdown, 3 段: 当时判断 / 当前市场反馈 / 自我反思
 4. 不预测, 不推荐买卖
-5. 严格 markdown 格式, 用 ### 标题`;
+5. 严格 JSON, 严禁多余文字`;
 
   const dataLine = cd.error
     ? `(行情拉取失败: ${cd.error})`
@@ -420,22 +426,181 @@ function buildVerifyPrompt(note, currentData) {
 【当前市场反馈】
 ${dataLine}
 
-请生成对照报告。`;
+【输出 JSON】
+{"verdict":"对|错|部分", "attribution":"追高|假设错|时机早|大盘拖累|黑天鹅|其他|无", "lesson":"≤30字", "narrative":"≤200字 markdown"}`;
   return { systemPrompt, userPrompt };
 }
 
 /**
- * 5.2 c: 把对照报告 append 到 note.content, 标记 verify='verified'
+ * Z2: 从 LLM 输出里抽 JSON, 校验 + 枚举值归一化
+ * 容错: 围栏 ```json, markdown 残留, 字段缺失
+ * @returns { ok, result: {verdict, attribution, lesson, narrative}, errors }
  */
-function applyVerifyReport(note, report) {
-  if (!note || !report) return note;
+const VERDICTS = ['对', '错', '部分'];
+const ATTRIBUTIONS = ['追高', '假设错', '时机早', '大盘拖累', '黑天鹅', '其他', '无'];
+
+function parseVerifyJsonOutput(text) {
+  if (!text || typeof text !== 'string') {
+    return { ok: false, result: null, errors: ['empty output'] };
+  }
+  // 1) 抽 JSON (容错围栏)
+  let jsonText = null;
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fence && fence[1]) jsonText = fence[1].trim();
+  if (!jsonText) {
+    const objStart = text.indexOf('{');
+    const objEnd = text.lastIndexOf('}');
+    if (objStart >= 0 && objEnd > objStart) jsonText = text.slice(objStart, objEnd + 1);
+  }
+  if (!jsonText) return { ok: false, result: null, errors: ['no JSON object found'] };
+  // 2) parse
+  let obj;
+  try { obj = JSON.parse(jsonText); }
+  catch (e) { return { ok: false, result: null, errors: ['JSON parse error: ' + e.message] }; }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+    return { ok: false, result: null, errors: ['root not object'] };
+  }
+  // 3) 字段校验 + 枚举归一化
+  const errors = [];
+  let verdict = obj.verdict;
+  if (!VERDICTS.includes(verdict)) errors.push(`verdict "${verdict}" 不在 ${VERDICTS.join('/')}`);
+  let attribution = obj.attribution;
+  if (!ATTRIBUTIONS.includes(attribution)) {
+    // 自由发挥归 "其他" (而不是直接 reject, 保留 narrative 价值)
+    attribution = '其他';
+  }
+  // verdict=对 → attribution 强制 "无"
+  if (verdict === '对' && attribution !== '无') {
+    console.warn(`[Verify] verdict=对 但 attribution=${attribution}, 强制归 "无"`);
+    attribution = '无';
+  }
+  const lesson = typeof obj.lesson === 'string' ? obj.lesson.slice(0, 60) : '';
+  const narrative = typeof obj.narrative === 'string' ? obj.narrative.slice(0, 200) : '';
+  if (!lesson) errors.push('lesson 缺失');
+  if (!narrative) errors.push('narrative 缺失');
+  return {
+    ok: errors.length === 0,
+    result: { verdict, attribution, lesson, narrative },
+    errors
+  };
+}
+
+/**
+ * 5.2 c: 把对照报告 + 结构化字段写回 note
+ *   - note.content 末尾 append narrative (人类可读)
+ *   - note.aiVerified = { verdict, attribution, lesson, ts } (Z2 反馈闭环用)
+ *   - note.verify = 'verified'
+ */
+function applyVerifyReport(note, parsed) {
+  if (!note || !parsed) return note;
   const updated = { ...note };
   const separator = '\n\n---\n\n';
-  const section = `### 🔁 AI 事后验证 (${new Date().toISOString().slice(0, 10)})\n${report}`;
+  const section = `### 🔁 AI 事后验证 (${new Date().toISOString().slice(0, 10)})
+**判定**: ${parsed.verdict} | **归因**: ${parsed.attribution} | **教训**: ${parsed.lesson}
+
+${parsed.narrative}`;
   updated.content = (updated.content || '') + separator + section;
   updated.verify = 'verified';
   updated.verifiedAt = Date.now();
+  // Z2: 结构化字段, 反馈闭环 + 历史成绩单的根基
+  updated.aiVerified = {
+    verdict: parsed.verdict,
+    attribution: parsed.attribution,
+    lesson: parsed.lesson,
+    ts: Date.now()
+  };
   return updated;
+}
+
+/**
+ * Z2: 统计复盘成绩单, 按 (assumption × verdict) 聚合
+ * 输出: {
+ *   total: 已验证总数,
+ *   byAssumption: { '题材催化': { total, hit: 对数, miss: 错数, partial, winRate }, ... },
+ *   byAttribution: { '追高': 计数, '假设错': 计数, ... },  // 错/部分时填
+ *   lessons: [{ lesson, count, assumption, attribution }, ...],  // 高频教训 (按 lesson 字面分组, >=2 次)
+ *   topMissAssumption: 命中率最低的假设 (>= 3 次才有意义),
+ *   topHitAssumption: 命中率最高的假设 (>= 3 次)
+ * }
+ *
+ * 这是 AI 升级 #2 的"反馈闭环"核心, 给后续 prompt 注入 "你的历史成绩单" 用.
+ */
+function getVerifyStats(notes, opts = {}) {
+  const minSamples = opts.minSamples || 3;
+  const arr = Array.isArray(notes) ? notes.filter(n => n && n.aiVerified) : [];
+  const byAssumption = {};
+  const byAttribution = {};
+  const lessonMap = new Map();
+  let total = 0;
+
+  for (const n of arr) {
+    const v = n.aiVerified;
+    const a = n.assumption || '其他';
+    if (!byAssumption[a]) byAssumption[a] = { total: 0, hit: 0, miss: 0, partial: 0, winRate: 0 };
+    byAssumption[a].total++;
+    if (v.verdict === '对') byAssumption[a].hit++;
+    else if (v.verdict === '错') byAssumption[a].miss++;
+    else if (v.verdict === '部分') byAssumption[a].partial++;
+
+    if (v.attribution && v.attribution !== '无') {
+      byAttribution[v.attribution] = (byAttribution[v.attribution] || 0) + 1;
+    }
+
+    if (v.lesson) {
+      const key = v.lesson.trim();
+      if (key) {
+        const cur = lessonMap.get(key) || { lesson: key, count: 0, assumption: a, attribution: v.attribution };
+        cur.count++;
+        lessonMap.set(key, cur);
+      }
+    }
+    total++;
+  }
+
+  // 算 winRate + 找 topHit / topMiss
+  let topHit = null, topMiss = null;
+  for (const a of Object.keys(byAssumption)) {
+    const x = byAssumption[a];
+    x.winRate = x.total > 0 ? +(x.hit / x.total * 100).toFixed(1) : 0;
+    if (x.total >= minSamples) {
+      if (!topHit || x.winRate > topHit.winRate) topHit = { assumption: a, ...x };
+      if (!topMiss || x.winRate < topMiss.winRate) topMiss = { assumption: a, ...x };
+    }
+  }
+
+  // 高频教训 (count >= 2)
+  const lessons = Array.from(lessonMap.values())
+    .filter(l => l.count >= 2)
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5);
+
+  return { total, byAssumption, byAttribution, lessons, topHit, topMiss };
+}
+
+/**
+ * Z2: 把成绩单渲染为 AI prompt 友好中文 (注入到 system prompt 用)
+ * @returns {string} 多行中文, 数据不足时返 '⚠ ...'
+ */
+function formatVerifyStatsForPrompt(stats) {
+  if (!stats || stats.total === 0) {
+    return '⚠ 暂无已验证的复盘数据, 无法提供历史成绩单 (先跑 `daily_summary.mjs --verify` 累积数据)';
+  }
+  const lines = [`- **复盘历史 (${stats.total} 条已验证)**`];
+  if (stats.topHit) {
+    lines.push(`- **最准假设**: ${stats.topHit.assumption} (${stats.topHit.winRate}%, ${stats.topHit.total} 次)`);
+  }
+  if (stats.topMiss) {
+    lines.push(`- **最差假设**: ${stats.topMiss.assumption} (${stats.topMiss.winRate}%, ${stats.topMiss.total} 次)`);
+  }
+  if (stats.lessons.length > 0) {
+    lines.push(`- **高频教训**: ${stats.lessons.map(l => `${l.lesson} (${l.count}次)`).join('; ')}`);
+  }
+  // 错误归因分布
+  const attEntries = Object.entries(stats.byAttribution).sort((a, b) => b[1] - a[1]);
+  if (attEntries.length > 0) {
+    lines.push(`- **错误归因分布**: ${attEntries.map(([k, v]) => `${k} ${v}次`).join(', ')}`);
+  }
+  return lines.join('\n');
 }
 
 // ==================== 拉个股行情 (事后验证用) ====================
@@ -524,8 +689,20 @@ async function runVerify(journalsPath, dryRun = false, deps = {}) {
       continue;
     }
 
-    // 3) 写回 note
-    const newNote = applyVerifyReport(note, report);
+    // 3) 解析结构化 JSON (Z2 反馈闭环)
+    const parsed = parseVerifyJsonOutput(report);
+    if (!parsed.ok) {
+      log(`  跳过 (JSON 解析失败: ${parsed.errors.join('; ')})`);
+      continue;
+    }
+    if (parsed.result.verdict === '对') {
+      log(`  ✅ 验证: ${parsed.result.verdict} | 归因: ${parsed.result.attribution} | 教训: ${parsed.result.lesson}`);
+    } else {
+      log(`  ⚠ 验证: ${parsed.result.verdict} | 归因: ${parsed.result.attribution} | 教训: ${parsed.result.lesson}`);
+    }
+
+    // 4) 写回 note (含 aiVerified 结构化字段)
+    const newNote = applyVerifyReport(note, parsed.result);
     updated.push(newNote);
   }
 
@@ -687,7 +864,10 @@ export {
   pushFeishu,
   pickJournalsForVerify,
   buildVerifyPrompt,
+  parseVerifyJsonOutput,
   applyVerifyReport,
+  getVerifyStats,
+  formatVerifyStatsForPrompt,
   runVerify,
   fetchUsIndices,
   buildEconomicCalendar,

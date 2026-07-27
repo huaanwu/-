@@ -1623,14 +1623,18 @@ section('19] 5.2 c 事后验证 (daily_summary.mjs --verify)');
     if (userPromptErr.includes('行情拉取失败') && userPromptErr.includes('network')) ok('verify prompt: 行情失败降级');
     else fail('verify prompt err', userPromptErr);
 
-    // ---- 19.4 applyVerifyReport ----
+    // ---- 19.4 applyVerifyReport (Z2 重构后: 接受已 parse 的结构化对象) ----
     const orig = { id: 'n1', title: 't', content: '原内容', verify: '1w', createdAt: now - 8 * day };
-    const updated = applyVerifyReport(orig, '### 当时判断\n看多\n### 当前反馈\n涨了');
+    const updated = applyVerifyReport(orig, {
+      verdict: '对', attribution: '无', lesson: '判断准', narrative: '### 当时判断\n看多\n### 当前反馈\n涨了'
+    });
     if (updated.content.includes('原内容') && updated.content.includes('AI 事后验证') && updated.content.includes('看多') && updated.content.includes('涨了')) ok('verify apply: 报告 append 到原内容');
     else fail('verify apply content', updated.content);
     if (updated.verify === 'verified' && typeof updated.verifiedAt === 'number') ok('verify apply: verify=verified + verifiedAt 时间戳');
     else fail('verify apply status', JSON.stringify({ verify: updated.verify, verifiedAt: updated.verifiedAt }));
-    if (orig.verify === '1w' && orig.content === '原内容' && !orig.verifiedAt) ok('verify apply: 纯函数 (原 note 未改)');
+    if (updated.aiVerified && updated.aiVerified.verdict === '对' && updated.aiVerified.attribution === '无') ok('verify apply: aiVerified 结构化字段 (Z2 反馈闭环根基)');
+    else fail('verify apply aiVerified', JSON.stringify(updated.aiVerified));
+    if (orig.verify === '1w' && orig.content === '原内容' && !orig.verifiedAt && !orig.aiVerified) ok('verify apply: 纯函数 (原 note 未改)');
     else fail('verify apply 副作用', JSON.stringify(orig));
 
     const updated2 = applyVerifyReport({ content: 'x' }, null);
@@ -1647,7 +1651,11 @@ section('19] 5.2 c 事后验证 (daily_summary.mjs --verify)');
       fetchQuote: async (code) => ({ price: 1680, changePct: 2.5 }),
       callLLM: async (userPrompt, systemPrompt) => {
         llmCalls.push({ code: userPrompt.match(/当前价/) ? 'has-data' : 'no-data', sys: systemPrompt.slice(0, 30) });
-        return '### 当时判断\n假设估值修复\n### 当前反馈\n当前价 1680 (+2.50%)\n### 自我反思\n与假设一致';
+        // Z2: 返回结构化 JSON (供 parseVerifyJsonOutput 解析)
+        return JSON.stringify({
+          verdict: '对', attribution: '无',
+          lesson: '判断准', narrative: '与假设一致, 走势符合预期'
+        });
       }
     });
     if (r1.updated.length === 4) ok('runVerify: 4 条到期全处理');
@@ -3892,6 +3900,170 @@ section('[29] Z1c ai-service.call() 自动注入 Core.MarketWidth (Z1b 配套)')
     else fail('Z1c unknown 过滤', sysUnk);
   } catch (e) {
     fail('Z1c ai-service 注入', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [30] Z2 verify 结构化 + 归因 (反馈闭环根基) ==========
+section('[30] Z2 verify JSON 结构化 + 归因统计 (daily_summary.mjs)');
+
+(async () => {
+  try {
+    const dsPath = path.join(ROOT, 'scripts/daily_summary.mjs');
+    // 用动态 import 把 ES module 拉进来 (Node 14+)
+    const ds = await import(require('url').pathToFileURL(dsPath).href);
+
+    // ---- 30.1 parseVerifyJsonOutput: 有效 JSON 路径 ----
+    const valid = ds.parseVerifyJsonOutput(JSON.stringify({
+      verdict: '对', attribution: '无', lesson: '题材风口判断准', narrative: '短期题材延续, 抓得很准。'
+    }));
+    if (valid.ok && valid.result.verdict === '对' && valid.result.attribution === '无') {
+      ok('Z2.1 parseVerifyJsonOutput: 有效 JSON → ok=true');
+    } else fail('Z2.1 有效 JSON', JSON.stringify(valid));
+
+    // ---- 30.2: 容错围栏 (```json ... ```) ----
+    const fenced = ds.parseVerifyJsonOutput('```json\n{"verdict":"错","attribution":"追高","lesson":"破位追入","narrative":"不该追"}\n```');
+    if (fenced.ok && fenced.result.attribution === '追高') ok('Z2.2 容错围栏: ```json 包裹可解析');
+    else fail('Z2.2 围栏', JSON.stringify(fenced));
+
+    // ---- 30.3: free-form attribution → 归 "其他" (而非 reject) ----
+    const freeAtt = ds.parseVerifyJsonOutput('{"verdict":"错","attribution":"贪心","lesson":"x","narrative":"y"}');
+    if (freeAtt.ok && freeAtt.result.attribution === '其他') ok('Z2.3 free-form attribution → "其他" (兼容叙事价值)');
+    else fail('Z2.3 attribution', JSON.stringify(freeAtt));
+
+    // ---- 30.4: verdict=对 + attribution=错 → 强制 attribution="无" (数据一致性) ----
+    const badAtt = ds.parseVerifyJsonOutput('{"verdict":"对","attribution":"追高","lesson":"x","narrative":"y"}');
+    if (badAtt.ok && badAtt.result.attribution === '无') ok('Z2.4 verdict=对 → attribution 强制 "无"');
+    else fail('Z2.4 verdict 强制', JSON.stringify(badAtt));
+
+    // ---- 30.5: 缺字段 → ok=false + errors ----
+    const missing = ds.parseVerifyJsonOutput('{"verdict":"对"}');
+    if (!missing.ok && missing.errors.length >= 2 && missing.errors.some(e => e.includes('lesson') || e.includes('narrative'))) {
+      ok('Z2.5 缺字段 → ok=false + errors[]');
+    } else fail('Z2.5 缺字段', JSON.stringify(missing));
+
+    // ---- 30.6: 无效 verdict → ok=false ----
+    const badVerdict = ds.parseVerifyJsonOutput('{"verdict":"不确定","attribution":"无","lesson":"x","narrative":"y"}');
+    if (!badVerdict.ok && badVerdict.errors.some(e => e.includes('verdict'))) {
+      ok('Z2.6 无效 verdict → errors[] (含 verdict 提示)');
+    } else fail('Z2.6 verdict 校验', JSON.stringify(badVerdict));
+
+    // ---- 30.7: 空输入 → ok=false ----
+    const empty = ds.parseVerifyJsonOutput(null);
+    if (!empty.ok && empty.errors[0] === 'empty output') ok('Z2.7 null 输入 → "empty output"');
+    else fail('Z2.7 null', JSON.stringify(empty));
+
+    // ---- 30.8: 烂 JSON → "JSON parse error" ----
+    const junk = ds.parseVerifyJsonOutput('这又不是 JSON, 随便说几句 {verdict: 错}');
+    if (!junk.ok && junk.errors[0] && junk.errors[0].includes('JSON parse error')) {
+      ok('Z2.8 烂 JSON → 友好错误 (含 parse)');
+    } else fail('Z2.8 烂 JSON', JSON.stringify(junk));
+
+    // ---- 30.9: 字段截断 (lesson 限 60 字, narrative 限 200 字) ----
+    const longStr = 'x'.repeat(300);
+    const truncated = ds.parseVerifyJsonOutput(JSON.stringify({
+      verdict: '对', attribution: '无',
+      lesson: longStr, narrative: longStr
+    }));
+    if (truncated.ok && truncated.result.lesson.length === 60 && truncated.result.narrative.length === 200) {
+      ok('Z2.9 字段截断: lesson≤60 / narrative≤200');
+    } else fail('Z2.9 截断', JSON.stringify({ ll: truncated.result.lesson.length, nl: truncated.result.narrative.length }));
+
+    // ---- 30.10 applyVerifyReport: 写 aiVerified 结构化字段 ----
+    const origNote = { id: 'n1', content: '原内容', assumption: '题材催化', verify: 'pending' };
+    const updated = ds.applyVerifyReport(origNote, {
+      verdict: '错', attribution: '追高', lesson: '高位追入无安全垫', narrative: '题材退潮, 杀跌明显'
+    });
+    if (updated.aiVerified && updated.aiVerified.verdict === '错' && updated.aiVerified.attribution === '追高' && updated.aiVerified.ts > 0 && updated.verify === 'verified' && updated.content.includes('AI 事后验证')) {
+      ok('Z2.10 applyVerifyReport: aiVerified/verify/content 三个字段都写回');
+    } else fail('Z2.10 applyVerifyReport', JSON.stringify({ aiVerified: updated.aiVerified, verify: updated.verify, hasContent: updated.content.includes('AI 事后验证') }));
+
+    // ---- 30.11 getVerifyStats: 按 assumption 聚合 + winRate ----
+    const notes = [
+      { aiVerified: { verdict: '对', attribution: '无', lesson: '抓题材' }, assumption: '题材催化' },
+      { aiVerified: { verdict: '对', attribution: '无', lesson: '抓题材' }, assumption: '题材催化' },
+      { aiVerified: { verdict: '错', attribution: '追高', lesson: '不该追' }, assumption: '题材催化' },
+      { aiVerified: { verdict: '部分', attribution: '时机早', lesson: '时机偏早' }, assumption: '题材催化' },
+      { aiVerified: { verdict: '对', attribution: '无', lesson: '业绩兑现' }, assumption: '业绩拐点' },
+      { aiVerified: { verdict: '错', attribution: '假设错', lesson: '业绩不及预期' }, assumption: '业绩拐点' }
+    ];
+    const stats = ds.getVerifyStats(notes);
+    if (stats.total === 6 && stats.byAssumption['题材催化'].total === 4 && stats.byAssumption['题材催化'].hit === 2 && stats.byAssumption['题材催化'].miss === 1 && stats.byAssumption['题材催化'].partial === 1) {
+      ok('Z2.11 getVerifyStats: byAssumption 聚合正确 (题材催化 4=2对1错1部分)');
+    } else fail('Z2.11 byAssumption', JSON.stringify(stats.byAssumption['题材催化']));
+    if (stats.byAssumption['题材催化'].winRate === 50 && stats.byAssumption['业绩拐点'].winRate === 50) {
+      ok('Z2.11.2 winRate: 命中数/总数 (50%)');
+    } else fail('Z2.11.2 winRate', JSON.stringify({ tc: stats.byAssumption['题材催化'].winRate, yj: stats.byAssumption['业绩拐点'].winRate }));
+
+    // ---- 30.12 byAttribution: 错/部分时归因计数 ----
+    if (stats.byAttribution['追高'] === 1 && stats.byAttribution['假设错'] === 1 && stats.byAttribution['时机早'] === 1 && !stats.byAttribution['无']) {
+      ok('Z2.12 byAttribution: 错/部分归因统计 + 无 排除');
+    } else fail('Z2.12 byAttribution', JSON.stringify(stats.byAttribution));
+
+    // ---- 30.13 topHit / topMiss: 样本不足 (<3) 时不参与排名 ----
+    const tiny = [
+      { aiVerified: { verdict: '对', attribution: '无', lesson: 'a' }, assumption: '题材催化' },
+      { aiVerified: { verdict: '错', attribution: '追高', lesson: 'b' }, assumption: '估值修复' }
+    ];
+    const statsTiny = ds.getVerifyStats(tiny);
+    if (statsTiny.total === 2 && !statsTiny.topHit && !statsTiny.topMiss) ok('Z2.13 topHit/topMiss: <3 样本 → null');
+    else fail('Z2.13 样本门槛', JSON.stringify({ total: statsTiny.total, h: statsTiny.topHit, m: statsTiny.topMiss }));
+    // 注意: 上面 stats (30.11) 里 '题材催化' 总数=4 满足 >=3 阈值, 应有 topHit=topMiss
+
+    // ---- 30.14 样本充足 → topHit/topMiss 出现 ----
+    const rich = [];
+    for (let i = 0; i < 5; i++) rich.push({ assumption: 'A', aiVerified: { verdict: i < 4 ? '对' : '错', attribution: i < 4 ? '无' : '假设错', lesson: 'l' } });
+    for (let i = 0; i < 5; i++) rich.push({ assumption: 'B', aiVerified: { verdict: i < 1 ? '对' : '错', attribution: i < 1 ? '无' : '追高', lesson: 'l' } });
+    const stats2 = ds.getVerifyStats(rich);
+    if (stats2.topHit && stats2.topHit.assumption === 'A' && stats2.topHit.winRate === 80 && stats2.topMiss && stats2.topMiss.assumption === 'B' && stats2.topMiss.winRate === 20) {
+      ok('Z2.14 topHit=最高命中率 (A 80%) / topMiss=最低 (B 20%)');
+    } else fail('Z2.14 topHit/topMiss', JSON.stringify({ h: stats2.topHit, m: stats2.topMiss }));
+
+    // ---- 30.15 lessons: 高频教训 (count >= 2) ----
+    const lessonNotes = [
+      { aiVerified: { verdict: '错', attribution: '追高', lesson: '破位追入无安全垫' }, assumption: '题材催化' },
+      { aiVerified: { verdict: '错', attribution: '追高', lesson: '破位追入无安全垫' }, assumption: '题材催化' },
+      { aiVerified: { verdict: '部分', attribution: '时机早', lesson: '时机偏早' }, assumption: '估值修复' }
+    ];
+    const stats3 = ds.getVerifyStats(lessonNotes);
+    if (stats3.lessons.length === 1 && stats3.lessons[0].lesson === '破位追入无安全垫' && stats3.lessons[0].count === 2) {
+      ok('Z2.15 lessons: count>=2 高频聚合 (破位追入无安全垫 × 2)');
+    } else fail('Z2.15 lessons', JSON.stringify(stats3.lessons));
+
+    // ---- 30.16 空 notes → 空统计 ----
+    const stats4 = ds.getVerifyStats([]);
+    if (stats4.total === 0 && !stats4.topHit && !stats4.topMiss && Object.keys(stats4.byAssumption).length === 0) {
+      ok('Z2.16 空数据 → total=0 / topHit=null / 空 byAssumption');
+    } else fail('Z2.16 空', JSON.stringify(stats4));
+
+    // ---- 30.17 无 aiVerified 的笔记 → 不计入 ----
+    const stats5 = ds.getVerifyStats([
+      { assumption: '题材催化' },  // 无 aiVerified
+      { assumption: '题材催化', aiVerified: { verdict: '对', attribution: '无', lesson: 'x' } }
+    ]);
+    if (stats5.total === 1 && stats5.byAssumption['题材催化'].total === 1) ok('Z2.17 无 aiVerified → 不计入');
+    else fail('Z2.17 过滤', JSON.stringify(stats5));
+
+    // ---- 30.18 formatVerifyStatsForPrompt: 空数据 → 提示 ----
+    const fmt0 = ds.formatVerifyStatsForPrompt(ds.getVerifyStats([]));
+    if (fmt0.includes('⚠') && fmt0.includes('暂无')) ok('Z2.18 空数据 → 提示"暂无" (引导用户跑 verify)');
+    else fail('Z2.18 空提示', fmt0);
+
+    // ---- 30.19 formatVerifyStatsForPrompt: 丰富数据 → 中文多行 ----
+    const fmt1 = ds.formatVerifyStatsForPrompt(stats2);
+    if (fmt1.includes('复盘历史') && fmt1.includes('最准假设') && fmt1.includes('最差假设') && fmt1.includes('错误归因')) {
+      ok('Z2.19 formatVerifyStatsForPrompt: 4 段中文输出 (历史/最准/最差/归因)');
+    } else fail('Z2.19 渲染', fmt1);
+
+    // ---- 30.20 buildVerifyPrompt: 提示词含 JSON 字段要求 ----
+    const promptObj = ds.buildVerifyPrompt({
+      title: 't', code: '600519', content: 'c', assumption: 'a'
+    });
+    const promptCombined = (promptObj.systemPrompt || '') + '\n' + (promptObj.userPrompt || '');
+    if (typeof promptCombined === 'string' && promptCombined.includes('verdict') && promptCombined.includes('attribution') && promptCombined.includes('lesson') && promptCombined.includes('narrative') && promptCombined.includes('对') && promptCombined.includes('错') && promptCombined.includes('部分')) {
+      ok('Z2.20 buildVerifyPrompt: 强 JSON schema (verdict/attribution/lesson/narrative + 三档 verdict)');
+    } else fail('Z2.20 prompt', String(promptCombined).slice(0, 300));
+  } catch (e) {
+    fail('Z2 verify 结构', e.message + ' / ' + (e.stack || ''));
   }
 })();
 
