@@ -105,6 +105,12 @@ export default defineConfig({
       '/api/tencent': {
         target: 'http://127.0.0.1:8089',
         changeOrigin: true
+      },
+      // 天天基金历史净值 (aktools 端点 500 时 fallback; dev-proxy 透传到 fund.eastmoney.com)
+      // 浏览器 → /api/fund/eastmoney/pingzhongdata/007194.js → dev-proxy → fund.eastmoney.com
+      '/api/fund': {
+        target: 'http://127.0.0.1:8089',
+        changeOrigin: true
       }
     }
   },
