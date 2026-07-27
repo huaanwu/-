@@ -12,20 +12,27 @@
       tushare: ''                // 付费 Tushare token(可选)
     },
     ai: {
-      provider: 'deepseek',      // deepseek / openai / moonshot / qwen / zhipu / custom
-      apiKey: '',                // 运行时 UI 输入, 禁止硬编码
-      model: '',                 // 留空用 provider 默认
-      baseURL: '',               // 留空用 provider 默认 (custom 必须填)
+      provider: 'custom',         // 改默认 provider 为 custom (本地 qwen3 :8082)
+      apiKey: '',                 // 运行时 UI 输入, 禁止硬编码
+      model: '',                  // 留空用 localEndpoint.model
+      baseURL: '',                // 留空 → AI service 自动用 localEndpoint
+      useProxy: false,            // 本地不走 dev-proxy (raw 直连)
       temperature: 0.7,
-      maxTokens: 8000            // v4-flash/pro 推理模型需要更多 token
+      maxTokens: 8000,            // 推理模型需更多 token
+      preferLocal: true,          // ✅ 默认优先本地 (无本地时降级远程)
+      localEndpoint: {
+        baseURL: 'http://127.0.0.1:8082/v1',  // 本地 qwen3 OpenAI 兼容
+        apiKey: '',                            // 运行时 UI 输入
+        model: 'qwen36-35b-a3b'                // 本地模型实测名称
+      }
     },
     sync: {
-      url: '',                   // Supabase Project URL (https://xxx.supabase.co)
-      anonKey: '',               // Supabase anon public key
-      autoSync: false,           // 自动同步 (改本地后自动推云)
-      userEmail: '',             // 登录邮箱
-      userId: '',                // 用户 UUID
-      accessToken: ''            // JWT (短期, 用完会重登)
+      url: '',                    // Supabase Project URL
+      anonKey: '',                // Supabase anon public key
+      autoSync: true,             // ✅ 默认开启自动同步 (需配 url+anonKey)
+      userEmail: '',              // 登录邮箱
+      userId: '',                 // 用户 UUID
+      accessToken: ''             // JWT (短期)
     },
     accountCash: 0,              // 现金余额 (用户在资金账户页编辑)
     marketOpen: false

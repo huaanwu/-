@@ -142,8 +142,13 @@ window._renderSettings = function() {
     ? `当前已设: ${escapeHtml(ai.model)} (留空用默认 ${currentPcfg.defaultModel}; 其他可填: ${currentPcfg.models.join(', ')})`
     : `默认: ${currentPcfg.defaultModel}; 可填: ${currentPcfg.models.join(', ')}`;
 
-  // 渲染后异步更新 sync auth area + 第二意见 key 带出
-  setTimeout(() => { _renderSyncAuth(); onSecondProviderChange(); }, 0);
+  // 渲染后异步更新 sync auth area + 第二意见 key 带出 + AI 预设徽章
+  setTimeout(() => {
+    _renderSyncAuth();
+    onSecondProviderChange();
+    _refreshAIStatus();
+    _refreshSyncStatus();
+  }, 0);
   root.innerHTML = `
     <div class="form-row" style="border-top:1px solid var(--border);padding-top:12px;margin-top:12px;">
       <label style="font-size:14px;font-weight:600;">📊 数据源路由 (c v0.2)</label>
@@ -170,6 +175,10 @@ window._renderSettings = function() {
       <label style="font-size:14px;font-weight:600;">🤖 AI 大模型 (用于选基/解读)</label>
       <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">
         配置后可在 🏦 基金 tab 用 "🤖 AI 选基"。支持所有 OpenAI 兼容 API。
+      </div>
+      <div id="aiPresetBadge" style="display:none;font-size:11px;background:var(--accent-soft);color:var(--accent);border:1px solid var(--accent);border-radius:6px;padding:6px 10px;margin-bottom:8px;line-height:1.5;">
+        ✅ <b>已预填默认值</b>: 优先本地 qwen3 (<code>http://127.0.0.1:8082/v1</code>, 模型 <code>qwen36-35b-a3b</code>)。
+        本地不验 key, 留空即可直接用; 想换远程 API 在下面填 Remote API Key 即可。
       </div>
     </div>
     <div class="form-row">
@@ -209,6 +218,11 @@ window._renderSettings = function() {
       <label>测试连接</label>
       <button class="btn" onclick="testAI()">🔗 测试 AI 连接</button>
       <span id="aiTestResult" style="font-size:12px;color:var(--text-muted);margin-left:8px;"></span>
+    </div>
+
+    <div class="form-row">
+      <label>当前生效</label>
+      <span id="aiCurrentConfig" style="font-size:12px;color:var(--text-secondary);"></span>
     </div>
 
     <div class="form-row" style="border-top:1px solid var(--border);padding-top:12px;margin-top:12px;">
@@ -291,6 +305,9 @@ window._renderSettings = function() {
         3. Project Settings → API 复制 URL 和 anon key 粘下面<br>
         4. 邮箱注册账号 → 点 "🔄 立即同步"
       </div>
+      <div id="syncPresetBadge" style="font-size:11px;background:var(--bg-elevated);border:1px solid var(--border);border-radius:6px;padding:6px 10px;margin-bottom:8px;line-height:1.5;color:var(--text-muted);">
+        💡 <b>同步设置</b>: 已默认开启自动同步 (改本地后自动推云), 只需填 URL + anon key + 注册账号即可。
+      </div>
     </div>
     <div class="form-row">
       <label>Project URL</label>
@@ -301,6 +318,17 @@ window._renderSettings = function() {
       <label>Anon Public Key</label>
       <input type="password" id="settingSyncAnonKey" value="${escapeHtml(Core.State.get('sync')?.anonKey || '')}"
              placeholder="eyJhbGciOi...  (anon public, 不是 service_role!)" autocomplete="off">
+    </div>
+    <div class="form-row">
+      <label>自动同步</label>
+      <label style="font-weight:normal;">
+        <input type="checkbox" id="settingSyncAuto" ${Core.State.get('sync')?.autoSync !== false ? 'checked' : ''}>
+        ✅ 改本地数据后自动推云
+      </label>
+    </div>
+    <div class="form-row">
+      <label>当前状态</label>
+      <span id="syncStatus" style="font-size:12px;color:var(--text-secondary);"></span>
     </div>
     <div class="form-row">
       <label>账户</label>
@@ -437,6 +465,49 @@ window.testLocalAI = async function() {
   }
 };
 
+// 显示当前 AI 配置 (本地/远程) + 预填提示
+function _refreshAIStatus() {
+  const ai = Core.State.get('ai') || {};
+  const local = ai.localEndpoint || {};
+  const prefLocal = ai.preferLocal === true && !!local.baseURL;
+
+  const badge = document.getElementById('aiPresetBadge');
+  if (badge) badge.style.display = prefLocal ? 'block' : 'none';
+
+  const cur = document.getElementById('aiCurrentConfig');
+  if (!cur) return;
+  // 模拟 resolveEndpoint 但不实际发请求
+  const parts = [];
+  if (prefLocal) {
+    parts.push(`🏠 本地: ${escapeHtml(local.baseURL)} / ${escapeHtml(local.model)}`);
+  }
+  if (ai.baseURL || ai.apiKey) {
+    parts.push(`☁️ 远程: provider=${escapeHtml(ai.provider || 'custom')} model=${escapeHtml(ai.model || '(默认)')}`);
+  }
+  if (!prefLocal && !ai.apiKey) {
+    parts.push('<span style="color:var(--down);">⚠ 未配置 (本地+远程都无)</span>');
+  }
+  cur.innerHTML = parts.join(' &nbsp;·&nbsp; ');
+}
+
+// 显示当前云同步状态
+function _refreshSyncStatus() {
+  const el = document.getElementById('syncStatus');
+  if (!el) return;
+  const s = Core.State.get('sync') || {};
+  const hasCfg = !!(s.url && s.anonKey);
+  const auto = s.autoSync !== false;
+  const parts = [];
+  if (!hasCfg) {
+    parts.push('<span style="color:var(--text-muted);">⚪ 未配置 (URL/anonKey 缺)</span>');
+  } else {
+    parts.push('<span style="color:var(--up);">✓ 已配置 URL + Key</span>');
+  }
+  parts.push(`自动同步: <b>${auto ? '开' : '关'}</b>`);
+  if (s.userEmail) parts.push(`登录: ${escapeHtml(s.userEmail)}`);
+  el.innerHTML = parts.join(' &nbsp;·&nbsp; ');
+}
+
 window.checkHealth = async function() {
   const el = document.getElementById('healthResult');
   el.textContent = '检查中...';
@@ -493,7 +564,8 @@ window.saveSettings = function(silent) {
   // Supabase 配置
   const syncUrl = document.getElementById('settingSyncUrl')?.value.trim() || '';
   const syncAnonKey = document.getElementById('settingSyncAnonKey')?.value.trim() || '';
-  Core.State.set('sync', { ...Core.State.get('sync'), url: syncUrl, anonKey: syncAnonKey });
+  const syncAuto = document.getElementById('settingSyncAuto')?.checked ?? true;
+  Core.State.set('sync', { ...Core.State.get('sync'), url: syncUrl, anonKey: syncAnonKey, autoSync: syncAuto });
 
   if (!silent) toastSuccess('已保存');
   _renderSyncAuth();
