@@ -89,6 +89,14 @@ function updateMarketStatus() {
       }
     });
 
+    // 4b. 大盘状态机每日重算 (Z1 Phase A, 接管 Kimi 活)
+    // 异步, 失败不阻塞 UI; 每日 1 次 by kv lastDate 去重
+    if (window.Core && Core.Regime && Core.Regime.refresh) {
+      Core.Regime.refresh().then(rec => {
+        console.log('[App] 大盘状态:', rec.state, rec.snapshot ? `HS300 ${rec.snapshot.close} vs MA60 ${rec.snapshot.ma60}` : '(无 snapshot)');
+      }).catch(e => console.warn('[App] Regime refresh 失败:', e && e.message || e));
+    }
+
     // 5. 初始化各域
     if (window.Watchlist && Watchlist.init) Watchlist.init();
     if (window.Holdings && Holdings.init) Holdings.init();

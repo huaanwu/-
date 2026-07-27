@@ -3721,6 +3721,103 @@ section('[28] Z1b Core.MarketWidth (Kimi regime 之外的宽度维度)');
   }
 })();
 
+// ========== [28.5] Z1 Phase A: Kimi 留下的 Core.Regime (接管接线) ==========
+section('[28.5] Z1 Phase A: 接管 Kimi 的 Core.Regime (HS300 + MA60 + bear 迟滞)');
+(async () => {
+  try {
+    const { TextDecoder: NodeTextDecoder } = require('util');
+    const DS = {
+      console, setTimeout, clearTimeout, URLSearchParams,
+      TextDecoder: NodeTextDecoder,
+      Core: {
+        State: { get: (k) => k === 'proxyBase' ? '/api/akshare' : null },
+        Storage: { cacheGet: async () => null, cacheSet: async () => {}, kvGet: async () => null, kvSet: async () => {} },
+        // K线 mock: 60+ 根, 全部 3800 (横盘, ma60 稳定, 走平)
+        Data: { getStockKLine: async () => {
+          const arr = [];
+          for (let i = 0; i < 120; i++) arr.push({ 日期: `2025-${String(Math.floor(i/30)+1).padStart(2,'0')}-${String(i%30+1).padStart(2,'0')}`, 开盘: 3800, 收盘: 3800, 成交量: 1e9 });
+          return arr;
+        } }
+      },
+      fetch: async () => ({ ok: false })
+    };
+    DS.window = DS;
+    vm.createContext(DS);
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/data.js')), DS);
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/regime.js')), DS);
+    const R = DS.window.Core.Regime;
+
+    if (typeof R._classify === 'function') ok('Z1-A: Core.Regime._classify 纯函数已挂载');
+    else fail('Z1-A _classify 挂载', typeof R);
+
+    if (typeof R.gateMultipliers === 'function') ok('Z1-A: gateMultipliers 同步函数已挂载');
+    else fail('Z1-A gateMultipliers 挂载', typeof R);
+
+    // ---- 28.5.1 _classify: bull (close>ma60 + maUp) ----
+    const bull = R._classify({ close: 4000, ma60: 3800, ma60Prev: 3700 });
+    if (bull.state === 'bull') ok('Z1-A: close>ma60 + maUp → bull');
+    else fail('Z1-A bull', JSON.stringify(bull));
+
+    // ---- 28.5.2 _classify: bear (close<ma60*(1-0.03) + maDown) ----
+    const bear = R._classify({ close: 3600, ma60: 3800, ma60Prev: 3850 });
+    if (bear.state === 'bear') ok('Z1-A: 跌破 MA60×0.97 + maDown → bear');
+    else fail('Z1-A bear', JSON.stringify(bear));
+
+    // ---- 28.5.3 _classify: range (价=ma60, maUp 走平) ----
+    const range = R._classify({ close: 3800, ma60: 3800, ma60Prev: 3790 });
+    if (range.state === 'range') ok('Z1-A: 价=ma60 (走平) → range');
+    else fail('Z1-A range', JSON.stringify(range));
+
+    // ---- 28.5.4 _classify: bear 迟滞 (prevState=bear + close<ma60 → 仍 bear, streak=0) ----
+    const stuck = R._classify({ close: 3700, ma60: 3800, ma60Prev: 3850, prevState: 'bear', aboveStreak: 2 });
+    if (stuck.state === 'bear' && stuck.aboveStreak === 0) ok('Z1-A: bear 迟滞 close<ma60 → 仍 bear, streak 归 0');
+    else fail('Z1-A bear 迟滞', JSON.stringify(stuck));
+
+    // ---- 28.5.5 _classify: bear 迟滞退出 (aboveStreak=3 → 转 range) ----
+    const exit = R._classify({ close: 3900, ma60: 3800, ma60Prev: 3850, prevState: 'bear', aboveStreak: 3 });
+    if (exit.state === 'range' && exit.aboveStreak === 0) ok('Z1-A: bear 迟滞 streak≥3 → range (退出)');
+    else fail('Z1-A bear 退出', JSON.stringify(exit));
+
+    // ---- 28.5.6 _classify: 非法输入降级 range ----
+    const bad = R._classify({ close: NaN, ma60: 3800, ma60Prev: 3700 });
+    if (bad.state === 'range') ok('Z1-A: 非法输入降级 range');
+    else fail('Z1-A 非法输入', JSON.stringify(bad));
+
+    // ---- 28.5.7 _classify: ma60Prev=null (斜率未知, 不上 bull 也不下 bear) ----
+    const noSlope = R._classify({ close: 4000, ma60: 3800, ma60Prev: null });
+    if (noSlope.state === 'range') ok('Z1-A: 斜率未知 → range (不上 bull)');
+    else fail('Z1-A 斜率未知', JSON.stringify(noSlope));
+
+    // ---- 28.5.8 gateMultipliers 默认 fallback range (mem=null) ----
+    const g0 = R.gateMultipliers();
+    if (g0.state === 'range' && g0.positionScale === 1.0 && g0.sharpeThreshold === 0.5) ok('Z1-A: gateMultipliers mem=null → range 兜底');
+    else fail('Z1-A gate 兜底', JSON.stringify(g0));
+
+    // ---- 28.5.9 GATES 三档定义完整 ----
+    if (R.GATES.bull && R.GATES.range && R.GATES.bear) ok('Z1-A: GATES 三档全定义');
+    else fail('Z1-A GATES', JSON.stringify(R.GATES));
+
+    // ---- 28.5.10 接 index.html / vite external 校验 ----
+    const html = readFileSafe(path.join(WWW, 'index.html'));
+    if (html.includes('/core/regime.js')) ok('index.html: /core/regime.js 已加 script');
+    else fail('index.html regime script', '');
+    // 顺序: regime.js 必须在 data.js 之后 (依赖 Core.Data.getStockKLine)
+    if (html.indexOf('/core/regime.js') > html.indexOf('/core/data.js')) ok('index.html: regime.js 在 data.js 之后');
+    else fail('index.html regime 顺序', '');
+
+    const vite = readFileSafe(path.join(ROOT, 'vite.config.js'));
+    if (vite.includes("'/core/regime.js'")) ok('vite.config: external 含 /core/regime.js');
+    else fail('vite external regime', '');
+
+    // ---- 28.5.11 app.js init 调 refresh (Phase A 接管) ----
+    const appJs = readFileSafe(path.join(WWW, 'app.js'));
+    if (appJs.includes('Core.Regime.refresh()')) ok('app.js: init 调 Core.Regime.refresh()');
+    else fail('app.js regime refresh', '');
+  } catch (e) {
+    fail('Z1-A Kimi 接管', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
 // ========== 总结 ==========
 // 同步 section 的 ok() 已经在 console 打印;
 // async IIFE 里的 ok() 还在 microtask 队列里, 用 setImmediate 给一次机会再读 passed/failed

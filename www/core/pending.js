@@ -9,7 +9,7 @@
  * 存储: kv 'pending_trades', 数组, 上限 MAX_ITEMS 条, 元素结构:
  *   { id, code, name, market, action: 'buy',
  *     suggestedShares, suggestedAmount, reason, assumption, stopLoss,
- *     falsifyCondition, invalidation,
+ *     falsifyCondition, invalidation, regime,
  *     source: 'screener', createdAt, expireAt,
  *     status: 'pending' | 'confirmed' | 'ignored' }
  */
@@ -45,7 +45,8 @@
 
     /**
      * 建议仓位计算 (纯函数, Node 沙箱可测)
-     * 金额 = 总资产 × SUGGEST_PCT(5%), 且不超纪律单票上限的剩余额度
+     * 金额 = 总资产 × SUGGEST_PCT(5%) × 大盘状态机仓位系数 (下跌市 ×0.5 → 2.5%),
+     * 且不超纪律单票上限的剩余额度
      * (单票上限口径与 Core.Discipline._checkConcentration 一致:
      *  (已持该 code 市值 + 本次金额) / 总资产 ≤ maxSingleStockPct)
      * 股数整手(100)向下取整, 不足一手返回 null
@@ -61,7 +62,20 @@
       const maxSinglePct = parseFloat(cfg.maxSingleStockPct) > 0
         ? parseFloat(cfg.maxSingleStockPct)
         : 0.20; // 与 Core.Discipline.DEFAULT_CONFIG 默认值一致
-      let amount = totalAssets * SUGGEST_PCT;
+      // 大盘状态机: 下跌市仓位系数 0.5; Regime 不可用/异常 → 回退 1.0 (旧行为)
+      let scale = 1;
+      try {
+        const R = window.Core && window.Core.Regime;
+        if (R && typeof R.gateMultipliers === 'function') {
+          const g = R.gateMultipliers();
+          if (g && typeof g.positionScale === 'number' && isFinite(g.positionScale) && g.positionScale > 0) {
+            scale = g.positionScale;
+          }
+        }
+      } catch (e) {
+        console.warn('[Pending] Regime gate 读取失败, 仓位系数回退 1.0:', e);
+      }
+      let amount = totalAssets * SUGGEST_PCT * scale;
       const room = totalAssets * maxSinglePct - (parseFloat(heldValue) || 0);
       amount = Math.min(amount, Math.max(room, 0));
       const shares = Math.floor(amount / price / LOT) * LOT;
@@ -86,6 +100,7 @@
         if (trade.suggestedShares) existing.suggestedShares = trade.suggestedShares;
         if (trade.suggestedAmount) existing.suggestedAmount = trade.suggestedAmount;
         if (trade.stopLoss) existing.stopLoss = trade.stopLoss;
+        if (trade.regime) existing.regime = trade.regime;
         await this._save(list);
         return existing.id;
       }
@@ -102,6 +117,7 @@
         stopLoss: trade.stopLoss || null,
         falsifyCondition: trade.falsifyCondition || '',
         invalidation: trade.invalidation || '',
+        regime: trade.regime || '',            // 建卡时的大盘市况标签 (Core.Regime)
         source: trade.source || 'unknown',
         createdAt: now,
         expireAt: now + EXPIRE_DAYS * DAY_MS,

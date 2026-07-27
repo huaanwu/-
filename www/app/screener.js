@@ -538,6 +538,16 @@ ${candidates}
               if (!pos) {
                 console.warn(`[Screener] 待确认交易跳过 ${code}: 建议仓位不足一手或单票额度已满 (价 ${price})`);
               } else {
+                // 大盘状态机: 卡片记录当前市况标签 (下跌市建议仓位已由 _suggestPosition 自动减半)
+                let regimeLabel = '';
+                try {
+                  if (Core.Regime && typeof Core.Regime.gateMultipliers === 'function') {
+                    const g = Core.Regime.gateMultipliers();
+                    if (g && g.label) regimeLabel = (g.icon || '') + g.label;
+                  }
+                } catch (e) {
+                  console.warn('[Screener] 市况标签读取失败:', e);
+                }
                 await Core.Pending.add({
                   code, name, market: Core.Util.stockCodePrefix(code), action: 'buy',
                   suggestedShares: pos.shares, suggestedAmount: pos.amount,
@@ -545,6 +555,7 @@ ${candidates}
                   assumption: '题材催化',                    // 与模拟盘口径一致: AI 场景固定归"题材催化"
                   stopLoss: +(price * 0.92).toFixed(2),      // 与模拟盘口径一致: 现价 × 0.92 (-8%)
                   falsifyCondition, invalidation,
+                  regime: regimeLabel,
                   source: 'screener'
                 });
                 toastSuccess('已生成实盘待确认交易, 请到持仓页确认');

@@ -58,13 +58,31 @@
   }
 
   /**
+   * 读大盘状态机的 Sharpe 门槛 (下跌市 0.5 → 1.0); Regime 不可用/异常 → 回退 SHARPE_GOOD
+   */
+  function _gateSharpeGood() {
+    try {
+      if (typeof Core !== 'undefined' && Core.Regime && typeof Core.Regime.gateMultipliers === 'function') {
+        const g = Core.Regime.gateMultipliers();
+        if (g && typeof g.sharpeThreshold === 'number' && isFinite(g.sharpeThreshold) && g.sharpeThreshold > 0) {
+          return g.sharpeThreshold;
+        }
+      }
+    } catch (e) {
+      console.warn('[PreBacktest] Regime gate 读取失败, 回退默认阈值:', e);
+    }
+    return SHARPE_GOOD;
+  }
+
+  /**
    * sharpe → verdict 三档判定 (纯函数, 阈值见头注释)
+   * "历史有效"的阈值走大盘状态机 gate (下跌市提高), 常量 SHARPE_GOOD 仅作回退默认
    * @returns {'历史无效'|'历史表现一般'|'历史有效'|null}
    */
   function judgeVerdict(sharpe) {
     if (typeof sharpe !== 'number' || !isFinite(sharpe)) return null;
     if (sharpe < SHARPE_INVALID) return '历史无效';
-    if (sharpe < SHARPE_GOOD) return '历史表现一般';
+    if (sharpe < _gateSharpeGood()) return '历史表现一般';
     return '历史有效';
   }
 
@@ -97,11 +115,24 @@
     const stratLabel = STRATEGY_LABELS[result.strategy] || result.strategy || '';
     const range = (result.startDate && result.endDate) ? ` ${_esc(result.startDate)} ~ ${_esc(result.endDate)}` : '';
     const sharpeTxt = isFinite(result.sharpe) ? result.sharpe.toFixed(2) : '?';
+    // 大盘状态机: 下跌市门槛已提高的小字提示 (gate 读取失败静默忽略, 不影响徽章)
+    let gateNote = '';
+    try {
+      if (typeof Core !== 'undefined' && Core.Regime && typeof Core.Regime.gateMultipliers === 'function') {
+        const g = Core.Regime.gateMultipliers();
+        if (g && g.state === 'bear') {
+          gateNote = `<br><span style="color:var(--text-muted);font-size:11px;">📉 下跌市门槛已提高 (历史有效需 Sharpe ≥ ${_esc(g.sharpeThreshold)})</span>`;
+        }
+      }
+    } catch (e) {
+      console.warn('[PreBacktest] Regime 徽章读取失败:', e);
+    }
     return `<div class="pb-result-inner" style="margin-top:8px;padding:8px 12px;background:var(--bg-base);border-radius:6px;font-size:12px;line-height:1.6;border-left:3px solid ${color};">` +
       `<strong style="color:${color};">${icon} ${_esc(v)}</strong>` +
       `<span style="color:var(--text-muted);"> · 近2年 ${_esc(stratLabel)} 回测${range}</span><br>` +
       `Sharpe <b>${sharpeTxt}</b> · 最大回撤 <b>${(result.maxDrawdown * 100).toFixed(1)}%</b> · ` +
       `年化 <b>${(result.annualReturn * 100).toFixed(1)}%</b> · 胜率 ${(result.winRate * 100).toFixed(0)}% · ${result.trades} 笔` +
+      gateNote +
       `</div>`;
   }
 
