@@ -1043,6 +1043,42 @@ body {
  * 11. 响应式
  * ============================================================ */
 
+/* 移动端: 底部固定 nav (单手拇指可及) */
+@media (width < 768px) {
+  body {
+    flex-direction: column;
+    height: 100vh;
+    height: 100dvh;          /* iOS/Android 动态视口高度, 避免底部被系统条遮 */
+  }
+
+  .app-nav {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: var(--nav-h);
+    border-top: 1px solid var(--border);
+    border-bottom: none;
+    background: var(--bg-card);
+    z-index: 100;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    /* 留出 iOS Home indicator / Android 系统手势条空间 */
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  .app-main {
+    /* 给底部 nav 留空, 内容不被遮 */
+    padding-bottom: calc(var(--nav-h) + env(safe-area-inset-bottom, 0px));
+  }
+
+  /* 移动端: nav-item 文字变小, 留出更多横向空间 */
+  .nav-label {
+    font-size: 11px;
+  }
+}
+
 /* 桌面端: 侧栏导航 */
 @media (width >= 768px) {
   body {
@@ -1190,7 +1226,8 @@ body {
   }
 
   .app-main {
-    padding: 8px;
+    /* padding-top/left/right 只 8px; padding-bottom 由 @media (width < 768px) 块的 nav 高度控制 */
+    padding: 8px 8px calc(var(--nav-h) + env(safe-area-inset-bottom, 0px) + 8px);
   }
 
   .ai-stream {
