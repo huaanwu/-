@@ -8132,6 +8132,37 @@ section('[44] short-trader.js 候选池扩展 + 阶段 1 排序截断');
   }
 })();
 
+// ========== [45] 短线两阶段选品 公告注入 prompt (Commit 3) ==========
+section('[45] short-trader.js 公告注入 prompt');
+(async () => {
+  try {
+    const stSrc = readFileSafe(path.join(WWW, 'app', 'short-trader.js'));
+    if (!stSrc) throw new Error('short-trader.js 读不到');
+
+    // 45.a ctx.noticesByCode 装配 (截断后并发拉, 单只 5 条上限由 data 层保证)
+    if (/noticesByCode = new Map\(\)[\s\S]{0,300}getStockNoticesByCode\(c\.code, 7\)[\s\S]{0,400}noticesByCode\.set\(ctx\.pool\[i\]\.code/.test(stSrc))
+      ok('45.a ctx.noticesByCode 装配 (getStockNoticesByCode 7 天 + Map.set)');
+    else fail('45.a ctx.noticesByCode', '源码未匹配公告 Map 装配');
+
+    // 45.b _buildUserPrompt 公告行渲染 ([公告:type+text|...])
+    if (/_buildUserPrompt[\s\S]{0,3000}noticesByCode[\s\S]{0,400}\[公告:\$\{notices\.map/.test(stSrc))
+      ok('45.b _buildUserPrompt 候选池行含 [公告:...] 渲染');
+    else fail('45.b 公告渲染', 'userPrompt 未含公告行');
+
+    // 45.c _buildSystemPrompt 含行业 + 公告准则
+    if (/_buildSystemPrompt[\s\S]{0,4000}【行业 \+ 公告[\s\S]{0,300}业绩预告\(预增→催化[\s\S]{0,300}股东减持\(→谨慎/.test(stSrc))
+      ok('45.c _buildSystemPrompt 含【行业 + 公告】准则段');
+    else fail('45.c systemPrompt 准则', '源码未匹配公告准则');
+
+    // 45.d 板块行渲染 ([行业:名 涨跌% (rank/total)])
+    if (/_buildUserPrompt[\s\S]{0,3000}industryChangeByCode[\s\S]{0,400}\[行业:\$\{indInfo\.industryName\}/.test(stSrc))
+      ok('45.d _buildUserPrompt 候选池行含 [行业:名 涨跌%] 渲染');
+    else fail('45.d 板块渲染', 'userPrompt 未含板块行');
+  } catch (e) {
+    fail('45 公告注入', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
 // ========== [50] 短线两阶段选品 资料接口 (Commit 1) ==========
 section('[50] data.js 行业映射 + 公告 + 量比');
 (async () => {

@@ -312,7 +312,15 @@
         '- MA5/MA20: 5/20 日均线, 价在 MA 上方 = 短线偏多, 下方 = 偏空',
         '- 量: 近 20 日均成交量 (股数), 流动性参考 (太低 = 滑点大)',
         '- 决策建议: 突破买入(above) 优先看 MA5>MA20 + 5日%为正; 回调买入(below) 优先看 5日%已回调 3-8% 且 MA20 之上',
-        '- 缺 K线特征的代码: 退化为只参考 currentPrice, 不强求'
+        '- 缺 K线特征的代码: 退化为只参考 currentPrice, 不强求',
+        '',
+        '【行业 + 公告 (Commit 2/3)】',
+        '- 行业标注: [行业:板块名 涨跌幅% (rank/total)]; rank 1 = 今日最强板块, 倒数 = 最弱',
+        '- 同板块多只候选时: 只选信号最强 1 只, 不集中同一赛道',
+        '- 逆风板块 (rank 后 30%) 候选: 必须有强催化才考虑, 否则降权',
+        '- 公告三类: 业绩预告(预增→催化, 预减/亏损→风险) / 股东减持(→谨慎, 触发止损从严) / 全市场公告(中性)',
+        '- 必须在 reason 引用至少 1 条具体行业排名或公告数字, 不能泛泛"该股近期有异动"',
+        '- 无公告标注的代码: 不代表没公告, 只是近 7 天未抓到, 不要过度解读'
       ].join('\n');
     },
 
@@ -360,7 +368,7 @@
       lines.push('');
       lines.push('## 候选池 (只能从这里选 code, 价格为当前快照)');
       if (ctx.pool.length) {
-        // Bug B 修复 (现价锚定) + Bug 159 (K线特征): 每只带 currentPrice + klineFeatures
+        // Bug B 修复 (现价锚定) + Bug 159 (K线特征) + Commit 2 (板块注入) + Commit 3 (公告注入)
         lines.push(ctx.pool.map(x => {
           const pricePart = x.currentPrice && x.currentPrice > 0
             ? `@${x.currentPrice.toFixed(2)}` + (x.changePct != null ? ` (${(x.changePct >= 0 ? '+' : '')}${x.changePct.toFixed(2)}%)` : '')
@@ -369,7 +377,15 @@
           const kfPart = kf
             ? ` [5日${kf.trend5pct >= 0 ? '+' : ''}${kf.trend5pct}%, 振幅${kf.range20}%, MA5=${kf.ma5}/MA20=${kf.ma20}, 量${kf.vol20}]`
             : '';
-          return `${x.code} ${x.name} ${pricePart}${kfPart}`.trim();
+          const indInfo = ctx.industryChangeByCode && ctx.industryChangeByCode.get(x.code);
+          const indPart = indInfo
+            ? ` [行业:${indInfo.industryName} ${(indInfo.change >= 0 ? '+' : '')}${indInfo.change}% (${indInfo.rank}/${indInfo.total})]`
+            : '';
+          const notices = ctx.noticesByCode && ctx.noticesByCode.get(x.code);
+          const noticePart = (notices && notices.length)
+            ? ` [公告:${notices.map(n => `${n.type}${(n.text || '').slice(0, 30)}`).join('|')}]`
+            : '';
+          return `${x.code} ${x.name} ${pricePart}${kfPart}${indPart}${noticePart}`.trim();
         }).join(' / '));
       } else {
         lines.push('(候选池为空 → 必须输出 plans: [])');
@@ -532,6 +548,19 @@
           ctx.stage1Dropped = ranked.slice(_POOL_TARGET).map(r => r.x.code);
         } else {
           ctx.stage1Dropped = [];
+        }
+        // 阶段 2: 公告注入 (业绩预告+股东减持+全市场公告, 单只 5 条上限; 截断后并发拉)
+        ctx.noticesByCode = new Map();
+        if (Array.isArray(ctx.pool) && ctx.pool.length) {
+          const noticeResults = await Promise.allSettled(
+            ctx.pool.map(c => Core.Data.getStockNoticesByCode(c.code, 7).catch(() => []))
+          );
+          for (let i = 0; i < ctx.pool.length; i++) {
+            const r = noticeResults[i];
+            if (r && r.status === 'fulfilled' && Array.isArray(r.value) && r.value.length) {
+              ctx.noticesByCode.set(ctx.pool[i].code, r.value);
+            }
+          }
         }
       } catch (e) { console.warn('[ShortTrader] ctx 读自选股/注入现价失败:', e); }
       // 同代码 48h 冷却集合 (transactions 表短线卖出)
