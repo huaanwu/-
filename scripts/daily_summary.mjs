@@ -603,6 +603,113 @@ function formatVerifyStatsForPrompt(stats) {
   return lines.join('\n');
 }
 
+/**
+ * Z3: 概率校准
+ * 数据要求: 每条 note.aiVerified 同时有 confidence (0-1) 和 verdict (对/错/部分)
+ *  - confidence: AI 在出具 verify 时填的"我猜对概率"
+ *  - verdict: '对' → outcome=1, '错' → outcome=0, '部分' → outcome=0.5 (部分对算 0.5 信用)
+ *
+ * 输出:
+ *   brierScore: 标量, BS = mean((p - o)^2), 越小越好, 完美=0, 全错=1
+ *   baselineBs: 0.25 (全猜 0.5 的无信息基线, 方便对比)
+ *   skillScore: 1 - brierScore/baselineBs, > 0 表示比瞎猜强, < 0 表示反向指标
+ *   samples: 有效样本数
+ *   buckets: [{ range: [lo, hi], predicted, actual, n, gap }]  // 10 桶
+ *   overconfidencePct: predicted > actual 的桶数占比
+ *   underconfidencePct: predicted < actual 的桶数占比
+ */
+function computeCalibration(notes, opts = {}) {
+  const bucketSize = opts.bucketSize || 0.1;
+  const samples = [];
+  for (const n of notes) {
+    if (!n || !n.aiVerified) continue;
+    const conf = typeof n.aiVerified.confidence === 'number' && Number.isFinite(n.aiVerified.confidence) ? n.aiVerified.confidence : null;
+    if (conf == null || conf < 0 || conf > 1) continue;
+    let outcome = null;
+    if (n.aiVerified.verdict === '对') outcome = 1;
+    else if (n.aiVerified.verdict === '错') outcome = 0;
+    else if (n.aiVerified.verdict === '部分') outcome = 0.5;
+    if (outcome == null) continue;
+    samples.push({ conf, outcome });
+  }
+
+  if (samples.length === 0) {
+    return {
+      brierScore: null, baselineBs: 0.25, skillScore: null,
+      samples: 0, buckets: [], overconfidencePct: 0, underconfidencePct: 0
+    };
+  }
+
+  // 1) Brier Score
+  let ss = 0;
+  for (const s of samples) ss += (s.conf - s.outcome) ** 2;
+  const brierScore = ss / samples.length;
+  const baselineBs = 0.25;
+  const skillScore = 1 - brierScore / baselineBs;
+
+  // 2) 10 桶 (0-0.1, 0.1-0.2, ...)
+  const buckets = [];
+  for (let lo = 0; lo < 1.0; lo += bucketSize) {
+    const hi = lo + bucketSize;
+    const inBucket = samples.filter(s => s.conf >= lo && s.conf < hi);
+    if (inBucket.length === 0) continue;
+    const meanConf = inBucket.reduce((a, b) => a + b.conf, 0) / inBucket.length;
+    const meanActual = inBucket.reduce((a, b) => a + b.outcome, 0) / inBucket.length;
+    buckets.push({
+      range: [lo, hi],
+      label: `${(lo * 100).toFixed(0)}-${(hi * 100).toFixed(0)}%`,
+      predicted: +meanConf.toFixed(3),
+      actual: +meanActual.toFixed(3),
+      n: inBucket.length,
+      gap: +(meanConf - meanActual).toFixed(3)  // 正=过度自信, 负=过度保守
+    });
+  }
+
+  // 3) 整体偏向
+  let overC = 0, underC = 0;
+  for (const b of buckets) {
+    if (b.gap > 0.05) overC++;
+    else if (b.gap < -0.05) underC++;
+  }
+  const total = buckets.length || 1;
+  return {
+    brierScore: +brierScore.toFixed(4),
+    baselineBs,
+    skillScore: +skillScore.toFixed(3),
+    samples: samples.length,
+    buckets,
+    overconfidencePct: +(overC / total * 100).toFixed(0),
+    underconfidencePct: +(underC / total * 100).toFixed(0)
+  };
+}
+
+/**
+ * Z3: 把校准报告渲染为 AI prompt 友好中文
+ * 数据不足时返 '⚠ ...', 否则 3 段: 综合 BS / 偏向警告 / 桶级明细 (前 3 桶)
+ */
+function formatCalibrationForPrompt(report) {
+  if (!report || report.samples === 0) {
+    return '⚠ 暂无含 confidence 的 verify 数据, 无法做概率校准 (从下次起, AI 出具 verify 时填 confidence 字段)';
+  }
+  const lines = [`- **校准样本 (${report.samples} 条)**`];
+  if (report.brierScore != null) {
+    const skillDesc = report.skillScore > 0.2 ? '良好' : report.skillScore > 0 ? '略胜瞎猜' : '反向指标';
+    lines.push(`- **Brier Score**: ${report.brierScore} (基线 0.25, 越小越好, Skill Score ${report.skillScore}, ${skillDesc})`);
+  }
+  if (report.overconfidencePct > 30) {
+    lines.push(`- ⚠ **过度自信警告**: ${report.overconfidencePct}% 的桶 predicted>actual, 后续判断时建议 confidence -10%`);
+  }
+  if (report.underconfidencePct > 30) {
+    lines.push(`- ⚠ **过度保守警告**: ${report.underconfidencePct}% 的桶 predicted<actual, 后续判断时建议 confidence +10%`);
+  }
+  if (report.buckets.length > 0) {
+    const top3 = report.buckets.slice(0, 3);
+    const txt = top3.map(b => `${b.label} → 预测 ${(b.predicted * 100).toFixed(0)}% / 实际 ${(b.actual * 100).toFixed(0)}% (n=${b.n})`).join('; ');
+    lines.push(`- **桶级明细 (前 3)**: ${txt}`);
+  }
+  return lines.join('\n');
+}
+
 // ==================== 拉个股行情 (事后验证用) ====================
 /**
  * Y7: 改用 stock_zh_a_hist (K 线接口, 接受 symbol), 取最后一根日线的收盘价 = 当前价
@@ -868,6 +975,8 @@ export {
   applyVerifyReport,
   getVerifyStats,
   formatVerifyStatsForPrompt,
+  computeCalibration,
+  formatCalibrationForPrompt,
   runVerify,
   fetchUsIndices,
   buildEconomicCalendar,

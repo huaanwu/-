@@ -4067,6 +4067,123 @@ section('[30] Z2 verify JSON 结构化 + 归因统计 (daily_summary.mjs)');
   }
 })();
 
+// ========== [31] Z3 概率校准 (Brier + 10 桶) ==========
+section('[31] Z3 概率校准 (Brier score + 10 桶)');
+
+(async () => {
+  try {
+    const ds = await import(require('url').pathToFileURL(path.join(ROOT, 'scripts/daily_summary.mjs')).href);
+
+    // ---- 31.1 空数据 → null BS / 0 samples ----
+    const empty = ds.computeCalibration([]);
+    if (empty.samples === 0 && empty.brierScore === null && empty.buckets.length === 0) {
+      ok('Z3.1 空数据 → samples=0 / BS=null');
+    } else fail('Z3.1 空', JSON.stringify(empty));
+
+    // ---- 31.2 完美校准: 概率=结果 → BS=0 ----
+    const perfect = [
+      { aiVerified: { verdict: '对', confidence: 1.0 } },  // 全对预测全赢
+      { aiVerified: { verdict: '对', confidence: 1.0 } },
+      { aiVerified: { verdict: '错', confidence: 0.0 } },
+      { aiVerified: { verdict: '错', confidence: 0.0 } }
+    ];
+    const r1 = ds.computeCalibration(perfect);
+    if (r1.brierScore === 0 && r1.skillScore === 1 && r1.samples === 4) {
+      ok('Z3.2 完美校准 → BS=0 / Skill=1');
+    } else fail('Z3.2 完美', JSON.stringify({ bs: r1.brierScore, ss: r1.skillScore, n: r1.samples }));
+
+    // ---- 31.3 全猜 0.5 → BS=0.25 (基线) ----
+    const all50 = Array.from({ length: 4 }, () => ({ aiVerified: { verdict: '对', confidence: 0.5 } }));
+    const r2 = ds.computeCalibration(all50);
+    if (Math.abs(r2.brierScore - 0.25) < 0.001 && Math.abs(r2.skillScore) < 0.001) {
+      ok('Z3.3 全猜 0.5 → BS=0.25 (基线) / Skill≈0');
+    } else fail('Z3.3 基线', JSON.stringify({ bs: r2.brierScore, ss: r2.skillScore }));
+
+    // ---- 31.4 部分 = 0.5 credit ----
+    const partial = [
+      { aiVerified: { verdict: '部分', confidence: 0.5 } },  // outcome=0.5, p=0.5 → (0)²=0
+      { aiVerified: { verdict: '部分', confidence: 0.8 } }   // outcome=0.5, p=0.8 → (0.3)²=0.09
+    ];
+    const r3 = ds.computeCalibration(partial);
+    if (Math.abs(r3.brierScore - 0.045) < 0.005) {
+      ok('Z3.4 部分=0.5 credit → BS=0.045 (0² + 0.3²)/2');
+    } else fail('Z3.4 部分', JSON.stringify({ bs: r3.brierScore }));
+
+    // ---- 31.5 缺 confidence 字段 → 跳过 (不计入) ----
+    const noConf = [
+      { aiVerified: { verdict: '对' } },                      // 缺 confidence
+      { aiVerified: { verdict: '错', confidence: 0.0 } }
+    ];
+    const r4 = ds.computeCalibration(noConf);
+    if (r4.samples === 1 && r4.brierScore === 0) {
+      ok('Z3.5 缺 confidence → 跳过 (samples=1)');
+    } else fail('Z3.5 缺字段', JSON.stringify({ n: r4.samples, bs: r4.brierScore }));
+
+    // ---- 31.6 confidence 非法值 (NaN/负数/>1) → 跳过 ----
+    const bad = [
+      { aiVerified: { verdict: '对', confidence: -0.1 } },
+      { aiVerified: { verdict: '对', confidence: 1.5 } },
+      { aiVerified: { verdict: '对', confidence: NaN } },
+      { aiVerified: { verdict: '对', confidence: 0.7 } }      // 唯一合法
+    ];
+    const r5 = ds.computeCalibration(bad);
+    if (r5.samples === 1) ok('Z3.6 非法 confidence → 跳过 (仅保留合法)');
+    else fail('Z3.6 非法', JSON.stringify({ n: r5.samples }));
+
+    // ---- 31.7 10 桶分布: confidence=0.7 落 [0.7,0.8) ----
+    const single = ds.computeCalibration([{ aiVerified: { verdict: '对', confidence: 0.73 } }]);
+    if (single.buckets.length === 1 && single.buckets[0].label === '70-80%' && single.buckets[0].n === 1 && single.buckets[0].predicted === 0.73 && single.buckets[0].actual === 1) {
+      ok('Z3.7 10 桶: confidence=0.73 → [70-80%) predicted/actual/n');
+    } else fail('Z3.7 桶', JSON.stringify(single.buckets));
+
+    // ---- 31.8 gap 正=过度自信, 负=过度保守 ----
+    const overC = ds.computeCalibration([
+      { aiVerified: { verdict: '错', confidence: 0.9 } },  // 预测 90%, 实际 0% → gap=+0.9
+      { aiVerified: { verdict: '错', confidence: 0.8 } }   // 预测 80%, 实际 0% → gap=+0.8
+    ]);
+    if (overC.buckets[0].gap > 0.5 && overC.overconfidencePct > 0) {
+      ok('Z3.8 过度自信: gap > 0 / overconfidencePct > 0');
+    } else fail('Z3.8 overC', JSON.stringify({ gap: overC.buckets[0].gap, op: overC.overconfidencePct }));
+
+    const underC = ds.computeCalibration([
+      { aiVerified: { verdict: '对', confidence: 0.1 } },  // 预测 10%, 实际 100% → gap=-0.9
+      { aiVerified: { verdict: '对', confidence: 0.2 } }   // 预测 20%, 实际 100% → gap=-0.8
+    ]);
+    if (underC.buckets[0].gap < -0.5 && underC.underconfidencePct > 0) {
+      ok('Z3.9 过度保守: gap < 0 / underconfidencePct > 0');
+    } else fail('Z3.9 underC', JSON.stringify({ gap: underC.buckets[0].gap, up: underC.underconfidencePct }));
+
+    // ---- 31.10 良好校准 → skillScore > 0.7 (实际 0.75) ----
+    const wellCal = [];
+    for (let i = 0; i < 10; i++) {
+      // 每桶 conf=0.6+0.04*i, 全部 对 (全猜对)
+      wellCal.push({ aiVerified: { verdict: '对', confidence: 0.6 + i * 0.04 } });
+    }
+    const r6 = ds.computeCalibration(wellCal);
+    if (r6.skillScore > 0.7 && r6.skillScore < 0.8) {
+      ok('Z3.10 良好校准 → Skill=' + r6.skillScore + ' (0.7-0.8, 数学正确)');
+    } else fail('Z3.10 skill', JSON.stringify({ ss: r6.skillScore }));
+
+    // ---- 31.11 formatCalibrationForPrompt: 空 → ⚠ ----
+    const fmt0 = ds.formatCalibrationForPrompt(ds.computeCalibration([]));
+    if (fmt0.includes('⚠') && fmt0.includes('confidence')) ok('Z3.11 空数据 → 引导提示 (让 AI 下次填 confidence)');
+    else fail('Z3.11 空渲染', fmt0);
+
+    // ---- 31.12 formatCalibrationForPrompt: 完整 → BS + 警告 + 桶 ----
+    const overCall = ds.formatCalibrationForPrompt(overC);
+    if (overCall.includes('Brier Score') && overCall.includes('过度自信')) {
+      ok('Z3.12 过度自信样本 → 渲染含 Brier + ⚠过度自信');
+    } else fail('Z3.12 渲染警告', overCall.slice(0, 200));
+
+    const wellFmt = ds.formatCalibrationForPrompt(r6);
+    if (wellFmt.includes('Brier') && wellFmt.includes('校准样本')) {
+      ok('Z3.13 良好校准 → 渲染含校准样本 + BS');
+    } else fail('Z3.13 良渲染', wellFmt.slice(0, 200));
+  } catch (e) {
+    fail('Z3 校准', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
 // ========== 总结 ==========
 // 同步 section 的 ok() 已经在 console 打印;
 // async IIFE 里的 ok() 还在 microtask 队列里, 用 setImmediate 给一次机会再读 passed/failed
