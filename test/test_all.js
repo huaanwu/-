@@ -104,13 +104,17 @@ for (const rel of syntaxFiles) {
 section('2] 域脚本接口完备性');
 const DOMAINS = {
   'Watchlist': ['init', 'render', 'addDialog', 'add', 'remove', 'showKLine', 'closeModal', 'closeKLine'],
-  'Holdings':  ['init', 'render', 'addDialog', 'editDialog', 'save', 'remove', 'addTxDialog', 'saveTx', 'closeModal', '_renderPending', 'confirmPending', 'ignorePending', '_markPendingConfirmed'],
+  'Holdings':  ['init', 'render', 'addDialog', 'editDialog', 'save', 'remove', 'addTxDialog', 'saveTx', 'closeModal', '_renderPending', 'confirmPending', 'ignorePending', '_markPendingConfirmed',
+    // 券商跳转 + 自动校准
+    'brokerDialog', 'reconcileDialog', 'reconcileSave'],
   'Paper':     ['init', 'buy', 'sell', 'getAccount', 'getPositions', 'resetAccount', 'snapshotIfNeeded', 'autoTradeFromPick', 'renderPage', 'buyFromForm', 'sellFromForm', 'sellAll', 'switchSleeve', '_getAccountRaw', '_saveAccountRaw', '_calcFee', '_roundLot', '_pushSnapshot', '_planAutoTrade', 'maybeGenerateEodReport', '_shouldGenerateEod', '_pushEodReport', '_appendDisciplineLog', '_logDisciplineBlock', '_buildEodReport', '_formatEodReportText', '_pushEodToFeishu', '_renderEodReport', 'addCondOrder', 'listCondOrders', 'cancelCondOrder', 'settleCondOrders', '_checkCondOrder', '_barOf', '_lastClosedBar', '_orderEligible', '_tradingDaysAfter', '_isGapDown', '_isGapUp', '_fillCheck', '_exitCheck', '_settleFill', '_settleExit', '_writeCondJournal', '_condPlanLines', 'addCondOrderFromForm', '_renderCondOrders'],
   'Journal':   ['init', 'render', 'newDialog', 'editDialog', 'save', 'remove', 'closeModal', '_buildHoldingsContext', '_renderHoldingBadge', '_renderStructuredTags', '_runAiAssistant'],
   'Screener':  ['init', 'run', '_addWatchlistFromPick', '_runPreBacktest',
     // Phase Y.2
     '_runRiskFilter', '_isAnyRiskFlagOn', '_readBlacklist'],
-  'Fund':      ['init', 'render', 'addDialog', 'save', 'remove', 'showChart', 'closeModal'],
+  'Fund':      ['init', 'render', 'addDialog', 'save', 'remove', 'showChart', 'closeModal',
+    // 基金对账(独立 kv: fund_reconcile_log, 跟股票 holdings_reconcile_log 区分)
+    'reconcileDialog', 'reconcileSave'],
   'Backtest':  ['init', 'run'],
   'Alerts':    ['init', 'render', 'addDialog', 'save', 'toggle', 'remove', 'closeModal', 'startPolling', 'stopPolling', 'runLongChecks', '_isTradingTime', '_fetchJournalContext', '_horizonOf', '_syncTimers', '_checkShort', '_checkLong', '_filterEarningsWarnings', '_regimeNotifyText', '_judgeValuation', '_notifyLong'],
   // T2 ShortTrader: 文件名 short-trader.js, key 用 'Short-Trader' (toLowerCase 后对得上)
@@ -2374,15 +2378,22 @@ section('21] c 数据源限流修复 (retry/退避/限流)');
       else fail('429 限流状态', JSON.stringify(s1));
     } else fail('HTTP 429 未触发限流', r1);
 
-    // ---- 21.3 限流期内不发起任何 fetch (走 getStockKLine 限流检查) ----
-    // getStockKLine 在限流期会直接 throw 不发请求, 与 fetchWithCache 行为一致
-    // (因腾讯 fetcher 不受 aktools 限流约束, 不能用 codes 路径测)
+    // ---- 21.3 限流期内不发起任何 fetch (2026-07-28 起限流按 path 独立: 需同 path 触发) ----
+    // 先在 stock_zh_a_hist 上触发 429 (腾讯 4xx 失败 → 降级 aktools 429 → 该 path 限流)
+    D.resetLimit();
+    DS.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes('gtimg.cn')) return { ok: false, status: 400, text: async () => 'Bad Request' };
+      return { ok: false, status: 429, text: async () => 'Too Many Requests' };
+    };
+    try { await D.getStockKLine('600519'); } catch (e) { /* 预期触发限流 */ }
+    // 第二次调用: 限流期应在任何 fetch 之前抛 (getStockKLine 入口先查 stock_zh_a_hist 限流)
     let fetchCalled = false;
     DS.fetch = async () => { fetchCalled = true; return { ok: false, status: 502, text: async () => 'Bad Gateway' }; };
     let r2;
     try { await D.getStockKLine('600519'); r2 = 'NO_THROW'; }
     catch (e) { r2 = e.message; }
-    if (r2.includes('限流') && r2.includes('后') && !fetchCalled) ok('限流期内 fetch 不发起请求');
+    if (r2.includes('限流') && r2.includes('后') && !fetchCalled) ok('限流期内 fetch 不发起请求 (path 独立)');
     else fail('限流期内行为', JSON.stringify({ msg: r2, fetchCalled }));
 
     // ---- 21.4 retry: 链式降级 (腾讯 4xx → 新浪 fail → aktools 200) ----
@@ -2414,17 +2425,16 @@ section('21] c 数据源限流修复 (retry/退避/限流)');
     if (r4.includes('HTTP 400') && attempt >= 3) ok('4xx 业务错误重试 3 次后抛错 (腾讯/新浪降级 + aktools retries=2)');
     else fail('4xx retry N 次', JSON.stringify({ r: r4, attempt }));
 
-    // ---- 21.6 5xx → 限流 (走 codes 路径, aktools 仍保有重试/限流能力) ----
-    // 注: 无 codes 时东财全市场已独立处理 (失败静默 []), 不进全局限流
+    // ---- 21.6 5xx 不触发限流 (2026-07-28 改: 仅 429/关键字算限流, 裸 5xx 走降级重试) ----
     D.resetLimit();
     attempt = 0;
-    DS.fetch = async () => ({ ok: false, status: 502, text: async () => 'Bad Gateway' });
+    DS.fetch = async () => { attempt++; return { ok: false, status: 502, text: async () => 'Bad Gateway' }; };
     let r5;
-    // codes 路径: 4xx 重试 3 次后抛, 5xx 触发限流
     try { await D.getStockSpot(['600519']); r5 = 'NO_THROW'; }
     catch (e) { r5 = e.message; }
-    if (r5.includes('数据源限流') && r5.includes('60s')) ok('5xx 触发 60s 限流 (codes 路径)');
-    else fail('5xx 限流', r5);
+    const s6 = D.getLimitStatus();
+    if (r5 !== 'NO_THROW' && !r5.includes('限流') && !s6.blocked) ok('5xx 不触发限流, 降级链重试后抛错');
+    else fail('5xx 行为', JSON.stringify({ r: r5, blocked: s6.blocked }));
 
     // ---- 21.7 缓存命中: 不发请求 (限流期内也用缓存) ----
     attempt = 0;
@@ -2485,6 +2495,8 @@ section('21] c 数据源限流修复 (retry/退避/限流)');
     DS.Core.Storage.cacheGet = async () => null;
 
     // 22.Y12.1 _tencentKLine 字段归一化 (mock 腾讯返回)
+    // 2026-07-28 口径: 端点不再返 7-11 列, 成交额/振幅/换手率恒 null,
+    // 涨跌幅/涨跌额由客户端按开收盘价计算 (即使 mock 给了旧列也忽略)
     let tencentUrls = [];
     DS.fetch = async (url) => {
       tencentUrls.push(url);
@@ -2512,15 +2524,17 @@ section('21] c 数据源限流修复 (retry/退避/限流)');
       && klineRows[0].最高 === 1720.00
       && klineRows[0].最低 === 1695.30
       && klineRows[0].成交量 === 12345 * 100
-      && klineRows[0].成交额 === 1.23e9
-      && klineRows[0].振幅 === 1.45
+      && klineRows[0].成交额 === null
+      && klineRows[0].振幅 === null
       && klineRows[0].涨跌幅 === 0.57
-      && klineRows[0].换手率 === 0.42
+      && klineRows[0].涨跌额 === 9.70
+      && klineRows[0].换手率 === null
       && symbolOK) {
       ok('_tencentKLine: 字段归一化正确 + 6→sh 前缀');
     } else fail('_tencentKLine 字段归一化', JSON.stringify({ row: klineRows[0], url: tencentUrls[0] }));
 
-    // 22.Y12.1b 真实腾讯只返 6 列 (无成交额/振幅/涨跌幅/换手率/涨跌额), 缺位应 null (不是 0)
+    // 22.Y12.1b 真实腾讯只返 6 列: 成交额/振幅/换手率=null,
+    // 涨跌幅/涨跌额由客户端按开收盘计算 ((1334.127-1335.787)/1335.787 ≈ -0.12 / -1.66)
     DS.fetch = async () => ({
       ok: true, status: 200,
       text: async () => JSON.stringify({
@@ -2534,10 +2548,10 @@ section('21] c 数据源限流修复 (retry/退避/限流)');
       && real6[0].成交量 === 2376300
       && real6[0].成交额 === null
       && real6[0].振幅 === null
-      && real6[0].涨跌幅 === null
-      && real6[0].涨跌额 === null
+      && real6[0].涨跌幅 === -0.12
+      && real6[0].涨跌额 === -1.66
       && real6[0].换手率 === null) {
-      ok('_tencentKLine: 真实 6 列数据, 缺位字段=null (非 0)');
+      ok('_tencentKLine: 真实 6 列数据, 缺位字段=null, 涨跌幅/涨跌额客户端计算');
     } else fail('_tencentKLine 6 列归一化', JSON.stringify(real6[0]));
 
     // 22.Y12.2 _tencentKLine 周期映射 + sz 前缀 (mock 任何 symbol 都返一对空模板)

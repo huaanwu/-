@@ -242,7 +242,9 @@
     const p = period === 'daily' ? 'day' : (period === 'weekly' ? 'week' : (period === 'monthly' ? 'month' : period));
     // Tencent 调整字段名: qfq/hfq day / qfq/hfq week / qfq/hfq month
     const adjKey = adjust === 'hfq' ? `hfq${p}` : (adjust === '' ? p : `qfq${p}`);
-    const params = [`${symbol}`, `${p}`, start || '', end || '', `${count}`, `${adjust}`];
+    // 注意: 2026-07-28 实测 fqkline 端点对 start/end 非空参数返 code=0 param error
+    // 必须 start/end 留空 (拿最近 count 根, 默认 240 ≈ 1 年日 K)
+    const params = [`${symbol}`, `${p}`, '', '', `${count}`, `${adjust || ''}`];
     const url = `${TENCENT_KLINE}?param=${params.join(',')}`;
 
     let resp;
@@ -270,21 +272,24 @@
     if (!Array.isArray(rows) || rows.length === 0) return [];
 
     // 归一化到 aktools 风格
+    // 2026-07-28 实测: 腾讯 fqkline 端点实际只返 6 列 [日期, 开盘, 收盘, 最高, 最低, 成交量]
+    // 7-11 列 (成交额/振幅/涨跌幅/涨跌额/换手率) 已被该端点移除, 客户端算
     return rows.map(row => {
-      // 腾讯字段: [日期, 开盘, 收盘, 最高, 最低, 成交量(手), 信息, 成交额, 振幅%, 涨跌幅%, 涨跌额, 换手率%]
-      // 实际只返 6 列 (0-5), 7-11 是 undefined → 用 _numOrNull 区别"无"和 0
+      const open = _num(row[1]);
+      const close = _num(row[2]);
+      const pct = open > 0 ? ((close - open) / open * 100) : null;
       return {
         日期: row[0],
-        开盘: _num(row[1]),
-        收盘: _num(row[2]),
+        开盘: open,
+        收盘: close,
         最高: _num(row[3]),
         最低: _num(row[4]),
         成交量: _num(row[5]) * 100,           // 手 → 股
-        成交额: _numOrNull(row[7]),            // 多数情况缺位
-        振幅: _numOrNull(row[8]),
-        涨跌幅: _numOrNull(row[9]),
-        涨跌额: _numOrNull(row[10]),
-        换手率: _numOrNull(row[11])
+        成交额: null,                          // 端点不再返
+        振幅: null,
+        涨跌幅: pct != null ? +pct.toFixed(2) : null,
+        涨跌额: open > 0 ? +(close - open).toFixed(2) : null,
+        换手率: null
       };
     });
   }
@@ -319,9 +324,9 @@
 
   async function _efinanceFetch() {
     // 限流检查 (跟 _fetch 一致: 限流期内不发起请求)
-    const s = getLimitStatus();
+    const s = getLimitStatus('efinance_full');
     if (s.blocked) {
-      throw new Error(`数据源限流, ${Math.ceil(s.retryIn/1000)}s 后可重试 (上次: ${_limitState.lastError.slice(0, 100)})`);
+      throw new Error(`数据源限流, ${Math.ceil(s.retryIn/1000)}s 后可重试 (上次: ${s.lastError.slice(0, 100)})`);
     }
     const url = `${EM_URL}?pn=1&pz=5000&po=1&fs=${EM_FS}&fields=${EM_FIELDS}`;
     let resp;
@@ -338,10 +343,8 @@
       throw new Error(`东方财富网络错误: ${e.message}`);
     }
     if (!resp.ok) {
-      // 5xx 触发限流 (东财不返 429)
-      if (resp.status >= 500) {
-        _setLimit(60 * 1000, `HTTP ${resp.status}`);
-      }
+      // 5xx 不当限流 (东财对裸请求常 500/403, 走降级更快), 仅 429 / 关键字触发限流
+      if (resp.status === 429) _setLimit('efinance_full', 60 * 1000, `HTTP ${resp.status}`);
       throw new Error(`东方财富 HTTP ${resp.status}`);
     }
     let j;
@@ -351,7 +354,8 @@
     if (!j.data || !j.data.diff) {
       throw new Error(`东方财富返空 (rc=${j.rc}, rt=${j.rt})`);
     }
-    _limitState.lastSuccess = Date.now();
+    if (!_limitByPath['efinance_full']) _limitByPath['efinance_full'] = { blocked: false, until: 0, lastError: '', lastSuccess: 0 };
+    _limitByPath['efinance_full'].lastSuccess = Date.now();
     // 字段映射成 aktools 风格
     const out = [];
     for (const k of Object.keys(j.data.diff)) {
@@ -392,46 +396,68 @@
     return data;
   }
 
-  // c (aktools 限流修复): 全局限流状态
-  // 触发: HTTP 429 / 5xx 且 body 含限流关键字
-  // 期间内 fetch 直接抛 "数据源限流, Ns 后可重试", 避免雪崩
-  const _limitState = {
-    blocked: false,
-    until: 0,         // ms 时间戳
-    lastError: '',    // 上次错误
-    lastSuccess: 0    // 上次成功
-  };
+  // c (aktools 限流修复): 按端点独立限流状态
+  // 触发: HTTP 429 / 文本含限流关键字 (500 单独重试, 不当限流, 因为 aktools 端点本身偶发 500)
+  // 期间内该端点 fetch 直接抛 "数据源限流, Ns 后可重试", 避免雪崩
+  // key 形如 "stock_zh_a_hist" / "stock_zh_a_spot" / "_tencentKLine:000001"
+  const _limitByPath = {};
 
-  function _setLimit(durationMs, err) {
-    _limitState.blocked = true;
-    _limitState.until = Date.now() + durationMs;
-    _limitState.lastError = err;
-    console.warn(`[Data] 数据源限流 ${Math.round(durationMs/1000)}s:`, err);
+  function _setLimit(path, durationMs, err) {
+    if (!_limitByPath[path]) _limitByPath[path] = { blocked: false, until: 0, lastError: '', lastSuccess: 0 };
+    _limitByPath[path].blocked = true;
+    _limitByPath[path].until = Date.now() + durationMs;
+    _limitByPath[path].lastError = err;
+    console.warn(`[Data] ${path} 限流 ${Math.round(durationMs/1000)}s:`, err);
   }
-  function _clearLimit() {
-    if (_limitState.blocked) {
-      console.log('[Data] 数据源恢复, 距上次成功', Date.now() - (_limitState.lastSuccess || Date.now()), 'ms');
+  function _clearLimit(path) {
+    const s = _limitByPath[path];
+    if (s && s.blocked) {
+      console.log(`[Data] ${path} 恢复, 距上次成功`, Date.now() - (s.lastSuccess || Date.now()), 'ms');
     }
-    _limitState.blocked = false;
-    _limitState.until = 0;
+    if (s) { s.blocked = false; s.until = 0; }
+  }
+  function _clearAllLimit() {
+    for (const k of Object.keys(_limitByPath)) {
+      const s = _limitByPath[k];
+      if (s && s.blocked) {
+        console.log(`[Data] ${k} 恢复, 距上次成功`, Date.now() - (s.lastSuccess || Date.now()), 'ms');
+      }
+      if (s) { s.blocked = false; s.until = 0; }
+    }
   }
   /**
-   * UI 读这个判断: { blocked, until, lastError, lastSuccess, retryIn }
+   * UI 读这个判断某 path: { blocked, until, lastError, lastSuccess, retryIn }
    * retryIn = blocked ? max(0, until - now) : 0
+   * 不传 path 返全量限流快照 (兼容老 API)
    */
-  function getLimitStatus() {
+  function getLimitStatus(path) {
     const now = Date.now();
-    return {
-      blocked: _limitState.blocked && now < _limitState.until,
-      until: _limitState.until,
-      lastError: _limitState.lastError,
-      lastSuccess: _limitState.lastSuccess,
-      retryIn: _limitState.blocked ? Math.max(0, _limitState.until - now) : 0
-    };
+    if (path) {
+      const s = _limitByPath[path];
+      if (!s) return { blocked: false, retryIn: 0, until: 0, lastError: '', lastSuccess: 0 };
+      return {
+        blocked: s.blocked && now < s.until,
+        until: s.until,
+        lastError: s.lastError,
+        lastSuccess: s.lastSuccess,
+        retryIn: s.blocked ? Math.max(0, s.until - now) : 0
+      };
+    }
+    // 不传 path: 返全量, 取最坏的一个
+    let worst = null;
+    for (const k of Object.keys(_limitByPath)) {
+      const s = _limitByPath[k];
+      if (s && s.blocked && now < s.until) {
+        if (!worst || s.until > worst.until) worst = { ...s, path: k };
+      }
+    }
+    if (worst) return { blocked: true, until: worst.until, lastError: worst.lastError, lastSuccess: worst.lastSuccess, retryIn: Math.max(0, worst.until - now), path: worst.path };
+    return { blocked: false, retryIn: 0, until: 0, lastError: '', lastSuccess: 0 };
   }
 
   // 通用 fetch + JSON + 错误处理 + retry
   // 不在顶部检查限流 (留给 fetchWithCache 决定: 缓存命中不限流, 没缓存才限流)
+  // 限流按 path 独立: 同一时间 stock_zh_a_hist 限流不影响 stock_zh_a_spot
   async function _fetch(path, params = {}, opts = {}) {
     const { retries = 2, baseDelay = 1500 } = opts;  // 第一次失败等 1.5s, 第二次 3s
     const base = (window.Core && Core.State && Core.State.get('proxyBase')) || DEFAULT_PROXY;
@@ -456,24 +482,24 @@
       }
 
       if (resp.ok) {
-        _clearLimit();
-        _limitState.lastSuccess = Date.now();
+        _clearLimit(path);
+        if (!_limitByPath[path]) _limitByPath[path] = { blocked: false, until: 0, lastError: '', lastSuccess: 0 };
+        _limitByPath[path].lastSuccess = Date.now();
         return await resp.json();
       }
 
       const text = await resp.text();
-      // 限流信号: 429 / 5xx / 文本含限流关键字
+      // 限流信号: 仅 429 / 文本含限流关键字 (裸 5xx 不当限流, aktools 端点本身会偶发 500)
       const isLimit = resp.status === 429
-        || (resp.status >= 500 && resp.status < 600)
         || /limit|rate|频|限|too many|频繁/i.test(text.slice(0, 500));
       if (isLimit) {
         // 限流: 60s 退避, 不重试
         const dur = 60 * 1000;
-        _setLimit(dur, `HTTP ${resp.status}: ${text.slice(0, 100)}`);
-        throw new Error(`数据源限流 (HTTP ${resp.status}), 60s 后可重试`);
+        _setLimit(path, dur, `HTTP ${resp.status}: ${text.slice(0, 100)}`);
+        throw new Error(`${path} 数据源限流 (HTTP ${resp.status}), 60s 后可重试`);
       }
 
-      // 其他错误 (4xx 业务错误): 重试 1 次
+      // 5xx / 其他错误: 重试
       lastErr = new Error(`HTTP ${resp.status}: ${text.slice(0, 200)}`);
       if (attempt < retries) {
         await new Promise(r => setTimeout(r, baseDelay * (attempt + 1)));
@@ -495,10 +521,10 @@
     const cached = await Core.Storage.cacheGet(cacheKey);
     if (cached) return cached;
 
-    // 2) 没缓存: 限流期直接抛 (避免雪崩)
-    const s = getLimitStatus();
+    // 2) 没缓存: 限流期直接抛 (避免雪崩) — 限流按 path 独立
+    const s = getLimitStatus(path);
     if (s.blocked) {
-      throw new Error(`数据源限流, ${Math.ceil(s.retryIn/1000)}s 后可重试 (上次: ${_limitState.lastError.slice(0, 100)})`);
+      throw new Error(`数据源限流, ${Math.ceil(s.retryIn/1000)}s 后可重试 (上次: ${s.lastError.slice(0, 100)})`);
     }
 
     // 3) 拉新数据
@@ -542,11 +568,22 @@
       );
       return all.filter(s => codes.includes(s.代码) || codes.includes(s.code));
     }
-    // 不传 codes: 优先东方财富全市场 (C 替代), 失败时不依赖 aktools (免等后端)
+    // 不传 codes: 优先 aktools stock_zh_a_spot (5532 条全市场, 浏览器可直连 dev-proxy)
+    // efinance 直连 push2.eastmoney.com 当前对裸请求 ECONNRESET, 仅作为 fallback
+    try {
+      return await fetchWithCache(
+        'stock_spot_all',
+        'stock_zh_a_spot',
+        {},
+        60 * 1000
+      );
+    } catch (e1) {
+      console.warn('[Data] aktools 全市场失败, 降级 efinance:', e1.message);
+    }
     try {
       return await getStockSpotEfinanceCached();
-    } catch (e) {
-      console.warn('[Data] 东方财富失败, 返回空 (不依赖 aktools):', e.message);
+    } catch (e2) {
+      console.warn('[Data] efinance 也失败, 返回空:', e2.message);
       return [];
     }
   }
@@ -579,10 +616,10 @@
     const cached = await Core.Storage.cacheGet(cacheKey);
     if (cached) return cached;
 
-    // 2) 限流期直接抛 (同 fetchWithCache 行为)
-    const s = getLimitStatus();
+    // 2) 限流期直接抛 (按 path 独立: stock_zh_a_hist 限流不影响别的)
+    const s = getLimitStatus('stock_zh_a_hist');
     if (s.blocked) {
-      throw new Error(`数据源限流, ${Math.ceil(s.retryIn/1000)}s 后可重试 (上次: ${_limitState.lastError.slice(0, 100)})`);
+      throw new Error(`数据源限流, ${Math.ceil(s.retryIn/1000)}s 后可重试 (上次: ${s.lastError.slice(0, 100)})`);
     }
 
     // 3) 优先腾讯 (Y12)
@@ -815,14 +852,85 @@
 
   /**
    * 基金历史净值
+   * 降级链: aktools fund_open_fund_info_em → 天天基金 fund.eastmoney.com/pingzhongdata
+   * 端点 2 字段: Data_fundHistoryNetValue (历史日净值数组)
+   * 端点 2 注意: 含大量其他 JS 变量 (Data_*: 持仓/分红/业绩), 只解析所需
    */
   async function getFundHistory(code, start, end) {
-    return await fetchWithCache(
-      `fund_hist_${code}_${start}_${end}`,
-      'fund_open_fund_info_em',
-      { fund: code, indicator: '单位净值走势', start_date: start, end_date: end },
-      24 * 60 * 60 * 1000
-    );
+    const cacheKey = `fund_hist_${code}_${start}_${end}`;
+    // 1) 缓存
+    const cached = await Core.Storage.cacheGet(cacheKey);
+    if (cached) return cached;
+
+    // 2) 限流 (按 path 独立) — 主源被限流时跳过, 直接走天天基金 fallback
+    const s = getLimitStatus('fund_open_fund_info_em');
+    if (!s.blocked) {
+      try {
+        const data = await fetchWithCache(
+          cacheKey,
+          'fund_open_fund_info_em',
+          { fund: code, indicator: '单位净值走势', start_date: start, end_date: end },
+          24 * 60 * 60 * 1000
+        );
+        return data;
+      } catch (e1) {
+        console.warn('[Data] aktools 基金净值失败, 降级天天基金:', e1.message);
+      }
+    } else {
+      console.warn('[Data] aktools 基金净值限流中, 直接走天天基金 fallback');
+    }
+    // 3) 降级: 天天基金 (跳过限流的主源)
+    try {
+      const rows = await _fetchTiantianFundHistory(code);
+      // 过滤日期
+      const startN = parseInt(start, 10);
+      const endN = parseInt(end, 10);
+      const out = rows.filter(r => {
+        const d = r.日期 && r.日期.replace(/-/g, '');
+        const dn = parseInt(d, 10);
+        return (!startN || dn >= startN) && (!endN || dn <= endN);
+      });
+      if (out.length > 0) {
+        await Core.Storage.cacheSet(cacheKey, out, 24 * 60 * 60 * 1000);
+      }
+      return out;
+    } catch (e2) {
+      throw new Error('基金净值源都失败: aktools+天天基金 (' + e2.message + ')');
+    }
+  }
+
+  /**
+   * 天天基金历史净值 fetcher
+   * 端点: /api/fund/eastmoney/pingzhongdata/{code}.js
+   * 返 JS 文本, 含 Data_netWorthTrend = [{x: ms, y: 单位净值, equityReturn: 日增长率%, unitMoney: ''}, ...]
+   * 归一化到 aktools 风格: [{日期, 单位净值, 日增长率, 累计净值(null 该端点不返)}]
+   */
+  async function _fetchTiantianFundHistory(code) {
+    const url = `/api/fund/eastmoney/pingzhongdata/${code}.js`;
+    // cache: 'no-store' 强制不走 HTTP cache: 浏览器曾因 301/302 链缓存 opaqueredirect,
+    // 后续不带 query string 的同 URL 默认 fetch 永久返 "TypeError: Failed to fetch"。
+    // 历史数据走 IndexedDB 缓存(fetchWithCache), 此处不需要 HTTP 缓存。
+    const resp = await fetch(url, { cache: 'no-store' });
+    if (!resp.ok) throw new Error('天天基金 HTTP ' + resp.status);
+    const text = await resp.text();
+    // 找 Data_netWorthTrend 数组 (obj 数组, 不是 [date,nav,...] 数组)
+    const m = text.match(/var\s+Data_netWorthTrend\s*=\s*(\[[\s\S]*?\]);/);
+    if (!m) throw new Error('天天基金无 Data_netWorthTrend 字段');
+    let arr;
+    try { arr = JSON.parse(m[1]); }
+    catch (e) { throw new Error('天天基金 JSON 解析失败: ' + e.message); }
+    if (!Array.isArray(arr) || arr.length === 0) return [];
+    return arr.map(r => {
+      // x 是 ms 时间戳
+      const d = new Date(parseInt(r.x, 10));
+      const date = d.toISOString().slice(0, 10);
+      return {
+        日期: date,
+        单位净值: parseFloat(r.y) || 0,
+        累计净值: null,  // 该端点不返累计净值
+        日增长率: parseFloat(r.equityReturn) || 0
+      };
+    });
   }
 
   /**
@@ -1514,7 +1622,7 @@
     fetch: fetchWithCache,
     health,
     getLimitStatus,  // c: UI 读这个显示限流状态
-    resetLimit: _clearLimit,  // 测试/手动重置
+    resetLimit: _clearAllLimit,  // 测试/手动重置 (全部端点; _clearLimit 需带 path)
     // 股票
     getStockSpot, getStockQuote, getStockKLine, getStockFinancial, getStockList,
     getStockSpotTencent,    // C: 腾讯 fetcher (codes 参数, 实时)
