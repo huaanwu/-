@@ -106,7 +106,7 @@ www/                        # Web 根 (= Capacitor webDir,Vite root)
 │   ├── watchlist.js        # 行情看板:自选股 + K线 + 行情
 │   ├── holdings.js         # 持仓管理:持仓 + 交易流水 + 持仓天数/浮盈
 │   ├── paper.js            # 模拟盘:虚拟资金 + isPaper 隔离持仓 + T1 分账户 sleeve (long/short) + AI 自动成交 + 每日快照曲线
-│   ├── short-trader.js     # ShortTrader:AI 短线操盘手 T2 盘前计划 (自动生成 + 校验管线 + 自动转条件单; 与 paper.js 内 T2 盘前计划手动流并存)
+│   ├── short-trader.js     # ShortTrader:AI 短线操盘手 T2 盘前计划 (自动生成 + 校验管线 + 自动转条件单; 已合并 paper.js 旧版 T2 手动流, 旧版已下线)
 │   ├── journal.js          # 复盘笔记:结构化标签 + 持仓上下文 + AI 助手 (874 行)
 │   ├── screener.js         # 选股筛选:条件筛选 + AI 选股 + 一键加自选 (待确认卡片走 Core.Portfolio.getAssets)
 │   ├── stock-advisor.js    # 单股 💡 AI 简评 + 历史验证 + 双模型交叉验证
@@ -255,7 +255,9 @@ vite.config.js              # root=www,域脚本 external 列表,dev proxy
 
 ### Phase T2 (ShortTrader) 盘前 AI 交易计划生成 (AI 短线操盘手: 自动生成 + 自动转条件单)
 
-> 独立域脚本 `www/app/short-trader.js` (window.ShortTrader), 与 paper.js 内 `generateMorningPlan` (T2 手动确认流, kv paper_morning_plan) **两套并存**, kv/逻辑互不干扰: 本套走"自动生成 + 校验管线 + 自动落地条件单"。
+> 独立域脚本 `www/app/short-trader.js` (window.ShortTrader), 走"自动生成 + 校验管线 + 自动落地条件单"。
+> **已合并去重**: paper.js 旧版 T2 手动确认流 (`generateMorningPlan`, kv `paper_morning_plan`) 已下线, 本套是唯一实现;
+> 旧 kv `paper_morning_plan` 已废弃 (IndexedDB 残留数据无害, 代码不再读写)。
 
 | 子项 | 实现位置 | 关键方法 |
 |------|----------|----------|
@@ -269,7 +271,8 @@ vite.config.js              # root=www,域脚本 external 列表,dev proxy
 
 ### Phase T4 (ShortTrader) 学习环 (平仓机械 verify → 成绩单 → 周末教训提炼 → 校准)
 
-> 与 paper.js 的 T4 短线学习环 (kv `paper_short_lessons` 数组, 每日 15:31 触发) **两套并存**, kv/逻辑互不干扰:
+> **已合并去重**: paper.js 旧版 T4 短线学习环 (kv `paper_short_lessons` 数组, 每日 15:31 触发) 已下线, 本套是唯一实现;
+> 旧 kv `paper_short_lessons` 已废弃 (IndexedDB 残留数据无害, 代码不再读写)。
 > 本套 kv `short_trader_lessons` `{items:[{text,createdAt,basedOn}], lastDistill}` (上限 20), 走"平仓机械判定 (不用 LLM) + 概率校准"路线。
 
 | 子项 | 实现位置 | 关键方法 |

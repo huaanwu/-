@@ -20,8 +20,8 @@
  *     shares = Paper._roundLot(短线现金 × positionPct / triggerPrice), 不足一手丢弃留痕
  *   - 失败不打扰: console.warn + kv 写 error 记录, UI 显示"生成失败可手动重试"
  *
- * 备注: 与 Paper.generateMorningPlan (T2 盘前计划, 手动确认流) 是两套独立实现,
- *   本模块走"自动生成 + 自动转条件单"路线, kv/逻辑互不干扰。
+ * 备注: 本模块是盘前计划的唯一实现 (自动生成 + 自动转条件单);
+ *   Paper 旧版 generateMorningPlan (手动确认流) 已下线, 旧 kv paper_morning_plan 废弃。
  *
  * T4 学习环 (本文档下半部分实现):
  *   - verifyClosedTrades(): 扫描 journals 里 sleeve='short'+auto:true 的卖出退出行 (含退出信息且
@@ -36,7 +36,7 @@
  *   - maybeDistillLessons(): 距上次 ≥7 天且新增已验证 ≥5 条 → LLM 提炼 2-3 条第一人称错误模式,
  *     kv short_trader_lessons { items: [{text, createdAt, basedOn}], lastDistill } (上限 20);
  *     JSON 校验失败只 console.warn 不动旧 lessons
- *     (注: 与 paper.js 的 kv paper_short_lessons 数组结构是两套并存, key 不同互不干扰)
+ *     (注: paper.js 旧版 lessons (kv paper_short_lessons) 已下线废弃, 本 key 为唯一实现)
  *   - UI: 短线 tab "📊 学习曲线" 区块 (Brier / 校准分桶 / 最近 10 条已验证 / 我的教训)
  */
 (function() {
