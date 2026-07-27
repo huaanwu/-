@@ -41,6 +41,7 @@ export default defineConfig({
         '/core/state.js',
         '/core/storage.js',
         '/core/data.js',
+        '/core/market-width.js',
         '/core/discipline.js',
         '/core/pending.js',
         '/core/premortem.js',

@@ -3601,6 +3601,126 @@ section('27] Phase E 待确认交易: Core.Pending 实测 + 接线检查');
   }
 })();
 
+// ========== [28] Z1b 市场宽度信号 (AI 升级 #1b 补充) ==========
+section('[28] Z1b Core.MarketWidth (Kimi regime 之外的宽度维度)');
+(async () => {
+  try {
+    const { TextDecoder: NodeTextDecoder } = require('util');
+    const DS = {
+      console, setTimeout, clearTimeout, URLSearchParams,
+      TextDecoder: NodeTextDecoder,
+      Core: {
+        State: { get: (k) => k === 'proxyBase' ? '/api/akshare' : null },
+        Storage: { cacheGet: async () => null, cacheSet: async () => {}, kvGet: async () => null, kvSet: async () => {} },
+        Data: {
+          // mock 全市场: 50 涨 / 30 跌 / 20 平
+          getStockSpotEfinanceCached: async () => {
+            const arr = [];
+            for (let i = 0; i < 50; i++) arr.push({ 涨跌幅: 2.5 + i * 0.1 });
+            for (let i = 0; i < 30; i++) arr.push({ 涨跌幅: -1.5 - i * 0.1 });
+            for (let i = 0; i < 20; i++) arr.push({ 涨跌幅: 0 });
+            return arr;
+          }
+        }
+      },
+      fetch: async () => ({ ok: false, status: 502 })
+    };
+    DS.window = DS;
+    vm.createContext(DS);
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/data.js')), DS);
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/market-width.js')), DS);
+    const MW = DS.window.Core.MarketWidth;
+
+    if (typeof MW.getMarketWidth === 'function') ok('Z1b: Core.MarketWidth 已挂载');
+    else fail('Z1b 挂载', typeof MW);
+
+    // ---- 28.1 _classifyWidth 弱市判定 (< 35%) ----
+    const weak = MW._classifyWidth([
+      ...Array(30).fill({ 涨跌幅: 1.5 }),  // 30 涨
+      ...Array(60).fill({ 涨跌幅: -1.5 }), // 60 跌
+      ...Array(10).fill({ 涨跌幅: 0 })     // 10 平
+    ]);
+    if (weak.status === 'weak' && weak.advancePct === 30) ok('Z1b: 上涨占比 30% → weak (弱势确认)');
+    else fail('Z1b 弱市', JSON.stringify(weak));
+
+    // ---- 28.2 强市判定 (> 65%) ----
+    const strong = MW._classifyWidth([
+      ...Array(70).fill({ 涨跌幅: 1.5 }),
+      ...Array(20).fill({ 涨跌幅: -1.5 }),
+      ...Array(10).fill({ 涨跌幅: 0 })
+    ]);
+    if (strong.status === 'strong' && strong.advancePct === 70) ok('Z1b: 上涨占比 70% → strong (强势确认)');
+    else fail('Z1b 强市', JSON.stringify(strong));
+
+    // ---- 28.3 中性判定 (40-60%) ----
+    const neutral = MW._classifyWidth([
+      ...Array(50).fill({ 涨跌幅: 1.5 }),
+      ...Array(40).fill({ 涨跌幅: -1.5 }),
+      ...Array(10).fill({ 涨跌幅: 0 })
+    ]);
+    if (neutral.status === 'neutral' && neutral.advancePct === 50) ok('Z1b: 上涨占比 50% → neutral');
+    else fail('Z1b 中性', JSON.stringify(neutral));
+
+    // ---- 28.4 涨跌幅 null 算平 ----
+    const nullish = MW._classifyWidth([
+      ...Array(40).fill({ 涨跌幅: 1.5 }),
+      ...Array(20).fill({ 涨跌幅: -1.5 }),
+      ...Array(20).fill({ 涨跌幅: null }),  // 20 个 null 算平
+      ...Array(20).fill({ 涨跌幅: 0 })
+    ]);
+    if (nullish.flat === 40 && nullish.advancePct === 40) ok('Z1b: 涨跌幅 null → 平 (40)');
+    else fail('Z1b null 处理', JSON.stringify(nullish));
+
+    // ---- 28.5 边界: 涨跌幅 0 (平) 走 flat 分支 ----
+    const exactZero = MW._classifyWidth([
+      ...Array(60).fill({ 涨跌幅: 0.5 }),  // 0.5% > 0.01 算涨
+      ...Array(40).fill({ 涨跌幅: 0 })       // = 0 算平 (不走 advance)
+    ]);
+    if (exactZero.advance === 60 && exactZero.flat === 40 && exactZero.decline === 0) ok('Z1b: 涨跌幅 0 → 平 (不归 advance)');
+    else fail('Z1b 0 边界', JSON.stringify(exactZero));
+
+    // ---- 28.6 数据不足 → unknown ----
+    const empty = MW._classifyWidth([]);
+    if (empty.status === 'unknown' && empty.advancePct === null) ok('Z1b: 空数组 → unknown');
+    else fail('Z1b 空数据', JSON.stringify(empty));
+
+    // ---- 28.7 getMarketWidth 走 cache 优先 (mock 命中时不再调 fetcher) ----
+    let fetchCount = 0;
+    const DS2 = {
+      console, setTimeout, clearTimeout, URLSearchParams,
+      TextDecoder: NodeTextDecoder,
+      Core: {
+        State: { get: () => null },
+        Storage: {
+          cacheGet: async () => ({ advance: 100, decline: 50, flat: 10, total: 160, advancePct: 62.5, status: 'neutral', ts: 'cached', partial: '' }),
+          cacheSet: async () => {}
+        },
+        Data: { getStockSpotEfinanceCached: async () => { fetchCount++; return []; } }
+      },
+      fetch: async () => ({ ok: false })
+    };
+    DS2.window = DS2;
+    vm.createContext(DS2);
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/data.js')), DS2);
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/market-width.js')), DS2);
+    const r = await DS2.window.Core.MarketWidth.getMarketWidth();
+    if (fetchCount === 0 && r.ts === 'cached') ok('Z1b: getMarketWidth 命中缓存, 不再调 fetcher');
+    else fail('Z1b 缓存', JSON.stringify({ fetchCount, r }));
+
+    // ---- 28.8 formatWidthForPrompt 弱市提示 ----
+    const txt = MW.formatWidthForPrompt(weak);
+    if (txt.includes('弱势确认') && txt.includes('30')) ok('Z1b: formatWidthForPrompt 含"弱势确认" + 数字');
+    else fail('Z1b 弱市 prompt', txt);
+
+    // ---- 28.9 formatWidthForPrompt unknown 走占位 ----
+    const txtU = MW.formatWidthForPrompt({ status: 'unknown' });
+    if (txtU.includes('⚠') && txtU.includes('缺失')) ok('Z1b: unknown 走"数据缺失"占位');
+    else fail('Z1b unknown prompt', txtU);
+  } catch (e) {
+    fail('Z1b 市场宽度', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
 // ========== 总结 ==========
 // 同步 section 的 ok() 已经在 console 打印;
 // async IIFE 里的 ok() 还在 microtask 队列里, 用 setImmediate 给一次机会再读 passed/failed
