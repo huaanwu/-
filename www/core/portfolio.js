@@ -24,9 +24,11 @@
   'use strict';
   window.Core = window.Core || {};
 
-  async function _getStockMkt(paperOnly) {
+  async function _getStockMkt(paperOnly, sleeve) {
     const holdings = ((await window.Core.Storage.all('holdings')) || [])
-      .filter(h => paperOnly ? !!h.isPaper : !h.isPaper);
+      .filter(h => paperOnly ? !!h.isPaper : !h.isPaper)
+      // T1 分账户: 模拟盘按 sleeve 过滤; 存量行无 sleeve 字段视为 'long' (向后兼容)
+      .filter(h => !paperOnly || (h.sleeve || 'long') === sleeve);
     let stockMkt = 0, quoteFail = 0;
     const valueByCode = {};
     await Promise.all(holdings.map(async (h) => {
@@ -71,22 +73,26 @@
     return { fundMkt, quoteFail };
   }
 
-  async function _getCash(paperOnly) {
+  async function _getCash(paperOnly, sleeve) {
     if (paperOnly) {
-      const acc = (await window.Core.Storage.kvGet('paper_account')) || { cash: 0 };
+      // T1: 'long' 沿用存量 kv paper_account (不迁移), 'short' 用 paper_account_short
+      const key = sleeve === 'short' ? 'paper_account_short' : 'paper_account';
+      const acc = (await window.Core.Storage.kvGet(key)) || { cash: 0 };
       return parseFloat(acc.cash) || 0;
     }
     return parseFloat(window.Core.State.get('accountCash')) || 0;
   }
 
   /**
-   * @param {{ paper?: boolean }} [opts]
-   * @returns { Promise<{ cash, stockMkt, fundMkt, totalAssets, valueByCode, quoteFail, paper: boolean }> }
+   * @param {{ paper?: boolean, sleeve?: 'long'|'short' }} [opts]
+   *        sleeve 仅 paper=true 时有效, 默认 'long' (存量数据无 sleeve 字段 = long)
+   * @returns { Promise<{ cash, stockMkt, fundMkt, totalAssets, valueByCode, quoteFail, paper: boolean, sleeve: string }> }
    */
   async function getAssets(opts = {}) {
     const paper = !!opts.paper;
-    const cash = await _getCash(paper);
-    const s = await _getStockMkt(paper);
+    const sleeve = opts.sleeve === 'short' ? 'short' : 'long';
+    const cash = await _getCash(paper, sleeve);
+    const s = await _getStockMkt(paper, sleeve);
     const f = await _getFundMkt(paper);
     const totalAssets = paper ? (cash + s.stockMkt) : (cash + s.stockMkt + f.fundMkt);
     return {
@@ -94,7 +100,8 @@
       totalAssets,
       valueByCode: s.valueByCode,
       quoteFail: s.quoteFail + f.quoteFail,
-      paper
+      paper,
+      sleeve
     };
   }
 

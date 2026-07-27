@@ -69,7 +69,7 @@ node scripts/daily_summary.mjs --verify-dry-run ./journals.json   # 事后验证
 node scripts/daily_summary.mjs --premarket   # Phase C 盘前简报 (隔夜外盘+日历+财新要闻 → LLM → 飞书; 建议 Windows 计划任务 交易日 08:30)
 ```
 
-`test/test_all.js` 36 节:JS 语法、域脚本接口完备性 (`DOMAINS` 字典)、Core 命名空间导出、index.html script 引用对账、Worker 结构、关键文件存在、Data 层方法签名、回测引擎 vm 沙箱实测、Vite external 对账、journal/market/fund/alerts 纯函数实测、daily_summary 单测 (含 --premarket 盘前简报)、5.1/5.2/5.3 互通闭环实测、数据源限流、Paper 模拟盘纯函数实测 (含 Phase C EOD 日终小结)、Discipline 纪律引擎实测、Phase D1 pre-mortem + 个股公告实测、Phase D2 回测前置 + 双模型实测、Phase E 待确认交易实测 (Pending 去重/上限/过期/状态机/建议仓位 + 接线)、Phase W 中长线盯盘实测 (horizon 打标/短线定时器起停注入断言/交易时段守卫/通知冷却/事件驱动接线/业绩预告 filter+lastNotifiedKeys 去重/regime 三态迁移/估值判定+进出阈值区去重/nextCheck 门控)。**改完域脚本或新增域方法必须先 `npm test`,并同步更新该文件的 `DOMAINS` 字典。**
+`test/test_all.js` 36 节:JS 语法、域脚本接口完备性 (`DOMAINS` 字典)、Core 命名空间导出、index.html script 引用对账、Worker 结构、关键文件存在、Data 层方法签名、回测引擎 vm 沙箱实测、Vite external 对账、journal/market/fund/alerts 纯函数实测、daily_summary 单测 (含 --premarket 盘前简报)、5.1/5.2/5.3 互通闭环实测、数据源限流、Paper 模拟盘纯函数实测 (含 Phase C EOD 日终小结 + 23b T1 sleeve 分账户: 双账户独立现金/过滤/重置/快照 shortTotal/纪律锚点分 sleeve/向后兼容)、Discipline 纪律引擎实测、Phase D1 pre-mortem + 个股公告实测、Phase D2 回测前置 + 双模型实测、Phase E 待确认交易实测 (Pending 去重/上限/过期/状态机/建议仓位 + 接线)、Phase W 中长线盯盘实测 (horizon 打标/短线定时器起停注入断言/交易时段守卫/通知冷却/事件驱动接线/业绩预告 filter+lastNotifiedKeys 去重/regime 三态迁移/估值判定+进出阈值区去重/nextCheck 门控)。**改完域脚本或新增域方法必须先 `npm test`,并同步更新该文件的 `DOMAINS` 字典。**
 
 `scripts/e2e.mjs` 注意:Chrome 路径硬编码 `C:\Program Files\Google\Chrome\Application\chrome.exe`,需要 Vite 已在 3003 端口跑着。
 
@@ -105,7 +105,7 @@ www/                        # Web 根 (= Capacitor webDir,Vite root)
 ├── app/                    # 按域拆分的页面脚本,每个挂 window.{Domain}(首字母大写)
 │   ├── watchlist.js        # 行情看板:自选股 + K线 + 行情
 │   ├── holdings.js         # 持仓管理:持仓 + 交易流水 + 持仓天数/浮盈
-│   ├── paper.js            # 模拟盘:虚拟资金 + isPaper 隔离持仓 + AI 自动成交 + 每日快照曲线
+│   ├── paper.js            # 模拟盘:虚拟资金 + isPaper 隔离持仓 + T1 分账户 sleeve (long/short) + AI 自动成交 + 每日快照曲线
 │   ├── journal.js          # 复盘笔记:结构化标签 + 持仓上下文 + AI 助手 (874 行)
 │   ├── screener.js         # 选股筛选:条件筛选 + AI 选股 + 一键加自选 (待确认卡片走 Core.Portfolio.getAssets)
 │   ├── stock-advisor.js    # 单股 💡 AI 简评 + 历史验证 + 双模型交叉验证
@@ -227,6 +227,16 @@ vite.config.js              # root=www,域脚本 external 列表,dev proxy
 | C.2 模拟盘日终小结 (浏览器侧) | `www/app/paper.js` | `Paper.maybeGenerateEodReport(now)` (工作日 ≥15:30 且当日无记录才生成, `_shouldGenerateEod` 纯函数可注入时间) / `_buildEodReport` (现金/市值/总资产/当日盈亏对照昨日快照 + 当日成交 🤖=AI 自动 + 纪律拦截 + 持仓 Top/Bottom) / `_pushEodToFeishu` (kv `feishu_webhook`, 失败只 warn) / `_renderEodReport` (页面"日终小结"区块); kv `paper_eod_reports` 上限 60, kv `paper_discipline_log` 上限 100 (`_logDisciplineBlock`, autoTradeFromPick 被 blocks 时 append); AI 自动成交交易行带 `auto: true` 标记 |
 | C.3 启动钩子 | `www/app.js` | init 里 `Paper.init()` 后 `Paper.maybeGenerateEodReport().catch(...)` (不 await 不阻塞) |
 
+### Phase T AI 短线操盘手 (T1: 模拟盘分账户 sleeve)
+
+| 子项 | 实现位置 | 关键方法 |
+|------|----------|----------|
+| T1.1 分账户常量 | `www/core/constants.js` | `PAPER_SHORT_CASH`(3万) / `PAPER_SHORT_POSITION_PCT`(0.20, 短线本金小单笔要够一手) |
+| T1.2 Paper sleeve | `www/app/paper.js` | holdings/transactions 行非索引字段 `sleeve`('long'\|'short'), **存量无字段 = long**(过滤一律 `(row.sleeve \|\| 'long') === sleeve`); 新 kv `paper_account_short` (3 万); 账户读写收口 `_accountKey`/`_defaultAccount`/`_getAccountRaw`/`_saveAccountRaw`; `getAccount/getPositions/resetAccount/buy(opts.sleeve)` 默认 'long' 向后兼容; `sell` 从持仓行读 sleeve 自动匹配账户; init 双账户各自初始化; `autoTradeFromPick` 预留 `pick.sleeve` (默认 long, T2 才写短线计划); resetAccount 只清对应 sleeve (快照只随 long 重置清空) |
+| T1.3 快照 shortTotal | `www/app/paper.js` `snapshotIfNeeded` | `paper_snapshots` 条目加 `shortTotal` (短线现金+市值); 老快照无此字段, 图表端容错 (映射 null 断点) |
+| T1.4 纪律引擎 sleeve | `www/core/discipline.js` + `www/core/portfolio.js` | `preBuyCheck` input.sleeve (默认 long); `Portfolio.getAssets({paper, sleeve})`; 月度锚点: long **沿用存量 key `discipline_month_anchor_paper`** (兼容读取, 不迁移), short 用 `discipline_month_anchor_paper_short`; `DEFAULT_CONFIG.short = {maxDailyTrades: 3, cooldownHours: 48}` 结构预留 (T2 启用, 本期不参与检查) |
+| T1.5 UI 双 tab | `www/index.html` + `www/app/paper.js` | 模拟盘页「📈 长线模拟」/「⚡ AI 短线」tab (`Paper._sleeve` / `switchSleeve`), 短线 tab 占位说明 (T2/T3 上线预告) + 保留手动表单; 曲线加"AI 短线总资产"第二条资产线; EOD 日终小结加 short 段 (合并卡片分段 + 飞书文本 ⚡ 段) |
+
 ### Phase D AI 建议"高手化" (D1)
 
 | 子项 | 实现位置 | 关键方法 |
@@ -321,7 +331,7 @@ vite.config.js              # root=www,域脚本 external 列表,dev proxy
 |------|--------|----------|
 | 行情看板 | `www/app/watchlist.js` | 自选股 + K 线 + 行情 |
 | 持仓管理 | `www/app/holdings.js` | 持仓 + 交易流水 + 持仓天数/浮盈 |
-| 模拟盘 | `www/app/paper.js` | 虚拟资金 + isPaper 隔离持仓 + AI 选股自动成交 + 每日快照 (kv: `paper_account` / `paper_snapshots`) + Phase C 日终小结 (kv: `paper_eod_reports` / `paper_discipline_log` / `feishu_webhook`) |
+| 模拟盘 | `www/app/paper.js` | 虚拟资金 + isPaper 隔离持仓 + T1 分账户 sleeve (长线 `paper_account` 10万 / AI 短线 `paper_account_short` 3万, 行上 `sleeve` 非索引字段, 存量=long) + AI 选股自动成交 + 每日快照 (kv: `paper_snapshots`, 含 shortTotal) + Phase C 日终小结 (kv: `paper_eod_reports` / `paper_discipline_log` / `feishu_webhook`) |
 | 复盘笔记 | `www/app/journal.js` | 结构化复盘 + 持仓上下文 + AI 助手 |
 | 选股筛选 | `www/app/screener.js` | 条件筛选 + AI 选股 + 一键加自选 |
 | 资金账户 | `www/app/account.js` | 现金 + 资金流水 + 账户总览 |

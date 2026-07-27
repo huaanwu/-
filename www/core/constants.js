@@ -38,6 +38,16 @@
    *  比模拟盘小,留人工加码空间 */
   const SUGGEST_PCT_PENDING = 0.05;
 
+  // ==================== 模拟盘分账户 (sleeve, AI 短线操盘手 T1) ====================
+
+  /** AI 短线模拟子账户初始资金 (kv paper_account_short)
+   *  与长线模拟 (kv paper_account, 10 万) 独立核算, 互不影响 */
+  const PAPER_SHORT_CASH = 30000;
+
+  /** AI 短线子账户单笔仓位比例
+   *  比长线 0.10 高: 短线账户本金小, 比例太低会买不起一手 */
+  const PAPER_SHORT_POSITION_PCT = 0.20;
+
   // ==================== 基金再平衡 ====================
 
   /** 默认基金组合再平衡目标配置
@@ -152,6 +162,8 @@
     STOP_LOSS_RATIO_AUTO,
     SUGGEST_PCT_PAPER,
     SUGGEST_PCT_PENDING,
+    PAPER_SHORT_CASH,
+    PAPER_SHORT_POSITION_PCT,
     REBALANCE_TARGET_DEFAULT,
     REBALANCE_DRIFT_THRESHOLD,
     MAX_MONTHLY_DRAWDOWN_PCT,

@@ -19,7 +19,10 @@
 
   const CONFIG_KEY = 'discipline_config';               // kv: 纪律配置
   const ANCHOR_KEY = 'discipline_month_anchor';         // kv: 实盘月度锚点 { month, startTotal }
-  const ANCHOR_KEY_PAPER = 'discipline_month_anchor_paper'; // kv: 模拟盘月度锚点 (独立账本)
+  // kv: 模拟盘长线子账户月度锚点。T1 分账户起存量此 key 即视为 long 锚点,
+  // 采用兼容读取 (long 继续用旧 key, 不做数据迁移, 最简方案); 短线子账户用独立 key
+  const ANCHOR_KEY_PAPER = 'discipline_month_anchor_paper';
+  const ANCHOR_KEY_PAPER_SHORT = 'discipline_month_anchor_paper_short'; // kv: AI 短线子账户月度锚点 (T1)
 
   // 默认配置 (出厂设置, 真值在 Core.Constants — 改一处生效全栈)
   const DEFAULT_CONFIG = {
@@ -28,7 +31,10 @@
     chaseWarnPct: 5,                                        // 当日涨幅超过此值视为追高 (警告不拦截)
     maxMonthlyDrawdownPct: Core.Constants.MAX_MONTHLY_DRAWDOWN_PCT,  // 月度回撤熔断线
     maxSingleIndustryPct: Core.Constants.MAX_SINGLE_INDUSTRY_PCT,   // 单行业集中度上限 (预留)
-    enabled: true
+    enabled: true,
+    // T1 结构预留: 短线子账户专属阈值 (每日最大笔数/同票冷却小时), T2 AI 短线操盘手才启用,
+    // 本期不参与任何检查逻辑
+    short: { maxDailyTrades: 3, cooldownHours: 48 }
   };
 
   /** 百分比文案: 0.235 → "23.5%" */
@@ -190,10 +196,11 @@
 
     /**
      * 模拟盘资产口径 (FIX-3 委托 Core.Portfolio.getAssets)
-     * @deprecated 直接调 Core.Portfolio.getAssets({paper:true})
+     * T1: 加 sleeve 维度 ('long'|'short'), 两个子账户各自独立检查
+     * @deprecated 直接调 Core.Portfolio.getAssets({paper:true, sleeve})
      */
-    async _getPaperAssets() {
-      const a = await window.Core.Portfolio.getAssets({ paper: true });
+    async _getPaperAssets(sleeve = 'long') {
+      const a = await window.Core.Portfolio.getAssets({ paper: true, sleeve });
       return { cash: a.cash, stockMkt: a.stockMkt, fundMkt: 0,
                totalAssets: a.totalAssets, valueByCode: a.valueByCode, quoteFail: a.quoteFail };
     },
@@ -203,8 +210,9 @@
     /**
      * 买入前纪律检查 (实盘/模拟盘共用)
      * @param {{ code: string, name?: string, market?: string, price?: number,
-     *           shares?: number, amount?: number, isPaper?: boolean,
+     *           shares?: number, amount?: number, isPaper?: boolean, sleeve?: 'long'|'short',
      *           assumption?: string, stopLoss?: number }} input
+     *        sleeve 仅 isPaper=true 时有效, 默认 'long' (T1 分账户)
      * @returns {Promise<{ ok: boolean, blocks: string[], warns: string[], history: string[] }>}
      *   ok = blocks.length === 0; 检查本身失败不 block 交易, 降级为 warn
      */
@@ -223,8 +231,9 @@
         const shares = parseFloat(input.shares) || 0;
         const buyAmount = parseFloat(input.amount) || (price * shares) || 0;
 
-        // 2. 资产口径 (isPaper 决定走哪套账本)
-        const assets = input.isPaper ? await this._getPaperAssets() : await this._getRealAssets();
+        // 2. 资产口径 (isPaper 决定走哪套账本; T1: 模拟盘再按 sleeve 分子账户)
+        const sleeve = input.sleeve === 'short' ? 'short' : 'long';
+        const assets = input.isPaper ? await this._getPaperAssets(sleeve) : await this._getRealAssets();
         if (assets.quoteFail > 0) result.warns.push('部分行情不可用, 已按成本价估算, 检查结果可能偏宽');
         if (!(assets.totalAssets > 0)) {
           result.warns.push('总资产为 0 (未记账?), 比例类检查跳过');
@@ -238,8 +247,11 @@
           const posBlock = this._checkTotalPosition({ stockValue: assets.stockMkt + buyAmount, totalAssets: assets.totalAssets, config });
           if (posBlock) result.blocks.push(posBlock);
 
-          // 5. 月度回撤熔断 (月初首次检查写锚点, 跨月自动重置; 实盘/模拟盘各自锚定)
-          const anchorKey = input.isPaper ? ANCHOR_KEY_PAPER : ANCHOR_KEY;
+          // 5. 月度回撤熔断 (月初首次检查写锚点, 跨月自动重置; 实盘/模拟盘各自锚定,
+          //    模拟盘再按 sleeve 分: long 沿用存量 key, short 独立 key)
+          const anchorKey = input.isPaper
+            ? (sleeve === 'short' ? ANCHOR_KEY_PAPER_SHORT : ANCHOR_KEY_PAPER)
+            : ANCHOR_KEY;
           const month = this._currentMonth();
           const oldAnchor = await window.Core.Storage.kvGet(anchorKey);
           const anchor = this._monthAnchorNext(oldAnchor, month, assets.totalAssets);

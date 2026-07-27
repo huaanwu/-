@@ -4,7 +4,12 @@
  *
  * 设计:
  *   - 模拟账户: kv 'paper_account' = { initialCash, cash, createdAt, positionPct }
- *   - 每日快照: kv 'paper_snapshots' = [{ date, paperTotal, realTotal, csi300 }] (上限 365 条)
+ *   - T1 分账户 (sleeve): 'long' 长线模拟 (存量, 沿用 paper_account) + 'short' AI 短线
+ *     (新 kv 'paper_account_short', 初始 3 万); holdings/transactions 行加非索引字段
+ *     sleeve ('long'|'short'), 存量行无此字段一律视为 'long' —— 所有过滤用
+ *     (row.sleeve || 'long') === sleeve 的写法, 不改 DB schema 不做数据迁移
+ *   - 每日快照: kv 'paper_snapshots' = [{ date, paperTotal, realTotal, csi300, shortTotal }]
+ *     (shortTotal = 短线子账户总资产, T1 新增; 老快照无此字段, 图表端容错) (上限 365 条)
  *   - 模拟持仓: 复用 holdings 表, 行上 isPaper=true (真实持仓无此字段, undefined 即真实)
  *   - 模拟交易: 复用 transactions 表, 同样 isPaper=true
  *   - 费用: 佣金万三 (最低 5 元), 卖出另加印花税万五
@@ -26,21 +31,18 @@
   const EOD_LIMIT = 60;                // 日终小结上限 (kv paper_eod_reports)
   const DISCIPLINE_LOG_LIMIT = 100;    // 纪律拦截日志上限 (kv paper_discipline_log)
   const EOD_MINUTES = 15 * 60 + 30;    // 日终小结生成时间: 工作日 15:30 后
-  const DEFAULT_CASH = 100000;         // 默认初始虚拟资金
+  const DEFAULT_CASH = 100000;         // 默认初始虚拟资金 (长线子账户)
   const DEFAULT_POSITION_PCT = Core.Constants.SUGGEST_PCT_PAPER;  // AI 自动成交单次仓位比例
+  const SHORT_CASH = Core.Constants.PAPER_SHORT_CASH;             // AI 短线子账户初始资金 (T1)
+  const SHORT_POSITION_PCT = Core.Constants.PAPER_SHORT_POSITION_PCT;  // 短线单笔仓位比例 (T1)
 
   const Paper = {
 
     async init() {
-      // 已存在则不覆盖
-      const acc = await Core.Storage.kvGet('paper_account');
-      if (!acc) {
-        await Core.Storage.kvSet('paper_account', {
-          initialCash: DEFAULT_CASH,
-          cash: DEFAULT_CASH,
-          createdAt: Date.now(),
-          positionPct: DEFAULT_POSITION_PCT
-        });
+      // T1: 两个子账户各自初始化, 已存在则不覆盖
+      for (const sleeve of ['long', 'short']) {
+        const acc = await Core.Storage.kvGet(this._accountKey(sleeve));
+        if (!acc) await this._saveAccountRaw(sleeve, this._defaultAccount(sleeve));
       }
       // 启动时尝试记当日快照 (失败不阻塞启动)
       this.snapshotIfNeeded().catch(e => console.warn('[Paper] 启动快照失败:', e));
@@ -128,29 +130,52 @@
 
     // ========== 账户与持仓 ==========
 
-    /** 模拟账户 (kv 'paper_account', 不存在时返回默认值) */
-    async getAccount() {
-      const acc = await Core.Storage.kvGet('paper_account');
-      return acc || {
-        initialCash: DEFAULT_CASH,
-        cash: DEFAULT_CASH,
+    // ---- T1: 账户读写私有助手 (按 sleeve 分 kv, 收口于此避免 if-else 散落) ----
+
+    /** sleeve → kv key ('long' 沿用存量 paper_account 不迁移, 'short' 用新 key) */
+    _accountKey(sleeve) {
+      return sleeve === 'short' ? 'paper_account_short' : 'paper_account';
+    },
+
+    /** sleeve → 出厂默认账户 (kv 缺失时用; 现金/仓位比例默认值都在 Core.Constants) */
+    _defaultAccount(sleeve) {
+      const cash = sleeve === 'short' ? SHORT_CASH : DEFAULT_CASH;
+      return {
+        initialCash: cash,
+        cash,
         createdAt: Date.now(),
-        positionPct: DEFAULT_POSITION_PCT
+        positionPct: sleeve === 'short' ? SHORT_POSITION_PCT : DEFAULT_POSITION_PCT
       };
     },
 
-    /** 模拟持仓原始行 (holdings 表 isPaper=true) */
-    async _getPaperHoldings() {
+    /** 读账户原始对象 (kv 缺失返回默认值, 不写回) */
+    async _getAccountRaw(sleeve = 'long') {
+      const acc = await Core.Storage.kvGet(this._accountKey(sleeve));
+      return acc || this._defaultAccount(sleeve);
+    },
+
+    /** 写账户 */
+    async _saveAccountRaw(sleeve, acc) {
+      await Core.Storage.kvSet(this._accountKey(sleeve), acc);
+    },
+
+    /** 模拟账户 (sleeve 默认 'long' 向后兼容; kv 不存在时返回默认值) */
+    async getAccount(sleeve = 'long') {
+      return this._getAccountRaw(sleeve);
+    },
+
+    /** 模拟持仓原始行 (holdings 表 isPaper=true, 按 sleeve 过滤; 存量行无 sleeve 字段 = 'long') */
+    async _getPaperHoldings(sleeve = 'long') {
       const all = await Core.Storage.all('holdings');
-      return (all || []).filter(h => h.isPaper);
+      return (all || []).filter(h => h.isPaper && (h.sleeve || 'long') === sleeve);
     },
 
     /**
      * 模拟持仓 + 实时行情: [{ ...h, shares, costPrice, price, cost, mkt, pl, plPct }]
      * 单只行情失败 → price/mkt/pl 为 null, 不阻塞其他
      */
-    async getPositions() {
-      const rows = await this._getPaperHoldings();
+    async getPositions(sleeve = 'long') {
+      const rows = await this._getPaperHoldings(sleeve);
       const quotes = {};
       await Promise.all(rows.map(async h => {
         try {
@@ -180,14 +205,17 @@
      * @param {string} name 名称 (可空)
      * @param {string} market sh/sz (可空, 自动按代码前缀推导)
      * @param {number} shares 股数 (自动向下取整到整手)
-     * @param {{ assumption?: string, stopLoss?: number, disciplineWarns?: string[], auto?: boolean, falsifyCondition?: string, invalidation?: string }} [opts]
+     * @param {{ assumption?: string, stopLoss?: number, disciplineWarns?: string[], auto?: boolean,
+     *           falsifyCondition?: string, invalidation?: string, sleeve?: 'long'|'short' }} [opts]
      *        Phase B 纪律信息: 非索引字段, 写到 holdings/transactions 行上 (不改 schema);
      *        auto=true 标记 AI 自动成交 (Phase C 日终小结 🤖 标注用);
-     *        falsifyCondition/invalidation 为 Phase D1 pre-mortem 沉淀 (只写 transactions 行)
+     *        falsifyCondition/invalidation 为 Phase D1 pre-mortem 沉淀 (只写 transactions 行);
+     *        sleeve 子账户 (T1), 默认 'long' 向后兼容
      * @returns 持仓行 | null (失败 toast + 返回 null)
      */
     async buy(code, name, market, shares, opts = {}) {
       try {
+        const sleeve = opts.sleeve === 'short' ? 'short' : 'long';
         shares = this._roundLot(shares);
         if (shares < LOT_SIZE) { toastError(`买入不足一手 (${LOT_SIZE} 股)`); return null; }
         const q = await Core.Data.getStockQuote(code);
@@ -195,7 +223,7 @@
         if (!price) { toastError('拉不到实时价, 无法成交'); return null; }
         const amount = shares * price;
         const fee = this._calcFee(amount, 'buy');
-        const acc = await this.getAccount();
+        const acc = await this._getAccountRaw(sleeve);
         if (amount + fee.total > acc.cash) {
           toastError(`现金不足: 需 ${fmtMoney(amount + fee.total)} (含费), 可用 ${fmtMoney(acc.cash)}`);
           return null;
@@ -203,7 +231,8 @@
 
         // 移动加权成本 (与真实持仓 Holdings.saveTx 一致; 费用不摊入成本, 只扣现金)
         const now = Date.now();
-        const rows = await this._getPaperHoldings();
+        const rows = await this._getPaperHoldings(sleeve);
+        // 同 code 不同子账户各自成行 (rows 已按 sleeve 过滤)
         let h = rows.find(x => x.code === code) || null;
         if (h) {
           const totalShares = h.shares + shares;
@@ -224,6 +253,7 @@
             shares,
             costPrice: price,
             isPaper: true,
+            sleeve,   // T1: 新行总是写 sleeve (非索引字段); 存量老行无此字段按 'long' 处理
             createdAt: now,
             updatedAt: now
           };
@@ -235,7 +265,7 @@
           id: uuid(), holdingId: h.id, code,
           type: 'buy', date: fmtDate(new Date()),
           price, shares, fee: fee.total,
-          isPaper: true, createdAt: now
+          isPaper: true, sleeve, createdAt: now
         };
         // Phase B 纪律信息 (非索引字段): 假设/止损/警告快照
         if (opts.assumption) tx.assumption = opts.assumption;
@@ -247,7 +277,7 @@
         if (opts.invalidation) tx.invalidation = opts.invalidation;
         await Core.Storage.add('transactions', tx);
         acc.cash = +(acc.cash - amount - fee.total).toFixed(2);
-        await Core.Storage.kvSet('paper_account', acc);
+        await this._saveAccountRaw(sleeve, acc);
         toastSuccess(`模拟买入 ${code} ${shares} 股 @ ${price} (费 ${fmtMoney(fee.total)})`);
         return h;
       } catch (e) {
@@ -267,6 +297,8 @@
       try {
         const h = await Core.Storage.get('holdings', holdingId);
         if (!h || !h.isPaper) { toastError('模拟持仓不存在'); return null; }
+        // T1: sleeve 从持仓行读 (存量行无字段 = 'long'), 现金自动回笼到对应子账户
+        const sleeve = h.sleeve === 'short' ? 'short' : 'long';
         shares = parseFloat(shares) || 0;
         if (shares <= 0) { toastError('卖出股数必须 > 0'); return null; }
         if (shares > h.shares) { toastError(`卖出股数超过持仓 (持有 ${h.shares})`); return null; }
@@ -288,11 +320,11 @@
           id: uuid(), holdingId: h.id, code: h.code,
           type: 'sell', date: fmtDate(new Date()),
           price, shares, fee: fee.total,
-          isPaper: true, createdAt: now
+          isPaper: true, sleeve, createdAt: now
         });
-        const acc = await this.getAccount();
+        const acc = await this._getAccountRaw(sleeve);
         acc.cash = +(acc.cash + amount - fee.total).toFixed(2);
-        await Core.Storage.kvSet('paper_account', acc);
+        await this._saveAccountRaw(sleeve, acc);
         toastSuccess(`模拟卖出 ${h.code} ${shares} 股 @ ${price} (费 ${fmtMoney(fee.total)})`);
         return h;
       } catch (e) {
@@ -302,22 +334,27 @@
       }
     },
 
-    /** 重置模拟盘: 清模拟持仓/交易/快照, 现金恢复初始值 (confirm 确认) */
-    async resetAccount() {
-      if (!confirm('确定重置模拟盘? 模拟持仓/交易记录/曲线全部清空, 现金恢复初始值')) return;
+    /** 重置模拟盘子账户: 只清对应 sleeve 的持仓/交易, 现金恢复该账户初始值 (confirm 确认) */
+    async resetAccount(sleeve = 'long') {
+      sleeve = sleeve === 'short' ? 'short' : 'long';
+      const label = sleeve === 'short' ? 'AI 短线' : '长线模拟';
+      if (!confirm(`确定重置${label}子账户? 该账户的模拟持仓/交易记录清空, 现金恢复初始值 (另一子账户不受影响)`)) return;
       try {
-        for (const h of await this._getPaperHoldings()) {
+        for (const h of await this._getPaperHoldings(sleeve)) {
           await Core.Storage.remove('holdings', h.id);
         }
-        const txs = ((await Core.Storage.all('transactions')) || []).filter(t => t.isPaper);
+        const txs = ((await Core.Storage.all('transactions')) || [])
+          .filter(t => t.isPaper && (t.sleeve || 'long') === sleeve);
         for (const t of txs) {
           await Core.Storage.remove('transactions', t.id);
         }
-        const acc = await this.getAccount();
+        const acc = await this._getAccountRaw(sleeve);
         acc.cash = acc.initialCash;
-        await Core.Storage.kvSet('paper_account', acc);
-        await Core.Storage.kvSet('paper_snapshots', []);
-        toastSuccess('模拟盘已重置');
+        await this._saveAccountRaw(sleeve, acc);
+        // 快照是双账户合并口径 (含 shortTotal), 只在重置长线时清空 (保持历史行为);
+        // 短线重置不动曲线, 次日起 shortTotal 自然回到初始资金
+        if (sleeve === 'long') await Core.Storage.kvSet('paper_snapshots', []);
+        toastSuccess(`${label}子账户已重置`);
         this.renderPage();
       } catch (e) {
         console.warn('[Paper] 重置失败:', e);
@@ -330,7 +367,8 @@
     /**
      * 每日快照 (每天一次, 当天已存在则跳过)
      * 口径:
-     *   - paperTotal = 模拟现金 + 模拟持仓市值
+     *   - paperTotal = 长线模拟现金 + 长线模拟持仓市值
+     *   - shortTotal = 短线模拟现金 + 短线模拟持仓市值 (T1 新增; 老快照无此字段, 图表端容错)
      *   - realTotal  = 真实持仓市值 (仅股票市值, 不含现金/基金)
      *   - csi300     = 沪深300 现价点位 (拉不到则 null)
      */
@@ -339,9 +377,14 @@
       const snaps = (await Core.Storage.kvGet('paper_snapshots')) || [];
       if (snaps.some(s => s.date === today)) return snaps;
 
-      const acc = await this.getAccount();
-      const positions = await this.getPositions();
+      const acc = await this._getAccountRaw('long');
+      const positions = await this.getPositions('long');
       const paperTotal = acc.cash + positions.reduce((s, p) => s + (p.mkt || 0), 0);
+
+      // T1: 短线子账户总资产
+      const shortAcc = await this._getAccountRaw('short');
+      const shortPositions = await this.getPositions('short');
+      const shortTotal = shortAcc.cash + shortPositions.reduce((s, p) => s + (p.mkt || 0), 0);
 
       // 真实持仓市值 (与 account.js 同款: 逐只 getStockQuote; 排除模拟盘行)
       let realTotal = 0;
@@ -372,7 +415,8 @@
         date: today,
         paperTotal: +paperTotal.toFixed(2),
         realTotal: +realTotal.toFixed(2),
-        csi300
+        csi300,
+        shortTotal: +shortTotal.toFixed(2)
       });
       await Core.Storage.kvSet('paper_snapshots', next);
       return next;
@@ -382,14 +426,17 @@
 
     /**
      * AI 选股自动成交 (screener._addWatchlistFromPick 加自选成功后调用)
-     * @param {{ code: string, name?: string, market?: string, falsifyCondition?: string, invalidation?: string }} pick
-     *        falsifyCondition/invalidation: Phase D1 pre-mortem 沉淀, 透传到 transactions 行
+     * @param {{ code: string, name?: string, market?: string, sleeve?: 'long'|'short',
+     *           falsifyCondition?: string, invalidation?: string }} pick
+     *        falsifyCondition/invalidation: Phase D1 pre-mortem 沉淀, 透传到 transactions 行;
+     *        sleeve: T1 预留 (T2 AI 短线计划传 'short'), 默认 'long' 维持现状
      * 买入金额 = 模拟现金 × positionPct; 现金不足/不足一手/任何失败 → console.warn 跳过, 不 throw
      */
     async autoTradeFromPick(pick) {
       try {
         if (!pick || !pick.code) return null;
-        const acc = await this.getAccount();
+        const sleeve = pick.sleeve === 'short' ? 'short' : 'long';
+        const acc = await this._getAccountRaw(sleeve);
         const q = await Core.Data.getStockQuote(pick.code);
         const price = q ? (parseFloat(q.最新价 ?? q.price ?? 0) || 0) : 0;
         const shares = this._planAutoTrade(acc.cash, acc.positionPct, price);
@@ -397,7 +444,7 @@
           console.warn(`[Paper] 自动成交跳过 ${pick.code}: 现金 ${acc.cash} 买不起一手 (价 ${price})`);
           return null;
         }
-        // Phase B 交易纪律: AI 自动成交走同一套 preBuyCheck
+        // Phase B 交易纪律: AI 自动成交走同一套 preBuyCheck (T1: 按 sleeve 分账户口径)
         // blocks 命中 → console.warn 跳过该笔 (不打扰用户); warns 无人确认不阻塞, 写入交易行 disciplineWarns
         if (Core.Discipline && Core.Discipline.preBuyCheck) {
           // AI 场景无人工假设: 固定归到"题材催化"; 止损默认 成交价 × 0.92 (-8%)
@@ -406,7 +453,7 @@
           const chk = await Core.Discipline.preBuyCheck({
             code: pick.code, name: pick.name || '', market: pick.market || '',
             price, shares, amount: shares * price,
-            isPaper: true, assumption, stopLoss
+            isPaper: true, sleeve, assumption, stopLoss
           });
           if (!chk.ok) {
             console.warn(`[Paper] 自动成交被纪律引擎拦截 ${pick.code}:`, chk.blocks.join('；'));
@@ -415,11 +462,11 @@
             return null;
           }
           return await this.buy(pick.code, pick.name || '', pick.market || '', shares,
-            { assumption, stopLoss, disciplineWarns: chk.warns, auto: true,
+            { assumption, stopLoss, disciplineWarns: chk.warns, auto: true, sleeve,
               falsifyCondition: pick.falsifyCondition, invalidation: pick.invalidation });
         }
         return await this.buy(pick.code, pick.name || '', pick.market || '', shares,
-          { auto: true, falsifyCondition: pick.falsifyCondition, invalidation: pick.invalidation });
+          { auto: true, sleeve, falsifyCondition: pick.falsifyCondition, invalidation: pick.invalidation });
       } catch (e) {
         console.warn('[Paper] 自动成交失败:', e);
         return null;
@@ -471,11 +518,12 @@
     /**
      * 汇总当日小结数据 (纯数据, 不调 LLM):
      *   现金/持仓市值/总资产/当日盈亏 (对照昨日快照) + 当日成交 (🤖=AI 自动) + 纪律拦截 + 持仓盈亏 Top/Bottom
+     *   T1: 主报告口径 = 长线子账户 (保持既有字段不变); 短线子账户聚成 short 段, 合并卡片分段展示
      */
     async _buildEodReport(now) {
       const today = fmtDate(now);
-      const acc = await this.getAccount();
-      const positions = await this.getPositions();
+      const acc = await this._getAccountRaw('long');
+      const positions = await this.getPositions('long');
       const mktValue = +(positions.reduce((s, p) => s + (p.mkt || 0), 0)).toFixed(2);
       // FIX-3: 总资产口径与纪律检查对齐 (paper: cash + stockMkt, 不含基金)
       const totalAssets = +(acc.cash + mktValue).toFixed(2);
@@ -487,16 +535,17 @@
         ? +(totalAssets - prev.paperTotal).toFixed(2)
         : null;
 
-      // 当日成交 (isPaper 且 date=今天; AI 自动成交: auto 标记, 兼容旧数据用 assumption='题材催化' 推断)
+      // 当日成交 (isPaper + 本 sleeve 且 date=今天; AI 自动成交: auto 标记, 兼容旧数据用 assumption='题材催化' 推断)
       const allTx = (await Core.Storage.all('transactions')) || [];
-      const trades = allTx
-        .filter(t => t.isPaper && t.date === today)
+      const tradeOf = (sleeve) => allTx
+        .filter(t => t.isPaper && t.date === today && (t.sleeve || 'long') === sleeve)
         .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))
         .map(t => ({
           type: t.type, code: t.code,
           price: t.price, shares: t.shares, fee: t.fee,
           auto: t.auto === true || t.assumption === '题材催化'
         }));
+      const trades = tradeOf('long');
 
       // 当日纪律拦截 (kv paper_discipline_log 里今天的部分)
       const dlog = (await Core.Storage.kvGet('paper_discipline_log')) || [];
@@ -507,6 +556,21 @@
       const pickPl = p => p ? { code: p.code, name: p.name || '', pl: +p.pl.toFixed(2), plPct: p.plPct } : null;
       const top = pickPl(sorted[0]);
       const bottom = sorted.length > 1 ? pickPl(sorted[sorted.length - 1]) : null;
+
+      // T1: 短线子账户段 (现金/市值/总资产/当日盈亏对照 prev.shortTotal, 老快照无此字段则 null)
+      const shortAcc = await this._getAccountRaw('short');
+      const shortPositions = await this.getPositions('short');
+      const shortMktValue = +(shortPositions.reduce((s, p) => s + (p.mkt || 0), 0)).toFixed(2);
+      const shortTotalAssets = +(shortAcc.cash + shortMktValue).toFixed(2);
+      const short = {
+        cash: +shortAcc.cash.toFixed(2),
+        mktValue: shortMktValue,
+        totalAssets: shortTotalAssets,
+        dayPnl: prev && typeof prev.shortTotal === 'number'
+          ? +(shortTotalAssets - prev.shortTotal).toFixed(2)
+          : null,
+        trades: tradeOf('short')
+      };
 
       return {
         date: today,
@@ -519,7 +583,8 @@
         trades,
         discipline,
         top,
-        bottom
+        bottom,
+        short
       };
     },
 
@@ -546,6 +611,18 @@
       }
       if (report.top) L.push(`🏆 最佳持仓 ${report.top.code} ${report.top.name} ${(report.top.plPct * 100).toFixed(2)}%`);
       if (report.bottom) L.push(`📉 最差持仓 ${report.bottom.code} ${report.bottom.name} ${(report.bottom.plPct * 100).toFixed(2)}%`);
+      // T1: 短线子账户段 (有 short 字段才输出, 兼容旧报告)
+      if (report.short) {
+        const s = report.short;
+        L.push(`⚡ AI 短线: 💵 现金 ${s.cash} | 📊 市值 ${s.mktValue} | 💰 总资产 ${s.totalAssets}`
+          + (s.dayPnl !== null ? ` | 📈 当日盈亏 ${s.dayPnl >= 0 ? '+' : ''}${s.dayPnl}` : ''));
+        if (s.trades && s.trades.length > 0) {
+          L.push(`  短线成交 ${s.trades.length} 笔:`);
+          for (const t of s.trades) {
+            L.push(`  ${t.auto ? '🤖 ' : ''}${t.type === 'buy' ? '买入' : '卖出'} ${t.code} @${t.price} ×${t.shares} 费${t.fee}`);
+          }
+        }
+      }
       return L.join('\n');
     },
 
@@ -618,6 +695,14 @@
             ${r.bottom ? `&nbsp;&nbsp;📉 最差 <span class="code">${escapeHtml(r.bottom.code)}</span> ${escapeHtml(r.bottom.name)} <span class="${pctClass(r.bottom.plPct)}">${fmtPct(r.bottom.plPct)}</span>` : ''}
           </div>`
         : '';
+      // T1: 短线子账户段 (合并卡片分段, 有 short 字段才渲染)
+      const shortHtml = r.short
+        ? `<div style="margin-top:8px;padding-top:8px;border-top:1px dashed var(--border, #30363d);font-size:12px;">
+            ⚡ AI 短线: 💵 ${fmtMoney(r.short.cash)} | 📊 ${fmtMoney(r.short.mktValue)} | 💰 ${fmtMoney(r.short.totalAssets)}
+            ${r.short.dayPnl !== null ? `| 📈 <span class="${pctClass(r.short.dayPnl)}">${fmtMoney(r.short.dayPnl)}</span>` : ''}
+            ${r.short.trades && r.short.trades.length ? `| 成交 ${r.short.trades.length} 笔` : ''}
+          </div>`
+        : '';
       el.innerHTML = `
         <div class="card-title">📋 日终小结 ${escapeHtml(r.date)}</div>
         <div class="summary-cards" style="margin-top:8px;">
@@ -637,13 +722,14 @@
         </table>
         ${disciplineHtml}
         ${plHtml}
+        ${shortHtml}
         ${hint}
       `;
     },
 
     // ========== 页面 UI ==========
 
-    /** 手动交易表单: 买入 (Phase B: 先过 Core.Discipline.preBuyCheck) */
+    /** 手动交易表单: 买入 (Phase B: 先过 Core.Discipline.preBuyCheck; T1: 走当前 tab 的子账户) */
     async buyFromForm() {
       const parsed = parseStockInput(document.getElementById('paperCode').value);
       if (!parsed) { toastError('代码格式不对 (6 位数字开头)'); return; }
@@ -652,7 +738,8 @@
       const resultEl = document.getElementById('paperCheckResult');
       const assumption = document.getElementById('paperAssumption').value;
       const stopLoss = parseFloat(document.getElementById('paperStopLoss').value);
-      let opts = {};
+      const sleeve = this._sleeve;
+      let opts = { sleeve };
       if (Core.Discipline && Core.Discipline.preBuyCheck) {
         // 先拉实时价供止损价/金额校验 (拉不到则 price=0, 检查内部降级为 warn)
         let price = 0;
@@ -666,7 +753,7 @@
         const chk = await Core.Discipline.preBuyCheck({
           code: parsed.code, name: parsed.name, market: '',
           price, shares: sharesLot, amount: sharesLot * price,
-          isPaper: true, assumption, stopLoss
+          isPaper: true, sleeve, assumption, stopLoss
         });
         if (!chk.ok) {
           if (resultEl) resultEl.innerHTML = Core.Discipline.renderCheckResult(chk);
@@ -674,7 +761,7 @@
           return;
         }
         if (chk.warns.length && !confirm(Core.Discipline._resultToText(chk) + '\n\n确认继续买入?')) return;
-        opts = { assumption, stopLoss, disciplineWarns: chk.warns };
+        opts = { sleeve, assumption, stopLoss, disciplineWarns: chk.warns };
       }
       const r = await this.buy(parsed.code, parsed.name, '', shares, opts);
       if (r) {
@@ -683,15 +770,15 @@
       }
     },
 
-    /** 手动交易表单: 卖出 (按代码找模拟持仓) */
+    /** 手动交易表单: 卖出 (按代码找当前子账户的模拟持仓) */
     async sellFromForm() {
       const parsed = parseStockInput(document.getElementById('paperCode').value);
       if (!parsed) { toastError('代码格式不对 (6 位数字开头)'); return; }
       const shares = parseFloat(document.getElementById('paperShares').value);
       if (!shares || shares <= 0) { toastError('股数必须 > 0'); return; }
-      const rows = await this._getPaperHoldings();
+      const rows = await this._getPaperHoldings(this._sleeve);
       const h = rows.find(x => x.code === parsed.code);
-      if (!h) { toastError('模拟盘没有这只持仓'); return; }
+      if (!h) { toastError('当前子账户没有这只持仓'); return; }
       const r = await this.sell(h.id, shares);
       if (r) this.renderPage();
     },
@@ -705,16 +792,39 @@
       if (r) this.renderPage();
     },
 
+    // T1: 当前展示的子账户 ('long' 长线模拟 / 'short' AI 短线), tab 切换
+    _sleeve: 'long',
+
+    /** 切换 长线/短线 tab 并重渲染 */
+    switchSleeve(sleeve) {
+      this._sleeve = sleeve === 'short' ? 'short' : 'long';
+      this.renderPage();
+    },
+
     /** 页面渲染 (挂 window._onShow_pagePaper) */
     async renderPage() {
       const summaryEl = document.getElementById('paperSummary');
       const tableEl = document.getElementById('paperPositions');
       if (!summaryEl || !tableEl) return;
 
+      const sleeve = this._sleeve;
+
+      // T1: tab 高亮 + 短线说明行
+      const tabLong = document.getElementById('paperTabLong');
+      const tabShort = document.getElementById('paperTabShort');
+      if (tabLong) tabLong.classList.toggle('btn-primary', sleeve === 'long');
+      if (tabShort) tabShort.classList.toggle('btn-primary', sleeve === 'short');
+      const noteEl = document.getElementById('paperSleeveNote');
+      if (noteEl) {
+        noteEl.textContent = sleeve === 'short'
+          ? '⚡ AI 短线操盘手即将上线 (T2/T3), 此账户将由 AI 自动交易; 当前可用手动表单测试'
+          : '';
+      }
+
       // 页面展示时也尝试记当日快照 (当天已记则跳过)
       this.snapshotIfNeeded().catch(e => console.warn('[Paper] 页面快照失败:', e));
 
-      const [acc, positions] = await Promise.all([this.getAccount(), this.getPositions()]);
+      const [acc, positions] = await Promise.all([this.getAccount(sleeve), this.getPositions(sleeve)]);
       const mktValue = positions.reduce((s, p) => s + (p.mkt || 0), 0);
       const totalAssets = acc.cash + mktValue;
       // 累计盈亏 = 总资产 - 初始资金 (含已实现盈亏与手续费)
@@ -790,10 +900,11 @@
     _chart: null,
 
     /**
-     * 表现对比曲线 (ECharts 双轴三线)
-     * 左轴: 模拟总资产 / 真实持仓市值 (元, 绝对值)
+     * 表现对比曲线 (ECharts 双轴四线)
+     * 左轴: 长线模拟总资产 / AI 短线总资产 / 真实持仓市值 (元, 绝对值)
      * 右轴: 沪深300 (以快照首日 = 100 指数化)
      * 口径差异: 资产线是绝对金额, 沪深300 是指数化相对走势, 两条轴只看各自趋势, 不比绝对高低
+     * T1: 短线线取快照 shortTotal 字段, 老快照无此字段 → null (ECharts 自动断点)
      */
     async _renderChart() {
       const chartEl = document.getElementById('paperChart');
@@ -818,7 +929,7 @@
       this._chart.setOption({
         tooltip: { trigger: 'axis' },
         legend: {
-          data: ['模拟总资产', '真实持仓市值', '沪深300 (首日=100)'],
+          data: ['长线模拟总资产', 'AI 短线总资产', '真实持仓市值', '沪深300 (首日=100)'],
           textStyle: { color: '#8b949e', fontSize: 11 }
         },
         grid: { left: 70, right: 60, top: 40, bottom: 30 },
@@ -828,7 +939,8 @@
           { type: 'value', name: '沪深300 指数化', axisLabel: { color: '#8b949e', fontSize: 10 }, splitLine: { show: false } }
         ],
         series: [
-          { name: '模拟总资产', type: 'line', data: snaps.map(s => s.paperTotal), smooth: true, showSymbol: false },
+          { name: '长线模拟总资产', type: 'line', data: snaps.map(s => s.paperTotal), smooth: true, showSymbol: false },
+          { name: 'AI 短线总资产', type: 'line', data: snaps.map(s => typeof s.shortTotal === 'number' ? s.shortTotal : null), smooth: true, showSymbol: false },
           { name: '真实持仓市值', type: 'line', data: snaps.map(s => s.realTotal), smooth: true, showSymbol: false },
           { name: '沪深300 (首日=100)', type: 'line', yAxisIndex: 1, data: csi300Indexed, smooth: true, showSymbol: false, lineStyle: { type: 'dashed' } }
         ]

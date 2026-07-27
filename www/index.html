@@ -8,7 +8,7 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <title>StockMaster</title>
   <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="apple-touch-icon" href="/icons/icon-192.png">
+  <link rel="apple-touch-icon" href="/icons/icon-192.png">
   <link rel="stylesheet" crossorigin href="/styles.src.css">
 </head>
 <body>
@@ -50,13 +50,18 @@
     <div id="holdingsTable" class="data-card"></div>
   </section>
 
-  <!-- 模拟盘 (Paper Trading): 验证 AI 建议的真实表现, 与真实持仓完全隔离 -->
+  <!-- 模拟盘 (Paper Trading): 验证 AI 建议的真实表现, 与真实持仓完全隔离; T1 分长线/AI 短线两个子账户 -->
   <section class="page" id="pagePaper">
     <div class="page-header">
       <h2>模拟盘</h2>
-      <button class="btn btn-sm btn-danger" onclick="Paper.resetAccount()">🔄 重置模拟盘</button>
+      <button class="btn btn-sm btn-danger" onclick="Paper.resetAccount(Paper._sleeve)">🔄 重置当前账户</button>
     </div>
     <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">模拟盘用于验证 AI 建议的真实表现, 与真实持仓完全隔离</div>
+    <div style="display:flex;gap:8px;margin-bottom:8px;">
+      <button class="btn btn-sm" id="paperTabLong" onclick="Paper.switchSleeve('long')">📈 长线模拟</button>
+      <button class="btn btn-sm" id="paperTabShort" onclick="Paper.switchSleeve('short')">⚡ AI 短线</button>
+    </div>
+    <div id="paperSleeveNote" style="font-size:12px;color:var(--text-muted);margin-bottom:8px;"></div>
     <div id="paperSummary" class="summary-cards"></div>
     <div class="filter-form" style="margin-top:8px;">
       <div class="form-row">
