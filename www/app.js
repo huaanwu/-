@@ -5,6 +5,26 @@
 
 var APP_VERSION = 'v0.1.0';
 var APP_BUILD_DATE = '2026-07-26';
+var APP_GIT_COMMIT = '';
+// build-web.mjs 写入 www/version.json, 启动时读它覆盖 (保证 package.json 是单一来源)
+(function _syncVersionFromBuild() {
+  try {
+    // fetch 在 web worker / file:// 不可用时静默失败
+    if (typeof fetch !== 'function') return;
+    fetch('/version.json?_=' + Date.now(), { cache: 'no-store' })
+      .then(r => r.ok ? r.json() : null)
+      .then(v => {
+        if (!v) return;
+        if (v.version) APP_VERSION = 'v' + v.version;
+        if (v.buildDate) APP_BUILD_DATE = v.buildDate;
+        if (v.gitCommit) APP_GIT_COMMIT = v.gitCommit;
+        // 重渲染设置页底部"关于"
+        const aboutEl = document.getElementById('appAboutLine');
+        if (aboutEl) aboutEl.innerHTML = `StockMaster ${APP_VERSION} · ${APP_BUILD_DATE}${APP_GIT_COMMIT ? ' · ' + APP_GIT_COMMIT : ''}`;
+      })
+      .catch(e => console.warn('[App] version.json 读取失败, 用本地默认值:', e.message));
+  } catch (e) { console.warn('[App] 版本同步初始化失败:', e); }
+})();
 
 // ========== 全局兼容层: HTML onclick 调用 ==========
 var switchPage = Core.Router.switchPage;
@@ -108,6 +128,11 @@ function updateMarketStatus() {
     // Phase T3: 短线条件单每日结算 (异步, 不阻塞启动; 当日已结算自动跳过)
     if (window.Paper && Paper.settleCondOrders) {
       Paper.settleCondOrders().catch(e => console.warn('[App] 条件单结算失败:', e));
+    }
+    // Phase T2 (ShortTrader): 盘前 AI 短线交易计划 (异步, 不阻塞启动; 交易日 + 无今日记录才生成)
+    if (window.ShortTrader && ShortTrader.init) ShortTrader.init();
+    if (window.ShortTrader && ShortTrader.maybeGeneratePlan) {
+      ShortTrader.maybeGeneratePlan().catch(e => console.warn('[App] 短线今日计划生成失败:', e));
     }
     if (window.Journal && Journal.init) Journal.init();
     if (window.Screener && Screener.init) Screener.init();
@@ -279,6 +304,12 @@ window._renderSettings = function() {
       <button class="btn" onclick="testLocalAI()">🏠 测试本地 AI</button>
       <span id="aiLocalTestResult" style="font-size:12px;color:var(--text-muted);margin-left:8px;"></span>
     </div>
+    <div class="form-row">
+      <label>自动发现 (局域网)</label>
+      <button class="btn" onclick="discoverLLM()">🔍 扫描本地大模型</button>
+      <span id="aiDiscoverResult" style="font-size:12px;color:var(--text-muted);margin-left:8px;"></span>
+    </div>
+    <div id="aiDiscoverList"></div>
 
     <div class="form-row" style="border-top:1px solid var(--border);padding-top:12px;margin-top:12px;">
       <label style="font-size:14px;font-weight:600;">🤝 第二意见 (双模型交叉验证, Phase D2)</label>
@@ -362,7 +393,7 @@ window._renderSettings = function() {
     </div>
     <div class="form-row" style="border-top:1px solid var(--border);padding-top:12px;margin-top:12px;">
       <label>关于</label>
-      <div style="font-size:12px;color:var(--text-muted);">
+      <div style="font-size:12px;color:var(--text-muted);" id="appAboutLine">
         StockMaster ${APP_VERSION} · ${APP_BUILD_DATE}<br>
         自用工具 · 数据本地化 · 零合规风险<br>
         <a href="https://github.com/akfamily/akshare" target="_blank" style="color:var(--link);">数据源 AKShare</a>
@@ -480,6 +511,66 @@ window.testLocalAI = async function() {
     el.innerHTML = '✗ ' + escapeHtml(e.message);
     el.style.color = 'var(--down)';
   }
+};
+
+// 局域网自动发现本地大模型 (Phase 自动发现)
+window.discoverLLM = async function() {
+  const status = document.getElementById('aiDiscoverResult');
+  const list = document.getElementById('aiDiscoverList');
+  if (status) { status.textContent = '⏳ 扫描中(1-3 秒)...'; status.style.color = 'var(--text-muted)'; }
+  if (list) list.innerHTML = '';
+  window._discoveredLLMs = [];
+  try {
+    const r = await Core.AI.discoverLocalLLM();
+    if (status) {
+      status.textContent = `扫描 ${r.scanned} 个端点, 命中 ${r.found.length} 个; dev-proxy 在 ${r.host}`;
+      status.style.color = r.found.length > 0 ? 'var(--up)' : 'var(--text-muted)';
+    }
+    if (!list) return;
+    if (r.found.length === 0) {
+      list.innerHTML = '<div style="font-size:12px;color:var(--text-muted);padding:8px 0;">未发现本地大模型。检查:① dev-proxy 在跑 ② LLM 服务启动 ③ 端口在白名单 (8082/1234/11434/11435/8000)</div>';
+      return;
+    }
+    window._discoveredLLMs = r.found;
+    list.innerHTML = r.found.map((f, idx) => `
+      <div class="data-card" style="margin-top:8px;padding:10px;">
+        <div style="display:flex;justify-content:space-between;align-items:start;gap:12px;">
+          <div style="flex:1;">
+            <div style="font-weight:600;">${escapeHtml(f.label)} <span style="font-size:11px;color:var(--text-muted);font-weight:normal;">(${f.latencyMs}ms)</span></div>
+            <div style="font-size:12px;color:var(--text-muted);margin-top:4px;font-family:monospace;">${escapeHtml(f.baseURL)}</div>
+            <div style="font-size:12px;margin-top:4px;">模型: ${f.models.map(m => `<code style="background:var(--bg-base);padding:1px 4px;border-radius:3px;">${escapeHtml(m)}</code>`).join(' ')}</div>
+          </div>
+          <button class="btn btn-sm btn-primary" onclick="applyDiscoveredLLM(${idx})">使用</button>
+        </div>
+      </div>
+    `).join('');
+  } catch (e) {
+    if (status) {
+      status.textContent = '❌ 扫描失败: ' + e.message;
+      status.style.color = 'var(--down)';
+    }
+    console.warn('[discoverLLM] 错误:', e);
+  }
+};
+
+// 用户点 [使用] 候选 → 填入设置 + 自动测试
+window.applyDiscoveredLLM = async function(idx) {
+  const found = window._discoveredLLMs || [];
+  const f = found[idx];
+  if (!f) return;
+  // 1) 填 UI 字段
+  document.getElementById('settingAILocalBaseURL').value = f.baseURL;
+  if (f.models.length > 0) {
+    document.getElementById('settingAILocalModel').value = f.models[0];
+  }
+  // 2) 自动勾 preferLocal
+  const cb = document.getElementById('settingAIPreferLocal');
+  if (cb && !cb.checked) cb.checked = true;
+  // 3) 持久化 + 测试
+  await saveSettings(true);
+  await testLocalAI();
+  // 4) toast 提示
+  if (window.toastSuccess) toastSuccess('已应用: ' + f.label + ' / ' + f.models[0]);
 };
 
 // 显示当前 AI 配置 (本地/远程) + 预填提示

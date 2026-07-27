@@ -168,6 +168,14 @@
   /** 盘前计划 prompt 注入的最近 lessons 条数 (T4 闭环, lessons 不足时取全部) */
   const PLAN_LESSON_INJECT_MAX = 7;
 
+  // ==================== AI 短线操盘手 T2 (ShortTrader): 盘前计划生成 ====================
+
+  /** ShortTrader 计划丢弃留痕上限 (kv paper_plan_log, 滚动截断最旧) */
+  const SHORT_PLAN_LOG_LIMIT = 100;
+
+  /** ShortTrader 盘前计划 prompt 注入的近 N 天短线 journal 摘要天数 */
+  const SHORT_PLAN_JOURNAL_DAYS = 3;
+
   // ==================== AI 短线操盘手 T4: 短线学习环 ====================
 
   /** 学习环 KV 保留条数 (kv paper_short_lessons, 滚动截断最旧) */
@@ -235,6 +243,8 @@
     PLAN_LIMIT,
     PLAN_CANDIDATES_MAX,
     PLAN_LESSON_INJECT_MAX,
+    SHORT_PLAN_LOG_LIMIT,
+    SHORT_PLAN_JOURNAL_DAYS,
     LESSON_LIMIT,
     LESSON_EXTRACT_MAX,
     LESSON_LAST_RUN_DATE_KEY,

@@ -14,6 +14,7 @@ export default defineConfig({
         '/app/stock-advisor.js',
         '/app/holdings.js',
         '/app/paper.js',
+        '/app/short-trader.js',
         '/app/journal.js',
         '/app/screener.js',
         '/app/backtest.js',
@@ -96,6 +97,12 @@ export default defineConfig({
       // 本地大模型透传 (绕浏览器 CORS)
       // 浏览器 → /api/local/v1/chat/completions → dev-proxy → http://127.0.0.1:8082/v1/...
       '/api/local': {
+        target: 'http://127.0.0.1:8089',
+        changeOrigin: true
+      },
+      // 腾讯/新浪行情透传 (绕浏览器 CORS, dev-proxy 加 Referer)
+      // 浏览器 → /api/tencent/list=sh600519 → dev-proxy → https://hq.sinajs.cn/list=...
+      '/api/tencent': {
         target: 'http://127.0.0.1:8089',
         changeOrigin: true
       }

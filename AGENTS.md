@@ -69,7 +69,7 @@ node scripts/daily_summary.mjs --verify-dry-run ./journals.json   # 事后验证
 node scripts/daily_summary.mjs --premarket   # Phase C 盘前简报 (隔夜外盘+日历+财新要闻 → LLM → 飞书; 建议 Windows 计划任务 交易日 08:30)
 ```
 
-`test/test_all.js` 36 节:JS 语法、域脚本接口完备性 (`DOMAINS` 字典)、Core 命名空间导出、index.html script 引用对账、Worker 结构、关键文件存在、Data 层方法签名、回测引擎 vm 沙箱实测、Vite external 对账、journal/market/fund/alerts 纯函数实测、daily_summary 单测 (含 --premarket 盘前简报)、5.1/5.2/5.3 互通闭环实测、数据源限流、Paper 模拟盘纯函数实测 (含 Phase C EOD 日终小结 + 23b T1 sleeve 分账户: 双账户独立现金/过滤/重置/快照 shortTotal/纪律锚点分 sleeve/向后兼容)、Discipline 纪律引擎实测、Phase D1 pre-mortem + 个股公告实测、Phase D2 回测前置 + 双模型实测、Phase E 待确认交易实测 (Pending 去重/上限/过期/状态机/建议仓位 + 接线)、Phase W 中长线盯盘实测 (horizon 打标/短线定时器起停注入断言/交易时段守卫/通知冷却/事件驱动接线/业绩预告 filter+lastNotifiedKeys 去重/regime 三态迁移/估值判定+进出阈值区去重/nextCheck 门控)。**改完域脚本或新增域方法必须先 `npm test`,并同步更新该文件的 `DOMAINS` 字典。**
+`test/test_all.js` 36 节:JS 语法、域脚本接口完备性 (`DOMAINS` 字典)、Core 命名空间导出、index.html script 引用对账、Worker 结构、关键文件存在、Data 层方法签名、回测引擎 vm 沙箱实测、Vite external 对账、journal/market/fund/alerts 纯函数实测、daily_summary 单测 (含 --premarket 盘前简报)、5.1/5.2/5.3 互通闭环实测、数据源限流、Paper 模拟盘纯函数实测 (含 Phase C EOD 日终小结 + 23b T1 sleeve 分账户: 双账户独立现金/过滤/重置/快照 shortTotal/纪律锚点分 sleeve/向后兼容)、Discipline 纪律引擎实测、Phase D1 pre-mortem + 个股公告实测、Phase D2 回测前置 + 双模型实测、Phase E 待确认交易实测 (Pending 去重/上限/过期/状态机/建议仓位 + 接线)、Phase W 中长线盯盘实测 (horizon 打标/短线定时器起停注入断言/交易时段守卫/通知冷却/事件驱动接线/业绩预告 filter+lastNotifiedKeys 去重/regime 三态迁移/估值判定+进出阈值区去重/nextCheck 门控)、ShortTrader T2 盘前计划实测 (39 节: 交易日边界/prompt 要素/校验管线全分支/丢弃留痕/空仓合法/整手换算/regime 缩放/当日防重复/addCondOrder 接线)。**改完域脚本或新增域方法必须先 `npm test`,并同步更新该文件的 `DOMAINS` 字典。**
 
 `scripts/e2e.mjs` 注意:Chrome 路径硬编码 `C:\Program Files\Google\Chrome\Application\chrome.exe`,需要 Vite 已在 3003 端口跑着。
 
@@ -106,6 +106,7 @@ www/                        # Web 根 (= Capacitor webDir,Vite root)
 │   ├── watchlist.js        # 行情看板:自选股 + K线 + 行情
 │   ├── holdings.js         # 持仓管理:持仓 + 交易流水 + 持仓天数/浮盈
 │   ├── paper.js            # 模拟盘:虚拟资金 + isPaper 隔离持仓 + T1 分账户 sleeve (long/short) + AI 自动成交 + 每日快照曲线
+│   ├── short-trader.js     # ShortTrader:AI 短线操盘手 T2 盘前计划 (自动生成 + 校验管线 + 自动转条件单; 与 paper.js 内 T2 盘前计划手动流并存)
 │   ├── journal.js          # 复盘笔记:结构化标签 + 持仓上下文 + AI 助手 (874 行)
 │   ├── screener.js         # 选股筛选:条件筛选 + AI 选股 + 一键加自选 (待确认卡片走 Core.Portfolio.getAssets)
 │   ├── stock-advisor.js    # 单股 💡 AI 简评 + 历史验证 + 双模型交叉验证
@@ -251,6 +252,20 @@ vite.config.js              # root=www,域脚本 external 列表,dev proxy
 | T3.5 journal 沉淀 | `www/app/paper.js` | `_writeCondJournal` (参照 screener `_addWatchlistFromPick` 模式): 成交/止损/止盈/强平/过期/纪律取消各写一条, 行上 `sleeve:'short'` + `auto:true`, content 含计划原文要素 (`_condPlanLines`: trigger/stop/target/assumption/证伪/失效) + 成交明细 + 原因 |
 | T3.6 UI | `www/index.html` + `www/app/paper.js` | 短线 tab `#paperCondSection`: 手动建条件单表单 (走 `Discipline.preBuyCheck({isPaper:true, sleeve:'short'})`) + `#paperCondOrders` 区块 (pending 单列表含取消按钮 + 近期已结算单状态徽标, 全 escapeHtml); `renderPage` 短线 tab 才显示; 结算有动作自动重渲染 |
 | T3.7 启动钩子 + 重置 | `www/app.js` + `www/app/paper.js` | app init 后 `Paper.settleCondOrders()` 异步不阻塞 (同 EOD 写法); `resetAccount('short')` 连带清 paper_cond_orders/paper_short_positions/paper_cond_settle |
+
+### Phase T2 (ShortTrader) 盘前 AI 交易计划生成 (AI 短线操盘手: 自动生成 + 自动转条件单)
+
+> 独立域脚本 `www/app/short-trader.js` (window.ShortTrader), 与 paper.js 内 `generateMorningPlan` (T2 手动确认流, kv paper_morning_plan) **两套并存**, kv/逻辑互不干扰: 本套走"自动生成 + 校验管线 + 自动落地条件单"。
+
+| 子项 | 实现位置 | 关键方法 |
+|------|----------|----------|
+| T2-ST.0 常量 | `www/core/constants.js` | SHORT_PLAN_LOG_LIMIT(100, kv paper_plan_log 上限) / SHORT_PLAN_JOURNAL_DAYS(3, prompt 注入短线 journal 回看天数); 纪律参数复用 `Core.Discipline.DEFAULT_CONFIG.short` (maxDailyTrades 3 / cooldownHours 48, T1 预留本期启用) |
+| T2-ST.1 自动生成 | `www/app/short-trader.js` + `www/app.js` | `maybeGeneratePlan(now)`: 交易日 (`_isTradingDay` 纯函数, 周一~周五, 节假日简化不判) + kv `paper_short_plan` 无今日记录 → 自动生成; app init 异步调用不阻塞 (同 settleCondOrders 写法); 失败 console.warn + kv 写 error 记录, UI 显示"生成失败可手动重试" |
+| T2-ST.2 上下文组装 | `www/app/short-trader.js` | `_buildPlanContext`: 短线现金/持仓 (含止损/目标/浮盈)/pending 条件单/今日已建单数/近 3 天 sleeve='short' journal 摘要/Regime 状态+gate/指数快照 (只用 Core.Data.getIndexSpot 现有接口)/**候选池 = watchlist 全部 + short 持仓代码** (`_buildCandidatePool` 纯函数去重) |
+| T2-ST.3 prompt | `www/app/short-trader.js` | `_buildSystemPrompt`/`_buildUserPrompt` 纯函数: 短线波段操盘手人设 (持有 1-5 天/保守/宁缺毋滥可空仓), 输出严格 JSON `{marketView, plans[0-3]}`, plans 含 code/name/triggerDirection/triggerPrice/stopLoss/targetPrice/positionPct/assumption/probability(0-100 必填)/confidence(低中高 必填)/reason + Core.Premortem 四字段 (bullCase/bearCase/falsifyCondition/invalidation) |
+| T2-ST.4 校验管线 | `www/app/short-trader.js` `_validatePlans` (纯函数) | a. JSON schema (`Core.AI.parseJsonOutput` Phase T 模式) + `Core.Premortem.checkPick`; b. 幻觉防护 code∈候选池; c. 价格关系 stopLoss<trigger<target; d. 短线纪律: 今日已建+本轮 ≤maxDailyTrades(3) (quota) / 同代码 48h 短线卖出冷却 (`_hasRecentShortSell`) / positionPct 超 PAPER_SHORT_POSITION_PCT **收敛不丢弃** (`_scalePositionPct`) / regime bear ×gate.positionScale; e. 每条丢弃写 kv `paper_plan_log` {date,code,stage,reason} 上限 100 (`_appendPlanLog`) |
+| T2-ST.5 落地 | `www/app/short-trader.js` `generatePlan` | 通过的 plans 逐条 `Paper.addCondOrder({..., source:'ai', sleeve:'short'})`; shares = `Paper._roundLot(短线现金×positionPct/triggerPrice)`, 不足一手丢弃留痕; 整轮存 kv `paper_short_plan` {date, marketView, plans(含 condOrderId), dropped, generatedAt}; LLM 走 `Core.AI.callWithTimeout` (60s), 测试注入 `opts.deps.callLLM` |
+| T2-ST.6 UI | `www/index.html` + `www/app/short-trader.js` + `www/app/paper.js` | 短线 tab `#shortTraderSection` "🤖 今日计划": marketView + plans 卡片 (方向/触发/止损/目标/仓位/胜率/信心/reason + pre-mortem 块 + 已转条件单徽标) + dropped 折叠区 + "🔄 重新生成" (`regenerate`, confirm 后覆盖今日记录); 渲染全在 ShortTrader.renderTodayPlan (全 escapeHtml), paper.js renderPage 仅 3 行挂载 |
 
 ### Phase D AI 建议"高手化" (D1)
 

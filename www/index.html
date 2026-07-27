@@ -106,6 +106,11 @@
       <h3 style="margin-top:16px;font-size:14px;color:var(--text-muted);">🪞 短线学习环 (T4)</h3>
       <div id="paperShortLessons" class="data-card" style="margin-top:8px;"></div>
     </div>
+    <!-- T2-ShortTrader: 今日计划 (自动生成+自动转条件单; 仅短线 tab 显示, paper.js renderPage 控制挂载) -->
+    <div id="shortTraderSection" style="display:none;">
+      <h3 style="margin-top:16px;font-size:14px;color:var(--text-muted);">🤖 今日计划 (ShortTrader)</h3>
+      <div id="shortTraderPlan" class="data-card" style="margin-top:8px;"></div>
+    </div>
     <!-- T3: 条件单区块 (仅短线 tab 显示, paper.js renderPage 控制) -->
     <div id="paperCondSection" style="display:none;">
       <h3 style="margin-top:16px;font-size:14px;color:var(--text-muted);">📋 条件单 (AI 短线, 日线级)</h3>
@@ -322,6 +327,7 @@
 <script src="/app/stock-advisor.js"></script>
 <script src="/app/holdings.js"></script>
 <script src="/app/paper.js"></script>
+<script src="/app/short-trader.js"></script>
 <script src="/app/journal.js"></script>
 <script src="/app/screener.js"></script>
 <script src="/app/fund.js"></script>

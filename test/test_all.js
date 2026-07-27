@@ -120,7 +120,11 @@ const DOMAINS = {
     '_runRiskFilter', '_isAnyRiskFlagOn', '_readBlacklist'],
   'Fund':      ['init', 'render', 'addDialog', 'save', 'remove', 'showChart', 'closeModal'],
   'Backtest':  ['init', 'run'],
-  'Alerts':    ['init', 'render', 'addDialog', 'save', 'toggle', 'remove', 'closeModal', 'startPolling', 'stopPolling', 'runLongChecks', '_isTradingTime', '_fetchJournalContext', '_horizonOf', '_syncTimers', '_checkShort', '_checkLong', '_filterEarningsWarnings', '_regimeNotifyText', '_judgeValuation', '_notifyLong']
+  'Alerts':    ['init', 'render', 'addDialog', 'save', 'toggle', 'remove', 'closeModal', 'startPolling', 'stopPolling', 'runLongChecks', '_isTradingTime', '_fetchJournalContext', '_horizonOf', '_syncTimers', '_checkShort', '_checkLong', '_filterEarningsWarnings', '_regimeNotifyText', '_judgeValuation', '_notifyLong'],
+  // T2 ShortTrader: 文件名 short-trader.js, key 用 'Short-Trader' (toLowerCase 后对得上)
+  'Short-Trader': ['init', 'maybeGeneratePlan', 'generatePlan', 'regenerate', 'renderTodayPlan', '_saveFailure',
+    '_isTradingDay', '_todayStr', '_normCode6', '_buildCandidatePool', '_hasRecentShortSell', '_scalePositionPct',
+    '_appendPlanLog', '_validatePlans', '_buildSystemPrompt', '_buildUserPrompt', '_buildPlanContext']
 };
 for (const [name, methods] of Object.entries(DOMAINS)) {
   const file = path.join(WWW, 'app', name.toLowerCase() + '.js');
@@ -2168,7 +2172,8 @@ try {
     console,
     setTimeout, clearTimeout,
     Core: { State: { get: () => ({}) } },
-    fetch: async () => ({ ok: false })
+    fetch: async () => ({ ok: false }),
+    location: { hostname: 'localhost', host: 'localhost:3003', protocol: 'http:' }  // ai-service getConfig 判 localhost 用
   };
   vm.createContext(AI);
   AI.window = AI;
@@ -2251,6 +2256,84 @@ try {
 } catch (e) {
   fail('ai-service 5.3.3', e.message + ' / ' + (e.stack || ''));
 }
+
+})();
+
+// ========== [20.9] 局域网自动发现本地大模型 ==========
+(async function() {
+  // 静态: dev-proxy 注册路由 + 实现探测
+  const proxySrc = readFileSafe(path.join(ROOT, 'scripts/dev-proxy.mjs'));
+  if (proxySrc.includes("app.get('/api/discover/local-llm'")) {
+    ok('20.9.a dev-proxy 注册 GET /api/discover/local-llm');
+  } else fail('20.9.a dev-proxy 路由缺失', '应注册 GET /api/discover/local-llm');
+  if (/_getScanHosts/.test(proxySrc) && (/_probeEndpoint/.test(proxySrc) || /probeEndpoint/.test(proxySrc))) {
+    ok('20.9.b dev-proxy 实现 _getScanHosts + _probeEndpoint');
+  } else fail('20.9.b dev-proxy 探测函数缺失', '应实现 host/port 扫描');
+  if (/DISCOVER_PORTS/.test(proxySrc) && (/1234/.test(proxySrc)) && (/11434/.test(proxySrc))) {
+    ok('20.9.c dev-proxy DISCOVER_PORTS 含 1234/11434 常见端口');
+  } else fail('20.9.c 端口列表缺失', '应含 1234/11434 等');
+
+  // 静态: ai-service.discoverLocalLLM 暴露
+  const aiSrc = readFileSafe(path.join(WWW, 'core/ai-service.js'));
+  if (/async function discoverLocalLLM/.test(aiSrc) && /\/api\/discover\/local-llm/.test(aiSrc)) {
+    ok('20.9.d ai-service 实现 discoverLocalLLM 调 /api/discover/local-llm');
+  } else fail('20.9.d AI.discoverLocalLLM 缺失', '应异步调发现端点');
+  if (/window\.Core\.AI\s*=\s*\{[\s\S]*?discoverLocalLLM/.test(aiSrc)) {
+    ok('20.9.e Core.AI.discoverLocalLLM 已导出');
+  } else fail('20.9.e Core.AI 导出缺失', 'discoverLocalLLM 应挂在 window.Core.AI');
+
+  // 静态: vite proxy /api/discover
+  const viteSrc = readFileSafe(path.join(ROOT, 'vite.config.js'));
+  if (/['"]\/api\/discover['"]\s*:/.test(viteSrc)) {
+    ok('20.9.f vite.config.js 含 /api/discover proxy');
+  } else fail('20.9.f vite proxy 缺失', '应透传到 dev-proxy :8089');
+
+  // 静态: app.js UI 接线
+  const appSrc = readFileSafe(path.join(WWW, 'app.js'));
+  if (/window\.discoverLLM\s*=/.test(appSrc) && /window\.applyDiscoveredLLM\s*=/.test(appSrc)) {
+    ok('20.9.g app.js 接线 discoverLLM + applyDiscoveredLLM');
+  } else fail('20.9.g app.js UI 缺失', '应加 discoverLLM 按钮 + apply 函数');
+  if (/aiDiscoverResult/.test(appSrc) && /aiDiscoverList/.test(appSrc)) {
+    ok('20.9.h app.js DOM 元素 ID aiDiscoverResult/aiDiscoverList');
+  } else fail('20.9.h DOM ID 缺失', '应新增 #aiDiscoverResult + #aiDiscoverList');
+
+  // 动态: 加载 ai-service, mock fetch 测 discoverLocalLLM
+  try {
+    const AI = {
+      console,
+      setTimeout, clearTimeout,
+      Core: { State: { get: () => ({}) } },
+      fetch: async (url) => {
+        if (url && url.includes && url.includes('/api/discover/local-llm')) {
+          return {
+            ok: true,
+            json: async () => ({
+              found: [{
+                baseURL: 'http://127.0.0.1:8082/v1', host: '127.0.0.1', port: 8082,
+                type: 'llama.cpp', label: 'llama.cpp server',
+                models: ['qwen36-35b-a3b'], latencyMs: 12
+              }],
+              scanned: 5, serverIPs: ['192.168.1.10'], host: '192.168.1.10',
+              timestamp: '2026-07-27T00:00:00Z'
+            })
+          };
+        }
+        return { ok: false };
+      }
+    };
+    vm.createContext(AI);
+    AI.window = AI;
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/ai-service.js')), AI);
+    const r = await AI.window.Core.AI.discoverLocalLLM();
+    if (r.found.length === 1 && r.found[0].models[0] === 'qwen36-35b-a3b' && r.host === '192.168.1.10') {
+      ok('20.9.i discoverLocalLLM 解析 found/models/host');
+    } else fail('20.9.i 解析错误', JSON.stringify(r));
+    if (r.scanned === 5 && r.serverIPs.length === 1 && r.serverIPs[0] === '192.168.1.10') {
+      ok('20.9.j discoverLocalLLM 解析 scanned/serverIPs');
+    } else fail('20.9.j 字段缺失', JSON.stringify(r));
+  } catch (e) {
+    fail('20.9.i dynamic discoverLocalLLM', e.message);
+  }
 
 })();
 
@@ -6543,6 +6626,348 @@ section('[38] Phase T3 日线级条件单引擎 (Paper)');
 
   } catch (e) {
     fail('T4 短线学习环', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [39] ShortTrader 盘前 AI 交易计划 (T2) ==========
+section('[39] ShortTrader 盘前 AI 交易计划 (T2): 交易日判定 / prompt / 校验管线 / 落地接线');
+(async () => {
+  try {
+    const stSrc = readFileSafe(path.join(WWW, 'app', 'short-trader.js'));
+    if (!stSrc) throw new Error('short-trader.js 读不到');
+    const K = _loadRealConstants();
+
+    // 39.0 T2 ShortTrader 常量进 Core.Constants
+    if (K.SHORT_PLAN_LOG_LIMIT === 100 && K.SHORT_PLAN_JOURNAL_DAYS === 3) {
+      ok('T2-ST 常量: SHORT_PLAN_LOG_LIMIT=100 / SHORT_PLAN_JOURNAL_DAYS=3');
+    } else fail('T2-ST 常量', JSON.stringify({ l: K.SHORT_PLAN_LOG_LIMIT, d: K.SHORT_PLAN_JOURNAL_DAYS }));
+
+    // 真实 Core.Premortem (校验管线 a2 依赖, checkPick 是纯函数)
+    const pmCtx = vm.createContext({ window: {}, console });
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/premortem.js')), pmCtx);
+    const realPremortem = pmCtx.window.Core.Premortem;
+    // 真实 Core.AI.parseJsonOutput (Phase T 模式, 从 ai-service 提取; 加载只需 State/get mock)
+    const aiCtx = { console, setTimeout, clearTimeout, Core: { State: { get: () => ({}) } }, fetch: async () => ({ ok: false }) };
+    vm.createContext(aiCtx);
+    aiCtx.window = aiCtx;
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/ai-service.js')), aiCtx);
+    const realParseJsonOutput = aiCtx.Core.AI.parseJsonOutput;
+    if (!realParseJsonOutput) throw new Error('ai-service.parseJsonOutput 提取失败');
+
+    // vm sandbox: mock Core.Storage (内存 kv/表) + Paper + Regime; LLM 走 deps.callLLM 注入
+    const buildCtx = (storageData) => {
+      storageData.addedOrders = storageData.addedOrders || [];
+      const sctx = {
+        window: {},
+        console,
+        escapeHtml: (s) => String(s == null ? '' : s),
+        fmtNum: (n, d) => (typeof n === 'number' ? n.toFixed(d || 0) : '0'),
+        fmtDateTime: () => '2026-07-27 08:30',
+        confirm: () => true,
+        document: { getElementById: () => null }
+      };
+      sctx.window.Core = {
+        Constants: K,
+        Storage: {
+          kvGet: async (k) => (k in storageData.kv ? storageData.kv[k] : null),
+          kvSet: async (k, v) => { storageData.kv[k] = v; },
+          all: async (t) => storageData.tables[t] || []
+        },
+        Data: { getIndexSpot: async () => storageData.indexSpot || [] },
+        Util: { stockCodePrefix: (c) => /^(60|68)/.test(c) ? 'sh' : 'sz' },
+        Premortem: realPremortem,
+        AI: {
+          parseJsonOutput: realParseJsonOutput,
+          callWithTimeout: async () => { throw new Error('测试不应走到真实 LLM'); }
+        },
+        Regime: storageData.regimeMock || {
+          get: async () => ({ state: 'range' }),
+          gateMultipliers: () => ({ state: 'range', label: '震荡市', positionScale: 1 })
+        },
+        Discipline: { DEFAULT_CONFIG: { short: { maxDailyTrades: 3, cooldownHours: 48 } } }
+      };
+      sctx.Core = sctx.window.Core;
+      const paperMock = {
+        _roundLot: (s) => Math.floor((parseFloat(s) || 0) / 100) * 100,
+        _getAccountRaw: async () => storageData.account || { cash: 30000, initialCash: 30000, positionPct: 0.2 },
+        getPositions: async () => storageData.positions || [],
+        listCondOrders: async () => storageData.condOrders || [],
+        addCondOrder: async (o) => {
+          storageData.addedOrders.push(o);
+          return { ok: true, order: { id: 'ord-' + storageData.addedOrders.length, ...o } };
+        }
+      };
+      sctx.window.Paper = paperMock;
+      sctx.Paper = paperMock;
+      sctx.window.document = sctx.document;
+      vm.createContext(sctx);
+      vm.runInContext(stSrc, sctx);
+      return sctx;
+    };
+
+    const ctx0 = buildCtx({ kv: {}, tables: {} });
+    const ST = ctx0.window.ShortTrader;
+    if (!ST) throw new Error('ShortTrader 未挂到 window');
+
+    // 39.1 _isTradingDay 边界 (2026-07-27 周一 / 07-31 周五 / 07-25 周六 / 07-26 周日)
+    if (ST._isTradingDay(new Date(2026, 6, 27)) === true
+      && ST._isTradingDay(new Date(2026, 6, 31)) === true) ok('tradingDay: 周一/周五 → true');
+    else fail('tradingDay 工作日', '');
+    if (ST._isTradingDay(new Date(2026, 6, 25)) === false
+      && ST._isTradingDay(new Date(2026, 6, 26)) === false) ok('tradingDay: 周六/周日 → false');
+    else fail('tradingDay 周末', '');
+    if (ST._isTradingDay('不是日期') === false) ok('tradingDay: 非法日期 → false');
+    else fail('tradingDay 非法', '');
+
+    // 39.2 prompt 组装要素
+    const sp = ST._buildSystemPrompt();
+    if (sp.includes('marketView') && sp.includes('plans') && sp.includes('probability')
+      && sp.includes('confidence') && sp.includes('宁缺毋滥') && sp.includes('below')
+      && sp.includes('falsifyCondition') && sp.includes('invalidation')) ok('prompt: systemPrompt 含 schema/空仓人设/pre-mortem 要素');
+    else fail('prompt systemPrompt', '');
+    const up = ST._buildUserPrompt({
+      today: '2026-07-27', cash: 30000,
+      positions: [{ code: '600519', name: '贵州茅台', shares: 100, costPrice: 10, price: 11, stopLoss: 9, targetPrice: 12, plPct: 0.1 }],
+      pendingOrders: [{ code: '000001', triggerDirection: 'below', triggerPrice: 5, stopLoss: 4.5, targetPrice: 5.5, shares: 100 }],
+      recentJournals: [{ date: '2026-07-26', code: '600519', title: '止损复盘' }],
+      regime: { state: 'bear', label: '下跌市 ⚠', positionScale: 0.5 },
+      marketText: '上证指数 3500 (0.5%)',
+      pool: [{ code: '600519', name: '贵州茅台' }]
+    });
+    if (up.includes('现金') && up.includes('候选池') && up.includes('大盘状态机')
+      && up.includes('待触发条件单') && up.includes('短线交易摘要') && up.includes('指数快照')
+      && up.includes('600519') && up.includes('仓位自动减半')) ok('prompt: userPrompt 含账户/持仓/条件单/journal/regime/市场/候选池');
+    else fail('prompt userPrompt', '');
+
+    // 39.3 校验管线全分支 (_validatePlans 纯函数)
+    const mkPlan = (over) => Object.assign({
+      code: '600519', name: '贵州茅台', triggerDirection: 'below',
+      triggerPrice: 10, stopLoss: 9, targetPrice: 11,
+      positionPct: 0.2, assumption: '技术突破',
+      falsifyCondition: '跌破 20 日线', invalidation: '3 日未反弹',
+      probability: 60, confidence: '中', reason: '回踩支撑',
+      bullCase: ['放量突破'], bearCase: ['大盘走弱拖累']
+    }, over || {});
+    const vctx = (over) => Object.assign({
+      pool: new Set(['600519', '000001']), cash: 30000, quotaLeft: 3,
+      recentSellCodes: new Set(), regimeState: 'range', positionScale: 1,
+      roundLot: (s) => Math.floor(s / 100) * 100
+    }, over || {});
+    // 合法通过 + shares 换算整手 (30000×0.2/10 = 600)
+    let r = ST._validatePlans([mkPlan()], vctx());
+    if (r.passed.length === 1 && r.dropped.length === 0 && r.passed[0].shares === 600
+      && r.passed[0].probability === 60 && r.passed[0].confidence === '中') ok('validate: 合法 plan 通过, shares=现金×pct/价→整手 600');
+    else fail('validate 通过', JSON.stringify(r));
+    // plans=[] 空仓合法
+    r = ST._validatePlans([], vctx());
+    if (r.passed.length === 0 && r.dropped.length === 0) ok('validate: plans=[] 空仓合法 (0 通过 0 丢弃)');
+    else fail('validate 空仓', JSON.stringify(r));
+    // (a) schema 分支
+    const schemaCases = [
+      [{ code: 'abc' }, 'code 非 6 位'],
+      [{ code: '600519', triggerDirection: 'up' }, '方向非法'],
+      [{ probability: undefined }, 'probability 缺'],
+      [{ probability: 120 }, 'probability 超界'],
+      [{ confidence: '很高' }, 'confidence 非法'],
+      [{ assumption: '' }, 'assumption 缺']
+    ];
+    let schemaOk = true;
+    for (const [over, tag] of schemaCases) {
+      const rr = ST._validatePlans([mkPlan(over)], vctx());
+      if (!(rr.passed.length === 0 && rr.dropped.length === 1 && rr.dropped[0].stage === 'schema')) {
+        schemaOk = false; fail('validate schema ' + tag, JSON.stringify(rr.dropped));
+      }
+    }
+    if (schemaOk) ok('validate: schema 6 分支全丢弃 (stage=schema)');
+    // (a2) premortem 分支
+    let pmOk = true;
+    for (const over of [{ bearCase: [] }, { falsifyCondition: '' }, { invalidation: '' }, { bearCase: ['无明显风险'] }]) {
+      const rr = ST._validatePlans([mkPlan(over)], vctx());
+      if (!(rr.passed.length === 0 && rr.dropped.length === 1 && rr.dropped[0].stage === 'premortem')) {
+        pmOk = false; fail('validate premortem', JSON.stringify(rr.dropped));
+      }
+    }
+    if (pmOk) ok('validate: pre-mortem 4 分支 (缺 bearCase/falsify/invalidation/空话) 全丢弃');
+    // (b) 幻觉防护
+    r = ST._validatePlans([mkPlan({ code: '600000' })], vctx());
+    if (r.passed.length === 0 && r.dropped[0] && r.dropped[0].stage === 'hallucination') ok('validate: 池外代码 → hallucination 丢弃');
+    else fail('validate 幻觉', JSON.stringify(r.dropped));
+    // (c) 价格关系
+    let priceOk = true;
+    for (const over of [{ stopLoss: 10.5 }, { targetPrice: 9.5 }, { stopLoss: 10 }]) {
+      const rr = ST._validatePlans([mkPlan(over)], vctx());
+      if (!(rr.passed.length === 0 && rr.dropped.length === 1 && rr.dropped[0].stage === 'price')) {
+        priceOk = false; fail('validate price', JSON.stringify(rr.dropped));
+      }
+    }
+    if (priceOk) ok('validate: 价格关系 3 分支 (止损≥触发 / 目标≤触发) 全丢弃');
+    // (d) 短线纪律: quota
+    r = ST._validatePlans([mkPlan()], vctx({ quotaLeft: 0 }));
+    if (r.passed.length === 0 && r.dropped[0] && r.dropped[0].stage === 'quota') ok('validate: 今日已建满 3 单 (quotaLeft=0) → quota 丢弃');
+    else fail('validate quota0', JSON.stringify(r.dropped));
+    r = ST._validatePlans([mkPlan(), mkPlan({ code: '000001', name: '平安银行' })], vctx({ quotaLeft: 1 }));
+    if (r.passed.length === 1 && r.dropped.length === 1 && r.dropped[0].stage === 'quota') ok('validate: quotaLeft=1 时第 2 条 → quota 丢弃');
+    else fail('validate quota1', JSON.stringify(r));
+    // (d) 短线纪律: cooldown
+    r = ST._validatePlans([mkPlan()], vctx({ recentSellCodes: new Set(['600519']) }));
+    if (r.passed.length === 0 && r.dropped[0] && r.dropped[0].stage === 'cooldown') ok('validate: 48h 内有卖出 → cooldown 丢弃');
+    else fail('validate cooldown', JSON.stringify(r.dropped));
+    // (d2) 不足一手
+    r = ST._validatePlans([mkPlan()], vctx({ cash: 500 }));
+    if (r.passed.length === 0 && r.dropped[0] && r.dropped[0].stage === 'shares') ok('validate: 现金 500 换算不足一手 → shares 丢弃');
+    else fail('validate shares', JSON.stringify(r.dropped));
+    // positionPct 超限收敛 (0.5 → 0.20, 不丢弃)
+    r = ST._validatePlans([mkPlan({ positionPct: 0.5 })], vctx());
+    if (r.passed.length === 1 && r.passed[0].positionPct === 0.2) ok('validate: positionPct 0.5 超上限 → 收敛 0.20 不丢弃');
+    else fail('validate pct 收敛', JSON.stringify(r));
+    // regime bear 仓位缩放 (0.2 × 0.5 = 0.1, shares 300)
+    r = ST._validatePlans([mkPlan()], vctx({ regimeState: 'bear', positionScale: 0.5 }));
+    if (r.passed.length === 1 && r.passed[0].positionPct === 0.1 && r.passed[0].shares === 300) ok('validate: regime bear → positionPct ×0.5, shares 随缩放 300');
+    else fail('validate regime 缩放', JSON.stringify(r));
+    // _scalePositionPct 直测
+    if (ST._scalePositionPct(undefined, 'range', 1) === 0.2
+      && ST._scalePositionPct(0.5, 'range', 1) === 0.2
+      && ST._scalePositionPct(0.1, 'bear', 0.5) === 0.05
+      && ST._scalePositionPct(0.1, 'bull', 0.5) === 0.1) ok('scalePct: 缺失默认/超限收敛/bear 缩放/非 bear 不缩放');
+    else fail('scalePct', '');
+
+    // 39.4 _hasRecentShortSell 分支
+    const NOW = new Date(2026, 6, 27, 8, 30).getTime();
+    const sellTx = (createdAt, over) => Object.assign({ isPaper: true, sleeve: 'short', type: 'sell', code: '600519', createdAt }, over || {});
+    if (ST._hasRecentShortSell([sellTx(NOW - 10 * 3600 * 1000)], '600519', NOW, 48) === true) ok('cooldown: 10h 前短线卖出 → true');
+    else fail('cooldown 10h', '');
+    if (ST._hasRecentShortSell([sellTx(NOW - 49 * 3600 * 1000)], '600519', NOW, 48) === false) ok('cooldown: 49h 前 → false (过冷却期)');
+    else fail('cooldown 49h', '');
+    if (ST._hasRecentShortSell([sellTx(NOW - 1000, { type: 'buy' })], '600519', NOW, 48) === false
+      && ST._hasRecentShortSell([sellTx(NOW - 1000, { sleeve: 'long' })], '600519', NOW, 48) === false
+      && ST._hasRecentShortSell([sellTx(NOW - 1000, { isPaper: false })], '600519', NOW, 48) === false
+      && ST._hasRecentShortSell([sellTx(NOW - 1000)], '000001', NOW, 48) === false) ok('cooldown: buy/长线/实盘/异代码 → false');
+    else fail('cooldown 排除项', '');
+
+    // 39.5 _appendPlanLog 上限 100
+    let log = [];
+    for (let i = 0; i < 105; i++) log = ST._appendPlanLog(log, { date: '2026-07-27', code: '600519', stage: 'quota', reason: 'r' + i });
+    if (log.length === 100 && log[0].reason === 'r5' && log[99].reason === 'r104') ok('planLog: 上限 100 滚动截断');
+    else fail('planLog 上限', 'len=' + log.length);
+    if (ST._appendPlanLog([], { code: '600519' }).length === 0) ok('planLog: 缺 stage 不入库');
+    else fail('planLog 缺 stage', '');
+
+    // 39.6 _buildCandidatePool: watchlist + short 持仓去重
+    const pool = ST._buildCandidatePool(
+      [{ code: '600519', name: '贵州茅台' }, { code: 'sh000001', name: '平安银行' }],
+      [{ code: '600519', name: '贵州茅台' }, { code: '300750', name: '宁德时代' }]
+    );
+    if (pool.length === 3 && pool[0].code === '600519' && pool[1].code === '000001' && pool[2].code === '300750') ok('pool: watchlist+持仓合并去重, 容忍 sh 前缀');
+    else fail('pool', JSON.stringify(pool));
+
+    // 39.7 generatePlan 集成: mock LLM → 1 条过 + 1 条幻觉丢弃 → addCondOrder 接线 + kv 落库
+    const store7 = {
+      kv: {},
+      tables: {
+        watchlist: [{ code: '600519', name: '贵州茅台' }, { code: '000001', name: '平安银行' }],
+        journals: [{ date: '2026-07-26', title: '短线止损复盘', code: '600519', sleeve: 'short' }],
+        transactions: []
+      },
+      condOrders: [],
+      indexSpot: [{ 代码: '000001', 名称: '上证指数', 最新价: 3500, 涨跌幅: 0.5 }]
+    };
+    const ctx7 = buildCtx(store7);
+    const ST7 = ctx7.window.ShortTrader;
+    const llmJson = JSON.stringify({
+      marketView: '震荡偏多, 关注回调低吸',
+      plans: [mkPlan(), mkPlan({ code: '600000', name: '浦发银行' })]
+    });
+    let llmCalls = 0;
+    const plan7 = await ST7.generatePlan({
+      now: new Date(2026, 6, 27, 8, 30),
+      deps: { callLLM: async ({ systemPrompt, prompt }) => { llmCalls++; return llmJson; } }
+    });
+    if (llmCalls === 1 && plan7.date === '2026-07-27' && plan7.marketView.includes('震荡')) ok('gen: LLM 调用 1 次, plan.date/marketView 落盘');
+    else fail('gen 基本', JSON.stringify({ llmCalls, date: plan7.date }));
+    if (plan7.plans.length === 1 && plan7.plans[0].code === '600519'
+      && plan7.plans[0].condOrderId && plan7.plans[0].shares === 600) ok('gen: 通过 1 条, condOrderId 回填, shares 600');
+    else fail('gen plans', JSON.stringify(plan7.plans));
+    if (plan7.dropped.length === 1 && plan7.dropped[0].stage === 'hallucination' && plan7.dropped[0].code === '600000') ok('gen: 池外 600000 → hallucination 丢弃');
+    else fail('gen dropped', JSON.stringify(plan7.dropped));
+    if (store7.addedOrders.length === 1 && store7.addedOrders[0].source === 'ai'
+      && store7.addedOrders[0].sleeve === 'short' && store7.addedOrders[0].code === '600519'
+      && store7.addedOrders[0].shares === 600 && store7.addedOrders[0].probability === 60) ok('gen: addCondOrder 接线 (source=ai, sleeve=short, 整手/probability 透传)');
+    else fail('gen addCondOrder', JSON.stringify(store7.addedOrders));
+    if (store7.kv.paper_short_plan && store7.kv.paper_short_plan.date === '2026-07-27'
+      && Array.isArray(store7.kv.paper_short_plan.plans)) ok('gen: kv paper_short_plan 落库');
+    else fail('gen kv plan', '');
+    if (Array.isArray(store7.kv.paper_plan_log) && store7.kv.paper_plan_log.length === 1
+      && store7.kv.paper_plan_log[0].code === '600000' && store7.kv.paper_plan_log[0].date === '2026-07-27') ok('gen: 丢弃留痕 paper_plan_log 落库');
+    else fail('gen kv log', JSON.stringify(store7.kv.paper_plan_log));
+
+    // 39.8 regime bear 集成缩放
+    const store8 = { kv: {}, tables: { watchlist: [{ code: '600519', name: '贵州茅台' }], transactions: [] }, condOrders: [],
+      regimeMock: { get: async () => ({ state: 'bear' }), gateMultipliers: () => ({ state: 'bear', label: '下跌市 ⚠', positionScale: 0.5 }) } };
+    const ctx8 = buildCtx(store8);
+    const plan8 = await ctx8.window.ShortTrader.generatePlan({
+      now: new Date(2026, 6, 27, 8, 30),
+      deps: { callLLM: async () => JSON.stringify({ marketView: 'm', plans: [mkPlan()] }) }
+    });
+    if (plan8.plans.length === 1 && plan8.plans[0].positionPct === 0.1 && plan8.plans[0].shares === 300) ok('gen: regime bear → 仓位 ×0.5 (0.2→0.1, shares 300)');
+    else fail('gen bear', JSON.stringify(plan8.plans));
+
+    // 39.9 当日已建 3 单 → quotaLeft=0 全丢弃不落地
+    const today3 = '2026-07-27';
+    const store9 = { kv: {}, tables: { watchlist: [{ code: '600519', name: '贵州茅台' }], transactions: [] },
+      condOrders: [1, 2, 3].map(i => ({ id: 'o' + i, code: '60051' + i, status: 'pending', createdDate: today3 })) };
+    const ctx9 = buildCtx(store9);
+    const plan9 = await ctx9.window.ShortTrader.generatePlan({
+      now: new Date(2026, 6, 27, 8, 30),
+      deps: { callLLM: async () => JSON.stringify({ marketView: 'm', plans: [mkPlan()] }) }
+    });
+    if (plan9.plans.length === 0 && plan9.dropped.length === 1 && plan9.dropped[0].stage === 'quota'
+      && store9.addedOrders.length === 0) ok('gen: 今日已建 3 单 → 新计划全 quota 丢弃, 不落地');
+    else fail('gen quota', JSON.stringify(plan9.dropped));
+
+    // 39.10 当日防重复 maybeGeneratePlan
+    const store10 = { kv: { paper_short_plan: { date: '2026-07-27', plans: [] } }, tables: {} };
+    const ctx10 = buildCtx(store10);
+    const ST10 = ctx10.window.ShortTrader;
+    const r10a = await ST10.maybeGeneratePlan(new Date(2026, 6, 27, 8, 30));
+    if (r10a.skipped === true && r10a.reason === 'exists') ok('maybe: 今日已有记录 → skipped exists');
+    else fail('maybe exists', JSON.stringify(r10a));
+    const r10b = await ST10.maybeGeneratePlan(new Date(2026, 6, 26, 8, 30));
+    if (r10b.skipped === true && r10b.reason === 'non-trading-day') ok('maybe: 周日 → skipped non-trading-day');
+    else fail('maybe weekend', JSON.stringify(r10b));
+    let genCalled = 0;
+    ST10.generatePlan = async () => { genCalled++; return { date: '2026-07-28', plans: [] }; };
+    const r10c = await ST10.maybeGeneratePlan(new Date(2026, 6, 28, 8, 30));
+    if (r10c.skipped === false && genCalled === 1) ok('maybe: 交易日无记录 → 自动生成 1 次');
+    else fail('maybe 自动生成', JSON.stringify({ r: r10c, genCalled }));
+
+    // 39.11 失败路径: LLM 异常 → generatePlan throw, maybeGeneratePlan 吞掉 + kv error 记录
+    const store11 = { kv: {}, tables: { watchlist: [] } };
+    const ctx11 = buildCtx(store11);
+    const ST11 = ctx11.window.ShortTrader;
+    let threw = false;
+    try {
+      await ST11.generatePlan({ now: new Date(2026, 6, 27, 8, 30), deps: { callLLM: async () => { throw new Error('LLM 超时'); } } });
+    } catch (e) { threw = true; }
+    if (threw) ok('gen: LLM 异常 → generatePlan throw (交给调用方)');
+    else fail('gen throw', '');
+    ST11.generatePlan = async () => { throw new Error('LLM 超时'); };
+    const r11 = await ST11.maybeGeneratePlan(new Date(2026, 6, 27, 8, 30));
+    if (r11.skipped === false && r11.error && store11.kv.paper_short_plan
+      && store11.kv.paper_short_plan.error && store11.kv.paper_short_plan.plans.length === 0) ok('maybe: 失败不打扰 → kv 写 error 记录 (UI 显示可重试)');
+    else fail('maybe 失败记录', JSON.stringify({ r: r11, kv: store11.kv.paper_short_plan }));
+
+    // 39.12 LLM 输出非 JSON → parseJsonOutput schema 拦截
+    const store12 = { kv: {}, tables: { watchlist: [] } };
+    const ctx12 = buildCtx(store12);
+    let threw12 = false;
+    try {
+      await ctx12.window.ShortTrader.generatePlan({ now: new Date(2026, 6, 27, 8, 30), deps: { callLLM: async () => '我无法给出建议' } });
+    } catch (e) { threw12 = e.message.includes('schema'); }
+    if (threw12) ok('gen: 非 JSON 输出 → parseJsonOutput schema 拦截 throw');
+    else fail('gen 非 JSON', '');
+
+  } catch (e) {
+    fail('39 ShortTrader T2', e.message + ' / ' + (e.stack || ''));
   }
 })();
 

@@ -2172,6 +2172,13 @@
       if (condSection) condSection.style.display = sleeve === 'short' ? '' : 'none';
       if (sleeve === 'short') await this._renderCondOrders();
 
+      // T2-ShortTrader: 今日计划区块只在短线 tab 显示 (渲染逻辑在 ShortTrader.renderTodayPlan)
+      const stSection = document.getElementById('shortTraderSection');
+      if (stSection) stSection.style.display = sleeve === 'short' ? '' : 'none';
+      if (sleeve === 'short' && window.ShortTrader && ShortTrader.renderTodayPlan) {
+        ShortTrader.renderTodayPlan().catch(e => console.warn('[Paper] ShortTrader 渲染失败:', e));
+      }
+
       // T3: 页面展示时异步触发每日结算 (当日已结算自动跳过; 有动作则重渲染刷新数据)
       this.settleCondOrders()
         .then(r => { if (r && !r.skipped && (r.filled || r.exited || r.expired || r.cancelled)) this.renderPage(); })
