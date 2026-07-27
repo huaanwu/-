@@ -4804,6 +4804,7 @@ section('36] 中长线盯盘: horizon 打标 / 分层轮询 / 业绩预告去重
         },
         getStockSpot: async () => []
       },
+      AI: { call: async () => '' },  // Phase B-1: 业绩预告 AI 归因, 默认返空
       Regime: {
         refresh: async () => {
           if (failFetch) throw new Error('模拟 regime 失败');
@@ -4908,6 +4909,56 @@ section('36] 中长线盯盘: horizon 打标 / 分层轮询 / 业绩预告去重
     if (done3 === false) ok('36.3d 拉数失败 → 返回 false (下轮重试, 不推进 nextCheck)');
     else fail('36.3d 失败重试', done3);
 
+    // ---- 36.3e-g B-1: AI 归因业绩预告 ----
+    // _fallbackEarningsNarrative 不调 AI, 纯函数, 直接测
+    const fb1 = Alerts._fallbackEarningsNarrative({ type: '首亏', code: '600519', periodKey: '2026-06-30' });
+    if (fb1.includes('首亏') && fb1.includes('严重')) ok('36.3e 兜底归因: 首亏 → 严重');
+    else fail('36.3e 兜底', fb1);
+    const fb2 = Alerts._fallbackEarningsNarrative({ type: '略减', code: '600519' });
+    if (fb2.includes('略减') && fb2.includes('中度')) ok('36.3f 兜底归因: 略减 → 中度');
+    else fail('36.3f 兜底', fb2);
+
+    // _aiEarningsNarrative: AI 调通 → 写 alert.aiNarrative; AI 调失败 → 兜底
+    notices.length = 0;
+    failFetch = false;
+    yjygRows = [
+      { '股票代码': '600519', '股票简称': '贵州茅台', '业绩预告类型': '首亏', '业绩预告摘要': '预计亏损 5 亿', '公告日期': '2026-07-20', '报告期': '2026-06-30' }
+    ];
+    const ew2 = { id: 'ew2', type: 'earnings_warning', active: true, hitCount: 0, lastNotifiedKeys: {} };
+    let aiCallCount = 0;
+    actx.Core.AI.call = async () => { aiCallCount++; return '⚡ 茅台业绩首亏, 严重信号。\n📌 中长线复核买入逻辑'; };
+    console.log('[DEBUG36.3g] before check, aiCallCount=', aiCallCount, 'Core.AI=', !!actx.Core.AI);
+    await Alerts._checkEarningsWarning(ew2);
+    console.log('[DEBUG36.3g] after check, aiCallCount=', aiCallCount, 'narrative=', ew2.aiNarrative);
+    // 等异步 aiNarrative 写回 (fire-and-forget Promise)
+    await new Promise(r => setTimeout(r, 200));
+    if (aiCallCount === 1 && ew2.aiNarrative && ew2.aiNarrative.includes('首亏') && ew2.aiNarrativeAt > 0) {
+      ok('36.3g AI 归因: 首检后 aiNarrative 异步写回 (命中缓存, 不重复调 AI)');
+    } else fail('36.3g AI 归因', JSON.stringify({ aiCallCount, narrative: ew2.aiNarrative }));
+
+    // 同 (code, type) 第二次同 report period 不重复通知 + 不重复调 AI
+    const aiCallCountBefore = aiCallCount;
+    notices.length = 0;
+    await Alerts._checkEarningsWarning(ew2);
+    await new Promise(r => setTimeout(r, 200));
+    if (aiCallCount === aiCallCountBefore && notices.length === 0) {
+      ok('36.3h 去重: 同 key 第二次 → 不通知 + 不重调 AI');
+    } else fail('36.3h 去重', JSON.stringify({ aiCallCount, notices: notices.length }));
+
+    // AI 抛错 → 兜底文案, 不阻塞主通知
+    const ew3 = { id: 'ew3', type: 'earnings_warning', active: true, hitCount: 0, lastNotifiedKeys: {} };
+    yjygRows = [
+      { '股票代码': '600519', '股票简称': '贵州茅台', '业绩预告类型': '续亏', '业绩预告摘要': '继续亏损', '公告日期': '2026-07-20', '报告期': '2026-09-30' }
+    ];
+    actx.Core.AI.call = async () => { throw new Error('模拟 AI 离线'); };
+    notices.length = 0;
+    await Alerts._checkEarningsWarning(ew3);
+    await new Promise(r => setTimeout(r, 200));
+    if (notices.length >= 1 && ew3.aiNarrative && ew3.aiNarrative.includes('续亏') && ew3.aiNarrative.includes('严重')) {
+      ok('36.3i AI 抛错 → 兜底归因 (不阻塞通知, 不抛错)');
+    } else fail('36.3i AI 失败兜底', JSON.stringify({ n: notices.length, narrative: ew3.aiNarrative }));
+    actx.Core.AI.call = async () => '';  // 还原默认 mock
+
     // ---- 36.4 大盘状态切换: lastState 三态迁移 ----
     notices.length = 0;
     const rg = { id: 'rg1', type: 'regime_change', active: true, hitCount: 0, lastState: null };
@@ -5001,6 +5052,152 @@ section('36] 中长线盯盘: horizon 打标 / 分层轮询 / 业绩预告去重
     } else fail('36.7 源码对账', '旧定时器残留或 horizon 未落行');
   } catch (e) {
     fail('36 中长线盯盘', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [37] AlertsAgent: AI 代理操作层 (白名单 + 两阶段落库) ==========
+section('[37] Core.AlertsAgent: 白名单校验 / parseIntent / preview / apply 守卫 / suggestForHoldings / interpretAlert');
+(async () => {
+  try {
+    const agentSrc = readFileSafe(path.join(WWW, 'core', 'alerts-agent.js'));
+    if (!agentSrc) throw new Error('alerts-agent.js 读不到');
+
+    // 静态对账: 暴露方法 + 不含 eval + 不含 innerHTML 写法
+    const exposed = ['parseIntent', 'validateSpec', 'validateSpecs', 'previewIntents', 'applyIntents', 'suggestForHoldings', 'interpretAlert'];
+    const missing = exposed.filter(m => !new RegExp('\\b' + m + '\\s*[:(]').test(agentSrc));
+    if (missing.length === 0) ok('37.1 暴露: 7 个方法全在 (parseIntent/validateSpec/validateSpecs/previewIntents/applyIntents/suggestForHoldings/interpretAlert)');
+    else fail('37.1 暴露缺失', missing.join(','));
+
+    if (!/\beval\s*\(/.test(agentSrc)) ok('37.2 不含 eval');
+    else fail('37.2 eval 残留', agentSrc.match(/eval\s*\([^)]*\)/)?.[0]);
+
+    if (/indexHTML\s*=/.test(agentSrc)) fail('37.3 含 innerHTML=', 'raw HTML write risk');
+    else ok('37.3 无 innerHTML= (AI 输出交给调用方 escapeHtml)');
+
+    // ---- vm 加载 + 纯函数实测 ----
+    const ctx = vm.createContext({
+      window: {},
+      console,
+      setTimeout, clearTimeout,
+      Core: {
+        Storage: {
+          add: async () => {}, get: async () => null, put: async () => {}, remove: async () => {}, where: async () => [], all: async () => []
+        },
+        AI: { call: async () => '' }
+      }
+    });
+    ctx.window = ctx;
+    vm.runInContext(agentSrc, ctx);
+    const A = ctx.Core.AlertsAgent;
+    if (!A || !A.TYPE_DEFS) throw new Error('Core.AlertsAgent 未挂载');
+    if (Object.keys(A.TYPE_DEFS).length >= 10) ok('37.4 TYPE_DEFS 注册: 10 条规则全覆盖 (5 短线 + 5 中长线)');
+    else fail('37.4 TYPE_DEFS 数量', String(Object.keys(A.TYPE_DEFS).length));
+
+    // 校验: 合法 spec 通过
+    const v1 = A.validateSpec({ type: 'price_above', code: '600519', value: 1700 });
+    if (v1.type === 'price_above' && v1.code === '600519' && v1.value === 1700) ok('37.5a validateSpec 合法 price_above: 归一 + 阈值保留');
+    else fail('37.5a validateSpec', JSON.stringify(v1));
+
+    const v2 = A.validateSpec({ type: 'earnings_warning' });
+    if (v2.type === 'earnings_warning' && v2.code === 'holdings' && v2.name === '业绩预告异动') ok('37.5b validateSpec 全局规则: code/name 自动填默认值');
+    else fail('37.5b 全局', JSON.stringify(v2));
+
+    // 校验: 拒绝未知 type
+    let threw = false;
+    try { A.validateSpec({ type: 'no_such_type', code: '600519', value: 1 }); } catch (e) { threw = true; }
+    if (threw) ok('37.5c 拒绝未知规则类型');
+    else fail('37.5c 未知 type 未拒');
+
+    // 校验: 拒绝缺 code (短线)
+    threw = false;
+    try { A.validateSpec({ type: 'price_above', code: 'abc', value: 1 }); } catch (e) { threw = true; }
+    if (threw) ok('37.5d 拒绝非法代码 (短线)');
+    else fail('37.5d 非法 code 未拒');
+
+    // 校验: 拒绝阈值越界
+    threw = false;
+    try { A.validateSpec({ type: 'change_above', code: '600519', value: 100 }); } catch (e) { threw = true; }
+    if (threw) ok('37.5e 拒绝阈值越界 (change_above max=50)');
+    else fail('37.5e 越界未拒');
+
+    // 校验: leadDays 兜底
+    const v3 = A.validateSpec({ type: 'earnings_disclosure', code: '600519', leadDays: 999 });
+    if (v3.leadDays === 3) ok('37.5f leadDays 越界 → 用默认 3');
+    else fail('37.5f leadDays 兜底', String(v3.leadDays));
+
+    // suggestForHoldings: 只挑实盘
+    const sugs = A.suggestForHoldings([
+      { code: '600519', name: '茅台', isPaper: false },
+      { code: '000002', isPaper: true },        // 模拟盘 → 排除
+      { code: 'abc', isPaper: false }            // 坏 code → 排除
+    ]);
+    if (sugs.length === 1 && sugs[0].type === 'earnings_disclosure' && sugs[0].code === '600519') ok('37.6 suggestForHoldings: 只推实盘且代码合法');
+    else fail('37.6 suggest', JSON.stringify(sugs));
+
+    // applyIntents: 没传 confirmed=true 必须拒绝
+    threw = false;
+    try {
+      await A.applyIntents([{ action: 'create', specs: { type: 'price_above', code: '600519', value: 1700 } }], {});
+    } catch (e) { threw = e.message.includes('用户确认'); }
+    if (threw) ok('37.7a applyIntents: 必须传 {confirmed: true} 否则拒');
+    else fail('37.7a confirmed 守卫');
+
+    // applyIntents: 空数组拒
+    threw = false;
+    try { await A.applyIntents([], { confirmed: true }); } catch (e) { threw = true; }
+    if (threw) ok('37.7b applyIntents: 空数组拒');
+    else fail('37.7b 空数组');
+
+    // parseIntent: 模拟 AI 返回合规 JSON → 应通过 validate
+    ctx.Core.AI.call = async () => '{"intents":[{"action":"create","specs":{"type":"price_above","code":"600519","value":1700},"reasoning":"用户想止盈"}]}';
+    const parsed = await A.parseIntent('给 600519 设个 1700 止盈', { holdings: [{ code: '600519', name: '茅台' }] });
+    if (parsed.intents.length === 1 && parsed.intents[0].action === 'create' && parsed.intents[0].specs.type === 'price_above') {
+      ok('37.8a parseIntent: AI 返回合规 JSON → 通过白名单校验');
+    } else fail('37.8a parseIntent', JSON.stringify(parsed));
+
+    // parseIntent: AI 编造未知 type → 应抛错 (不静默)
+    ctx.Core.AI.call = async () => '{"intents":[{"action":"create","specs":{"type":"invented_type","code":"600519","value":1},"reasoning":"x"}]}';
+    threw = false;
+    try { await A.parseIntent('造个新规则', {}); } catch (e) { threw = e.message.includes('未知规则类型'); }
+    if (threw) ok('37.8b parseIntent: AI 编造 type → 抛错 (抗幻觉)');
+    else fail('37.8b 抗幻觉失败');
+
+    // parseIntent: AI 返回非 JSON → 抛错
+    ctx.Core.AI.call = async () => '对不起, 我不能...';
+    threw = false;
+    try { await A.parseIntent('...', {}); } catch (e) { threw = e.message.includes('未返回 JSON'); }
+    if (threw) ok('37.8c parseIntent: 非 JSON 输出 → 抛错');
+    else fail('37.8c 非 JSON');
+
+    // parseIntent: AI 包 ```json ... ``` → 应能抽
+    ctx.Core.AI.call = async () => '```json\n{"intents":[{"action":"create","specs":{"type":"regime_change"},"reasoning":"大盘切换"}]}\n```';
+    const r4 = await A.parseIntent('...', {});
+    if (r4.intents[0].specs.type === 'regime_change') ok('37.8d parseIntent: AI 包 ```json``` 仍能抽');
+    else fail('37.8d 包代码块', JSON.stringify(r4));
+
+    // previewIntents: 转可读
+    const previews = A.previewIntents([
+      { action: 'create', specs: { type: 'price_above', code: '600519', value: 1700, name: '茅台' }, reasoning: '止盈' },
+      { action: 'delete', specs: { id: 'a1' }, reasoning: '清理' }
+    ]);
+    if (previews.length === 2 && previews[0].title.includes('茅台') && previews[1].title.includes('a1')) {
+      ok('37.9 previewIntents: create/delete 都可生成预览');
+    } else fail('37.9 preview', JSON.stringify(previews));
+
+    // interpretAlert: AI 调用错误应 throw (不吞)
+    ctx.Core.AI.call = async () => { throw new Error('AI 离线'); };
+    threw = false;
+    try { await A.interpretAlert({ type: 'price_above', code: '600519' }, {}); } catch (e) { threw = e.message.includes('AI 调用失败'); }
+    if (threw) ok('37.10 interpretAlert: AI 失败 throw, 不静默');
+    else fail('37.10 interpretAlert 吞错');
+
+    // interpretAlert: 正常调用返回文本
+    ctx.Core.AI.call = async () => '⚡ 600519 触发价格 ≥ 1700 ...';
+    const interp = await A.interpretAlert({ type: 'price_above', code: '600519', value: 1700, hitCount: 1, lastHit: Date.now() }, { regime: { state: 'bull', label: '趋势市 🐂' } });
+    if (interp.includes('600519')) ok('37.11 interpretAlert: 返回中文解读');
+    else fail('37.11 interpretAlert', interp);
+  } catch (e) {
+    fail('37 AlertsAgent', e.message + ' / ' + (e.stack || ''));
   }
 })();
 

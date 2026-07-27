@@ -95,6 +95,28 @@
   /** 估值偏离监控的指数 (stock_market_pe_lg 的 index_name 关键词, 与 data.js _fetchMarketValuation 一致) */
   const VALUATION_INDEX_NAMES = ['上证', '深证', '创业板', '科创50'];
 
+  // ==================== AI 历史成绩单 + 概率校准 (Scorecard) ====================
+
+  /** AI 验证结论枚举 (journals.verifyOutcome, 非索引字段)
+   *  与 daily_summary.mjs VERDICT_TO_OUTCOME 对齐: 对→correct / 错→wrong / 部分→partial */
+  const VERIFY_OUTCOMES = ['correct', 'wrong', 'partial'];
+
+  /** AI 验证错误归因枚举 (journals.verifyFailureReason, 非索引字段)
+   *  与 daily_summary.mjs ATTRIBUTION_TO_REASON 对齐 */
+  const VERIFY_FAILURE_REASONS = ['追高', '假设错误', '时机过早', '大盘拖累', '黑天鹅'];
+
+  /** 成绩单注入最少已验证样本数: 低于此数不注入, 避免误导 */
+  const SCORECARD_MIN_SAMPLES = 3;
+
+  /** 成绩单 prompt 文本缓存 TTL: 10 分钟 (内存缓存) */
+  const SCORECARD_CACHE_TTL_MS = 10 * 60 * 1000;
+
+  /** Brier / 校准最少样本数: 低于此数 UI 显示"积累中" */
+  const BRIER_MIN_SAMPLES = 5;
+
+  /** 校准分桶边界 (probability 百分比, lo 含 hi 不含): <40 / 40-60 / 60-80 / ≥80 */
+  const CALIBRATION_BUCKET_EDGES = [0, 40, 60, 80, 101];
+
   // ==================== 调试辅助 ====================
 
   /** 给 console.log 打 tag 用: 让日志快速定位模块 */
@@ -125,6 +147,12 @@
     EARNINGS_WARNING_FRESH_MS,
     VALUATION_PERCENTILE_WARN,
     VALUATION_INDEX_NAMES,
+    VERIFY_OUTCOMES,
+    VERIFY_FAILURE_REASONS,
+    SCORECARD_MIN_SAMPLES,
+    SCORECARD_CACHE_TTL_MS,
+    BRIER_MIN_SAMPLES,
+    CALIBRATION_BUCKET_EDGES,
     MODULE_TAG
   };
 })();

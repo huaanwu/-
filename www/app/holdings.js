@@ -94,6 +94,7 @@
           </td>
           <td>
             <button class="btn btn-sm" title="AI 简评" onclick="StockAdvisor.show('${escapeHtml(r.h.code)}','${escapeHtml(r.h.name || r.s?.名称 || '')}')">💡</button>
+            <button class="btn btn-sm" title="让 AI 给这只持仓设盯盘规则" onclick="Holdings._aiSuggestForOne('${escapeHtml(r.h.id)}')">🪄</button>
             <button class="btn btn-sm" onclick="Holdings.addTxDialog('${escapeHtml(r.h.id)}')">+T</button>
             <button class="btn btn-sm" onclick="Holdings.editDialog('${escapeHtml(r.h.id)}')">✎</button>
             <button class="btn btn-sm" onclick="Holdings.remove('${escapeHtml(r.h.id)}')">✕</button>
@@ -116,6 +117,25 @@
 
     addDialog() { this._formDialog(null); },
     editDialog(id) { this._formDialog(id); },
+
+    /**
+     * 让 AI 给单只持仓生成盯盘规则建议
+     * 复用 Alerts.aiAssistantDialog, 预填 textarea 让用户改写或直接让 AI 解析
+     */
+    async _aiSuggestForOne(id) {
+      const list = await Core.Storage.all('holdings');
+      const h = list.find(x => x.id === id);
+      if (!h) { if (window.toastError) toastError('找不到这只持仓'); return; }
+      const code = h.code;
+      const name = h.name || code;
+      // 复用 alerts 弹窗, 预填 "给 600519 加一条财报披露前 3 天提醒"
+      await Alerts.aiAssistantDialog();
+      const ta = document.getElementById('aaInput');
+      if (ta) {
+        ta.value = `给 ${code} (${name}) 加一条财报披露前 3 天提醒`;
+        ta.focus();
+      }
+    },
 
     // ========== Phase E: 实盘"待确认交易" (AI 建议 → 人确认 → 原有买入流程, 不绕过纪律) ==========
 

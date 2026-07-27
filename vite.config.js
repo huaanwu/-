@@ -51,6 +51,7 @@ export default defineConfig({
         '/core/prebacktest.js',
         '/core/crosscheck.js',
         '/core/kb.js',
+        '/core/alerts-agent.js',
         '/core/util.js'
       ]
     }

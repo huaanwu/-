@@ -149,6 +149,7 @@
                 </td>
                 <td>${a.hitCount || 0}</td>
                 <td>
+                  <button class="btn btn-sm" title="AI 解读这条规则" onclick="Alerts._aiInterpretForRule('${a.id}')">🪄</button>
                   <button class="btn btn-sm" onclick="Alerts.toggle('${a.id}')">${a.active ? '⏸' : '▶'}</button>
                   <button class="btn btn-sm" onclick="Alerts.remove('${a.id}')">✕</button>
                 </td>
@@ -732,6 +733,7 @@
 
       const hits = this._filterEarningsWarnings(rows, codes, Date.now());
       if (!a.lastNotifiedKeys || typeof a.lastNotifiedKeys !== 'object') a.lastNotifiedKeys = {};
+      const notifiedHits = [];  // 本轮新通知的 hit, 用于 AI 归因 (异步, 不阻塞)
       let notified = 0;
       for (const h of hits) {
         const key = `${h.periodKey}_${h.type}`;
@@ -742,12 +744,27 @@
         seenArr.push(key);
         a.lastNotifiedKeys[h.code] = seenArr;
         notified++;
+        notifiedHits.push(h);
         this._notifyLong(a, this._earningsWarningMsg(h), h.code);
       }
       if (notified > 0) {
         a.triggered = true;
         a.hitCount = (a.hitCount || 0) + notified;
         a.lastHit = Date.now();
+        // Phase B-1: 异步 AI 归因 (失败降级硬编码兜底, 不影响主通知)
+        // 只取第一条 hit 写 aiNarrative (避免 AI 重复调用 + 弹窗读最近一条足够)
+        const firstHit = notifiedHits[0];
+        if (firstHit) {
+          this._aiEarningsNarrative(a, firstHit).then(narrative => {
+            console.log('[DEBUG-B1] .then 触发, narrative=', JSON.stringify(narrative).slice(0, 100));
+            try {
+              a.aiNarrative = narrative;
+              a.aiNarrativeAt = Date.now();
+              a.aiNarrativeHit = firstHit;
+              Core.Storage.put('alerts', a).catch(e => console.warn('[Alerts] 写 aiNarrative 失败:', e));
+            } catch (e) { console.warn('[Alerts] aiNarrative 落库失败:', e); }
+          }).catch(e => console.warn('[Alerts] AI 归因 promise reject:', e));
+        }
       }
       return true;
     },
@@ -809,6 +826,48 @@
       if (h.summary) msg += `\n${h.summary.slice(0, 80)}`;
       msg += '\n💡 中长线持仓遇到业绩下修信号, 建议复核当初买入逻辑(业绩拐点/估值修复)是否仍成立, 再决定加仓/持有/减仓。';
       return msg;
+    },
+
+    /**
+     * Phase B-1: AI 归因业绩预告 (异步, 不阻塞主通知; 失败 fallback 硬编码模板)
+     * 把结果写到 a.aiNarrative 字段, 供 _aiInterpretForRule 弹窗读取
+     */
+    async _aiEarningsNarrative(a, h) {
+      if (!window.Core || !Core.AI) return this._fallbackEarningsNarrative(h);
+      const code = h.code;
+      const tname = h.name || code;
+      const summary = (h.summary || '').slice(0, 80);
+      const systemPrompt = [
+        '你是「业绩预告归因助手」, 给小白用户解释一条业绩下修信号意味着什么。',
+        '- 100-200 字中文, 2 段: ⚡ 这条信号在说什么 / 📌 对中长线持仓的下一步动作',
+        '- 不要推荐具体买卖金额, 只解释逻辑、优先级',
+        '- 不要凭空举数字, 只引用用户实际数据 (代码/名称/预告类型/摘要)',
+        '- 不知道就明说 "需要看更多数据", 不要编'
+      ].join('\n');
+      const prompt = `事件:
+- 标的: ${code} (${tname})
+- 预告类型: ${h.type}
+- 摘要: ${summary || '(无)'}
+- 报告期: ${h.periodKey}
+请输出归因。`;
+
+      try {
+        const text = await Core.AI.call({ systemPrompt, prompt, stream: false, maxTokens: 400 });
+        const narrative = String(text || '').trim();
+        if (!narrative) return this._fallbackEarningsNarrative(h);
+        return narrative;
+      } catch (e) {
+        console.warn('[Alerts] AI 业绩归因失败, 用硬编码兜底:', e.message || e);
+        return this._fallbackEarningsNarrative(h);
+      }
+    },
+
+    /** AI 失败兜底: 简单模板 (不调 AI) */
+    _fallbackEarningsNarrative(h) {
+      const t = h.type;
+      const severity = ['首亏', '续亏', '增亏'].includes(t) ? '严重' :
+                       ['略减', '预减'].includes(t) ? '中度' : '轻微';
+      return `⚡ 业绩预告 ${t}, 信号强度 ${severity}。\n📌 中长线纪律: 看当初买入逻辑(业绩拐点/估值修复)是否仍成立, 再决定持有/减仓。`;
     },
 
     // ==================== 中长线规则: 大盘状态切换 (日频) ====================
@@ -1192,6 +1251,240 @@
 
     closeModal() {
       document.getElementById('modalRoot').innerHTML = '';
+    },
+
+    // ==================== Phase AlertsAgent: AI 助手弹窗 ====================
+
+    /**
+     * AI 助手弹窗 (两阶段: 输入 → parseIntent → preview → 用户确认 → applyIntents)
+     * 全部走 Core.AlertsAgent, AI 不直接写库
+     */
+    async aiAssistantDialog() {
+      if (!window.Core || !Core.AlertsAgent) {
+        toastError('AI 助手未加载, 请刷新页面');
+        return;
+      }
+      const html = `
+        <div class="modal-backdrop" onclick="if(event.target===this)Alerts.closeModal()">
+          <div class="modal" style="max-width:640px;width:100%;">
+            <h3>🤖 AI 盯盘助手</h3>
+            <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px;line-height:1.6;">
+              用自然语言告诉 AI 你想盯什么, 它会先生成预览让你确认, 再写库。<br>
+              例: 「给 600519 设个 1700 止盈」「跌 5% 提醒我」「把这条规则删了」
+            </div>
+            <div class="form-row">
+              <label>你想做什么？</label>
+              <textarea id="aaInput" rows="3" style="width:100%;resize:vertical;font-size:13px;"
+                        placeholder="例: 600519 设个 1700 止盈提醒, 跌 5% 也加一个"></textarea>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+              <button class="btn" id="aaSendBtn" onclick="Alerts._aaRunParse()">✨ 让 AI 解析</button>
+              <button class="btn btn-ghost btn-sm" onclick="Alerts._aaQuickFill()">📋 一键填充: 全部实盘加财报披露</button>
+              <span id="aaStatus" style="font-size:12px;color:var(--text-muted);margin-left:auto;"></span>
+            </div>
+            <div id="aaPreview" style="margin-top:10px;"></div>
+            <div class="modal-footer">
+              <button class="btn btn-ghost" onclick="Alerts.closeModal()">取消</button>
+              <button class="btn btn-primary" id="aaApplyBtn" disabled onclick="Alerts._aaApply()">✅ 确认落库</button>
+            </div>
+          </div>
+        </div>
+      `;
+      document.getElementById('modalRoot').innerHTML = html;
+      // 状态 (暂存 preview, 用户确认后传给 apply)
+      this._aaLastIntents = null;
+      const ta = document.getElementById('aaInput');
+      if (ta) ta.focus();
+    },
+
+    /**
+     * 一键填充: 把所有实盘持仓加一条 "财报披露前 3 天" 提醒
+     * (Core.AlertsAgent.suggestForHoldings 纯逻辑, 不调 AI)
+     */
+    async _aaQuickFill() {
+      if (!window.Core || !Core.AlertsAgent) return;
+      const holdings = await Core.Storage.all('holdings');
+      const specs = Core.AlertsAgent.suggestForHoldings(holdings || []);
+      if (specs.length === 0) {
+        toastWarning('当前没有实盘持仓, 无可推荐');
+        return;
+      }
+      // 转成 intents (每条 create)
+      const intents = specs.map(s => ({
+        action: 'create',
+        specs: s,
+        reasoning: '实盘持仓默认加一条财报披露前 3 天提醒'
+      }));
+      this._aaLastIntents = intents;
+      this._aaRenderPreview(intents);
+      toastInfo(`已生成 ${specs.length} 条预览, 检查无误后点确认`);
+    },
+
+    /**
+     * 跑 AI 解析用户输入 → preview
+     */
+    async _aaRunParse() {
+      const btn = document.getElementById('aaSendBtn');
+      const status = document.getElementById('aaStatus');
+      const ta = document.getElementById('aaInput');
+      if (!ta || !ta.value.trim()) {
+        toastWarning('请先输入');
+        return;
+      }
+      if (!window.Core || !Core.AlertsAgent || !Core.AI) {
+        toastError('AI 未配置 (设置页 → AI 大模型)');
+        return;
+      }
+      btn.disabled = true;
+      if (status) status.textContent = '⏳ AI 解析中...';
+      try {
+        const holdings = await Core.Storage.all('holdings');
+        const r = await Core.AlertsAgent.parseIntent(ta.value.trim(), {
+          holdings: (holdings || []).map(h => ({ code: h.code, name: h.name, isPaper: h.isPaper }))
+        });
+        this._aaLastIntents = r.intents;
+        this._aaRenderPreview(r.intents);
+        if (status) status.textContent = `✅ ${r.intents.length} 条建议`;
+      } catch (e) {
+        if (status) status.textContent = '❌';
+        toastError('AI 解析失败: ' + (e.message || e));
+        console.warn('[Alerts] AI 助手解析失败:', e);
+      } finally {
+        btn.disabled = false;
+      }
+    },
+
+    /**
+     * 渲染预览 (list + checkbox 自动勾上 create/delete 的项)
+     */
+    _aaRenderPreview(intents) {
+      const root = document.getElementById('aaPreview');
+      const applyBtn = document.getElementById('aaApplyBtn');
+      if (!root) return;
+      const previews = Core.AlertsAgent.previewIntents(intents);
+      if (previews.length === 0) {
+        root.innerHTML = '<div style="font-size:12px;color:var(--text-muted);">无预览</div>';
+        if (applyBtn) applyBtn.disabled = true;
+        return;
+      }
+      root.innerHTML = previews.map((p, i) => `
+        <div style="padding:10px;border:1px solid var(--border);border-radius:6px;margin-bottom:8px;background:var(--bg-base);">
+          <label style="display:flex;gap:8px;align-items:flex-start;cursor:pointer;">
+            <input type="checkbox" data-aa-idx="${i}" checked style="margin-top:3px;">
+            <div style="flex:1;">
+              <div style="font-weight:600;">${escapeHtml(p.title)}</div>
+              <div style="font-size:12px;color:var(--text-secondary);margin-top:4px;">${p.body || ''}</div>
+            </div>
+          </label>
+        </div>
+      `).join('');
+      if (applyBtn) applyBtn.disabled = false;
+    },
+
+    /**
+     * 用户点确认 → 收集勾选 → applyIntents → 刷新列表 → 关闭弹窗
+     */
+    async _aaApply() {
+      const applyBtn = document.getElementById('aaApplyBtn');
+      const status = document.getElementById('aaStatus');
+      if (!this._aaLastIntents || this._aaLastIntents.length === 0) {
+        toastWarning('没有待应用的规则');
+        return;
+      }
+      // 收集勾选
+      const checkedIdx = new Set(
+        Array.from(document.querySelectorAll('#aaPreview input[type="checkbox"][data-aa-idx]'))
+          .filter(cb => cb.checked)
+          .map(cb => parseInt(cb.dataset.aaIdx, 10))
+      );
+      const intents = this._aaLastIntents.filter((_, i) => checkedIdx.has(i));
+      if (intents.length === 0) {
+        toastWarning('没勾选任何规则');
+        return;
+      }
+      applyBtn.disabled = true;
+      if (status) status.textContent = `⏳ 写入 ${intents.length} 条...`;
+      try {
+        const r = await Core.AlertsAgent.applyIntents(intents, { confirmed: true });
+        toastSuccess(`已落库: 新建 ${r.written} / 删除 ${r.deleted}`);
+        this.closeModal();
+        this.render();
+        // 短线新增时立刻同步分层定时器 (幂等)
+        this._syncTimers().catch(e => console.warn('[Alerts] syncTimers 失败:', e));
+      } catch (e) {
+        toastError('落库失败: ' + (e.message || e));
+        console.warn('[Alerts] AI 助手落库失败:', e);
+        applyBtn.disabled = false;
+        if (status) status.textContent = '❌';
+      }
+    },
+
+    /**
+     * 列表行 AI 解读按钮: 弹一个只读 modal, 显示 Core.AlertsAgent.interpretAlert 输出
+     * 只读, 不改规则
+     */
+    async _aiInterpretForRule(id) {
+      if (!window.Core || !Core.AlertsAgent) {
+        toastError('AI 助手未加载');
+        return;
+      }
+      const all = await Core.Storage.all('alerts');
+      const a = all.find(x => x.id === id);
+      if (!a) { toastError('找不到这条规则'); return; }
+      const html = `
+        <div class="modal-backdrop" onclick="if(event.target===this)Alerts.closeModal()">
+          <div class="modal" style="max-width:600px;width:100%;">
+            <h3>🪄 AI 解读这条规则</h3>
+            <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px;">
+              ${escapeHtml(a.code)} · ${this._typeLabel(a.type)} · ${escapeHtml(this._conditionLabel(a))}
+              ${a.triggered ? ' · <span style="color:var(--down);">已触发 ' + (a.hitCount || 0) + ' 次</span>' : ''}
+            </div>
+            <div id="aiInterpBody" style="padding:14px;background:var(--bg-base);border-radius:6px;line-height:1.7;font-size:13px;min-height:80px;">
+              ⏳ AI 解读中, 大约 10-30 秒...
+            </div>
+            <div class="modal-footer">
+              <button class="btn btn-ghost" onclick="Alerts.closeModal()">关闭</button>
+            </div>
+          </div>
+        </div>
+      `;
+      document.getElementById('modalRoot').innerHTML = html;
+      try {
+        // 拉最近 3 条同 (code, type) 的触发历史 (自身之外, 作为 context)
+        const history = all
+          .filter(x => x.code === a.code && x.type === a.type && x.id !== a.id && x.lastHit)
+          .sort((p, q) => (q.lastHit || 0) - (p.lastHit || 0))
+          .slice(0, 3)
+          .map(x => ({ 当天: new Date(x.lastHit).toISOString().slice(0, 10), 阈值: x.value || x.leadDays || x.intervalDays }));
+        // 大盘状态 (Core.Regime 有就带, 没就 null)
+        let regime = null;
+        try {
+          if (Core.Regime && typeof Core.Regime.get === 'function') {
+            const r = await Core.Regime.get();
+            if (r && r.state) regime = { state: r.state, label: (r.state === 'bull' ? '趋势市 🐂' : r.state === 'bear' ? '下跌市 ⚠' : '震荡市 ↔️') };
+          }
+        } catch (e) { /* regime 不可用不阻断 */ }
+        const text = await Core.AlertsAgent.interpretAlert(a, { history, regime });
+        const el = document.getElementById('aiInterpBody');
+        if (el) {
+          // Phase B-1: 业绩预告类规则若已有 aiNarrative (之前触发时 AI 写的), 优先显示 (避免重复调 AI)
+          let body = '';
+          if (a.type === 'earnings_warning' && a.aiNarrative) {
+            body = '<div style="color:var(--accent);font-size:11px;margin-bottom:6px;">📌 触发时 AI 归因 (缓存):</div>'
+              + escapeHtml(a.aiNarrative).replace(/\n/g, '<br>')
+              + '<hr style="border:0;border-top:1px dashed var(--border);margin:12px 0;">'
+              + '<div style="color:var(--accent);font-size:11px;margin-bottom:6px;">🤖 AI 重新解读:</div>'
+              + escapeHtml(text).replace(/\n/g, '<br>');
+          } else {
+            body = escapeHtml(text).replace(/\n/g, '<br>');
+          }
+          el.innerHTML = body;
+        }
+      } catch (e) {
+        const el = document.getElementById('aiInterpBody');
+        if (el) el.textContent = '❌ ' + (e.message || e);
+        console.warn('[Alerts] AI 解读失败:', e);
+      }
     }
   };
 
