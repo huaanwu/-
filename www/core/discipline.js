@@ -179,76 +179,23 @@
     // ========== 资产口径 (实盘/模拟盘两套独立账本) ==========
 
     /**
-     * 实盘资产口径 (与 www/app/account.js 一致): 现金 + 股票市值 + 基金市值
-     * 行情拉取失败回退成本价/成本净值 (quoteFail 计数, 调用方据此提示"估算偏宽")
+     * 实盘资产口径 (FIX-3 委托 Core.Portfolio.getAssets)
+     * @deprecated 直接调 Core.Portfolio.getAssets({paper:false}) — 保留是为了不破坏旧调用方
      */
     async _getRealAssets() {
-      const cash = parseFloat(window.Core.State.get('accountCash')) || 0;
-      const holdings = ((await window.Core.Storage.all('holdings')) || []).filter(h => !h.isPaper);
-      let stockMkt = 0, quoteFail = 0;
-      const valueByCode = {};
-      await Promise.all(holdings.map(async h => {
-        const shares = parseFloat(h.shares) || 0;
-        if (shares <= 0) return;
-        let price = null;
-        try {
-          const q = await window.Core.Data.getStockQuote(h.code);
-          price = q ? (parseFloat(q.最新价 ?? q.price) || null) : null;
-        } catch (e) {
-          console.warn('[Discipline] 拉行情失败:', h.code, e);
-        }
-        if (!price) { quoteFail++; price = parseFloat(h.costPrice ?? h.cost) || 0; } // 行情失败回退成本价
-        const v = shares * price;
-        valueByCode[h.code] = (valueByCode[h.code] || 0) + v;
-        stockMkt += v;
-      }));
-      let fundMkt = 0;
-      const funds = (await window.Core.Storage.all('funds')) || [];
-      await Promise.all(funds.map(async f => {
-        const shares = parseFloat(f.shares) || 0;
-        if (shares <= 0) return;
-        let nav = null;
-        try {
-          const arr = await window.Core.Data.getFundSpot(f.code);
-          if (Array.isArray(arr) && arr.length > 0) {
-            const last = arr[arr.length - 1];
-            nav = parseFloat(last.单位净值 ?? last.value) || null;
-          }
-        } catch (e) {
-          console.warn('[Discipline] 拉基金净值失败:', f.code, e);
-        }
-        if (!nav) { quoteFail++; nav = parseFloat(f.costNav) || 0; } // 失败回退成本净值
-        fundMkt += shares * nav;
-      }));
-      return { cash, stockMkt, fundMkt, totalAssets: cash + stockMkt + fundMkt, valueByCode, quoteFail };
+      const a = await window.Core.Portfolio.getAssets({ paper: false });
+      return { cash: a.cash, stockMkt: a.stockMkt, fundMkt: a.fundMkt,
+               totalAssets: a.totalAssets, valueByCode: a.valueByCode, quoteFail: a.quoteFail };
     },
 
     /**
-     * 模拟盘资产口径: 模拟现金 (kv 'paper_account') + 模拟持仓市值 (isPaper=true 行)
-     * 与实盘账本完全隔离, 分母同为模拟口径
+     * 模拟盘资产口径 (FIX-3 委托 Core.Portfolio.getAssets)
+     * @deprecated 直接调 Core.Portfolio.getAssets({paper:true})
      */
     async _getPaperAssets() {
-      const acc = (await window.Core.Storage.kvGet('paper_account')) || { cash: 0 };
-      const cash = parseFloat(acc.cash) || 0;
-      const holdings = ((await window.Core.Storage.all('holdings')) || []).filter(h => h.isPaper);
-      let stockMkt = 0, quoteFail = 0;
-      const valueByCode = {};
-      await Promise.all(holdings.map(async h => {
-        const shares = parseFloat(h.shares) || 0;
-        if (shares <= 0) return;
-        let price = null;
-        try {
-          const q = await window.Core.Data.getStockQuote(h.code);
-          price = q ? (parseFloat(q.最新价 ?? q.price) || null) : null;
-        } catch (e) {
-          console.warn('[Discipline] 拉行情失败:', h.code, e);
-        }
-        if (!price) { quoteFail++; price = parseFloat(h.costPrice ?? h.cost) || 0; } // 行情失败回退成本价
-        const v = shares * price;
-        valueByCode[h.code] = (valueByCode[h.code] || 0) + v;
-        stockMkt += v;
-      }));
-      return { cash, stockMkt, fundMkt: 0, totalAssets: cash + stockMkt, valueByCode, quoteFail };
+      const a = await window.Core.Portfolio.getAssets({ paper: true });
+      return { cash: a.cash, stockMkt: a.stockMkt, fundMkt: 0,
+               totalAssets: a.totalAssets, valueByCode: a.valueByCode, quoteFail: a.quoteFail };
     },
 
     // ========== 主入口: 买入前纪律检查 ==========

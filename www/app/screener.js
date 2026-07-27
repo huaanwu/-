@@ -528,8 +528,8 @@ ${candidates}
             const q = await Core.Data.getStockQuote(code);
             const price = q ? (parseFloat(q.最新价 ?? q.price ?? 0) || 0) : 0;
             if (price > 0) {
-              // 总资产/单票已持市值复用 Core.Discipline 的实盘口径 (_getRealAssets), 保证与纪律检查分母一致
-              const assets = await Core.Discipline._getRealAssets();
+              // 总资产/单票已持市值复用 Core.Portfolio.getAssets (FIX-3 收口, 与纪律检查分母一致)
+              const assets = await Core.Portfolio.getAssets({ paper: false });
               const config = await Core.Discipline.getConfig();
               const pos = Core.Pending._suggestPosition({
                 totalAssets: assets.totalAssets, price, config,

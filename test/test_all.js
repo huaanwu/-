@@ -50,6 +50,38 @@ function _loadRealConstants() {
   return _REAL_CONSTANTS;
 }
 
+// FIX-3: 同样真实加载 portfolio.js 让 sandbox 有 Core.Portfolio
+let _REAL_PORTFOLIO = null;
+function _loadRealPortfolio() {
+  if (_REAL_PORTFOLIO !== null) return _REAL_PORTFOLIO;
+  const src = readFileSafe(path.join(WWW, 'core', 'portfolio.js'));
+  if (!src) { _REAL_PORTFOLIO = null; return _REAL_PORTFOLIO; }
+  const cctx = vm.createContext({
+    window: {},
+    console,
+    Core: {
+      State: { get: () => 0 },
+      Storage: {
+        all: async () => [],
+        kvGet: async () => ({ cash: 0 })
+      },
+      Data: {
+        getStockQuote: async () => null,
+        getFundSpot: async () => []
+      },
+      Constants: _loadRealConstants()
+    }
+  });
+  try {
+    vm.runInContext(src, cctx);
+    _REAL_PORTFOLIO = cctx.window.Core && cctx.window.Core.Portfolio
+      ? cctx.window.Core.Portfolio : null;
+  } catch (e) {
+    _REAL_PORTFOLIO = null;
+  }
+  return _REAL_PORTFOLIO;
+}
+
 // ========== [1] JS 语法检查 ==========
 section('1] JS 语法检查');
 const syntaxFiles = [
@@ -2966,7 +2998,46 @@ section('24] Discipline 交易纪律引擎纯函数 + 集成实测');
         },
         State: { get: (k) => storageData.state[k] ?? null },
         Util: { escapeHtml: (s) => String(s == null ? '' : s).replace(/</g, '&lt;').replace(/>/g, '&gt;') },
-        Constants: _loadRealConstants()
+        Constants: _loadRealConstants(),
+        // FIX-3: sandbox 里 mock Portfolio.getAssets — 测试只关心 discipline 逻辑,
+        // 不重新实现 portfolio 的行情拉取逻辑。返回 storageData 里的口径。
+        Portfolio: {
+          getAssets: async (opts = {}) => {
+            const paper = !!opts.paper;
+            const cash = paper
+              ? ((storageData.kv.paper_account && storageData.kv.paper_account.cash) || 0)
+              : (storageData.state.accountCash || 0);
+            const tbl = storageData.tables.holdings || [];
+            const filt = tbl.filter(h => paper ? !!h.isPaper : !h.isPaper);
+            let stockMkt = 0, quoteFail = 0;
+            const valueByCode = {};
+            for (const h of filt) {
+              const shares = parseFloat(h.shares) || 0;
+              if (shares <= 0) continue;
+              let price = null;
+              try {
+                const q = await storageData._getQuote(h.code);
+                price = q ? (parseFloat(q.最新价 ?? q.price) || null) : null;
+              } catch (e) { /* skip */ }
+              if (!price) { quoteFail++; price = parseFloat(h.costPrice ?? h.cost) || 0; }
+              const v = shares * price;
+              valueByCode[h.code] = (valueByCode[h.code] || 0) + v;
+              stockMkt += v;
+            }
+            let fundMkt = 0;
+            if (!paper) {
+              const funds = storageData.tables.funds || [];
+              for (const f of funds) {
+                const shares = parseFloat(f.shares) || 0;
+                if (shares <= 0) continue;
+                fundMkt += shares * (parseFloat(f.costNav) || 0);
+              }
+            }
+            return { cash, stockMkt, fundMkt,
+                     totalAssets: paper ? (cash + stockMkt) : (cash + stockMkt + fundMkt),
+                     valueByCode, quoteFail, paper };
+          }
+        }
       };
       dctx.Core = dctx.window.Core;
       vm.createContext(dctx);
@@ -3603,9 +3674,10 @@ section('27] Phase E 待确认交易: Core.Pending 实测 + 接线检查');
 
     // ---- 接线静态检查 ----
     const scrSrcE = readFileSafe(path.join(WWW, 'app', 'screener.js'));
+    // FIX-3: 资产口径已统一走 Core.Portfolio.getAssets, screener 不再需要 Discipline 的 _getRealAssets
     if (scrSrcE.includes('Core.Pending.add') && scrSrcE.includes('Core.Pending._suggestPosition')
       && scrSrcE.includes("source: 'screener'") && scrSrcE.includes('已生成实盘待确认交易')
-      && scrSrcE.includes('Core.Discipline._getRealAssets')) ok('screener: _addWatchlistFromPick 生成待确认卡片 (口径复用 Discipline)');
+      && scrSrcE.includes('Core.Portfolio.getAssets')) ok('screener: _addWatchlistFromPick 生成待确认卡片 (口径走 Portfolio)');
     else fail('screener E 接线', '');
     const hSrcE = readFileSafe(path.join(WWW, 'app', 'holdings.js'));
     if (hSrcE.includes('_renderPending') && hSrcE.includes('Core.Pending.confirm')

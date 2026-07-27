@@ -477,6 +477,7 @@
       const acc = await this.getAccount();
       const positions = await this.getPositions();
       const mktValue = +(positions.reduce((s, p) => s + (p.mkt || 0), 0)).toFixed(2);
+      // FIX-3: 总资产口径与纪律检查对齐 (paper: cash + stockMkt, 不含基金)
       const totalAssets = +(acc.cash + mktValue).toFixed(2);
 
       // 当日盈亏 = 当前总资产 - 最近一条早于今日的快照 paperTotal (无快照则 null)
