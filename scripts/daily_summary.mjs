@@ -710,6 +710,108 @@ function formatCalibrationForPrompt(report) {
   return lines.join('\n');
 }
 
+/**
+ * Z5: 从所有已验证的 notes 提炼"结构化教训"
+ * 每条教训: {
+ *   situation: { assumption, attribution, regimeHint }  // 情境指纹 (用于检索)
+ *   lesson: 教训文本 (≤60 字)
+ *   verdict: 对/错/部分
+ *   count: 出现次数
+ *   examples: [{ noteId, ts }]  // 来源追溯
+ *   ts: 最近一次时间戳
+ * }
+ * 输出: { lessons: [...], total }
+ *
+ * 设计: FINCON (arXiv:2311.10759) 主张把投资经验编码为"情境→教训"映射, 检索比 append 有效.
+ *   此处用 assumption + attribution 当"情境指纹"近似, 比纯字符串聚合更结构化.
+ */
+function buildStructuredLessons(notes, opts = {}) {
+  const minCount = opts.minCount || 2;  // 至少出现 2 次才入教训
+  const maxLessons = opts.maxLessons || 50;
+  const arr = Array.isArray(notes) ? notes.filter(n => n && n.aiVerified && n.aiVerified.lesson) : [];
+  // key: lesson 文本 (归一化)
+  const map = new Map();
+  for (const n of arr) {
+    const v = n.aiVerified;
+    const key = (v.lesson || '').trim();
+    if (!key) continue;
+    const situation = {
+      assumption: n.assumption || '其他',
+      attribution: v.attribution || '无'
+    };
+    if (!map.has(key)) {
+      map.set(key, {
+        situation,
+        lesson: key,
+        verdict: v.verdict,
+        count: 0,
+        examples: [],
+        ts: 0
+      });
+    }
+    const item = map.get(key);
+    item.count++;
+    if ((v.ts || 0) > item.ts) {
+      item.ts = v.ts || 0;
+      item.verdict = v.verdict;  // 用最新的 verdict
+    }
+    if (item.examples.length < 3) {
+      item.examples.push({ noteId: n.id, ts: v.ts || 0 });
+    }
+  }
+  const lessons = Array.from(map.values())
+    .filter(l => l.count >= minCount)
+    .sort((a, b) => b.count - a.count)
+    .slice(0, maxLessons);
+  return { lessons, total: arr.length };
+}
+
+/**
+ * Z5: 按当前情境检索最相关的历史教训 (FINCON 检索模拟)
+ * @param ctx { assumption?, attribution? } 当前复盘的假设/初步归因
+ * @param lessons 上一步 buildStructuredLessons 的输出
+ * @param opts { topK=3, sameAssumptionBoost=2 }
+ * @returns 命中的 lessons (按相关性排序), 限 topK 条
+ *
+ * 评分 (无 embedding 时的简化版):
+ *   +3 if same assumption
+ *   +2 if same attribution
+ *   +1 per count (高频加权)
+ */
+function recallLessons(ctx, lessonsObj, opts = {}) {
+  const topK = opts.topK || 3;
+  const sameAssumptionBoost = opts.sameAssumptionBoost || 3;
+  const sameAttributionBoost = opts.sameAttributionBoost || 2;
+  const arr = (lessonsObj && lessonsObj.lessons) || [];
+  const scored = arr.map(l => {
+    let score = l.count;  // baseline
+    if (ctx && ctx.assumption && l.situation.assumption === ctx.assumption) {
+      score += sameAssumptionBoost;
+    }
+    if (ctx && ctx.attribution && l.situation.attribution === ctx.attribution) {
+      score += sameAttributionBoost;
+    }
+    return { ...l, score };
+  });
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, topK);
+}
+
+/**
+ * Z5: 把检索结果渲染为中文 (注入 AI prompt 用)
+ */
+function formatRecalledLessonsForPrompt(recalled) {
+  if (!Array.isArray(recalled) || recalled.length === 0) {
+    return '⚠ 无相关历史教训 (先跑 `daily_summary.mjs --verify` 累积 2+ 条同类教训)';
+  }
+  const lines = [`- **📚 相关历史教训 (${recalled.length} 条, 按相似度)**`];
+  for (const r of recalled) {
+    const tag = r.verdict === '错' ? '⚠️' : r.verdict === '部分' ? '⚡' : '✅';
+    lines.push(`- ${tag} ${r.lesson} _(假设:${r.situation.assumption} 归因:${r.situation.attribution}, ${r.count}次)_`);
+  }
+  return lines.join('\n');
+}
+
 // ==================== 拉个股行情 (事后验证用) ====================
 /**
  * Y7: 改用 stock_zh_a_hist (K 线接口, 接受 symbol), 取最后一根日线的收盘价 = 当前价
@@ -977,6 +1079,9 @@ export {
   formatVerifyStatsForPrompt,
   computeCalibration,
   formatCalibrationForPrompt,
+  buildStructuredLessons,
+  recallLessons,
+  formatRecalledLessonsForPrompt,
   runVerify,
   fetchUsIndices,
   buildEconomicCalendar,

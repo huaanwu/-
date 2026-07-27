@@ -4387,6 +4387,89 @@ section('[32] Z4 Core.SelfConsistency (多采样 + 众数/共识率)');
   }
 })();
 
+// ========== [33] Z5 FINCON 风格结构化教训 + 情境检索 ==========
+section('[33] Z5 FINCON 风格结构化教训 (情境指纹 + 检索)');
+
+(async () => {
+  try {
+    const ds = await import(require('url').pathToFileURL(path.join(ROOT, 'scripts/daily_summary.mjs')).href);
+
+    // ---- 33.1 空数据 → 空教训 ----
+    const empty = ds.buildStructuredLessons([]);
+    if (empty.lessons.length === 0 && empty.total === 0) ok('Z5.1 空数据 → 0 lessons / total=0');
+    else fail('Z5.1 空', JSON.stringify(empty));
+
+    // ---- 33.2 同 lesson 出现 3 次 → 聚合 1 条, count=3 ----
+    const lessonText = '题材退潮要止损';
+    const notes = [
+      { id: 'n1', assumption: '题材催化', aiVerified: { verdict: '错', attribution: '追高', lesson: lessonText, ts: 100 } },
+      { id: 'n2', assumption: '题材催化', aiVerified: { verdict: '错', attribution: '追高', lesson: lessonText, ts: 200 } },
+      { id: 'n3', assumption: '题材催化', aiVerified: { verdict: '错', attribution: '追高', lesson: lessonText, ts: 300 } },
+      { id: 'n4', assumption: '业绩拐点', aiVerified: { verdict: '对', attribution: '无', lesson: '业绩兑现', ts: 400 } }  // 只 1 次, 不入
+    ];
+    const r1 = ds.buildStructuredLessons(notes);
+    if (r1.lessons.length === 1 && r1.lessons[0].count === 3 && r1.lessons[0].lesson === lessonText && r1.total === 4) {
+      ok('Z5.2 同 lesson 3 次 → 聚合 1 条 (count=3, examples ≤ 3)');
+    } else fail('Z5.2 聚合', JSON.stringify(r1));
+
+    // ---- 33.3 examples 上限 3 ----
+    const r2 = ds.buildStructuredLessons([
+      { id: 'a', assumption: 'A', aiVerified: { verdict: '错', attribution: 'x', lesson: 'L', ts: 1 } },
+      { id: 'b', assumption: 'A', aiVerified: { verdict: '错', attribution: 'x', lesson: 'L', ts: 2 } },
+      { id: 'c', assumption: 'A', aiVerified: { verdict: '错', attribution: 'x', lesson: 'L', ts: 3 } },
+      { id: 'd', assumption: 'A', aiVerified: { verdict: '错', attribution: 'x', lesson: 'L', ts: 4 } },
+      { id: 'e', assumption: 'A', aiVerified: { verdict: '错', attribution: 'x', lesson: 'L', ts: 5 } }
+    ]);
+    if (r2.lessons[0].examples.length === 3) ok('Z5.3 examples 上限 3 (不爆内存)');
+    else fail('Z5.3 examples', JSON.stringify(r2.lessons[0].examples.length));
+
+    // ---- 33.4 verdict 用最新 ts 的 ----
+    const r3 = ds.buildStructuredLessons([
+      { id: '1', assumption: 'A', aiVerified: { verdict: '对', attribution: 'x', lesson: 'L', ts: 100 } },
+      { id: '2', assumption: 'A', aiVerified: { verdict: '错', attribution: 'x', lesson: 'L', ts: 500 } },  // 最新, 应胜出
+      { id: '3', assumption: 'A', aiVerified: { verdict: '部分', attribution: 'x', lesson: 'L', ts: 200 } }
+    ]);
+    if (r3.lessons[0].verdict === '错' && r3.lessons[0].ts === 500) ok('Z5.4 verdict 用最新 ts (错误占多数)');
+    else fail('Z5.4 verdict 最新', JSON.stringify(r3.lessons[0]));
+
+    // ---- 33.5 recallLessons: 同 assumption 加分 ----
+    const pool = ds.buildStructuredLessons([
+      { id: '1', assumption: '题材催化', aiVerified: { verdict: '错', attribution: '追高', lesson: '题材退潮止损', ts: 1 } },
+      { id: '2', assumption: '题材催化', aiVerified: { verdict: '错', attribution: '追高', lesson: '题材退潮止损', ts: 2 } },
+      { id: '3', assumption: '业绩拐点', aiVerified: { verdict: '错', attribution: '假设错', lesson: '业绩兑现慢', ts: 3 } },
+      { id: '4', assumption: '业绩拐点', aiVerified: { verdict: '错', attribution: '假设错', lesson: '业绩兑现慢', ts: 4 } }
+    ]);
+    const recall1 = ds.recallLessons({ assumption: '题材催化' }, pool);
+    if (recall1[0] && recall1[0].lesson === '题材退潮止损' && recall1.length > 0) {
+      ok('Z5.5 recall: ctx.assumption=题材催化 → 题材退潮止损排第一');
+    } else fail('Z5.5 recall', JSON.stringify(recall1.map(r => r.lesson)));
+
+    // ---- 33.6 recallLessons: topK 限制 ----
+    const recall2 = ds.recallLessons({}, pool, { topK: 1 });
+    if (recall2.length === 1) ok('Z5.6 recall topK=1 → 只返 1 条');
+    else fail('Z5.6 topK', recall2.length);
+
+    // ---- 33.7 recallLessons: 无 ctx 时按 count 排序 ----
+    const noCtx = ds.recallLessons({}, pool);
+    // 两组都 count=2, ties 时保持原顺序 (Array.sort 不稳, 不强求)
+    if (noCtx.length === 2) ok('Z5.7 无 ctx → 返 2 条 (按 count)');
+    else fail('Z5.7 no ctx', noCtx.length);
+
+    // ---- 33.8 formatRecalledLessonsForPrompt: 渲染含标签 + 假设/归因 ----
+    const fmt = ds.formatRecalledLessonsForPrompt(recall1);
+    if (fmt.includes('相关历史教训') && fmt.includes('题材退潮止损') && fmt.includes('题材催化') && fmt.includes('追高') && (fmt.includes('⚠️') || fmt.includes('✅'))) {
+      ok('Z5.8 formatRecall: 含教训文本 + 情境标签 + 计数');
+    } else fail('Z5.8 渲染', fmt.slice(0, 200));
+
+    // ---- 33.9 formatRecalledLessonsForPrompt: 空 → ⚠ ----
+    const fmt0 = ds.formatRecalledLessonsForPrompt([]);
+    if (fmt0.includes('⚠') && fmt0.includes('历史教训')) ok('Z5.9 空 → 引导提示');
+    else fail('Z5.9 空渲染', fmt0);
+  } catch (e) {
+    fail('Z5 FINCON lessons', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
 // ========== 总结 ==========
 // 同步 section 的 ok() 已经在 console 打印;
 // async IIFE 里的 ok() 还在 microtask 队列里, 用 setImmediate 给一次机会再读 passed/failed
