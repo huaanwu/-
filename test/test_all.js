@@ -4851,26 +4851,26 @@ section('36] 中长线盯盘: horizon 打标 / 分层轮询 / 业绩预告去重
 
     db.alerts = [{ id: 'l1', type: 'earnings_warning', active: true }];
     await Alerts._syncTimers();
-    if (intervals.length === 1 && intervals[0] === C.ALERT_TICK_LONG_MS && Alerts._timers.long && !Alerts._timers.short) {
-      ok('36.2b 只有中长线规则 → 只起 30 分钟调度定时器');
+    if (intervals.length === 0 && !Alerts._timers.short && !Alerts._timers.long) {
+      ok('36.2b 只有中长线规则 → 不起定时器 (P1 事件驱动)');
     } else fail('36.2b 中长线定时器', JSON.stringify({ intervals, timers: Alerts._timers }));
 
     db.alerts.push({ id: 's1', type: 'price_above', active: true, value: 100 });
     await Alerts._syncTimers();
-    if (intervals.length === 2 && intervals[1] === C.ALERT_TICK_SHORT_MS && Alerts._timers.short) {
-      ok('36.2c 出现短线规则 → 补起 1 分钟定时器');
+    if (intervals.length === 1 && intervals[0] === C.ALERT_TICK_SHORT_MS && Alerts._timers.short) {
+      ok('36.2c 出现短线规则 → 起 1 分钟定时器');
     } else fail('36.2c 短线定时器', JSON.stringify({ intervals, timers: Alerts._timers }));
 
     db.alerts.find(a => a.id === 's1').active = false;  // 停掉短线规则
     await Alerts._syncTimers();
-    if (cleared.length === 1 && !Alerts._timers.short && Alerts._timers.long) {
-      ok('36.2d 短线规则全停 → 1 分钟定时器被清除, 中长线保留');
+    if (cleared.length === 1 && !Alerts._timers.short && !Alerts._timers.long) {
+      ok('36.2d 短线规则全停 → 1 分钟定时器被清除, 中长线本无定时器');
     } else fail('36.2d 定时器清除', JSON.stringify({ cleared, timers: Alerts._timers }));
 
     db.alerts = [];
     await Alerts._syncTimers();
-    if (!Alerts._timers.short && !Alerts._timers.long && cleared.length === 2) {
-      ok('36.2e 规则清空 → 全部定时器停止');
+    if (!Alerts._timers.short && !Alerts._timers.long && cleared.length === 1) {
+      ok('36.2e 规则清空 → 全部定时器停止 (短线历史遗留也清)');
     } else fail('36.2e 全部停止', JSON.stringify({ cleared, timers: Alerts._timers }));
 
     // ---- 36.3 业绩预告: filter 纯函数 + lastNotifiedKeys 去重 ----
@@ -4927,11 +4927,11 @@ section('36] 中长线盯盘: horizon 打标 / 分层轮询 / 业绩预告去重
     const ew2 = { id: 'ew2', type: 'earnings_warning', active: true, hitCount: 0, lastNotifiedKeys: {} };
     let aiCallCount = 0;
     actx.Core.AI.call = async () => { aiCallCount++; return '⚡ 茅台业绩首亏, 严重信号。\n📌 中长线复核买入逻辑'; };
-    console.log('[DEBUG36.3g] before check, aiCallCount=', aiCallCount, 'Core.AI=', !!actx.Core.AI);
     await Alerts._checkEarningsWarning(ew2);
-    console.log('[DEBUG36.3g] after check, aiCallCount=', aiCallCount, 'narrative=', ew2.aiNarrative);
-    // 等异步 aiNarrative 写回 (fire-and-forget Promise)
-    await new Promise(r => setTimeout(r, 200));
+    // fire-and-forget .then 跨 vm 边界:用 setImmediate + 多轮 await 链确保 vm 微任务 drain
+    for (let i = 0; i < 5 && !ew2.aiNarrative; i++) {
+      await new Promise(r => setTimeout(r, 50));
+    }
     if (aiCallCount === 1 && ew2.aiNarrative && ew2.aiNarrative.includes('首亏') && ew2.aiNarrativeAt > 0) {
       ok('36.3g AI 归因: 首检后 aiNarrative 异步写回 (命中缓存, 不重复调 AI)');
     } else fail('36.3g AI 归因', JSON.stringify({ aiCallCount, narrative: ew2.aiNarrative }));
@@ -4940,7 +4940,9 @@ section('36] 中长线盯盘: horizon 打标 / 分层轮询 / 业绩预告去重
     const aiCallCountBefore = aiCallCount;
     notices.length = 0;
     await Alerts._checkEarningsWarning(ew2);
-    await new Promise(r => setTimeout(r, 200));
+    for (let i = 0; i < 5 && notices.length === 0 && aiCallCount === aiCallCountBefore; i++) {
+      await new Promise(r => setTimeout(r, 50));
+    }
     if (aiCallCount === aiCallCountBefore && notices.length === 0) {
       ok('36.3h 去重: 同 key 第二次 → 不通知 + 不重调 AI');
     } else fail('36.3h 去重', JSON.stringify({ aiCallCount, notices: notices.length }));
@@ -4953,7 +4955,9 @@ section('36] 中长线盯盘: horizon 打标 / 分层轮询 / 业绩预告去重
     actx.Core.AI.call = async () => { throw new Error('模拟 AI 离线'); };
     notices.length = 0;
     await Alerts._checkEarningsWarning(ew3);
-    await new Promise(r => setTimeout(r, 200));
+    for (let i = 0; i < 5 && !ew3.aiNarrative; i++) {
+      await new Promise(r => setTimeout(r, 50));
+    }
     if (notices.length >= 1 && ew3.aiNarrative && ew3.aiNarrative.includes('续亏') && ew3.aiNarrative.includes('严重')) {
       ok('36.3i AI 抛错 → 兜底归因 (不阻塞通知, 不抛错)');
     } else fail('36.3i AI 失败兜底', JSON.stringify({ n: notices.length, narrative: ew3.aiNarrative }));

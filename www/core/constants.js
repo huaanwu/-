@@ -66,8 +66,20 @@
    *  只在存在启用的短线规则时才起这个定时器 */
   const ALERT_TICK_SHORT_MS = 60 * 1000;
 
-  /** 中长线调度 tick: 30 分钟扫一次, 各规则按自己的 nextCheck/freq 决定要不要真跑 */
+  /** 中长线规则频率兜底值 (30 分钟)
+   *  历史上曾是 30 分钟调度定时器的间隔; P1 起中长线改事件驱动 (app 启动/页面展示触发),
+   *  定时器已删除, 此常量仅作 _freqMs 找不到对应频率时的兜底 */
   const ALERT_TICK_LONG_MS = 30 * 60 * 1000;
+
+  /** A 股连续竞价交易时段 (分钟数, 本地时间): [ [09:30, 11:30], [13:00, 15:00] ]
+   *  边界含端点 (09:30/11:30/13:00/15:00 均视为交易时间)
+   *  alerts.js _isTradingTime 用: 短线轮询非交易时段不发请求 */
+  const TRADING_WINDOWS = [[9 * 60 + 30, 11 * 60 + 30], [13 * 60, 15 * 60]];
+
+  /** 短线提醒通知冷却期 (30 分钟)
+   *  防 flapping: 振荡价在阈值附近反复穿越, triggered 复位后立刻再命中,
+   *  冷却期内只落 triggered 不发通知, 超过冷却期才恢复通知 */
+  const ALERT_NOTIFY_COOLDOWN_MS = 30 * 60 * 1000;
 
   /** 中长线规则各自的检查频率 (毫秒)
    *  rebalance_quarterly 不在此列: 用规则行自带的 intervalDays */
@@ -141,6 +153,8 @@
     MAX_SINGLE_INDUSTRY_PCT,
     ALERT_TICK_SHORT_MS,
     ALERT_TICK_LONG_MS,
+    TRADING_WINDOWS,
+    ALERT_NOTIFY_COOLDOWN_MS,
     ALERT_LONG_FREQ_MS,
     ALERT_LONG_CACHE_TTL_MS,
     EARNINGS_WARNING_NEGATIVE_TYPES,

@@ -3,9 +3,12 @@
  *
  * 双模式分层轮询:
  *   - 短线规则 (价格/涨跌幅/成交量, horizon='short'): 1 分钟轮询,
- *     只在存在启用的短线规则时才起定时器 (没有就不起, 省电省请求)
- *   - 中长线规则 (horizon='long'): 30 分钟调度 tick, 各规则按 nextCheck + 自身频率
- *     (再平衡=intervalDays / 财报日历=日频 / 业绩预告=周频 / 大盘趋势=日频 / 估值=双周频) 决定是否真跑
+ *     只在存在启用的短线规则时才起定时器 (没有就不起, 省电省请求);
+ *     定时器常驻, 交易时段守卫在 _checkShort 入口 (非交易时段直接 return, 判断成本为零)
+ *   - 中长线规则 (horizon='long'): 事件驱动 (app 启动 + alerts 页展示时触发 runLongChecks),
+ *     不再用 30 分钟定时器; 各规则按 nextCheck + 自身频率
+ *     (再平衡=intervalDays / 财报日历=日频 / 业绩预告=周频 / 大盘趋势=日频 / 估值=双周频) 决定是否真跑,
+ *     所以事件点触发频繁也无副作用 (nextCheck 门控拦截)
  *
  * 中长线规则类型:
  *   - rebalance_quarterly 季度再平衡 (已有)
@@ -279,8 +282,8 @@
               目标配置从 Fund tab 的 type 字段自动读(short_bond=20% / pure_bond=80%)。
             </div>
             <div style="font-size:11px;color:var(--text-muted);margin-top:8px;">
-              💡 短线规则每 1 分钟检查(有启用的短线规则才轮询);<br>
-              中长线规则按各自周期低频检查(浏览器必须打开)。<br>
+              💡 短线规则每 1 分钟检查(有启用的短线规则才轮询, 仅 app 前台 + 交易时段内有效);<br>
+              中长线规则按各自周期低频检查(app 启动和打开本页时触发, 浏览器必须打开)。<br>
               Android 上可配合 Capacitor Local Notifications 推系统通知。
             </div>
             <div class="modal-footer">
@@ -354,7 +357,7 @@
       const horizonHint = document.getElementById('alHorizonHint');
       if (horizonHint) {
         if (this._horizonOf(t) === 'short') {
-          horizonHint.textContent = '⚡ 短线规则, 适合日内盯盘 (1 分钟轮询)';
+          horizonHint.textContent = '⚡ 短线规则, 适合日内盯盘 (1 分钟轮询); 短线盯盘仅在 app 前台且交易时段内有效';
         } else {
           const longHints = {
             earnings_disclosure: '📅 中长线规则: 日频检查, 披露日前 N 天通知',
@@ -499,8 +502,8 @@
     },
 
     // ==================== 分层轮询 ====================
-    // 短线定时器: 1 分钟, 只在存在启用的短线规则时运行
-    // 中长线定时器: 30 分钟调度 tick, 各规则按 nextCheck + 自身频率决定要不要真跑
+    // 短线定时器: 1 分钟, 只在存在启用的短线规则时运行 (交易时段守卫在 _checkShort 入口)
+    // 中长线: 无定时器, 事件驱动 (runLongChecks: app 启动 + alerts 页展示), 规则自带 nextCheck 门控
     // 定时器工厂可注入 (测试可断言注册/清除次数)
     _timers: { short: null, long: null },
     _setInterval: (fn, ms) => setInterval(fn, ms),
@@ -521,7 +524,7 @@
     /**
      * 定时器与规则表对齐 (幂等):
      *   有启用的短线规则 ↔ short 定时器在跑
-     *   有启用的中长线规则 ↔ long 定时器在跑
+     *   中长线规则不起定时器 (P1 改事件驱动); 若存在历史遗留的 long 定时器则清掉
      * save/toggle/remove 后经 render() 自动重同步
      */
     async _syncTimers() {
@@ -533,7 +536,6 @@
         return;
       }
       const hasShort = (list || []).some(a => a.active && this._horizonOf(a.type) === 'short');
-      const hasLong = (list || []).some(a => a.active && this._horizonOf(a.type) === 'long');
 
       if (hasShort && !this._timers.short) {
         this._timers.short = this._setInterval(
@@ -545,21 +547,48 @@
         this._timers.short = null;
       }
 
-      if (hasLong && !this._timers.long) {
-        this._timers.long = this._setInterval(
-          () => this._checkLong().catch(e => console.warn('[Alerts] 中长线检查失败:', e)),
-          Core.Constants.ALERT_TICK_LONG_MS
-        );
-      } else if (!hasLong && this._timers.long) {
+      // P1: 中长线 30 分钟调度定时器已废弃 (事件驱动), 防御性清理历史遗留
+      if (this._timers.long) {
         this._clearInterval(this._timers.long);
         this._timers.long = null;
       }
     },
 
     /**
+     * 中长线检查公开入口 (事件驱动, 供 app.js 启动序列 / alerts 页展示钩子调用)
+     * _checkLong 的安全包装: 异常不外抛 (内部已按规则 try/catch, 这里再兜一层)
+     * 设计依据: 规则自带 nextCheck 门控 (日频/周频/双周频), 事件点触发再频繁也不会重复拉数
+     */
+    async runLongChecks() {
+      try {
+        await this._checkLong();
+      } catch (e) {
+        console.warn('[Alerts] 中长线检查失败:', e);
+      }
+    },
+
+    /**
+     * 交易时段判定 (纯函数, now 可注入便于测试):
+     *   周一~周五 且 (09:30-11:30 或 13:00-15:00), 边界含端点
+     * @param {Date|number} [now] Date 实例或时间戳, 缺省取当前时间
+     */
+    _isTradingTime(now) {
+      const d = now instanceof Date ? now : new Date(now == null ? Date.now() : now);
+      if (isNaN(d.getTime())) return false;
+      const day = d.getDay();
+      if (day === 0 || day === 6) return false;  // 周末
+      const mins = d.getHours() * 60 + d.getMinutes();
+      return Core.Constants.TRADING_WINDOWS.some(([s, e]) => mins >= s && mins <= e);
+    },
+
+    /**
      * 短线检查 (1 分钟轮询): 价格/涨跌幅/成交量, 行为与原 _check 的行情类一致
+     * 设计: 定时器常驻、交易时段守卫在检查入口 — 非交易时段直接 return, 不发请求;
+     *       判断成本为零, 不值得为此时起时停定时器 (也避免后台节流下的状态错配)
      */
     async _checkShort() {
+      // P0: 交易时段守卫 — 夜间/周末/午间休市不拉行情 (防空转 + 限流风险)
+      if (!this._isTradingTime(new Date())) return;
       const list = await Core.Storage.where('alerts', 'active', true);
       const stockAlerts = (list || []).filter(a => this._horizonOf(a.type) === 'short');
       if (!stockAlerts.length) return;
@@ -587,9 +616,17 @@
           case 'volume_above': hit = volume >= a.value; break;
         }
         if (hit && !a.triggered) {
+          const now = Date.now();
+          // P2 通知冷却 (防 flapping): 振荡价在阈值附近反复穿越, 价格回落后 triggered 复位,
+          // 下一分钟又会再命中 — 冷却期内只落 triggered 不发通知, 避免反复打扰
+          if (a.lastHit && now - a.lastHit < Core.Constants.ALERT_NOTIFY_COOLDOWN_MS) {
+            a.triggered = true;
+            await Core.Storage.put('alerts', a);
+            continue;
+          }
           a.triggered = true;
           a.hitCount = (a.hitCount || 0) + 1;
-          a.lastHit = Date.now();
+          a.lastHit = now;
           await Core.Storage.put('alerts', a);
           this._notify(a, s);
         } else if (!hit && a.triggered) {
@@ -600,7 +637,7 @@
     },
 
     /**
-     * 中长线调度 (30 分钟 tick): 遍历中长线规则, 到点 (nextCheck) 才真跑, 跑完按自身频率推进
+     * 中长线检查 (事件驱动, 由 runLongChecks 包装调用): 遍历中长线规则, 到点 (nextCheck) 才真跑, 跑完按自身频率推进
      */
     async _checkLong() {
       const list = await Core.Storage.where('alerts', 'active', true);
@@ -654,7 +691,11 @@
 
     /** 规则检查频率: 再平衡用行上 intervalDays, 其余走 Constants.ALERT_LONG_FREQ_MS */
     _freqMs(a) {
-      if (a.intervalDays) return a.intervalDays * 24 * 60 * 60 * 1000;
+      // 陷阱防御: intervalDays 是 rebalance_quarterly 专属字段, 其他类型行上若误带
+      // (老数据/手工改库/AI 写库串字段) 不能拿来当频率, 否则会把日频规则拖成月频
+      if (this._normType(a.type) === 'rebalance_quarterly' && a.intervalDays) {
+        return a.intervalDays * 24 * 60 * 60 * 1000;
+      }
       return Core.Constants.ALERT_LONG_FREQ_MS[this._normType(a.type)] || Core.Constants.ALERT_TICK_LONG_MS;
     },
 
@@ -756,7 +797,6 @@
         const firstHit = notifiedHits[0];
         if (firstHit) {
           this._aiEarningsNarrative(a, firstHit).then(narrative => {
-            console.log('[DEBUG-B1] .then 触发, narrative=', JSON.stringify(narrative).slice(0, 100));
             try {
               a.aiNarrative = narrative;
               a.aiNarrativeAt = Date.now();
@@ -1489,9 +1529,13 @@
   };
 
   window.Alerts = Alerts;
-  window._onShow_pageAlerts = function() { Alerts.render(); };
+  // P1: 打开提醒页时顺带跑一轮中长线检查 (规则自带 nextCheck 门控, 频繁打开无副作用)
+  window._onShow_pageAlerts = function() {
+    Alerts.render();
+    Alerts.runLongChecks();
+  };
 
-  // 启动分层轮询 (短线 1 分钟 / 中长线 30 分钟调度, 按需起定时器)
+  // 启动分层轮询 (短线 1 分钟按需定时器; 中长线改事件驱动, 见 runLongChecks)
   document.addEventListener('DOMContentLoaded', () => {
     Alerts.startPolling().catch(e => console.warn('[Alerts] 启动轮询失败:', e));
   });

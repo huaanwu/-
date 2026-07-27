@@ -110,6 +110,11 @@ function updateMarketStatus() {
     if (window.Fund && Fund.init) Fund.init();
     if (window.Backtest && Backtest.init) Backtest.init();
     if (window.Alerts && Alerts.init) Alerts.init();
+    // Phase W-P1: 中长线盯盘改事件驱动 — 启动时先跑一轮 (异步不阻塞, 参照上面 Data.health 的写法;
+    // 规则自带 nextCheck 门控, 频繁触发无副作用)
+    if (window.Alerts && Alerts.runLongChecks) {
+      Alerts.runLongChecks().catch(e => console.warn('[App] 中长线首检失败:', e));
+    }
 
     // 6. 默认页
     switchPage('pageWatchlist');
