@@ -9,6 +9,14 @@
 
     async init() {
       this._renderForm();
+      // Y.2: 从 Dexie kv 恢复用户黑名单
+      try {
+        const v = window.Core && Core.Storage && Core.Storage.kvGet
+          ? await Core.Storage.kvGet('screener_blacklist')
+          : null;
+        const ta = document.getElementById('scBlacklist');
+        if (ta && v && typeof v === 'string') ta.value = v;
+      } catch (e) { console.warn('[screener] blacklist 恢复失败:', e); }
     },
 
     _renderForm() {
@@ -65,6 +73,28 @@
             跑完硬筛后, 点 [🤖 AI 解读结果] 会把这些偏好 + 宏观环境 + top 候选股 一起喂给 LLM。
           </div>
         </div>
+        <fieldset style="border:1px solid var(--bg-base);border-radius:6px;padding:8px 12px;margin:8px 0;">
+          <legend style="font-size:12px;color:var(--text-muted);padding:0 4px;">🛡️ 自动排雷 (默认全开)</legend>
+          <label style="display:block;font-size:13px;margin:4px 0;">
+            <input type="checkbox" id="scExclGoodwill" checked> 商誉偏高 (占总资产 &gt; 30%)
+          </label>
+          <label style="display:block;font-size:13px;margin:4px 0;">
+            <input type="checkbox" id="scExclDecrease" checked> 股东大额减持 (变动比例 &gt; 1%)
+          </label>
+          <label style="display:block;font-size:13px;margin:4px 0;">
+            <input type="checkbox" id="scExclLoss" checked> 业绩亏损/预减 (首亏/续亏/同比下降)
+          </label>
+          <label style="display:block;font-size:13px;margin:4px 0;">
+            <input type="checkbox" id="scExclCapitulate" checked> 主力出逃 (主力净流入 &lt; -1000 万)
+          </label>
+          <div style="margin-top:8px;">
+            <label style="font-size:12px;color:var(--text-muted);">🚫 用户黑名单 (代码或名称, 一行一条):</label>
+            <textarea id="scBlacklist" rows="2" placeholder="例:
+600519
+贵州茅台
+002594"></textarea>
+          </div>
+        </fieldset>
         <div style="font-size:11px;color:var(--text-muted);margin-top:8px;">
           ⚠️ 拉全市场数据较慢,请耐心等待。当前 AI: <strong>${escapeHtml(aiCfg.provider)}</strong>
         </div>
@@ -146,8 +176,18 @@
         filtered.sort((a, b) => parseFloat(b.涨跌幅) - parseFloat(a.涨跌幅));
         const top = filtered.slice(0, limit);
 
+        // Y.2 排雷 (位置 B: 硬筛后, top 截取后, 不隐藏被排雷股票)
+        const riskResult = await this._runRiskFilter(all, filtered);
+        const riskMap = riskResult.map;
+        const riskErrors = riskResult.errors;
+
         // 保存结果供 AI 解读
-        this._lastResults = { all, filtered, top, conditions: { market, peMax, pbMax, mktCapMin, turnoverMin, changeMin, changeMax } };
+        this._lastResults = {
+          all, filtered, top, conditions: { market, peMax, pbMax, mktCapMin, turnoverMin, changeMin, changeMax },
+          _riskMap: riskMap,
+          _riskErrors: riskErrors,
+          _riskEnabled: riskResult.enabled
+        };
 
         // 4) 渲染
         if (top.length === 0) {
@@ -158,9 +198,16 @@
         const aiCfg = Core.AI.getConfig();
         const hasAiKey = !!aiCfg.apiKey || aiCfg.provider === 'custom';
 
+        const flaggedCount = top.filter(s => riskMap && riskMap.has(s.代码)).length;
+        const riskHint = riskResult.enabled
+          ? (flaggedCount > 0
+              ? `,排雷命中 <strong style="color:var(--down);">${flaggedCount}</strong> 只 (已标 ⚠,仅供参考)`
+              : `,排雷全清 ✓`)
+          : `,排雷未启用`;
+
         resultEl.innerHTML = `
           <div style="padding:12px 16px;color:var(--text-muted);font-size:12px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
-            <span>命中 ${filtered.length} 只,展示前 ${top.length} 只(按涨跌幅降序)</span>
+            <span>命中 ${filtered.length} 只,展示前 ${top.length} 只(按涨跌幅降序)${riskHint}</span>
             <button class="btn btn-sm btn-primary" onclick="Screener.aiInterpret()" ${hasAiKey ? '' : 'disabled title="请先到 ⚙️ 设置页配置 AI API Key"'}>
               🤖 AI 解读结果
             </button>
@@ -170,11 +217,14 @@
             <thead>
               <tr>
                 <th>代码</th><th>名称</th><th>现价</th><th>涨跌幅</th>
-                <th>PE</th><th>PB</th><th>换手率</th><th>总市值</th>
+                <th>PE</th><th>PB</th><th>换手率</th><th>总市值</th><th>⚠ 排雷</th>
               </tr>
             </thead>
             <tbody>
-              ${top.map(s => `
+              ${top.map(s => {
+                const reasons = riskMap && riskMap.has(s.代码) ? Array.from(riskMap.get(s.代码)) : [];
+                const reasonsHtml = reasons.map(r => `<span style="display:inline-block;background:var(--bg-base);color:var(--down);border-radius:3px;padding:1px 4px;margin:1px;font-size:11px;">${escapeHtml(r)}</span>`).join('');
+                return `
                 <tr style="cursor:pointer;" onclick="Watchlist.showKLine('${escapeHtml(s.代码)}','${escapeHtml(s.名称)}')">
                   <td><span class="code">${escapeHtml(s.代码)}</span></td>
                   <td>${escapeHtml(s.名称)}</td>
@@ -184,8 +234,10 @@
                   <td>${s.市净率 !== '-' && s.市净率 != null ? parseFloat(s.市净率).toFixed(2) : '-'}</td>
                   <td>${s.换手率 ? parseFloat(s.换手率).toFixed(2) + '%' : '-'}</td>
                   <td>${s.总市值 ? fmtMoney(parseFloat(s.总市值)) : '-'}</td>
+                  <td>${reasonsHtml}</td>
                 </tr>
-              `).join('')}
+              `;
+              }).join('')}
             </tbody>
           </table>
         `;
@@ -204,12 +256,25 @@
         toastError('请先到 ⚙️ 设置页配置 AI API Key');
         return;
       }
-      const { filtered, top, conditions } = this._lastResults;
+      const { filtered, top, conditions, _riskMap, _riskErrors, _riskEnabled } = this._lastResults;
       const preference = document.getElementById('scPreference')?.value.trim() || '';
 
       const aiResultEl = document.getElementById('screenerAiResult');
       if (!aiResultEl) return;
       aiResultEl.innerHTML = '<div class="ai-stream" style="background:var(--bg-base);border-radius:6px;padding:12px;margin-bottom:12px;font-size:13px;line-height:1.6;white-space:pre-wrap;color:var(--text-muted);">⏳ AI 思考中, 大约 10-30 秒...</div>';
+
+      // Y.3 P-A: 我的现有持仓 (top 10, 让 AI 不要推已重仓的)
+      let portfolioLine = '(无)';
+      try {
+        const portfolio = await Core.Portfolio.getAssets({ paper: false });
+        if (portfolio && portfolio.valueByCode) {
+          const held = Object.entries(portfolio.valueByCode)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 10)
+            .map(([code, val]) => `${code} ${(val / 10000).toFixed(1)}万`);
+          portfolioLine = held.length > 0 ? held.join(', ') : '(无)';
+        }
+      } catch (e) { console.warn('[screener] 拉持仓失败:', e); }
 
       // 喂 LLM: 命中股票 top 30 (限制 token)
       const candidates = top.slice(0, 30).map((s, i) => {
@@ -217,21 +282,24 @@
         const pb = parseFloat(s.市净率);
         const turn = parseFloat(s.换手率);
         const mcap = parseFloat(s.总市值);
-        return `[${i}] ${s.代码} ${s.名称} | PE=${isNaN(pe) ? '-' : pe.toFixed(1)} | PB=${isNaN(pb) ? '-' : pb.toFixed(2)} | 换手=${isNaN(turn) ? '-' : turn.toFixed(2) + '%'} | 市值=${isNaN(mcap) ? '-' : (mcap / 1e8).toFixed(1) + '亿'} | 涨跌幅=${parseFloat(s.涨跌幅).toFixed(2)}%`;
+        // Y.3 P-C: PE<=0 (亏损股) 标 '亏损' 防误读
+        const peStr = isNaN(pe) ? '-' : (pe <= 0 ? '亏损' : pe.toFixed(1));
+        return `[${i}] ${s.代码} ${s.名称} | PE=${peStr} | PB=${isNaN(pb) ? '-' : pb.toFixed(2)} | 换手=${isNaN(turn) ? '-' : turn.toFixed(2) + '%'} | 市值=${isNaN(mcap) ? '-' : (mcap / 1e8).toFixed(1) + '亿'} | 涨跌幅=${parseFloat(s.涨跌幅).toFixed(2)}%`;
       }).join('\n');
 
-      // 并行加载宏观 + 新闻 + Phase O: 13 维上下文 + KB
-      const macroP = Core.Macro.get().catch(e => ({ data: {} }));
-      const newsP = Core.News.get().catch(e => ({ relevant: [] }));
+      // 并行加载宏观 + 新闻 + Phase O: 13 维上下文 + KB + Y.3 P-A 持仓
+      const macroP = Core.Macro.get().catch(e => null);
+      const newsP = Core.News.get().catch(e => null);
       const ctxP = Core.Data.getAiContextSnapshot().catch(e => null);
       const intlP = Core.Data.getIntlSnapshot().catch(e => null);
       const [macro, news, ctx, intl] = await Promise.all([macroP, newsP, ctxP, intlP]);
-      const macroText = macro && macro.data ? Core.Macro.formatForPrompt(macro) : '';
-      const newsText = news ? Core.News.formatForPrompt(news, 8) : '';
-      const ctxText = ctx ? Core.Data.formatAiContextForPrompt(ctx) : '(市场上下文不可用)';
-      const intlText = intl ? Core.Data.formatIntlForPrompt(intl) : '(国际形势不可用)';
+      // Y.3 P-D: 失败用 [降级] 标记
+      const macroText = macro ? Core.Macro.formatForPrompt(macro) : '[降级] 宏观数据不可用';
+      const newsText = news ? Core.News.formatForPrompt(news, 8) : '[降级] 新闻数据不可用';
+      const ctxText = ctx ? Core.Data.formatAiContextForPrompt(ctx) : '[降级] 市场上下文 (9 维) 不可用';
+      const intlText = intl ? Core.Data.formatIntlForPrompt(intl) : '[降级] 国际形势不可用';
 
-      // KB 智能匹配 (Phase N+O)
+      // KB 智能匹配 (Phase N+O) — 失败同样 [降级]
       let kbText = '';
       try {
         const topNames = top.slice(0, 8).map(s => ({ name: s.名称 }));
@@ -240,8 +308,25 @@
           context: ctx || {},
           maxN: 4
         });
-        kbText = Core.KB.formatForPrompt(kbEntries);
-      } catch (e) { console.warn('[screener] KB 取条失败:', e); }
+        kbText = Core.KB.formatForPrompt(kbEntries) || '[降级] KB 知识库为空';
+      } catch (e) {
+        console.warn('[screener] KB 取条失败:', e);
+        kbText = '[降级] KB 拉取失败';
+      }
+
+      // Y.2 排雷段: 把 _riskMap 序列化成 代码 → [reason, ...] 文本
+      const riskList = _riskMap ? Core.RiskMine.serialize(_riskMap) : [];
+      let riskText = '';
+      if (!_riskEnabled) {
+        riskText = '本轮未启用排雷过滤 (用户未勾任何 checkbox)';
+      } else if (riskList.length === 0 && (_riskErrors || []).length === 0) {
+        riskText = '本轮已启用排雷但全部清零 ✓ (无商誉/减持/亏损/主力出逃命中)';
+      } else if (riskList.length === 0) {
+        riskText = `[降级] 4 个排雷数据源全部拉取失败: ${(_riskErrors || []).join(', ')}`;
+      } else {
+        riskText = '被排雷的股票 (★ 严禁选入 picks 除非 KB 明确反驳):\n' + riskList
+          .map(r => `- ${r.code}: ${r.reasons.join(', ')}`).join('\n');
+      }
 
       const condsDesc = [];
       if (conditions.market && conditions.market !== 'all') condsDesc.push(`市场=${conditions.market}`);
@@ -287,14 +372,23 @@
 5. **KB 引用**: 如有相关条目, 在 reasons 里引用条目号, kbRefs 数组填条目号
 6. **置信度**: 高 (多维数据一致+符合 KB 经典模式) / 中 (数据冲突) / 低 (极端市场/新策略)
 7. **pre-mortem 必填**: 每只 pick 必须给 bullCase/bearCase/falsifyCondition/invalidation 四字段; bearCase 禁止"无明显风险/暂无风险"空话, falsifyCondition 必须具体可观测 (价格/指标/财报数字)
-8. 严禁绝对化表述 ("一定涨" 等)`;
+8. **已有持仓友好**: 用户持仓超过 10 万的代码视为"重复持仓", 应在 marketView / risks 中提示, 不强制进 picks
+9. **排雷标签 ✓ 必须尊重**: 候选池中如已被前端标 [排雷] 的代码 (商誉偏高/股东减持/业绩亏损/主力出逃), 一律不进 picks, 除非 KB 经典模式能给出反转理由 (例如"高商誉但 ROE 持续 > 20% 的特例")
+10. 严禁绝对化表述 ("一定涨" 等)`;
 
-      const userPrompt = `【用户筛选条件】
+      const userPrompt = `【我的现有持仓 (前 10, Y.3 P-A)】
+${portfolioLine}
+若候选池含以上已有持仓, 按规则 8 处理.
+
+【用户筛选条件】
 ${condsDesc.length > 0 ? condsDesc.join(', ') : '(无特定条件, 全市场)'}
 命中 ${filtered.length} 只, 已按涨跌幅降序展示前 ${top.length} 只。
 
 【用户偏好】
 ${preference || '(无)'}
+
+【排雷标记 (Y.2, 必须在 picks 中遵守规则 9)】
+${riskText}
 
 ${macroText}
 
@@ -412,6 +506,104 @@ ${candidates}
         }
         toastError('AI 调用失败: ' + e.message);
       }
+    },
+
+    /**
+     * Y.2 排雷 UI: 4 checkbox + blacklist textarea 状态聚合
+     * 任一 checkbox 勾选 或 blacklist 非空 即视为启用
+     */
+    _isAnyRiskFlagOn() {
+      const ck = id => !!document.getElementById(id) && document.getElementById(id).checked;
+      const c1 = ck('scExclGoodwill');
+      const c2 = ck('scExclDecrease');
+      const c3 = ck('scExclLoss');
+      const c4 = ck('scExclCapitulate');
+      const bl = (document.getElementById('scBlacklist')?.value || '').trim();
+      return c1 || c2 || c3 || c4 || bl.length > 0;
+    },
+
+    /**
+     * Y.2 读取用户黑名单 textarea → { codes: [], names: [] }
+     * 自动 trim / 去空 / 去重; 输入含 "600519" → codes, "茅台" → names
+     * 多合一 (例 "600519 茅台" 拆成 code + name 两部分)
+     * 顺便把当前内容存到 Dexie kv (跨刷新持久化)
+     */
+    async _readBlacklist() {
+      const raw = document.getElementById('scBlacklist')?.value || '';
+      const lines = raw.split(/[\n,，\s]+/).map(s => s.trim()).filter(Boolean);
+      const codes = new Set();
+      const names = new Set();
+      for (const tok of lines) {
+        // 全 6 位数字 → 当代码
+        if (/^\d{6}$/.test(tok)) codes.add(tok);
+        // 含汉字/英文 → 当名称
+        else if (/[一-龥A-Za-z]/.test(tok)) names.add(tok);
+      }
+      const out = { codes: Array.from(codes), names: Array.from(names) };
+      // Dexie kv 持久化 (失败静默, 不影响本次)
+      try {
+        if (window.Core && Core.Storage && Core.Storage.kvSet) {
+          await Core.Storage.kvSet('screener_blacklist', raw);
+        }
+      } catch (e) { console.warn('[screener] blacklist 持久化失败:', e); }
+      return out;
+    },
+
+    /**
+     * Y.2 排雷主入口: 4 个 fetch 并行 + RiskMine 聚合 + 用户黑名单叠加
+     * 全部失败也只是返空 map + errors[], 不抛
+     */
+    async _runRiskFilter(allStocks, _hardFiltered) {
+      const enabled = this._isAnyRiskFlagOn();
+      if (!enabled) {
+        return { enabled: false, map: null, errors: [] };
+      }
+      const errors = [];
+      const safeFetch = async (name, fn) => {
+        try {
+          const r = await fn();
+          if (!Array.isArray(r) || r.length === 0) {
+            errors.push(`${name}=空`);
+            return [];
+          }
+          return r;
+        } catch (e) {
+          console.warn(`[screener] ${name} 排雷数据拉取失败:`, e);
+          errors.push(name);
+          return [];
+        }
+      };
+      const [g, d, p, c] = await Promise.all([
+        safeFetch('商誉', () => Core.Data.getStockGoodwillRanks()),
+        safeFetch('减持', () => Core.Data.getStockHolderDecreases()),
+        safeFetch('业绩', () => Core.Data.getStockEarningsForecastFresh()),
+        safeFetch('主力', () => Core.Data.getStockCapitalFlight())
+      ]);
+      // 仅在前端确实勾选时计入对应类 (避免无关数据污染 map)
+      const ck = id => !!document.getElementById(id) && document.getElementById(id).checked;
+      const bl = await this._readBlacklist();
+      const map = Core.RiskMine.buildReasonSet(
+        ck('scExclGoodwill') ? g : [],
+        ck('scExclDecrease') ? d : [],
+        ck('scExclLoss') ? p : [],
+        ck('scExclCapitulate') ? c : []
+      );
+      // 用户黑名单叠加 (代码 + 名称)
+      if (bl.codes.length > 0 || bl.names.length > 0) {
+        for (const code of bl.codes) {
+          if (!map.has(code)) map.set(code, new Set());
+          map.get(code).add(Core.RiskMine.REASONS.BLACKLIST);
+        }
+        if (Array.isArray(allStocks) && bl.names.length > 0) {
+          for (const s of allStocks) {
+            if (s.名称 && bl.names.some(n => s.名称.includes(n))) {
+              if (!map.has(s.代码)) map.set(s.代码, new Set());
+              map.get(s.代码).add(Core.RiskMine.REASONS.BLACKLIST);
+            }
+          }
+        }
+      }
+      return { enabled: true, map, errors };
     },
 
     /**

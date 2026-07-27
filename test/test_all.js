@@ -107,7 +107,9 @@ const DOMAINS = {
   'Holdings':  ['init', 'render', 'addDialog', 'editDialog', 'save', 'remove', 'addTxDialog', 'saveTx', 'closeModal', '_renderPending', 'confirmPending', 'ignorePending', '_markPendingConfirmed'],
   'Paper':     ['init', 'buy', 'sell', 'getAccount', 'getPositions', 'resetAccount', 'snapshotIfNeeded', 'autoTradeFromPick', 'renderPage', 'buyFromForm', 'sellFromForm', 'sellAll', 'switchSleeve', '_getAccountRaw', '_saveAccountRaw', '_calcFee', '_roundLot', '_pushSnapshot', '_planAutoTrade', 'maybeGenerateEodReport', '_shouldGenerateEod', '_pushEodReport', '_appendDisciplineLog', '_logDisciplineBlock', '_buildEodReport', '_formatEodReportText', '_pushEodToFeishu', '_renderEodReport', 'addCondOrder', 'listCondOrders', 'cancelCondOrder', 'settleCondOrders', '_checkCondOrder', '_barOf', '_lastClosedBar', '_orderEligible', '_tradingDaysAfter', '_isGapDown', '_isGapUp', '_fillCheck', '_exitCheck', '_settleFill', '_settleExit', '_writeCondJournal', '_condPlanLines', 'addCondOrderFromForm', '_renderCondOrders'],
   'Journal':   ['init', 'render', 'newDialog', 'editDialog', 'save', 'remove', 'closeModal', '_buildHoldingsContext', '_renderHoldingBadge', '_renderStructuredTags', '_runAiAssistant'],
-  'Screener':  ['init', 'run', '_addWatchlistFromPick', '_runPreBacktest'],
+  'Screener':  ['init', 'run', '_addWatchlistFromPick', '_runPreBacktest',
+    // Phase Y.2
+    '_runRiskFilter', '_isAnyRiskFlagOn', '_readBlacklist'],
   'Fund':      ['init', 'render', 'addDialog', 'save', 'remove', 'showChart', 'closeModal'],
   'Backtest':  ['init', 'run'],
   'Alerts':    ['init', 'render', 'addDialog', 'save', 'toggle', 'remove', 'closeModal', 'startPolling', 'stopPolling', 'runLongChecks', '_isTradingTime', '_fetchJournalContext', '_horizonOf', '_syncTimers', '_checkShort', '_checkLong', '_filterEarningsWarnings', '_regimeNotifyText', '_judgeValuation', '_notifyLong']
@@ -269,7 +271,9 @@ section('6] 关键文件存在');
 section('7] Core.Data 方法签名');
 const dataContent = readFileSafe(path.join(WWW, 'core/data.js'));
 const DATA_METHODS = ['getStockSpot', 'getStockQuote', 'getStockKLine', 'getStockFinancial', 'getStockList',
-  'getFundSpot', 'getFundHistory', 'getFundPortfolio', 'getIndexSpot', 'health', 'fetch'];
+  'getFundSpot', 'getFundHistory', 'getFundPortfolio', 'getIndexSpot', 'health', 'fetch',
+  // Phase Y.1 排雷 4 fetcher
+  'getStockGoodwillRanks', 'getStockHolderDecreases', 'getStockEarningsForecastFresh', 'getStockCapitalFlight'];
 for (const m of DATA_METHODS) {
   if (new RegExp(`\\b${m}\\b`).test(dataContent)) ok(`Data.${m}`);
   else fail(`Data.${m}`, '缺失');
@@ -5385,6 +5389,63 @@ section('36] 中长线盯盘: horizon 打标 / 分层轮询(短线定时器+中�
     if (/h\.currentPrice\s*=/.test(journalSrc) && /getStockQuote/.test(journalSrc)) {
       ok('36.X.f journal._runAgentPipeline 给 holdings 注入 currentPrice (via getStockQuote)');
     } else fail('36.X.f currentPrice 注入', 'h.currentPrice = 或 getStockQuote 缺失');
+
+    // ---- 36.Y Phase Y: 排雷 + screener AI 三补丁 (静态源码 grep) ----
+    const riskSrc = fs.readFileSync('www/core/risk-mine.js', 'utf-8');
+    const scSrc = fs.readFileSync('www/app/screener.js', 'utf-8');
+
+    // 36.Y.a 4 类风险聚合函数都在 risk-mine.js
+    ['buildReasonSet', 'serialize'].forEach(m => {
+      if (new RegExp(`\\b${m}\\b`).test(riskSrc)) ok(`36.Y.a RiskMine.${m} 存在`);
+      else fail(`36.Y.a RiskMine.${m}`, '缺失');
+    });
+
+    // 36.Y.b REASONS 含全部 7 个 reason
+    const reasonsNeeded = ['商誉偏高', '股东减持', '业绩首亏', '业绩续亏', '业绩预减', '主力净流出', '用户黑名单'];
+    const missingReasons = reasonsNeeded.filter(r => !riskSrc.includes(r));
+    if (missingReasons.length === 0) {
+      ok('36.Y.b REASONS 枚举 7 项全在');
+    } else fail('36.Y.b REASONS 缺项', `缺: ${missingReasons.join(', ')}`);
+
+    // 36.Y.c screener 接入 RiskMine + 4 fetch
+    if (/Core\.RiskMine\.buildReasonSet/.test(scSrc)
+        && /getStockGoodwillRanks/.test(scSrc)
+        && /getStockHolderDecreases/.test(scSrc)
+        && /getStockEarningsForecastFresh/.test(scSrc)
+        && /getStockCapitalFlight/.test(scSrc)) {
+      ok('36.Y.c screener 接线: RiskMine + 4 fetcher 全部调');
+    } else fail('36.Y.c 接线不全', 'RiskMine 或 4 fetcher 任一未调');
+
+    // 36.Y.d PE 负值标 "亏损" (P-C)
+    if (/pe\s*<=\s*0[^"]*"[^"]*亏损|PE=.*pe\s*<=\s*0.*亏损/.test(scSrc)
+        || /pe<=\s*0\s*\?\s*['"]亏损['"]/.test(scSrc)
+        || /isNaN\(pe\)\s*\?\s*'-'\s*:\s*\(?\s*pe\s*<=\s*0\s*\?\s*['"]亏损['"]/.test(scSrc)) {
+      ok('36.Y.d PE<=0 标 "亏损" (防 LLM 误读亏损股为低估)');
+    } else fail('36.Y.d PE 修复', '源码未匹配 pe<=0 ? "亏损"');
+
+    // 36.Y.e [降级] 标记 4 处失败兜底 (P-D)
+    const downgradeCount = (scSrc.match(/\[降级\]/g) || []).length;
+    if (downgradeCount >= 4) {
+      ok(`36.Y.e [降级] 标记 ≥4 处 (macro/news/ctx/intl/KB 失败兜底, 实有 ${downgradeCount})`);
+    } else fail('36.Y.e [降级]', `仅 ${downgradeCount} 处, 期望 ≥4`);
+
+    // 36.Y.f 我的持仓感知 (Y.3 P-A)
+    if (/Core\.Portfolio\.getAssets\(\{\s*paper:\s*false\s*\}\)[\s\S]*?valueByCode/.test(scSrc)
+        && /portfolioLine/.test(scSrc)) {
+      ok('36.Y.f aiInterpret 装配 Portfolio.getAssets({paper:false}) + 我的持仓段');
+    } else fail('36.Y.f 持仓感知', 'Portfolio.getAssets 或 我的持仓 段缺失');
+
+    // 36.Y.g screener 4 个排雷 checkbox + blacklist textarea
+    const checkboxesNeeded = ['scExclGoodwill', 'scExclDecrease', 'scExclLoss', 'scExclCapitulate', 'scBlacklist'];
+    const missingCk = checkboxesNeeded.filter(c => !scSrc.includes(`id="${c}"`));
+    if (missingCk.length === 0) {
+      ok('36.Y.g 排雷 UI: 4 checkbox + 1 blacklist textarea 都在 _renderForm');
+    } else fail('36.Y.g 排雷 UI 缺控件', `缺: ${missingCk.join(', ')}`);
+
+    // 36.Y.h Dexie kv 持久化 blacklist (kvSet + kvGet)
+    if (/kvSet\(['"]screener_blacklist/.test(scSrc) && /kvGet\(['"]screener_blacklist/.test(scSrc)) {
+      ok('36.Y.h blacklist Dexie kv 持久化 + 恢复 (kvSet + kvGet)');
+    } else fail('36.Y.h 持久化', 'kvSet/kvGet 任一缺失');
 
     // _aiEarningsNarrative: AI 调通 → 写 alert.aiNarrative; AI 调失败 → 兜底
     notices.length = 0;

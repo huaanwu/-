@@ -52,7 +52,8 @@ export default defineConfig({
         '/core/crosscheck.js',
         '/core/kb.js',
         '/core/alerts-agent.js',
-        '/core/util.js'
+        '/core/util.js',
+        '/core/risk-mine.js'  // Phase Y.1.2: 排雷数据聚合
       ]
     }
   },

@@ -63,7 +63,12 @@
     }
     if (!resp.ok) throw new Error(`腾讯财经 HTTP ${resp.status}`);
     // GBK 解码
-    const buf = await resp.arrayBuffer();
+    let buf;
+    try {
+      buf = await resp.arrayBuffer();
+    } catch (e) {
+      throw new Error(`响应解码失败 (resp.arrayBuffer 不可用): ${e.message || e}`);
+    }
     const text = new TextDecoder('gb18030').decode(new Uint8Array(buf));
     return _tencentParse(text);
   }
@@ -134,7 +139,12 @@
     }
     if (!resp.ok) throw new Error(`新浪财经 HTTP ${resp.status}`);
     // GBK 解码 (跟 _tencentFetch 一致)
-    const buf = await resp.arrayBuffer();
+    let buf;
+    try {
+      buf = await resp.arrayBuffer();
+    } catch (e) {
+      throw new Error(`响应解码失败 (resp.arrayBuffer 不可用): ${e.message || e}`);
+    }
     const text = new TextDecoder('gb18030').decode(new Uint8Array(buf));
     return _sinaParse(text, codes);
   }
@@ -691,6 +701,75 @@
     const list = await getFinancialCalendar(q.year, q.quarter);
     const hit = list.find(r => r.code === c);
     return hit ? { noticeDate: hit.noticeDate, reportPeriod: hit.reportPeriod } : null;
+  }
+
+  // ============ 排雷数据 (Phase Y.1) ============
+  // 4 类 fetcher 全部走标准 fetchWithCache 模板, 调用方独立 try/catch
+  // 失败策略: 每个 fetcher 内部不抛, 客户端 .catch 兜底
+
+  /** (A) 全市场商誉明细 (东方财富 /sy/list.html) — date 仅半年末/年末有效 */
+  async function getStockGoodwillRanks() {
+    const today = new Date();
+    const y = today.getFullYear();
+    const m = today.getMonth() + 1;
+    const date = m >= 7 ? `${y}0630` : `${y - 1}1231`;
+    return await fetchWithCache(
+      `risk_goodwill_${date}`,
+      'stock_sy_em',
+      { date },
+      7 * 24 * 60 * 60 * 1000  // 7 天 (半年报周期)
+    );
+  }
+
+  /** (B) 东财高管/股东减持公告 (symbol='股东减持' 取减持明细) */
+  async function getStockHolderDecreases() {
+    return await fetchWithCache(
+      'risk_decrease_em',
+      'stock_ggcg_em',
+      { symbol: '股东减持' },
+      6 * 60 * 60 * 1000  // 6 小时 (公告是滚动数据)
+    );
+  }
+
+  /** (C) 业绩预告 (最近一期, 半年内过滤, 含首亏/续亏/预减)
+   *    复用 _fetchEarningsCalendar 已验证的字段容错模板 */
+  async function getStockEarningsForecastFresh() {
+    const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const today2 = today.replace(/-/g, '');
+    const raw = await fetchWithCache(
+      `risk_yjyg_${today2}`,
+      'stock_yjyg_em',
+      {},
+      6 * 60 * 60 * 1000  // 6 小时
+    );
+    if (!Array.isArray(raw)) return [];
+    const halfYearAgo = Date.now() - 180 * 24 * 60 * 60 * 1000;
+    return raw.filter(r => {
+      const t = (r['业绩预告类型'] || r['预告类型'] || '').toString();
+      if (!/增|减|扭亏|首亏|续亏|续盈/.test(t)) return false;
+      const dStr = r['公告日期'] || r['最新公告日期'] || r['报告日期'] || r['发布日期'];
+      if (dStr) {
+        const ts = Date.parse(dStr);
+        if (!isNaN(ts) && ts < halfYearAgo) return false;
+      }
+      return true;
+    }).map(r => ({
+      code: String(r['股票代码'] || r.code || '').padStart(6, '0'),
+      name: r['股票简称'] || r.name || '',
+      type: r['业绩预告类型'] || r['预告类型'] || '',
+      summary: r['业绩预告摘要'] || r.summary || '',
+      reportDate: r['公告日期'] || r['最新公告日期'] || r['报告日期'] || r['发布日期'] || ''
+    }));
+  }
+
+  /** (D) 个股资金流排行 (今日, 个股主力净流入净流出) */
+  async function getStockCapitalFlight() {
+    return await fetchWithCache(
+      'risk_capital_flight_today',
+      'stock_individual_fund_flow_rank',
+      { indicator: '今日' },
+      5 * 60 * 1000  // 5 分钟 (日内高频)
+    );
   }
 
   /**
@@ -1444,6 +1523,9 @@
     getStockSpotEfinance,  // C: 东方财富 fetcher (全市场, screener 用)
     getStockFinancialHistory,  // Phase R: 近 N 期财报对比
     getFinancialCalendar, getStockNextDisclosure,  // Phase U: 财报披露日历
+    // 排雷 (Phase Y.1)
+    getStockGoodwillRanks, getStockHolderDecreases,  // 商誉 / 减持
+    getStockEarningsForecastFresh, getStockCapitalFlight,  // 业绩亏损 / 主力出逃
     // 基金
     getFundSpot, getFundHistory, getFundPortfolio,
     // 指数
