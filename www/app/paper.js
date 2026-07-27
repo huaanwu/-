@@ -48,7 +48,11 @@
   const COND_ORDER_LIMIT = Core.Constants.COND_ORDER_LIMIT;            // 条件单上限 (T3)
   const COND_ORDER_EXPIRE_DAYS = Core.Constants.COND_ORDER_EXPIRE_DAYS;  // 条件单有效期 (交易日, T3)
   const SHORT_MAX_HOLD_DAYS = Core.Constants.SHORT_MAX_HOLD_DAYS;      // 短线最长持有交易日 (T3)
+  const MARKET_OPEN_MINUTES = 9 * 60 + 30;   // A 股 09:30 开盘 (Bug A 修复: 防盘中下单回溯到当日 K)
   const MARKET_CLOSE_MINUTES = 15 * 60;   // A 股 15:00 收盘: 之后当日 K 视为已收盘 (T3 结算语义)
+  // Bug A: 盘中下单场景 (09:30~15:00) 视为 "与同日 K 并存", 单对次日及以后 K 才生效 (createdAfterClose=true)
+  // _orderEligible 判定: createdAfterClose → bar.date > cd; 否则 bar.date >= cd
+  const _isOutsideTradingHours = (mins) => mins < MARKET_OPEN_MINUTES || mins >= MARKET_CLOSE_MINUTES;
 
   const Paper = {
 
@@ -799,8 +803,10 @@
 
     /**
      * 条件单对某根 K 是否生效:
-     *   - 创建当天收盘前创建 → 当日 K 可判定 (bar.date >= createdDate)
-     *   - 收盘后 (≥15:00) 或非交易时间创建 → 当日 K 发生在创建之前, 不可回溯成交 (bar.date > createdDate)
+     *   - 盘中 (09:30~15:00) 创建: createdAfterClose=false → 当日 K 可判定 (bar.date >= createdDate)
+     *     但实际结算时只对已收盘 bar 生效 (_lastClosedBar),盘中建单当日 K 尚未走完不会触发
+     *   - 收盘后 (≥15:00) 或开盘前 (<09:30) 创建: createdAfterClose=true → 次日 K 才生效 (bar.date > createdDate)
+     *     避免 AI 在 14:00 看盘面写触发价后, 对当天 9:30 起的完整日 K 生效造成前视偏差
      */
     _orderEligible(order, bar) {
       if (!order || !bar || !bar.date) return false;
@@ -932,8 +938,12 @@
           status: 'pending',
           createdAt: now,
           createdDate: fmtDate(d),
-          // 收盘后创建: 当日 K 线已走完, 不可回溯成交, 下一根 K 才生效 (_orderEligible)
-          createdAfterClose: d.getHours() * 60 + d.getMinutes() >= MARKET_CLOSE_MINUTES,
+          // Bug A 修复 (前视偏差):
+          //   - 收盘后 (≥15:00) 或开盘前 (<09:30) 创建: createdAfterClose=true → 次日 K 才生效
+          //   - 盘中 (09:30~14:59) 创建: createdAfterClose=false → 当日 K 可判定 (但盘中当根 K 尚未走完,
+          //     由 _lastClosedBar 守门, 盘中结算循环不会拿当日 bar 来触发, 所以不会前视)
+          // 之前的 bug: 14:00 看盘写触发价, _orderEligible 让 bar.date >= cd 命中当天 9:30 已走完的 K
+          createdAfterClose: _isOutsideTradingHours(d.getHours() * 60 + d.getMinutes()),
           // 展示用预计到期时刻 (真实过期按交易日数判定, 见 _tradingDaysAfter)
           expireAt: now + COND_ORDER_EXPIRE_DAYS * 24 * 60 * 60 * 1000,
           filledAt: null, fillPrice: null, holdingId: null

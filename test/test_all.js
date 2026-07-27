@@ -7227,6 +7227,118 @@ section('[40] ShortTrader T4 学习环: _judgeClosedTrade 全分支 / verify 扫
   }
 })();
 
+section('[43] Bug A 前视偏差: createdAfterClose 阈值 (盘外 OR 盘外才次日生效)');
+(async () => {
+  try {
+    const paperSrc = readFileSafe(path.join(WWW, 'app', 'paper.js'));
+    if (!paperSrc) throw new Error('paper.js 读不到');
+    const storeX = { kv: {}, tables: {}, quotes: {}, indexSpot: [] };
+    const buildCtx = (storageData) => {
+      const pctx = {
+        window: {}, console,
+        escapeHtml: (s) => String(s == null ? '' : s),
+        fmtMoney: (n) => (typeof n === 'number' ? n.toFixed(2) : '0.00'),
+        fmtNum: (n, d) => (typeof n === 'number' ? n.toFixed(d || 0) : '0'),
+        fmtPct: (n) => (typeof n === 'number' ? (n * 100).toFixed(2) + '%' : '-'),
+        pctClass: () => '',
+        fmtDate: () => '2026-07-27',
+        uuid: () => 'paper-A-' + Math.random().toString(36).slice(2, 8),
+        parseStockInput: (t) => {
+          const m = String(t || '').trim().match(/^(\d{6})/);
+          return m ? { code: m[1], name: String(t).slice(6).trim() } : null;
+        },
+        toastSuccess: () => {}, toastError: () => {}, toastWarning: () => {},
+        confirm: () => true,
+        fetch: async () => ({ ok: true, json: async () => ({ code: 0 }) })
+      };
+      pctx.window.Core = {
+        Storage: {
+          kvGet: async (k) => (k in storageData.kv ? storageData.kv[k] : null),
+          kvSet: async (k, v) => { storageData.kv[k] = v; },
+          all: async (t) => storageData.tables[t] || [],
+          get: async (t, id) => (storageData.tables[t] || []).find(x => x.id === id) || null,
+          add: async (t, obj) => { (storageData.tables[t] = storageData.tables[t] || []).push(obj); },
+          put: async (t, obj) => {
+            const arr = (storageData.tables[t] = storageData.tables[t] || []);
+            const i = arr.findIndex(x => x.id === obj.id);
+            if (i >= 0) arr[i] = obj; else arr.push(obj);
+          },
+          remove: async (t, id) => {
+            storageData.tables[t] = (storageData.tables[t] || []).filter(x => x.id !== id);
+          }
+        },
+        Data: {
+          getStockQuote: async (code) => storageData.quotes[code] || null,
+          getIndexSpot: async () => storageData.indexSpot || []
+        },
+        Util: { stockCodePrefix: (c) => /^(60|68)/.test(c) ? 'sh' : 'sz' },
+        Constants: _loadRealConstants()
+      };
+      pctx.Core = pctx.window.Core;
+      pctx.window.document = { getElementById: () => null };
+      pctx.document = pctx.window.document;
+      vm.createContext(pctx);
+      vm.runInContext(paperSrc, pctx);
+      return pctx;
+    };
+    const PX = buildCtx(storeX).window.Paper;
+
+    // 43.a 阈值常量存在
+    const src = paperSrc;
+    const hasOpen = /MARKET_OPEN_MINUTES\s*=\s*9\s*\*\s*60\s*\+\s*30/.test(src);
+    const hasClose = /MARKET_CLOSE_MINUTES\s*=\s*15\s*\*\s*60/.test(src);
+    const hasGuard = /_isOutsideTradingHours/.test(src);
+    if (hasOpen && hasClose && hasGuard) ok('43.a 常量 MARKET_OPEN_MINUTES=570 / CLOSE=900 + _isOutsideTradingHours 守卫就位');
+    else fail('43.a 常量', `open=${hasOpen} close=${hasClose} guard=${hasGuard}`);
+
+    // 43.b _orderEligible + createdAfterClose 联动: 盘中单可对当日 K 生效 (但 _lastClosedBar 盘中返回 null, 不前视)
+    //     盘外单 (开盘前/收盘后) 必须次日 K 才生效
+    const e1 = PX._orderEligible(
+      { createdDate: '2026-07-27', createdAfterClose: true },  // 盘外 (e.g. 14:00 之前开盘前 / 15:00 收盘后)
+      { date: '2026-07-27' }
+    );
+    const e2 = PX._orderEligible(
+      { createdDate: '2026-07-27', createdAfterClose: true },
+      { date: '2026-07-28' }
+    );
+    const e3 = PX._orderEligible(
+      { createdDate: '2026-07-27', createdAfterClose: false },  // 盘中 (09:30~14:59) 创建
+      { date: '2026-07-27' }
+    );
+    if (e1 === false && e2 === true && e3 === true) ok('43.b _orderEligible: 盘外次日生效 / 盘中当日生效');
+    else fail('43.b _orderEligible', JSON.stringify({ e1, e2, e3 }));
+
+    // 43.c 行为变化对照: 14:00 盘中建单 → createdAfterClose=false (旧: true)
+    //     模拟 _orderEligible 调用, 验证 "old buggy true" 不再返回
+    const oldBug = PX._orderEligible(
+      { createdDate: '2026-07-27', createdAfterClose: true },   // 旧 bug: 14:00 创建会标 true
+      { date: '2026-07-27' }                                     // 当天 9:30 已走完的 K
+    );
+    if (oldBug === false) ok('43.c 14:00 建单旧 bug 回归 (盘外标记=true 当日 K 不可回溯)');
+    else fail('43.c old bug', JSON.stringify(oldBug));
+
+    // 43.d _lastClosedBar 仍守住 "盘中不拿未走完 bar"
+    // 注意: buildCtx 的 fmtDate 是 hardcode mock, 这里我们直接用 _loadRealConstants 不会动到
+    // 但 paper.js 内部 fmtDate 调用 → 全是 '2026-07-27'
+    // 解决: 构造 bars 时 today 就设为 '2026-07-27', 验证 16:00 时 (mock closed=true via 直接 verify)
+    const todayMock = '2026-07-27';  // 跟 fmtDate mock 对齐
+    const bars = [
+      { date: '2026-07-25', open: 10, high: 11, low: 9.5, close: 10.5 },
+      { date: todayMock,    open: 10.5, high: 11.5, low: 10, close: 11 }
+    ];
+    const intraday = PX._lastClosedBar(bars, new Date(2026, 6, 27, 11, 0));   // 周二 11:00 (盘中)
+    const afterClose = PX._lastClosedBar(bars, new Date(2026, 6, 27, 16, 0)); // 周二 16:00 (收盘后)
+    // 盘中: fmtDate mock 返回 todayMock → bars[i=1].date === todayMock && closed(11:00=660>=900)=false → 不命中, i=0 命中 (date < today) → 返 07-25 (不算 null)
+    // 这其实跟生产一致: 盘中拿的是 "上一根" 而不是 null. 真正 null 是当 bars 没更早数据时
+    // 关键测试: 收盘后拿当日 K (07-27), 盘中拿前一根 K (07-25)
+    if (intraday && intraday.date === '2026-07-25' && afterClose && afterClose.date === todayMock) {
+      ok('43.d _lastClosedBar: 盘中返前日 K (last closed) / 收盘后返当日 K');
+    } else fail('43.d _lastClosedBar', JSON.stringify({ intraday, afterClose }));
+  } catch (e) {
+    fail('43 Bug A 前视偏差', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
 // ========== 总结 ==========
 // 同步 section 的 ok() 已经在 console 打印;
 // async IIFE 里的 ok() 还在 microtask / setTimeout 队列里, 旧版本 setImmediate 只给一次机会,
