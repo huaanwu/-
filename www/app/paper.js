@@ -911,6 +911,25 @@
       try {
         const acc = await this._getAccountRaw('short');
         const errs = this._checkCondOrder(order, acc.cash);
+
+        // Bug C 修复 (同代码去重): 同 code 已有 pending 单或已持 short 仓 → 拒绝
+        // 防多张同代码单叠加触发导致持仓翻倍越过 positionPct=0.20 纪律线
+        // (加仓应建新方向单 above 突破买入, 而非重复 below 回调买入)
+        if (!errs.length) {
+          const code = String(order.code || '');
+          const list = (await Core.Storage.kvGet('paper_cond_orders')) || [];
+          const dupPending = list.find(o => o && o.code === code && o.status === 'pending');
+          if (dupPending) {
+            errs.push(`同代码 ${code} 已有未触发的条件单 (方向 ${dupPending.triggerDirection} / 触发价 ${dupPending.triggerPrice}). 加仓请建新方向单`);
+          } else {
+            const holdings = (await Core.Storage.all('paper_holdings')) || [];
+            const sameShort = holdings.find(h => h && h.code === code && (h.sleeve === 'short' || !h.sleeve));
+            if (sameShort && sameShort.shares > 0) {
+              errs.push(`已持有 ${code} 短线仓位 (${sameShort.shares} 股 @ ${sameShort.costPrice}). 加仓请建新方向单`);
+            }
+          }
+        }
+
         if (errs.length) {
           toastError('条件单校验失败: ' + errs[0]);
           return { ok: false, errors: errs };

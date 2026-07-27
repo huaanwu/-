@@ -7339,6 +7339,141 @@ section('[43] Bug A 前视偏差: createdAfterClose 阈值 (盘外 OR 盘外才�
   }
 })();
 
+section('[44] Bug C 同代码去重: addCondOrder 拒绝同 code pending/已持仓');
+(async () => {
+  try {
+    const paperSrc = readFileSafe(path.join(WWW, 'app', 'paper.js'));
+    if (!paperSrc) throw new Error('paper.js 读不到');
+    const storeC = {
+      kv: {
+        paper_account_short: { initialCash: 30000, cash: 30000, createdAt: 1, positionPct: 0.20 }
+      },
+      tables: {
+        paper_holdings: []
+      },
+      quotes: {}, indexSpot: []
+    };
+    const buildCtx = (storageData) => {
+      const pctx = {
+        window: {}, console,
+        escapeHtml: (s) => String(s == null ? '' : s),
+        fmtMoney: (n) => (typeof n === 'number' ? n.toFixed(2) : '0.00'),
+        fmtNum: (n, d) => (typeof n === 'number' ? n.toFixed(d || 0) : '0'),
+        fmtPct: (n) => (typeof n === 'number' ? (n * 100).toFixed(2) + '%' : '-'),
+        pctClass: () => '',
+        fmtDate: () => '2026-07-27',
+        uuid: () => 'paper-C-' + Math.random().toString(36).slice(2, 8),
+        parseStockInput: (t) => {
+          const m = String(t || '').trim().match(/^(\d{6})/);
+          return m ? { code: m[1], name: String(t).slice(6).trim() } : null;
+        },
+        toastSuccess: () => {}, toastError: () => {}, toastWarning: () => {},
+        confirm: () => true,
+        fetch: async () => ({ ok: true, json: async () => ({ code: 0 }) })
+      };
+      pctx.window.Core = {
+        Storage: {
+          kvGet: async (k) => (k in storageData.kv ? storageData.kv[k] : null),
+          kvSet: async (k, v) => { storageData.kv[k] = v; },
+          all: async (t) => storageData.tables[t] || [],
+          get: async (t, id) => (storageData.tables[t] || []).find(x => x.id === id) || null,
+          add: async (t, obj) => { (storageData.tables[t] = storageData.tables[t] || []).push(obj); },
+          put: async (t, obj) => {
+            const arr = (storageData.tables[t] = storageData.tables[t] || []);
+            const i = arr.findIndex(x => x.id === obj.id);
+            if (i >= 0) arr[i] = obj; else arr.push(obj);
+          },
+          remove: async (t, id) => {
+            storageData.tables[t] = (storageData.tables[t] || []).filter(x => x.id !== id);
+          }
+        },
+        Data: {
+          getStockQuote: async (code) => storageData.quotes[code] || null,
+          getIndexSpot: async () => storageData.indexSpot || []
+        },
+        Util: { stockCodePrefix: (c) => /^(60|68)/.test(c) ? 'sh' : 'sz' },
+        Constants: _loadRealConstants()
+      };
+      pctx.Core = pctx.window.Core;
+      pctx.window.document = { getElementById: () => null };
+      pctx.document = pctx.window.document;
+      vm.createContext(pctx);
+      vm.runInContext(paperSrc, pctx);
+      return pctx;
+    };
+    const PC = buildCtx(storeC).window.Paper;
+    await PC.init();
+
+    // 44.a 建第 1 张 000001 below 单 → 通过 (paper_cond_orders 存在 kv)
+    const r1 = await PC.addCondOrder({
+      code: '000001', triggerDirection: 'below', triggerPrice: 10,
+      stopLoss: 9, targetPrice: 12, shares: 100
+    });
+    const kvList = (storeC.kv.paper_cond_orders || []);
+    if (r1.ok && kvList.length === 1 && kvList[0].code === '000001') {
+      ok('44.a 第 1 张单: 通过 + 入库 kv.paper_cond_orders (1 条)');
+    } else fail('44.a', 'r1.ok=' + r1.ok + ' kvLen=' + kvList.length + ' r1=' + JSON.stringify(r1));
+
+    // 44.b 重复建同代码 000001 below → 拒绝 (已有 pending)
+    const r2 = await PC.addCondOrder({
+      code: '000001', triggerDirection: 'below', triggerPrice: 9.5,
+      stopLoss: 8.5, targetPrice: 11, shares: 100
+    });
+    if (!r2.ok && r2.errors && r2.errors[0].includes('同代码 000001 已有未触发')) {
+      ok('44.b 同代码重复 pending → 拒绝 (错误文案明确指向 "已有未触发")');
+    } else fail('44.b', JSON.stringify(r2));
+
+    // 44.c 同代码 000001 改 above 方向 (加仓场景) → 仍拒绝 (Bug C 严禁同代码不论方向)
+    const r3 = await PC.addCondOrder({
+      code: '000001', triggerDirection: 'above', triggerPrice: 11,
+      stopLoss: 10, targetPrice: 13, shares: 100
+    });
+    if (!r3.ok && r3.errors && r3.errors[0].includes('同代码')) {
+      ok('44.c 同代码 + 不同方向 (above) → 拒绝 (addCondOrder 只认 code 不认方向)');
+    } else fail('44.c', JSON.stringify(r3));
+
+    // 44.d 清掉 pending, 加一个 short 持仓, 再建同代码 → 拒绝 (已持仓)
+    storeC.kv.paper_cond_orders = [];
+    storeC.tables.paper_holdings = [{
+      code: '000001', name: '平安银行', shares: 100, costPrice: 10, sleeve: 'short',
+      boughtAt: Date.now(), source: 'ai'
+    }];
+    const r4 = await PC.addCondOrder({
+      code: '000001', triggerDirection: 'above', triggerPrice: 11,
+      stopLoss: 10, targetPrice: 13, shares: 100
+    });
+    if (!r4.ok && r4.errors && r4.errors[0].includes('已持有 000001 短线仓位')) {
+      ok('44.d 已持仓 short + 新建同代码 → 拒绝 (已持仓错误文案)');
+    } else fail('44.d', JSON.stringify(r4));
+
+    // 44.e 长线持仓 (sleeve=long) 不算短线的"同代码已持仓", 短线条件单允许
+    storeC.tables.paper_holdings = [{
+      code: '000001', name: '平安银行', shares: 1000, costPrice: 10, sleeve: 'long',
+      boughtAt: Date.now(), source: 'manual'
+    }];
+    const r5 = await PC.addCondOrder({
+      code: '000001', triggerDirection: 'below', triggerPrice: 10,
+      stopLoss: 9, targetPrice: 12, shares: 100
+    });
+    if (r5.ok && (storeC.kv.paper_cond_orders || []).length === 1) {
+      ok('44.e 长线持仓不影响短线条件单 (sleeve 隔离)');
+    } else fail('44.e', JSON.stringify(r5));
+
+    // 44.f 不同代码 → 通过 (去重只在同 code 内)
+    // 短线现金 30000, 选 000002 @ 5 元 × 1000 股 = 5000 (LOT_SIZE=100 → 1000 是 10 手, 可行)
+    // LOT_SIZE 是 100, 1000 股 = 10 手, valid. 5000 < 30000 + fee, 通过
+    const r6 = await PC.addCondOrder({
+      code: '000002', triggerDirection: 'below', triggerPrice: 5,
+      stopLoss: 4.5, targetPrice: 6, shares: 1000
+    });
+    if (r6.ok && (storeC.kv.paper_cond_orders || []).length === 2) {
+      ok('44.f 不同代码 → 通过 (去重不跨 code)');
+    } else fail('44.f', JSON.stringify(r6));
+  } catch (e) {
+    fail('44 Bug C 同代码去重', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
 // ========== 总结 ==========
 // 同步 section 的 ok() 已经在 console 打印;
 // async IIFE 里的 ok() 还在 microtask / setTimeout 队列里, 旧版本 setImmediate 只给一次机会,
