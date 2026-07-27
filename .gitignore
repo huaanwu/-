@@ -27,3 +27,4 @@ emu_screenshots/
 *.log.*
 android/
 .claude/
+www/sw.js

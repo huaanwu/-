@@ -6,7 +6,8 @@
  *   - 行情 / LLM / akshare / Supabase API: network-only (不缓存, 数据要实时)
  *   - navigation: network-first → 失败 fallback cache
  *
- * 升级: 改 CACHE_NAME 版本号, 旧 cache 会自动清理
+ * 升级: CACHE_NAME 由 scripts/build-web.mjs 在每次 build 时自动重写为时间戳
+ *       (拷到 www/sw.js 的产物上), 源文件此处保持占位, 无需手改版本号
  */
 const CACHE_NAME = 'stockmaster-v1';
 const SHELL = [

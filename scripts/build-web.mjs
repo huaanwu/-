@@ -126,6 +126,18 @@ async function main() {
     }
   }
 
+  // 3.6) Service Worker 缓存版本戳: 每次 build 重写 www/sw.js 的 CACHE_NAME
+  //      (cache-first 策略下, CACHE_NAME 不变 → 旧 SW 永远供旧资源, APK/浏览器"打到旧版")
+  //      源文件 www/public/sw.js 保持占位, 不污染 git
+  const swOut = path.join(WWW, 'sw.js');
+  if (await exists(swOut)) {
+    let sw = await fs.readFile(swOut, 'utf-8');
+    const stamp = `stockmaster-${Date.now()}`;
+    sw = sw.replace(/const CACHE_NAME = '[^']*';/, `const CACHE_NAME = '${stamp}';`);
+    await fs.writeFile(swOut, sw);
+    console.log(`  [sw] CACHE_NAME → ${stamp} (旧缓存随新 SW activate 自动清理)`);
+  }
+
   // 4) 清理 dist/
   await rimraf(DIST);
 
