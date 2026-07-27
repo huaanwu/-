@@ -25,6 +25,7 @@ export default defineConfig({
         '/app/fund/news-impact.js',
         '/app/fund/rebalance.js',
         '/app/fund/buy-import.js',
+        '/app/fund/weekly-report.js',
         '/app/account.js',
         '/app/market-bar.js',
         '/core/ai-service.js',
