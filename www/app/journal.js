@@ -882,7 +882,7 @@ ${content.slice(0, 800)}
         btn.disabled = true;
       }
       // scroll-into-view 让用户看到进度
-      try { card.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); } catch (e) {}
+      try { card.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); } catch (e) { console.warn('[Journal] scrollIntoView 失败:', e); }
 
       try {
         const aiCfg = (window.Core && Core.AI) ? Core.AI.getConfig() : null;

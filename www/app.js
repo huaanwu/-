@@ -736,7 +736,7 @@ window.exportTodaySnapshot = async function() {
   // 拉实时价 (并行, 失败降级)
   const stockQuotes = {};
   await Promise.all(holdings.map(async h => {
-    try { const q = await Core.Data.getStockQuote(h.code); if (q) stockQuotes[h.code] = parseFloat(q.最新价 ?? q.price ?? 0); } catch (e) {}
+    try { const q = await Core.Data.getStockQuote(h.code); if (q) stockQuotes[h.code] = parseFloat(q.最新价 ?? q.price ?? 0); } catch (e) { console.warn('[snapshot] 拉行情失败:', h.code, e); }
   }));
   const fundNavs = {};
   await Promise.all(funds.map(async f => {
@@ -748,7 +748,7 @@ window.exportTodaySnapshot = async function() {
         const nav = parseFloat(last.单位净值 || last['单位净值'] || last.value);
         if (nav) fundNavs[f.code] = nav;
       }
-    } catch (e) {}
+    } catch (e) { console.warn('[snapshot] 拉净值失败:', f.code, e); }
   }));
 
   // 算

@@ -180,7 +180,7 @@
     async refresh(group) {
       _memCache[group] = null;
       if (window.Core && Core.Storage) {
-        try { await Core.Storage.cacheSet(`market_${group}`, null, 0); } catch (e) {}
+        try { await Core.Storage.cacheSet(`market_${group}`, null, 0); } catch (e) { console.warn('[Market] 清缓存失败:', e); }
       }
       return this.get(group);
     },
