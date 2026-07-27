@@ -4575,6 +4575,93 @@ section('[34] Z6 Core.AICallLog (AI 调用 trace + 审计)');
   }
 })();
 
+// ========== [35] Z7 月度教训提炼 (summarizeMonth + formatMonthReportForPrompt) ==========
+section('[35] Z7 月度复盘报告 (汇总所有 Z2/Z3/Z5 信号)');
+
+(async () => {
+  try {
+    const ds = await import(require('url').pathToFileURL(path.join(ROOT, 'scripts/daily_summary.mjs')).href);
+
+    // ---- 35.1 空数据 → 引导提示 ----
+    const empty = ds.summarizeMonth([], { month: '2026-07' });
+    if (empty.total === 0 && empty.hitRate === 0 && empty.oneThing.includes('暂无')) {
+      ok('Z7.1 空数据 → total=0 / 引导提示');
+    } else fail('Z7.1 空', JSON.stringify(empty));
+
+    // ---- 35.2 命中率: 对+部分×0.5 / 总 ----
+    const r1 = ds.summarizeMonth([
+      { aiVerified: { verdict: '对' }, assumption: 'A' },
+      { aiVerified: { verdict: '错' }, assumption: 'A' },
+      { aiVerified: { verdict: '部分' }, assumption: 'A' }
+    ], { month: '2026-07' });
+    // hits = 1 + 0 + 0.5 = 1.5, hitRate = 1.5/3 = 50%
+    if (r1.total === 3 && r1.hitRate === 50) ok('Z7.2 命中率: (1+0+0.5)/3 = 50%');
+    else fail('Z7.2 命中率', JSON.stringify({ total: r1.total, hr: r1.hitRate }));
+
+    // ---- 35.3 topAssumption: 样本 >=3 才入 ----
+    const r2 = ds.summarizeMonth([
+      // A: 4 次全对 (100%)
+      { aiVerified: { verdict: '对', lesson: 'l1' }, assumption: 'A' },
+      { aiVerified: { verdict: '对', lesson: 'l1' }, assumption: 'A' },
+      { aiVerified: { verdict: '对', lesson: 'l1' }, assumption: 'A' },
+      { aiVerified: { verdict: '对', lesson: 'l1' }, assumption: 'A' },
+      // B: 5 次全错 (0%)
+      { aiVerified: { verdict: '错', attribution: '追高', lesson: 'l2' }, assumption: 'B' },
+      { aiVerified: { verdict: '错', attribution: '追高', lesson: 'l2' }, assumption: 'B' },
+      { aiVerified: { verdict: '错', attribution: '追高', lesson: 'l2' }, assumption: 'B' },
+      { aiVerified: { verdict: '错', attribution: '追高', lesson: 'l2' }, assumption: 'B' },
+      { aiVerified: { verdict: '错', attribution: '追高', lesson: 'l2' }, assumption: 'B' },
+      // C: 1 次 (样本不足, 不入排名)
+      { aiVerified: { verdict: '对' }, assumption: 'C' }
+    ]);
+    if (r2.topAssumption.best && r2.topAssumption.best.assumption === 'A' && r2.topAssumption.best.winRate === 100 &&
+        r2.topAssumption.worst && r2.topAssumption.worst.assumption === 'B' && r2.topAssumption.worst.winRate === 0) {
+      ok('Z7.3 topAssumption: best=A 100% / worst=B 0% (C 样本 <3 不入)');
+    } else fail('Z7.3 topAssumption', JSON.stringify(r2.topAssumption));
+
+    // ---- 35.4 topAttribution: 最常见错因 ----
+    if (r2.topAttribution === '追高') ok('Z7.4 topAttribution: 5/5 错都 "追高"');
+    else fail('Z7.4 attribution', r2.topAttribution);
+
+    // ---- 35.5 topLessons: 高频教训 Top 3 ----
+    if (r2.topLessons.length > 0 && r2.topLessons[0].includes('l2') && r2.topLessons[0].includes('5次')) {
+      ok('Z7.5 topLessons: l2 (5次) 排第一 (count 降序)');
+    } else fail('Z7.5 topLessons', JSON.stringify(r2.topLessons));
+
+    // ---- 35.6 oneThing: worst assumption 时优先 ----
+    if (r2.oneThing.includes('B') && r2.oneThing.includes('0%') && r2.oneThing.includes('放弃')) {
+      ok('Z7.6 oneThing: worst assumption (B 0%) → 建议放弃/加严入场');
+    } else fail('Z7.6 oneThing', r2.oneThing);
+
+    // ---- 35.7 calibration: 复用 computeCalibration (无 confidence → samples=0) ----
+    if (r2.calibration.samples === 0 && r2.calibration.brierScore === null) {
+      ok('Z7.7 calibration: 无 confidence 字段 → samples=0 / BS=null (Z3 安全降级)');
+    } else fail('Z7.7 cal', JSON.stringify(r2.calibration));
+
+    // ---- 35.8 fallback: 无 worst 时用 attribution ----
+    const noWorst = ds.summarizeMonth([
+      { aiVerified: { verdict: '对' }, assumption: 'A' },
+      { aiVerified: { verdict: '对' }, assumption: 'A' }
+    ]);
+    if (noWorst.oneThing.includes('积累中') || noWorst.oneThing.includes('命中率')) {
+      ok('Z7.8 fallback: 样本不足无 worst → 命中率高/积累中提示');
+    } else fail('Z7.8 fallback', noWorst.oneThing);
+
+    // ---- 35.9 formatMonthReportForPrompt: 完整报告 ----
+    const fmt = ds.formatMonthReportForPrompt(r2);
+    if (fmt.includes('2026-') && fmt.includes('月度复盘') && fmt.includes('命中率') && fmt.includes('最准假设') && fmt.includes('最差假设') && fmt.includes('最常见错因') && fmt.includes('下月重点') && fmt.includes('追高') && fmt.includes('B')) {
+      ok('Z7.9 formatMonthReport: 含命中/最准/最差/归因/教训/下月重点');
+    } else fail('Z7.9 渲染', fmt.slice(0, 300));
+
+    // ---- 35.10 formatMonthReportForPrompt: 空 → ⚠ ----
+    const fmt0 = ds.formatMonthReportForPrompt(ds.summarizeMonth([]));
+    if (fmt0.includes('⚠')) ok('Z7.10 空渲染 → 引导写日记');
+    else fail('Z7.10 空渲染', fmt0);
+  } catch (e) {
+    fail('Z7 月度', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
 // ========== 总结 ==========
 // 同步 section 的 ok() 已经在 console 打印;
 // async IIFE 里的 ok() 还在 microtask 队列里, 用 setImmediate 给一次机会再读 passed/failed

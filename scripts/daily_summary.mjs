@@ -812,6 +812,121 @@ function formatRecalledLessonsForPrompt(recalled) {
   return lines.join('\n');
 }
 
+/**
+ * Z7: 月度教训提炼 - 把当月所有已验证复盘浓缩成一份报告
+ * @param notes Array 已过滤好当月的笔记
+ * @returns {
+ *   month: 'YYYY-MM',
+ *   total, hitRate,             // 总数 + 命中率 (对+部分×0.5 / 总)
+ *   topAssumption,              // 命中率最高/最低的假设 (>=3 样本)
+ *   topLessons: string[],       // Top 3 高频教训
+ *   topAttribution: string,     // 最常见的错因
+ *   oneThing: string,           // 一句话总结: "本月最该改的一件事"
+ *   calibration: { brierScore, samples }  // 月度校准 (样本少时可能 null)
+ * }
+ */
+function summarizeMonth(notes, opts = {}) {
+  const arr = Array.isArray(notes) ? notes.filter(n => n && n.aiVerified) : [];
+  if (arr.length === 0) {
+    return {
+      month: opts.month || new Date().toISOString().slice(0, 7),
+      total: 0,
+      hitRate: 0,
+      topAssumption: null,
+      topLessons: [],
+      topAttribution: null,
+      oneThing: '本月暂无已验证的复盘数据, 多写日记并跑 verify 即可累积',
+      calibration: { brierScore: null, samples: 0 }
+    };
+  }
+
+  // 1) 命中率
+  let hits = 0;
+  for (const n of arr) {
+    if (n.aiVerified.verdict === '对') hits += 1;
+    else if (n.aiVerified.verdict === '部分') hits += 0.5;
+  }
+  const hitRate = +(hits / arr.length * 100).toFixed(1);
+
+  // 2) Top assumption (复用 getVerifyStats)
+  const stats = getVerifyStats(arr);
+  let topHit = null, topMiss = null;
+  for (const a of Object.keys(stats.byAssumption)) {
+    const x = stats.byAssumption[a];
+    if (x.total >= 3) {
+      if (!topHit || x.winRate > topHit.winRate) topHit = { assumption: a, ...x };
+      if (!topMiss || x.winRate < topMiss.winRate) topMiss = { assumption: a, ...x };
+    }
+  }
+  const topAssumption = {
+    best: topHit ? { assumption: topHit.assumption, winRate: topHit.winRate, total: topHit.total } : null,
+    worst: topMiss ? { assumption: topMiss.assumption, winRate: topMiss.winRate, total: topMiss.total } : null
+  };
+
+  // 3) Top 3 lessons (复用 buildStructuredLessons)
+  const lessonsObj = buildStructuredLessons(arr, { minCount: 1, maxLessons: 3 });
+  const topLessons = lessonsObj.lessons.map(l => `${l.lesson} (${l.count}次)`);
+
+  // 4) Top attribution
+  const attEntries = Object.entries(stats.byAttribution).sort((a, b) => b[1] - a[1]);
+  const topAttribution = attEntries.length > 0 ? attEntries[0][0] : null;
+
+  // 5) 一句话: 优先 worst assumption → fallback top attribution → fallback total
+  let oneThing;
+  if (topMiss) {
+    oneThing = `${topMiss.assumption} 假设本月命中率仅 ${topMiss.winRate}% (${topMiss.total} 次), 下月考虑放弃或加更严的入场条件`;
+  } else if (topAttribution) {
+    oneThing = `本月最常见的错因是 "${topAttribution}", 建议复盘入场流程`;
+  } else if (arr.length >= 3) {
+    oneThing = `本月命中率 ${hitRate}%, ${hits} 对 / ${arr.length} 总, 保持节奏`;
+  } else {
+    oneThing = `数据积累中 (本月 ${arr.length} 条), 多写日记跑 verify`;
+  }
+
+  // 6) 月度校准
+  const cal = computeCalibration(arr);
+
+  return {
+    month: opts.month || new Date().toISOString().slice(0, 7),
+    total: arr.length,
+    hitRate,
+    topAssumption,
+    topLessons,
+    topAttribution,
+    oneThing,
+    calibration: { brierScore: cal.brierScore, samples: cal.samples }
+  };
+}
+
+/**
+ * Z7: 把月度报告渲染为中文 (适合直接 push 给用户的格式)
+ */
+function formatMonthReportForPrompt(report) {
+  if (!report || report.total === 0) {
+    return '⚠ 本月暂无已验证的复盘, 建议先写几条日记并在到期时跑 verify';
+  }
+  const lines = [`📅 **${report.month} 月度复盘** (${report.total} 条已验证)`];
+  lines.push(`- **命中率**: ${report.hitRate}% (${report.hitRate >= 60 ? '良好 ✅' : report.hitRate >= 40 ? '中等 ⚡' : '偏低 ⚠️'})`);
+  if (report.topAssumption.best) {
+    lines.push(`- **最准假设**: ${report.topAssumption.best.assumption} (${report.topAssumption.best.winRate}%, ${report.topAssumption.best.total} 次)`);
+  }
+  if (report.topAssumption.worst) {
+    lines.push(`- **最差假设**: ${report.topAssumption.worst.assumption} (${report.topAssumption.worst.winRate}%, ${report.topAssumption.worst.total} 次)`);
+  }
+  if (report.topAttribution) {
+    lines.push(`- **最常见错因**: ${report.topAttribution}`);
+  }
+  if (report.topLessons.length > 0) {
+    lines.push(`- **本月教训 Top ${report.topLessons.length}**:`);
+    report.topLessons.forEach(l => lines.push(`  - ${l}`));
+  }
+  if (report.calibration.samples > 0 && report.calibration.brierScore != null) {
+    lines.push(`- **校准**: Brier ${report.calibration.brierScore} (n=${report.calibration.samples})`);
+  }
+  lines.push(`- **🎯 下月重点**: ${report.oneThing}`);
+  return lines.join('\n');
+}
+
 // ==================== 拉个股行情 (事后验证用) ====================
 /**
  * Y7: 改用 stock_zh_a_hist (K 线接口, 接受 symbol), 取最后一根日线的收盘价 = 当前价
@@ -1082,6 +1197,8 @@ export {
   buildStructuredLessons,
   recallLessons,
   formatRecalledLessonsForPrompt,
+  summarizeMonth,
+  formatMonthReportForPrompt,
   runVerify,
   fetchUsIndices,
   buildEconomicCalendar,
