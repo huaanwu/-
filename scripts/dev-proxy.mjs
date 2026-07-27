@@ -202,16 +202,18 @@ app.use('/api/eastmoney', (req, res) => {
   });
 });
 
-// 腾讯 / 新浪行情代理 (解决浏览器 fetch hq.sinajs.cn 的 CORS / Referer 问题)
-// 用法: /api/tencent/{rest} → https://hq.sinajs.cn/{rest}
-// 注意: hq.sinajs.cn 必须带 Referer: https://finance.sina.com.cn/ 否则返回 401
+// 腾讯行情代理 (qt.gtimg.cn 备用通道, 浏览器直连失败时 fallback)
+// 用法: /api/tencent/{rest} → https://qt.gtimg.cn/{rest}
+// 主用通道: www/core/data.js _tencentFetch 直连 https://qt.gtimg.cn (CORS 友好)
+// 此 proxy 用于: 某些环境下 qt.gtimg.cn 被运营商劫持/限流, 改走本机 dev-proxy
 app.use('/api/tencent', createProxyMiddleware({
-  target: 'https://hq.sinajs.cn',
+  target: 'https://qt.gtimg.cn',
   changeOrigin: true,
   pathRewrite: (path) => path,
   onProxyReq: (proxyReq, req) => {
-    proxyReq.setHeader('Referer', 'https://finance.sina.com.cn/');
-    console.log(`[tencent] ${req.method} ${req.url} → hq.sinajs.cn${req.url}`);
+    proxyReq.setHeader('Referer', 'https://gu.qq.com/');
+    proxyReq.setHeader('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+    console.log(`[tencent] ${req.method} ${req.url} → qt.gtimg.cn${req.url}`);
   },
   onError: (err, req, res) => {
     console.error(`[tencent] ${req.method} ${req.url} → ${err.message}`);
@@ -327,7 +329,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   /api/discover/local-llm → scan ${DISCOVER_PORTS.length} ports × N hosts (server-side)`);
   console.log(`   /api/discover/dev-proxy → 暴露 serverIPs (给 APK 局域网自动发现用)`);
   console.log(`   /api/local/* → ${LOCAL_LLM_TARGET} (本地大模型透传, 绕浏览器 CORS)`);
-  console.log(`   /api/tencent/* → hq.sinajs.cn (腾讯/新浪行情代理, 绕 CORS + 加 Referer)`);
+  console.log(`   /api/tencent/* → qt.gtimg.cn (腾讯行情备用通道, 主用 data.js 直连)`);
   console.log(`   Health: http://127.0.0.1:${PORT}/health`);
   console.log('');
   console.log('⚠️  Make sure AKShare is running:');
