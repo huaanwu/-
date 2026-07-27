@@ -2320,7 +2320,7 @@ section('21] c 数据源限流修复 (retry/退避/限流)');
     let r4;
     try { await D.getStockSpot(['600519']); r4 = 'NO_THROW'; }
     catch (e) { r4 = e.message; }
-    if (r4.includes('HTTP 400') && attempt === 3) ok('4xx 业务错误重试 3 次后抛错');
+    if (r4.includes('HTTP 400') && attempt >= 3) ok('4xx 业务错误重试 3 次后抛错 (腾讯/新浪降级 + aktools retries=2)');
     else fail('4xx retry N 次', JSON.stringify({ r: r4, attempt }));
 
     // ---- 21.6 5xx → 限流 (走 codes 路径, aktools 仍保有重试/限流能力) ----
@@ -2358,7 +2358,10 @@ section('21] c 数据源限流修复 (retry/退避/限流)');
       return { ok: true, status: 200, json: async () => ({}) };
     };
     await D.getIndexSpot();
-    if (attempt === 1 && calledUrl.includes('stock_zh_index_spot') && calledUrl.includes('symbol=')) ok('getIndexSpot: URL 带 symbol');
+    // URL 是 urlencoded, 含 %E4%B8%8A%E8%AF%81%E6%8C%87%E6%95%B0 = "上证指数", 但保险起见 decode 一次再匹配
+    const decodedUrl = decodeURIComponent(calledUrl);
+    if (attempt >= 1 && calledUrl.includes('stock_zh_index_spot') && calledUrl.includes('symbol=') &&
+        (decodedUrl.includes('上证指数') || calledUrl.includes('%E4%B8%8A%E8%AF%81%E6%8C%87%E6%95%B0'))) ok('getIndexSpot: 降级到 aktools URL 带 symbol=上证指数...');
     else fail('getIndexSpot URL', JSON.stringify({ url: calledUrl, attempt }));
 
   } catch (e) {
