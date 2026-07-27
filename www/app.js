@@ -210,6 +210,13 @@ window._renderSettings = function() {
       </div>
     </div>
     <div class="form-row">
+      <label>🔧 服务自检 (APK 在外网/连不上后端时点这个)</label>
+      <button class="btn" onclick="selfCheckServices()">▶ 一键自检 dev-proxy / aktools / LLM</button>
+      <span id="selfCheckResult" style="font-size:12px;color:var(--text-muted);margin-left:8px;"></span>
+    </div>
+    <div id="selfCheckList" style="margin-top:8px;"></div>
+
+    <div class="form-row">
       <label>AKShare 代理地址</label>
       <input type="text" id="settingProxyBase" value="${escapeHtml(state.proxyBase)}"
              placeholder="/api/akshare 或 http://192.168.1.3:8089/api/akshare">
@@ -517,6 +524,103 @@ window.testLocalAI = async function() {
   } catch (e) {
     el.innerHTML = '✗ ' + escapeHtml(e.message);
     el.style.color = 'var(--down)';
+  }
+};
+
+// 服务自检 (Phase Z) — 一键看 dev-proxy / aktools / 本地 LLM 是否在线
+window.selfCheckServices = async function() {
+  const status = document.getElementById('selfCheckResult');
+  const list = document.getElementById('selfCheckList');
+  if (status) { status.textContent = '⏳ 自检中...'; status.style.color = 'var(--text-muted)'; }
+  if (list) list.innerHTML = '';
+
+  const proxyBase = (Core.State.get().proxyBase || '/api/akshare').replace(/\/api\/.*$/, '');
+  // proxyBase 可能形如 http://192.168.x.x:8089/api/akshare → 截到 :8089
+
+  const checks = [
+    {
+      name: 'dev-proxy',
+      desc: 'Node 代理 (行情/行业/LLM/扫描 都在这里)',
+      test: async () => {
+        const start = Date.now();
+        const r = await fetch(proxyBase + '/health', { cache: 'no-store' });
+        const j = await r.json();
+        return { ok: r.ok, latencyMs: Date.now() - start, detail: 'akshare_target=' + (j.akshare_target || '?') };
+      }
+    },
+    {
+      name: 'aktools',
+      desc: 'Python AKShare 后端 (深度财务/龙虎榜 等)',
+      test: async () => {
+        const start = Date.now();
+        // aktools /api/public 接口较多, 用 stock_zh_a_spot 单只代码做 probe
+        const r = await fetch(proxyBase + '/api/akshare/stock_zh_a_spot?symbol=000001', { cache: 'no-store' });
+        const t = await r.text();
+        const ok = r.ok && t.length > 100 && t.trim().startsWith('[');
+        return { ok, latencyMs: Date.now() - start, detail: t.length > 200 ? `${t.length} bytes` : t.slice(0, 80) };
+      }
+    },
+    {
+      name: '本地大模型',
+      desc: '扫描局域网 qwen/Ollama/LM Studio',
+      test: async () => {
+        const start = Date.now();
+        const r = await Core.AI.discoverLocalLLM();
+        return {
+          ok: r.found.length > 0,
+          latencyMs: Date.now() - start,
+          detail: `${r.found.length} 个候选 (扫了 ${r.scanned} 个端点, dev-proxy 在 ${r.host})`
+        };
+      }
+    }
+  ];
+
+  const results = [];
+  for (const c of checks) {
+    try {
+      const r = await c.test();
+      results.push({ ...c, ...r, error: null });
+    } catch (e) {
+      results.push({ ...c, ok: false, latencyMs: 0, detail: '', error: e.message });
+      console.warn('[selfCheck] ' + c.name + ' 错误:', e);
+    }
+  }
+
+  const allOk = results.every(r => r.ok);
+  const someOk = results.some(r => r.ok);
+  if (status) {
+    status.textContent = allOk
+      ? '✅ 全部服务正常'
+      : (someOk ? '⚠️ 部分服务异常' : '❌ 全部服务不可用 (手机端请检查 dev-proxy 是否在 PC 跑)');
+    status.style.color = allOk ? 'var(--up)' : (someOk ? 'var(--accent)' : 'var(--down)');
+  }
+  if (list) {
+    list.innerHTML = results.map((r, i) => {
+      const tag = r.ok
+        ? `<span style="color:var(--up);font-weight:600;">✅</span>`
+        : (r.error ? `<span style="color:var(--down);font-weight:600;">❌</span>` : `<span style="color:var(--down);font-weight:600;">❌</span>`);
+      const ms = r.latencyMs ? `${r.latencyMs}ms` : '-';
+      const detail = r.error ? `<code style="color:var(--down);">${escapeHtml(r.error)}</code>` : escapeHtml(r.detail || '');
+      return `
+        <div style="padding:8px 10px;border:1px solid var(--border);border-radius:6px;margin-bottom:6px;font-size:12px;line-height:1.6;">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <div>${tag} <b>${escapeHtml(r.name)}</b> <span style="color:var(--text-muted);">— ${escapeHtml(r.desc)}</span></div>
+            <div style="font-size:11px;color:var(--text-muted);">${ms}</div>
+          </div>
+          ${detail ? `<div style="margin-top:4px;color:var(--text-muted);font-size:11px;">${detail}</div>` : ''}
+        </div>`;
+    }).join('');
+    // 故障提示
+    if (!allOk) {
+      list.innerHTML += `
+        <div style="margin-top:8px;padding:8px;background:var(--bg-base);border-radius:6px;font-size:11px;color:var(--text-muted);line-height:1.7;">
+          <b>修复步骤</b>:<br>
+          ① 在 PC 上跑 <code>gst-dev</code> 起 dev-proxy + vite<br>
+          ② 跑 <code>python -m aktools --host 127.0.0.1 --port 8088</code><br>
+          ③ 确认 PC 的 IP 在手机能 ping 通<br>
+          ④ 在 AKShare 代理地址 输入 <code>http://PC的IP:8089/api/akshare</code>
+        </div>`;
+    }
   }
 };
 

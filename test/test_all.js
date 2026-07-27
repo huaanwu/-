@@ -7043,6 +7043,84 @@ section('[40] ShortTrader T4 学习环: _judgeClosedTrade 全分支 / verify 扫
   }
 })();
 
+// ========== [41] Z 服务自检面板 (dev-proxy / aktools / 本地 LLM) ==========
+(async () => {
+  section('[41] Z 服务自检面板');
+  try {
+    const appSrc = readFileSafe(path.join(WWW, 'app.js'));
+    if (!appSrc) { fail('41.a', 'app.js 缺失'); return; }
+    if (/window\.selfCheckServices\s*=/.test(appSrc)) {
+      ok('41.a app.js 定义 window.selfCheckServices');
+    } else fail('41.a', 'selfCheckServices 函数缺失');
+
+    if (/id="selfCheckResult"/.test(appSrc) && /id="selfCheckList"/.test(appSrc)) {
+      ok('41.b settings UI 注入 selfCheckResult + selfCheckList 两个 ID');
+    } else fail('41.b', 'settings UI 缺 selfCheck* 容器');
+
+    if (/fetch\([^)]*\/health/.test(appSrc) && /stock_zh_a_spot/.test(appSrc) && /Core\.AI\.discoverLocalLLM/.test(appSrc)) {
+      ok('41.c 三个探测项都在 (dev-proxy /health + aktools stock_zh_a_spot + 本地 LLM discoverLocalLLM)');
+    } else fail('41.c', '三个探测项任一缺失');
+
+    if (/(?:const|let|var) allOk = results\.every/.test(appSrc) && /修复步骤/.test(appSrc)) {
+      ok('41.d 故障状态渲染 (allOk 配色 + 修复步骤提示)');
+    } else fail('41.d', '故障展示不完整');
+
+    // 41.e runtime 行为模拟: 把 selfCheckServices 拉到 vm 里跑 (mock fetch + Core.AI.discoverLocalLLM)
+    const fetchCalls = [];
+    const fetchMock = async (url) => {
+      fetchCalls.push(url);
+      if (url.includes('/health')) return { ok: true, status: 200, json: async () => ({ status: 'ok', akshare_target: 'http://127.0.0.1:8088' }) };
+      if (url.includes('stock_zh_a_spot')) return { ok: true, status: 200, text: async () => '[' + 'x'.repeat(200) };
+      return { ok: false, status: 500, text: async () => '' };
+    };
+    const ctx41 = vm.createContext({
+      window: {}, console,
+      document: {
+        getElementById: (id) => {
+          if (id === 'selfCheckResult' || id === 'selfCheckList') {
+            return { textContent: '', innerHTML: '', style: {} };
+          }
+          return null;
+        },
+        querySelector: () => null,
+        querySelectorAll: () => [],
+        addEventListener: () => {}
+      },
+      localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+      navigator: { clipboard: { writeText: async () => {} } },
+      location: { reload: () => {}, href: '' },
+      history: { pushState: () => {} },
+      fetch: fetchMock,
+      setTimeout: (fn, ms) => Promise.resolve().then(fn),
+      clearTimeout: () => {},
+      Promise,
+      Date,
+      Math,
+      JSON,
+      console,
+      escapeHtml: (s) => String(s),
+      Core: {
+        State: { get: () => ({ proxyBase: '/api/akshare' }) },
+        AI: { discoverLocalLLM: async () => ({ found: [{ host: '127.0.0.1', port: 8082, models: ['qwen3'] }], scanned: 4, host: '127.0.0.1' }) },
+        // app.js 顶层会解引用这些, 但 selfCheckServices 不依赖它们, 给个空 stub 避免顶层赋值炸
+        Router: { switchPage: () => {}, goSettings: () => {} },
+        Util: { escapeHtml: (s) => String(s) },
+        Toast: { success: () => {}, error: () => {} },
+        Storage: { all: async () => [], kvGet: async () => null, kvSet: async () => {} }
+      }
+    });
+    vm.runInContext(appSrc, ctx41);
+    if (typeof ctx41.window.selfCheckServices !== 'function') { fail('41.e selfCheckServices 不可调用', ''); return; }
+    await ctx41.window.selfCheckServices();
+    const healthHit = fetchCalls.some(u => u.includes('/health'));
+    const spotHit = fetchCalls.some(u => u.includes('stock_zh_a_spot'));
+    if (healthHit && spotHit) ok('41.e 自检函数运行时: 同时触发 dev-proxy /health + aktools /stock_zh_a_spot');
+    else fail('41.e runtime', 'fetch 调用不完整: ' + fetchCalls.join(' | '));
+  } catch (e) {
+    fail('41 Z 自检', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
 // ========== 总结 ==========
 // 同步 section 的 ok() 已经在 console 打印;
 // async IIFE 里的 ok() 还在 microtask / setTimeout 队列里, 旧版本 setImmediate 只给一次机会,
