@@ -2142,6 +2142,8 @@ section('21] c 数据源限流修复 (retry/退避/限流)');
     if (r6 && typeof r6 === 'object' && r6.ret === 'cached' && attempt === 0 && cacheGetCalled >= 1) ok('限流期缓存命中不发请求');
     else fail('限流期缓存命中', JSON.stringify({ r: r6, attempt, cacheGetCalled }));
 
+    D.resetLimit();
+
     // ---- 21.8 getIndexSpot 用 symbol 参数 ----
     D.resetLimit();
     attempt = 0;
@@ -2158,6 +2160,164 @@ section('21] c 数据源限流修复 (retry/退避/限流)');
 
   } catch (e) {
     fail('c 数据源限流修复', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [22] Y12 腾讯 K 线 fetcher ==========
+// 独立 IIFE: 不依赖 [21] (避免 21.5 retry bug 阻塞 Y12 跑不到)
+(async () => {
+  try {
+    const DS = {
+      console,
+      setTimeout, clearTimeout,
+      URLSearchParams,
+      Core: {
+        State: { get: (k) => k === 'proxyBase' ? '/api/akshare' : null },
+        Storage: {
+          cacheGet: async () => null,
+          cacheSet: async () => {}
+        }
+      },
+      fetch: async () => ({ ok: false, status: 500, text: async () => 'error' })
+    };
+    DS.window = DS;
+    vm.createContext(DS);
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/data.js')), DS);
+    const D = DS.window.Core.Data;
+    D.resetLimit();
+    DS.Core.Storage.cacheGet = async () => null;
+
+    // 22.Y12.1 _tencentKLine 字段归一化 (mock 腾讯返回)
+    let tencentUrls = [];
+    DS.fetch = async (url) => {
+      tencentUrls.push(url);
+      return {
+        ok: true, status: 200,
+        text: async () => JSON.stringify({
+          code: 0, msg: '',
+          data: {
+            sh600519: {
+              qfqday: [
+                ['2024-07-10', 1700.50, 1710.20, 1720.00, 1695.30, 12345, '...', 1.23e9, 1.45, 0.57, 9.70, 0.42],
+                ['2024-07-11', 1710.00, 1705.50, 1715.00, 1700.10, 11000, '...', 1.10e9, 0.87, -0.28, -4.70, 0.38]
+              ]
+            }
+          }
+        })
+      };
+    };
+    const klineRows = await D._tencentKLine('600519', 'day', '2024-07-10', '2024-07-11', 5, 'qfq');
+    const symbolOK = tencentUrls[0] && tencentUrls[0].includes('sh600519');
+    if (klineRows.length === 2
+      && klineRows[0].日期 === '2024-07-10'
+      && klineRows[0].开盘 === 1700.50
+      && klineRows[0].收盘 === 1710.20
+      && klineRows[0].最高 === 1720.00
+      && klineRows[0].最低 === 1695.30
+      && klineRows[0].成交量 === 12345 * 100
+      && klineRows[0].成交额 === 1.23e9
+      && klineRows[0].振幅 === 1.45
+      && klineRows[0].涨跌幅 === 0.57
+      && klineRows[0].换手率 === 0.42
+      && symbolOK) {
+      ok('_tencentKLine: 字段归一化正确 + 6→sh 前缀');
+    } else fail('_tencentKLine 字段归一化', JSON.stringify({ row: klineRows[0], url: tencentUrls[0] }));
+
+    // 22.Y12.2 _tencentKLine 周期映射 + sz 前缀 (mock 任何 symbol 都返一对空模板)
+    tencentUrls = [];
+    DS.fetch = async (url) => {
+      tencentUrls.push(url);
+      // 从 URL 提取 symbol: ?param=symbol,period,... 第 0 段
+      const m = url.match(/param=([^,]+),/);
+      const sym = m ? m[1] : 'sh600519';
+      return {
+        ok: true, status: 200,
+        text: async () => JSON.stringify({
+          code: 0, msg: '',
+          data: { [sym]: { qfqday: [['2024-07-10', 1700, 1710, 1720, 1695, 12345, '', 1e9, 1, 0.5, 8, 0.4]] } }
+        })
+      };
+    };
+    await D._tencentKLine('600519', 'weekly', '', '', 240, 'qfq');
+    await D._tencentKLine('600519', 'monthly', '', '', 240, 'qfq');
+    await D._tencentKLine('600519', 'daily', '', '', 240, 'qfq');
+    await D._tencentKLine('000001', 'daily', '', '', 240, 'qfq');
+    await D._tencentKLine('300750', 'daily', '', '', 240, 'qfq');
+    const urlOK = tencentUrls.length === 5
+      && tencentUrls[0].includes(',week,')
+      && tencentUrls[1].includes(',month,')
+      && tencentUrls[2].includes(',day,')
+      && tencentUrls[3].includes('sz000001')
+      && tencentUrls[4].includes('sz300750');
+    if (urlOK) ok('_tencentKLine: daily/weekly/monthly + 0/3→sz 前缀');
+    else fail('_tencentKLine 周期+前缀', JSON.stringify(tencentUrls));
+
+    // 22.Y12.3 _tencentKLine code ≠ 0 抛错
+    DS.fetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ code: -1, msg: 'invalid symbol', data: {} }) });
+    let klineErr = '';
+    try { await D._tencentKLine('999999', 'day', '', '', 240, 'qfq'); }
+    catch (e) { klineErr = e.message; }
+    if (klineErr.includes('invalid symbol')) ok('_tencentKLine: code≠0 抛错');
+    else fail('_tencentKLine code≠0', klineErr);
+
+    // 22.Y12.4 getStockKLine 缓存命中不走任何 fetch
+    DS.Core.Storage.cacheGet = async () => [{ 日期: '2024-07-10', 收盘: 1710 }];
+    let fetchHit = 0;
+    DS.fetch = async () => { fetchHit++; return { ok: true, status: 200, json: async () => [] }; };
+    const cachedKline = await D.getStockKLine('600519', 'daily', '20240710', '20240710', 'qfq');
+    if (fetchHit === 0 && cachedKline.length === 1 && cachedKline[0].收盘 === 1710) {
+      ok('getStockKLine: 缓存命中不发请求');
+    } else fail('getStockKLine 缓存命中', JSON.stringify({ fetchHit, cached: cachedKline }));
+
+    // 22.Y12.5 getStockKLine 腾讯失败 → 降级 aktools
+    DS.Core.Storage.cacheGet = async () => null;
+    fetchHit = 0;
+    DS.fetch = async (url) => {
+      fetchHit++;
+      if (url.includes('web.ifzq.gtimg.cn')) {
+        throw new Error('Tencent net error');
+      }
+      return { ok: true, status: 200, json: async () => [{ 日期: '2024-07-10', 收盘: 1710 }] };
+    };
+    const fallbackKline = await D.getStockKLine('600519', 'daily', '20240710', '20240710', 'qfq');
+    if (fetchHit === 2 && fallbackKline.length === 1 && fallbackKline[0].收盘 === 1710) {
+      ok('getStockKLine: 腾讯失败降级 aktools');
+    } else fail('getStockKLine 降级', JSON.stringify({ fetchHit, fallback: fallbackKline }));
+
+    // 22.Y12.6 getStockKLine 腾讯 HTTP 400 → 降级
+    DS.Core.Storage.cacheGet = async () => null;
+    fetchHit = 0;
+    DS.fetch = async (url) => {
+      fetchHit++;
+      if (url.includes('web.ifzq.gtimg.cn')) {
+        return { ok: false, status: 400, text: async () => 'Bad Request' };
+      }
+      return { ok: true, status: 200, json: async () => [{ 日期: '2024-07-10', 收盘: 1710 }] };
+    };
+    const fallback2 = await D.getStockKLine('600519', 'daily', '20240710', '20240710', 'qfq');
+    if (fetchHit === 2 && fallback2[0].收盘 === 1710) ok('getStockKLine: 腾讯 HTTP 400 → 降级 aktools');
+    else fail('getStockKLine 400 降级', JSON.stringify({ fetchHit, fallback: fallback2 }));
+
+    // 22.Y12.7 getStockKLine 缓存失败仍走 fetch (一次成功即返)
+    DS.Core.Storage.cacheGet = async () => null;
+    fetchHit = 0;
+    DS.fetch = async (url) => {
+      fetchHit++;
+      if (url.includes('web.ifzq.gtimg.cn')) {
+        const m = url.match(/param=([^,]+),/);
+        const sym = m ? m[1] : 'sh600519';
+        return { ok: true, status: 200, text: async () => JSON.stringify({ code: 0, data: { [sym]: { qfqday: [['2024-07-10', 1700, 1710, 1720, 1695, 12345, '', 1e9, 1, 0.5, 8, 0.4]] } } }) };
+      }
+      return { ok: true, status: 200, json: async () => [] };
+    };
+    const txKline = await D.getStockKLine('600519', 'daily', '20240710', '20240710', 'qfq');
+    if (fetchHit === 1 && txKline.length === 1 && txKline[0].收盘 === 1710) {
+      ok('getStockKLine: 缓存失败走腾讯, 一次成功即返');
+    } else fail('getStockKLine 一次成功', JSON.stringify({ fetchHit, tx: txKline }));
+
+    D.resetLimit();
+  } catch (e) {
+    fail('Y12 腾讯 K 线 fetcher', e.message + ' / ' + (e.stack || ''));
   }
 })();
 

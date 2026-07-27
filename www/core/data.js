@@ -104,6 +104,92 @@
   }
   function _num(s) { const n = parseFloat(s); return isNaN(n) ? 0 : n; }
 
+  // ===== 腾讯财经 K 线 fetcher (Y12: 备用源) =====
+  // URL: https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={symbol},{period},{start},{end},{count},{adjust}
+  //   symbol: sh600519 / sz000001
+  //   period: day / week / month / m5/m15/m30/m60 (分钟)
+  //   start/end: YYYY-MM-DD (或不传, 用 count)
+  //   count: 返回根数
+  //   adjust: qfq (前复权) / hfq (后复权) / 空 (不复权)
+  // 编码: UTF-8 (JSON)
+  // CORS: Access-Control-Allow-Origin: * (浏览器直连 OK)
+  // 返回 JSON 结构:
+  //   { code: 0, msg: '', data: { sh600519: { qfqday: [[date, open, close, high, low, vol, ...], ...],
+  //                                            qfq: [...], qfqweek: [...], qfqmonth: [...] } } }
+  const TENCENT_KLINE = 'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get';
+
+  /**
+   * 拉腾讯 K 线, 字段归一化到 aktools 风格 (中文键)
+   * @param {string} code 6 位代码 (可含 sh/sz 前缀)
+   * @param {string} period day/week/month
+   * @param {string} [start] YYYYMMDD (可省, 用 count)
+   * @param {string} [end] YYYYMMDD (可省)
+   * @param {number} [count] 根数 (默认 240, ≈ 一年日 K)
+   * @param {string} [adjust] qfq/hfq/空 (默认 qfq)
+   * @returns {Promise<Array>} 数组元素: {日期, 开盘, 收盘, 最高, 最低, 成交量, 成交额, 振幅, 涨跌幅, 涨跌额, 换手率}
+   */
+  async function _tencentKLine(code, period = 'day', start, end, count = 240, adjust = 'qfq') {
+    const symbol = _tencentSymbol(code);
+    const p = period === 'daily' ? 'day' : (period === 'weekly' ? 'week' : (period === 'monthly' ? 'month' : period));
+    // Tencent 调整字段名: qfq/hfq day / qfq/hfq week / qfq/hfq month
+    const adjKey = adjust === 'hfq' ? `hfq${p}` : (adjust === '' ? p : `qfq${p}`);
+    const params = [`${symbol}`, `${p}`, start || '', end || '', `${count}`, `${adjust}`];
+    const url = `${TENCENT_KLINE}?param=${params.join(',')}`;
+
+    let resp;
+    try {
+      resp = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+      });
+    } catch (e) {
+      throw new Error(`腾讯 K 线网络错误: ${e.message}`);
+    }
+    if (!resp.ok) throw new Error(`腾讯 K 线 HTTP ${resp.status}`);
+
+    const text = await resp.text();
+    let j;
+    try { j = JSON.parse(text); }
+    catch (e) { throw new Error(`腾讯 K 线 JSON 解析失败: ${e.message}`); }
+
+    if (j.code !== 0) throw new Error(`腾讯 K 线 code=${j.code} ${j.msg || ''}`);
+    const stock = j.data?.[symbol];
+    if (!stock) throw new Error(`腾讯 K 线无 ${symbol} 数据`);
+    const rows = stock[adjKey] || stock[p] || [];
+    if (!Array.isArray(rows) || rows.length === 0) return [];
+
+    // 归一化到 aktools 风格
+    return rows.map(row => {
+      // Tencent 字段: [日期, 开盘, 收盘, 最高, 最低, 成交量(手), 信息, 成交额(元), 振幅%, 涨跌幅%, 涨跌额, 换手率%]
+      const date = row[0];                  // '2024-07-10'
+      const open = _num(row[1]);
+      const close = _num(row[2]);
+      const high = _num(row[3]);
+      const low = _num(row[4]);
+      const volHand = _num(row[5]);         // 手
+      const amount = _num(row[7]);          // 元
+      const amplitude = _num(row[8]);       // %
+      const pctChange = _num(row[9]);       // %
+      const change = _num(row[10]);
+      const turnover = _num(row[11]);       // %
+      return {
+        日期: date,
+        开盘: open,
+        收盘: close,
+        最高: high,
+        最低: low,
+        成交量: volHand * 100,              // 手 → 股
+        成交额: amount,
+        振幅: amplitude,
+        涨跌幅: pctChange,
+        涨跌额: change,
+        换手率: turnover
+      };
+    });
+  }
+
   /**
    * 腾讯 fetcher 的便捷接口:
    *   getStockSpotTencent()  - 拉自选股 + 持仓的代码, 一次性取
@@ -379,7 +465,7 @@
   }
 
   /**
-   * 历史 K 线
+   * 历史 K 线 (Y12: 优先 Tencent, 失败降级 aktools)
    * @param {string} code - 6 位代码
    * @param {string} period - daily/weekly/monthly
    * @param {string} start - YYYYMMDD
@@ -387,12 +473,32 @@
    * @param {string} adjust - qfq/hfq(前/后复权)/空(不复权)
    */
   async function getStockKLine(code, period = 'daily', start, end, adjust = 'qfq') {
-    return await fetchWithCache(
-      `kline_${code}_${period}_${start}_${end}_${adjust}`,
-      'stock_zh_a_hist',
-      { symbol: code, period, start_date: start, end_date: end, adjust },
-      24 * 60 * 60 * 1000  // 1 天
-    );
+    const cacheKey = `kline_${code}_${period}_${start}_${end}_${adjust}`;
+    // 1) 缓存优先
+    const cached = await Core.Storage.cacheGet(cacheKey);
+    if (cached) return cached;
+
+    // 2) 限流期直接抛 (同 fetchWithCache 行为)
+    const s = getLimitStatus();
+    if (s.blocked) {
+      throw new Error(`数据源限流, ${Math.ceil(s.retryIn/1000)}s 后可重试 (上次: ${_limitState.lastError.slice(0, 100)})`);
+    }
+
+    // 3) 优先腾讯 (Y12)
+    try {
+      const data = await _tencentKLine(code, period, start, end, 240, adjust);
+      await Core.Storage.cacheSet(cacheKey, data, 24 * 60 * 60 * 1000);
+      return data;
+    } catch (e) {
+      console.warn('[Data] 腾讯 K 线失败, 降级 aktools:', e.message);
+      // 4) 降级 aktools
+      return await fetchWithCache(
+        cacheKey,
+        'stock_zh_a_hist',
+        { symbol: code, period, start_date: start, end_date: end, adjust },
+        24 * 60 * 60 * 1000
+      );
+    }
   }
 
   /**
@@ -1242,6 +1348,7 @@
     // 股票
     getStockSpot, getStockQuote, getStockKLine, getStockFinancial, getStockList,
     getStockSpotTencent,    // C: 腾讯 fetcher (codes 参数, 实时)
+    _tencentKLine,          // Y12: 腾讯 K 线 fetcher (内部)
     getStockSpotEfinance,  // C: 东方财富 fetcher (全市场, screener 用)
     getStockFinancialHistory,  // Phase R: 近 N 期财报对比
     getFinancialCalendar, getStockNextDisclosure,  // Phase U: 财报披露日历
