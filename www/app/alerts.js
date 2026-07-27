@@ -1479,7 +1479,7 @@
      * 列表行 AI 解读按钮: 弹一个只读 modal, 显示 Core.AlertsAgent.interpretAlert 输出
      * 只读, 不改规则
      */
-    async _aiInterpretForRule(id) {
+    async _aiInterpretForRule(id, forceRefresh) {
       if (!window.Core || !Core.AlertsAgent) {
         toastError('AI 助手未加载');
         return;
@@ -1487,6 +1487,9 @@
       const all = await Core.Storage.all('alerts');
       const a = all.find(x => x.id === id);
       if (!a) { toastError('找不到这条规则'); return; }
+      // 业绩预告类规则有 aiNarrative 缓存 → 默认不调 AI (省 token + 速度快)
+      const hasCachedNarrative = a.type === 'earnings_warning' && a.aiNarrative;
+      const willCallAI = forceRefresh || !hasCachedNarrative;
       const html = `
         <div class="modal-backdrop" onclick="if(event.target===this)Alerts.closeModal()">
           <div class="modal" style="max-width:600px;width:100%;">
@@ -1496,15 +1499,26 @@
               ${a.triggered ? ' · <span style="color:var(--down);">已触发 ' + (a.hitCount || 0) + ' 次</span>' : ''}
             </div>
             <div id="aiInterpBody" style="padding:14px;background:var(--bg-base);border-radius:6px;line-height:1.7;font-size:13px;min-height:80px;">
-              ⏳ AI 解读中, 大约 10-30 秒...
+              ${willCallAI ? '⏳ AI 解读中, 大约 10-30 秒...' : '📌 显示触发时缓存的归因 (点击「🔄 重新解读」走 AI)'}
             </div>
             <div class="modal-footer">
+              ${hasCachedNarrative ? '<button class="btn btn-ghost" id="aiInterpRefresh" onclick="Alerts._aiInterpretForRule(\'' + a.id + '\', true)">🔄 AI 重新解读</button>' : ''}
               <button class="btn btn-ghost" onclick="Alerts.closeModal()">关闭</button>
             </div>
           </div>
         </div>
       `;
       document.getElementById('modalRoot').innerHTML = html;
+      // 默认走缓存路径, 直接渲染
+      if (!willCallAI) {
+        const el = document.getElementById('aiInterpBody');
+        if (el) {
+          el.innerHTML =
+            '<div style="color:var(--accent);font-size:11px;margin-bottom:6px;">📌 触发时 AI 归因 (' + new Date(a.aiNarrativeAt).toISOString().slice(0, 16).replace('T', ' ') + '):</div>'
+            + escapeHtml(a.aiNarrative).replace(/\n/g, '<br>');
+        }
+        return;
+      }
       try {
         // 拉最近 3 条同 (code, type) 的触发历史 (自身之外, 作为 context)
         const history = all
@@ -1523,18 +1537,17 @@
         const text = await Core.AlertsAgent.interpretAlert(a, { history, regime });
         const el = document.getElementById('aiInterpBody');
         if (el) {
-          // Phase B-1: 业绩预告类规则若已有 aiNarrative (之前触发时 AI 写的), 优先显示 (避免重复调 AI)
-          let body = '';
-          if (a.type === 'earnings_warning' && a.aiNarrative) {
-            body = '<div style="color:var(--accent);font-size:11px;margin-bottom:6px;">📌 触发时 AI 归因 (缓存):</div>'
+          // 强制刷新模式下, 若原本有缓存, 仍展示两层 (缓存 + 重新解读)
+          if (forceRefresh && hasCachedNarrative) {
+            el.innerHTML =
+              '<div style="color:var(--accent);font-size:11px;margin-bottom:6px;">📌 触发时 AI 归因 (缓存):</div>'
               + escapeHtml(a.aiNarrative).replace(/\n/g, '<br>')
               + '<hr style="border:0;border-top:1px dashed var(--border);margin:12px 0;">'
-              + '<div style="color:var(--accent);font-size:11px;margin-bottom:6px;">🤖 AI 重新解读:</div>'
+              + '<div style="color:var(--accent);font-size:11px;margin-bottom:6px;">🔄 AI 重新解读:</div>'
               + escapeHtml(text).replace(/\n/g, '<br>');
           } else {
-            body = escapeHtml(text).replace(/\n/g, '<br>');
+            el.innerHTML = escapeHtml(text).replace(/\n/g, '<br>');
           }
-          el.innerHTML = body;
         }
       } catch (e) {
         const el = document.getElementById('aiInterpBody');

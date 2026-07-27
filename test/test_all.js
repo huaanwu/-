@@ -5165,6 +5165,14 @@ section('36] 中长线盯盘: horizon 打标 / 分层轮询(短线定时器+中�
     if (!/this\._timer\s*=\s*setInterval/.test(alertsSrc) && /horizon:\s*'short'/.test(alertsSrc) && /horizon:\s*'long'/.test(alertsSrc)) {
       ok('36.7 源码: 旧 60s 单定时器移除, 新规则保存时 horizon 落行');
     } else fail('36.7 源码对账', '旧定时器残留或 horizon 未落行');
+
+    // ---- 36.8 AI 解读默认走缓存 + 强制刷新开关 ----
+    // 源码对账: 默认 hasCachedNarrative 命中时不会调 interpretAlert, forceRefresh=true 才调
+    if (/forceRefresh\s*\|\|\s*!hasCachedNarrative/.test(alertsSrc) &&
+        /hasCachedNarrative\s*\?\s*'<button[^>]*aiInterpRefresh[^>]*🔄 AI 重新解读/.test(alertsSrc) &&
+        /if\s*\(forceRefresh\s*&&\s*hasCachedNarrative\)/.test(alertsSrc)) {
+      ok('36.8 AI 解读: 默认缓存路径 + 强制刷新开关 (源码对账)');
+    } else fail('36.8 AI 解读开关', '默认缓存或强制刷新分支未匹配');
   } catch (e) {
     fail('36 中长线盯盘', e.message + ' / ' + (e.stack || ''));
   }
