@@ -802,6 +802,8 @@
               a.aiNarrativeAt = Date.now();
               a.aiNarrativeHit = firstHit;
               Core.Storage.put('alerts', a).catch(e => console.warn('[Alerts] 写 aiNarrative 失败:', e));
+              // Phase B-1+: 同步写一条复盘 (idempotent, 与 aiNarrative 写库并行)
+              this._writeAutoJournal(a, firstHit, narrative);
             } catch (e) { console.warn('[Alerts] aiNarrative 落库失败:', e); }
           }).catch(e => console.warn('[Alerts] AI 归因 promise reject:', e));
         }
@@ -908,6 +910,79 @@
       const severity = ['首亏', '续亏', '增亏'].includes(t) ? '严重' :
                        ['略减', '预减'].includes(t) ? '中度' : '轻微';
       return `⚡ 业绩预告 ${t}, 信号强度 ${severity}。\n📌 中长线纪律: 看当初买入逻辑(业绩拐点/估值修复)是否仍成立, 再决定持有/减仓。`;
+    },
+
+    /**
+     * Phase B-1+: 业绩预告异动自动写复盘 (idempotent)
+     *   - 同 (code, periodKey, type) 只写一条, 靠 id = `auto-earn-${code}-${periodKey}-${type}` 防重
+     *   - 失败不抛: 复盘写不出不影响 alerts 主流程
+     *   - 不依赖 Journal 模块, 直接走 Core.Storage.add('journals', ...) 与现有 save() 同口径
+     *   - 标签加 📌 区分自动 vs 手动
+     */
+    async _writeAutoJournal(a, h, narrative) {
+      try {
+        if (!window.Core || !Core.Storage) return;
+        const id = `auto-earn-${h.code}-${h.periodKey}-${h.type}`;
+        // idempotent 探针: 已有直接跳过 (alert 重触发不会刷出重复)
+        const existing = await Core.Storage.get('journals', id);
+        if (existing) {
+          // 把最新 narrative 顺手回写 (覆盖更新 aiNarrative, 让复盘卡也能看到归因)
+          try {
+            existing.content = this._formatAutoJournalContent(h, narrative);
+            existing.updatedAt = Date.now();
+            await Core.Storage.put('journals', existing);
+          } catch (e) { console.warn('[Alerts] 自动复盘回写失败:', e); }
+          return;
+        }
+        const title = `⚠️ 业绩预告 ${h.type} - ${h.name || h.code} (${h.periodKey})`;
+        const content = this._formatAutoJournalContent(h, narrative);
+        const data = {
+          id,
+          title,
+          content,
+          code: h.code,
+          date: h.periodKey,
+          tags: ['📌 自动', '业绩预告', h.type],
+          mood: '',
+          assumption: '',
+          emotion: '',
+          verify: 'pending',
+          source: 'auto:earnings_warning',
+          alertId: a.id,
+          aiSuggested: false,
+          createdAt: Date.now(),
+          updatedAt: Date.now()
+        };
+        await Core.Storage.add('journals', data);
+      } catch (e) {
+        console.warn('[Alerts] 自动复盘写入失败:', e);
+      }
+    },
+
+    /** 自动复盘正文模板: 摘要 + AI 归因 + 中长线纪律提醒 */
+    _formatAutoJournalContent(h, narrative) {
+      const summary = (h.summary || '').slice(0, 120);
+      return [
+        `**业绩预告信号**: ${h.type}`,
+        `**标的**: ${h.code} (${h.name || h.code})`,
+        `**报告期**: ${h.periodKey}`,
+        summary ? `**摘要**: ${summary}` : '',
+        '',
+        '---',
+        '',
+        '**🪄 AI 归因**:',
+        narrative || '(无)',
+        '',
+        '---',
+        '',
+        '**📌 中长线纪律提醒**:',
+        '回到当初买入逻辑, 评估这次预告对逻辑的冲击:',
+        '- 业绩拐点预期是否被打破?',
+        '- 估值修复假设是否需要重估?',
+        '- 是否触发计划内减仓/止损?',
+        '',
+        '后续在 1 周 / 1 月 / 3 月节点回头看, 验证当时判断'
+      ].filter(line => line !== '' || summary).join('\n');
     },
 
     // ==================== 中长线规则: 大盘状态切换 (日频) ====================

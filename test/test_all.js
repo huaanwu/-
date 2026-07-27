@@ -5065,6 +5065,36 @@ section('36] 中长线盯盘: horizon 打标 / 分层轮询(短线定时器+中�
     } else fail('36.3i AI 失败兜底', JSON.stringify({ n: notices.length, narrative: ew3.aiNarrative }));
     actx.Core.AI.call = async () => '';  // 还原默认 mock
 
+    // ---- 36.3j 自动复盘: 业绩预告触发后, journals 表自动写一条带 source=auto 的记录 ----
+    // 同步检测 _writeAutoJournal 是否被注册 + 在 _aiEarningsNarrative 链路里被调用
+    const dbJournalsBefore = db.journals.length;
+    if (typeof Alerts._writeAutoJournal !== 'function') {
+      fail('36.3j 自动复盘: 方法 _writeAutoJournal 未注册');
+    } else {
+      // 直接调一次, 测 idempotent + 内容
+      const ew4 = { id: 'ew4', type: 'earnings_warning', active: true, hitCount: 0, lastNotifiedKeys: {} };
+      await Alerts._writeAutoJournal(ew4, {
+        code: '600519', periodKey: '2026-06-30', type: '预减',
+        name: '贵州茅台', summary: '净利润预减 30%'
+      }, '⚡ 茅台业绩预减, 中度信号。\n📌 复盘买入逻辑');
+      const autoJournal = db.journals.find(j => j.id === 'auto-earn-600519-2026-06-30-预减');
+      if (autoJournal && autoJournal.source === 'auto:earnings_warning' &&
+          autoJournal.code === '600519' && autoJournal.alertId === 'ew4' &&
+          Array.isArray(autoJournal.tags) && autoJournal.tags.includes('📌 自动') &&
+          autoJournal.content && autoJournal.content.includes('AI 归因') &&
+          autoJournal.content.includes('中长线纪律提醒')) {
+        ok('36.3j 自动复盘: journals 表自动落一条 source=auto (📌 标签 + AI 归因 + 纪律提醒)');
+      } else fail('36.3j 自动复盘', JSON.stringify({ added: db.journals.length - dbJournalsBefore, auto: autoJournal }));
+
+      // ---- 36.3k 自动复盘幂等: 同 (code, periodKey, type) 二次写不重复落库 ----
+      const dbJournalsAfterFirst = db.journals.length;
+      await Alerts._writeAutoJournal(ew4, { code: '600519', periodKey: '2026-06-30', type: '预减',
+                                            name: '贵州茅台', summary: '净利润预减' }, 'AI 归因 v2');
+      if (db.journals.length === dbJournalsAfterFirst) {
+        ok('36.3k 自动复盘幂等: 同 (code, periodKey, type) 二次写不重复落库');
+      } else fail('36.3k 自动复盘幂等', 'db.journals 涨了 ' + (db.journals.length - dbJournalsAfterFirst));
+    }
+
     // ---- 36.4 大盘状态切换: lastState 三态迁移 ----
     notices.length = 0;
     const rg = { id: 'rg1', type: 'regime_change', active: true, hitCount: 0, lastState: null };
@@ -5327,6 +5357,7 @@ section('[37] Core.AlertsAgent: 白名单校验 / parseIntent / preview / apply 
 // ========== 总结 ==========
 // 同步 section 的 ok() 已经在 console 打印;
 // async IIFE 里的 ok() 还在 microtask 队列里, 用 setImmediate 给一次机会再读 passed/failed
+// 注: 36.x 段内有 setTimeout wait 链, 真实计数可能比显示略小 (已知 harness 限制, 后续单独修)
 setImmediate(() => {
   console.log(`\n\x1b[1m===== 测试结果 =====\x1b[0m`);
   console.log(`\x1b[32m通过: ${passed}\x1b[0m  |  \x1b[${failed > 0 ? '31' : '32'}]m失败: ${failed}\x1b[0m`);
