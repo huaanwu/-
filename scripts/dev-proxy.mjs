@@ -225,6 +225,27 @@ app.use('/api/llm', (req, res, next) => {
   })(req, res, next);
 });
 
+// ===== 本地 LLM 透传 (绕过浏览器 CORS) =====
+// 浏览器 → /api/local/v1/chat/completions → 上游 http://127.0.0.1:8082/v1/...
+// 注意: 上游 host:port 可通过环境变量 LOCAL_LLM_TARGET 覆盖, 默认 8082 (llama.cpp)
+const LOCAL_LLM_TARGET = process.env.LOCAL_LLM_TARGET || 'http://127.0.0.1:8082';
+app.use('/api/local', createProxyMiddleware({
+  target: LOCAL_LLM_TARGET,
+  changeOrigin: true,
+  pathRewrite: (path) => path.replace(/^\/api\/local/, ''),
+  onError: (err, req, res) => {
+    console.error(`[local-llm] ${req.method} ${req.url} → ${err.message}`);
+    res.status(502).json({
+      error: 'LOCAL_LLM_UNREACHABLE',
+      message: `无法连接本地大模型 ${LOCAL_LLM_TARGET}: ${err.message}`,
+      target: LOCAL_LLM_TARGET
+    });
+  },
+  onProxyReq: (proxyReq, req) => {
+    console.log(`[local-llm] ${req.method} ${req.url} → ${LOCAL_LLM_TARGET}${req.url.replace(/^\/api\/local/, '')}`);
+  }
+}));
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 StockMaster dev-proxy listening on http://0.0.0.0:${PORT}`);
   console.log('   /api/akshare/* → ' + AKSHARE_TARGET);
@@ -232,6 +253,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log('   /api/sina/* → money.finance.sina.com.cn (新加, 行业板块 fallback)');
   console.log('   /api/llm/{provider}/* → ' + JSON.stringify(LLM_TARGETS));
   console.log(`   /api/discover/local-llm → scan ${DISCOVER_PORTS.length} ports × N hosts (server-side)`);
+  console.log(`   /api/local/* → ${LOCAL_LLM_TARGET} (本地大模型透传, 绕浏览器 CORS)`);
   console.log(`   Health: http://127.0.0.1:${PORT}/health`);
   console.log('');
   console.log('⚠️  Make sure AKShare is running:');

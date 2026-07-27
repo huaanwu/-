@@ -92,6 +92,12 @@ export default defineConfig({
       '/api/discover': {
         target: 'http://127.0.0.1:8089',
         changeOrigin: true
+      },
+      // 本地大模型透传 (绕浏览器 CORS)
+      // 浏览器 → /api/local/v1/chat/completions → dev-proxy → http://127.0.0.1:8082/v1/...
+      '/api/local': {
+        target: 'http://127.0.0.1:8089',
+        changeOrigin: true
       }
     }
   },

@@ -90,8 +90,18 @@
     // 5.3.3: 本地 LLM 配置 (DeepSeek v4-flash 本地部署, 个人自用)
     // 优先用 ai.localEndpoint, 否则回退到主配置
     const local = ai.localEndpoint || {};
+    // 7) 自动发现模式: baseURL 形如 http://<ip>:8082/v1 → 强制走 /api/local/v1 绕浏览器 CORS
+    // APK / 真机场景保留直连
+    let localBaseURL = local.baseURL || '';
+    if (localBaseURL && !localBaseURL.startsWith('/') && (location.hostname === 'localhost' || location.hostname === '127.0.0.1' || /^\[.*\]$/.test(location.hostname) || /^::1$/.test(location.hostname))) {
+      // dev / 本机访问场景: 重写为 /api/local/v1
+      try {
+        const u = new URL(localBaseURL);
+        localBaseURL = `/api/local${u.pathname}`.replace(/\/v1\/v1$/, '/v1');
+      } catch (e) { console.warn('[AI] 本地 LLM baseURL 解析失败, 保留原值:', e.message); }
+    }
     const localConfig = {
-      baseURL: local.baseURL || '',
+      baseURL: localBaseURL,
       apiKey: local.apiKey || 'local-no-auth',  // 本地部署通常不验 key
       model: local.model || ai.model || pcfg.defaultModel,
       enabled: ai.preferLocal === true && !!local.baseURL
@@ -356,6 +366,23 @@
   }
 
   /**
+   * 自动发现本地大模型端点
+   * 浏览器调用 /api/discover/local-llm (dev-proxy 服务器端扫, 避开 CORS)
+   * @returns {Promise<{found: Array<{baseURL, host, port, type, label, models, latencyMs}>, scanned, serverIPs, host}>}
+   */
+  async function discoverLocalLLM() {
+    const resp = await fetch('/api/discover/local-llm', { method: 'GET' });
+    if (!resp.ok) throw new Error('自动发现端点 HTTP ' + resp.status);
+    const j = await resp.json();
+    return {
+      found: j.found || [],
+      scanned: j.scanned || 0,
+      serverIPs: j.serverIPs || [],
+      host: j.host || '127.0.0.1'
+    };
+  }
+
+  /**
    * selfCheck (Phase P 反向 self-check)
    * 拿之前的 AI 输出, 让 LLM 自己挑刺
    * @param {object} opts - { originalOutput, originalSystemPrompt, originalPrompt, onChunk, maxTokens=400 }
@@ -576,6 +603,7 @@
     jsonCall,
     parseJsonOutput,
     testConnection,
+    discoverLocalLLM,
     getConfig,
     getProviderConfig,
     resolveEndpoint,
