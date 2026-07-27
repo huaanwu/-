@@ -57,7 +57,7 @@ async function main() {
   if (await exists(distIndex)) {
     let distContent = await fs.readFile(distIndex, 'utf-8');
     distContent = distContent.replace(
-      /<link\s+rel="stylesheet"\s+crossorigin\s+href="\/assets\/(?:index|style)-[A-Za-z0-9_-]+\.css"\s*\/?>/g,
+      /<link\s+rel="stylesheet"\s+crossorigin\s+href="(?:\/assets\/(?:index|style)-[A-Za-z0-9_-]+\.css|\/styles\.src\.css)"\s*\/?>/g,
       '<link rel="stylesheet" crossorigin href="/styles.css">'
     );
     await fs.writeFile(wwwIndex, distContent);
