@@ -2359,6 +2359,26 @@ section('21] c 数据源限流修复 (retry/退避/限流)');
       ok('_tencentKLine: 字段归一化正确 + 6→sh 前缀');
     } else fail('_tencentKLine 字段归一化', JSON.stringify({ row: klineRows[0], url: tencentUrls[0] }));
 
+    // 22.Y12.1b 真实腾讯只返 6 列 (无成交额/振幅/涨跌幅/换手率/涨跌额), 缺位应 null (不是 0)
+    DS.fetch = async () => ({
+      ok: true, status: 200,
+      text: async () => JSON.stringify({
+        code: 0, msg: '',
+        data: { sh600519: { qfqday: [['2024-07-10', 1335.787, 1334.127, 1362.417, 1331.537, 23763]] } }
+      })
+    });
+    const real6 = await D._tencentKLine('600519', 'day', '2024-07-10', '2024-07-10', 5, 'qfq');
+    if (real6.length === 1
+      && real6[0].收盘 === 1334.127
+      && real6[0].成交量 === 2376300
+      && real6[0].成交额 === null
+      && real6[0].振幅 === null
+      && real6[0].涨跌幅 === null
+      && real6[0].涨跌额 === null
+      && real6[0].换手率 === null) {
+      ok('_tencentKLine: 真实 6 列数据, 缺位字段=null (非 0)');
+    } else fail('_tencentKLine 6 列归一化', JSON.stringify(real6[0]));
+
     // 22.Y12.2 _tencentKLine 周期映射 + sz 前缀 (mock 任何 symbol 都返一对空模板)
     tencentUrls = [];
     DS.fetch = async (url) => {

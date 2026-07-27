@@ -103,6 +103,12 @@
     return out;
   }
   function _num(s) { const n = parseFloat(s); return isNaN(n) ? 0 : n; }
+  // Y12 修复: 字段缺位 (腾讯 K 线只返 6 列, aktools 返 12) 时返 null, 不要变 0
+  function _numOrNull(s) {
+    if (s == null || s === '') return null;
+    const n = parseFloat(s);
+    return isNaN(n) ? null : n;
+  }
 
   // ===== 腾讯财经 K 线 fetcher (Y12: 备用源) =====
   // URL: https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={symbol},{period},{start},{end},{count},{adjust}
@@ -162,30 +168,20 @@
 
     // 归一化到 aktools 风格
     return rows.map(row => {
-      // Tencent 字段: [日期, 开盘, 收盘, 最高, 最低, 成交量(手), 信息, 成交额(元), 振幅%, 涨跌幅%, 涨跌额, 换手率%]
-      const date = row[0];                  // '2024-07-10'
-      const open = _num(row[1]);
-      const close = _num(row[2]);
-      const high = _num(row[3]);
-      const low = _num(row[4]);
-      const volHand = _num(row[5]);         // 手
-      const amount = _num(row[7]);          // 元
-      const amplitude = _num(row[8]);       // %
-      const pctChange = _num(row[9]);       // %
-      const change = _num(row[10]);
-      const turnover = _num(row[11]);       // %
+      // 腾讯字段: [日期, 开盘, 收盘, 最高, 最低, 成交量(手), 信息, 成交额, 振幅%, 涨跌幅%, 涨跌额, 换手率%]
+      // 实际只返 6 列 (0-5), 7-11 是 undefined → 用 _numOrNull 区别"无"和 0
       return {
-        日期: date,
-        开盘: open,
-        收盘: close,
-        最高: high,
-        最低: low,
-        成交量: volHand * 100,              // 手 → 股
-        成交额: amount,
-        振幅: amplitude,
-        涨跌幅: pctChange,
-        涨跌额: change,
-        换手率: turnover
+        日期: row[0],
+        开盘: _num(row[1]),
+        收盘: _num(row[2]),
+        最高: _num(row[3]),
+        最低: _num(row[4]),
+        成交量: _num(row[5]) * 100,           // 手 → 股
+        成交额: _numOrNull(row[7]),            // 多数情况缺位
+        振幅: _numOrNull(row[8]),
+        涨跌幅: _numOrNull(row[9]),
+        涨跌额: _numOrNull(row[10]),
+        换手率: _numOrNull(row[11])
       };
     });
   }
