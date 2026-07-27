@@ -23,9 +23,9 @@
     "@capacitor/local-notifications": "^8.0.0",
     "@capacitor/preferences": "^8.0.0",
     "@capacitor/share": "^8.0.0",
-    "dexie": "^4.0.10",
-    "echarts": "^5.5.1",
-    "marked": "^15.0.0"
+    "dexie": "^4.4.4",
+    "echarts": "^5.6.0",
+    "marked": "^15.0.12"
   },
   "devDependencies": {
     "concurrently": "^9.1.0",
