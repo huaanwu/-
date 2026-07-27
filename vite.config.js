@@ -39,6 +39,7 @@ export default defineConfig({
         '/core/state.js',
         '/core/storage.js',
         '/core/data.js',
+        '/core/kb.js',
         '/core/util.js'
       ]
     }
