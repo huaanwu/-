@@ -13,6 +13,7 @@
 
   const DEFAULT_PROXY = '/api/akshare';
   const TENCENT_QUOTE = 'https://qt.gtimg.cn/q=';  // 腾讯财经行情, CORS 友好, GBK 编码
+  const SINA_QUOTE = 'https://hq.sinajs.cn/list='; // 新浪兜底 (腾讯失败时降级), GBK, 需 Referer
 
   // ===== 腾讯财经 fetcher (C 替代源) =====
   // 单只:  https://qt.gtimg.cn/q=sh600519     → v_sh600519="1~贵州茅台~...";
@@ -102,6 +103,98 @@
     }
     return out;
   }
+
+  /**
+   * 新浪行情 fetcher (Z13: 腾讯失败兜底). 单只/批量 codes 都支持.
+   *   URL: hq.sinajs.cn/list=sh600519,sz000001
+   *   强制 Referer: https://finance.sina.com.cn/ (否则 403)
+   *   GBK 编码
+   * 字段:
+   *   0 名称  1 今开  2 昨收  3 当前价  4 今日最高  5 今日最低
+   *   6 买一价 7 卖一价  8 成交量(股)  9 成交金额(元)  ...
+   *   30 日期  31 时间
+   * 涨跌幅 / 涨跌额 不直给, 用 (现价 - 昨收) 推算.
+   * 换手率 / 市盈率 / 流通市值 不在免费接口 — 留 null.
+   */
+  async function _sinaFetch(codes) {
+    if (!Array.isArray(codes) || codes.length === 0) return [];
+    const symbols = codes.map(_tencentSymbol).join(',');
+    const url = SINA_QUOTE + symbols;
+    let resp;
+    try {
+      resp = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'Referer': 'https://finance.sina.com.cn/',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+      });
+    } catch (e) {
+      throw new Error(`新浪财经网络错误: ${e.message}`);
+    }
+    if (!resp.ok) throw new Error(`新浪财经 HTTP ${resp.status}`);
+    // GBK 解码 (跟 _tencentFetch 一致)
+    const buf = await resp.arrayBuffer();
+    const text = new TextDecoder('gb18030').decode(new Uint8Array(buf));
+    return _sinaParse(text, codes);
+  }
+
+  /**
+   * 解析新浪响应.
+   *   每行格式: var hq_str_sh600519="贵州茅台,1308.00,...,日期,时间";
+   *   字段有 null (港股休市) — 涨跌幅 = null, 不要硬算 0
+   */
+  function _sinaParse(text, codes) {
+    const out = [];
+    const lines = text.split(/;\s*/).filter(Boolean);
+    // codeByIndex: 新浪响应顺序按请求顺序排, 但保险起见再从 var 名解析
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const m = line.match(/^var hq_str_([a-z]{2}\d+)="(.+)"$/);
+      if (!m) continue;
+      const sym = m[1];
+      const code = sym.slice(2);
+      const fields = m[2].split(',');
+      // 字段可能在收盘后或港股时为空字符串 — 安全 parseFloat
+      const safe = (idx) => {
+        const v = fields[idx];
+        if (v == null || v === '') return null;
+        const n = parseFloat(v);
+        return isNaN(n) ? null : n;
+      };
+      const latest = safe(3);   // 当前价 (核心)
+      const prevClose = safe(2);  // 昨收
+      // 涨跌幅 / 涨跌额: 仅当两者都有效才计算
+      const change = (latest != null && prevClose != null && prevClose !== 0)
+        ? latest - prevClose : null;
+      const changePct = (change != null && prevClose != null && prevClose !== 0)
+        ? (change / prevClose) * 100 : null;
+      out.push({
+        代码: code,
+        名称: fields[0] || '',
+        最新价: latest,
+        昨收: prevClose,
+        今开: safe(1),
+        最高: safe(4),
+        最低: safe(5),
+        成交量: safe(8),         // 股 (新浪直给股数, 不用 ×100)
+        成交额: safe(9),         // 元
+        时间: fields[31] ? `${fields[30] || ''} ${fields[31]}` : '',
+        涨跌额: change,
+        涨跌幅: changePct,
+        // 换手率 / 市盈率 / 流通市值不在免费接口 — null (UI 显示 '-')
+        换手率: null,
+        市盈率: null,
+        流通市值: null,
+        总市值: null
+      });
+    }
+    // 用请求 codes 顺序排序 (新浪按请求顺序响应, 但保险)
+    const codeMap = {};
+    out.forEach(r => { codeMap[r.代码] = r; });
+    return codes.map(c => codeMap[c] || codeMap[_tencentSymbol(c).slice(2)]).filter(Boolean);
+  }
+
   function _num(s) { const n = parseFloat(s); return isNaN(n) ? 0 : n; }
   // Y12 修复: 字段缺位 (腾讯 K 线只返 6 列, aktools 返 12) 时返 null, 不要变 0
   function _numOrNull(s) {
@@ -417,20 +510,27 @@
    */
   async function getStockSpot(codes) {
     if (Array.isArray(codes) && codes.length > 0) {
-      // 优先腾讯
+      // 降级链: 腾讯 → 新浪 → aktools
+      // 1) 腾讯 (主, 最快)
       try {
         return await getStockSpotTencent(codes);
       } catch (e) {
-        console.warn('[Data] 腾讯失败, 降级 aktools:', e.message);
-        // 降级: aktools 全市场, 然后过滤
-        const all = await fetchWithCache(
-          'stock_spot_all',
-          'stock_zh_a_spot',
-          {},
-          60 * 1000
-        );
-        return all.filter(s => codes.includes(s.代码) || codes.includes(s.code));
+        console.warn('[Data] 腾讯失败, 降级新浪:', e.message);
       }
+      // 2) 新浪 (兜底, GBK, 需 Referer)
+      try {
+        return await _sinaFetch(codes);
+      } catch (e) {
+        console.warn('[Data] 新浪失败, 降级 aktools:', e.message);
+      }
+      // 3) aktools (终极, 但如果不通会自动 throw 让 UI 显示)
+      const all = await fetchWithCache(
+        'stock_spot_all',
+        'stock_zh_a_spot',
+        {},
+        60 * 1000
+      );
+      return all.filter(s => codes.includes(s.代码) || codes.includes(s.code));
     }
     // 不传 codes: 优先东方财富全市场 (C 替代), 失败时不依赖 aktools (免等后端)
     try {
@@ -1339,6 +1439,7 @@
     // 股票
     getStockSpot, getStockQuote, getStockKLine, getStockFinancial, getStockList,
     getStockSpotTencent,    // C: 腾讯 fetcher (codes 参数, 实时)
+    _sinaFetch, _sinaParse,  // Z13: 新浪 fetcher + 解析 (腾讯失败兜底, 测试用)
     _tencentKLine,          // Y12: 腾讯 K 线 fetcher (内部)
     getStockSpotEfinance,  // C: 东方财富 fetcher (全市场, screener 用)
     getStockFinancialHistory,  // Phase R: 近 N 期财报对比

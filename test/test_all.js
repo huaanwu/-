@@ -2235,20 +2235,21 @@ section('21] c 数据源限流修复 (retry/退避/限流)');
     if (r2.includes('限流') && r2.includes('后') && !fetchCalled) ok('限流期内 fetch 不发起请求');
     else fail('限流期内行为', JSON.stringify({ msg: r2, fetchCalled }));
 
-    // ---- 21.4 retry: 第一次 fail 4xx (非限流), 第二次 success (codes 路径) ----
-    D.resetLimit();  // 清 21.2/21.3 残留的限流状态
+    // ---- 21.4 retry: 链式降级 (腾讯 4xx → 新浪 fail → aktools 200) ----
+    // 注: Z13 新增新浪兜底层, mock 模拟"两个源都挂, 第三个走 aktools 拿数据"
+    D.resetLimit();
     DS.Core.Storage.cacheGet = async () => null;
     let attempt = 0;
     DS.fetch = async () => {
       attempt++;
-      if (attempt === 1) return { ok: false, status: 400, text: async () => 'Bad Request - invalid symbol' };
-      // aktools 降级返全市场, 含被请求的 code
-      return { ok: true, status: 200, json: async () => ([{ ret: 'success', 代码: '600519' }]) };
+      if (attempt === 1) return { ok: false, status: 400, text: async () => 'Bad Request' };  // 腾讯 4xx
+      if (attempt === 2) return { ok: false, status: 502, text: async () => 'Bad Gateway' }; // 新浪 5xx
+      // aktools 返全市场
+      return { ok: true, status: 200, json: async () => ([{ 代码: '600519', ret: 'success' }]) };
     };
-    // 4xx 走重试 (不触发限流)
     const r3 = await D.getStockSpot(['600519']);
-    if (r3 && Array.isArray(r3) && r3[0] && r3[0].ret === 'success' && attempt === 2) ok('4xx retry 第二次成功');
-    else fail('4xx retry', JSON.stringify({ r: r3, attempt }));
+    if (r3 && Array.isArray(r3) && r3[0] && r3[0].ret === 'success' && attempt === 3) ok('降级链: 腾讯→新浪→aktools');
+    else fail('降级链', JSON.stringify({ r: r3, attempt }));
 
     // ---- 21.5 4xx 业务错误: 重试 N 次后抛 (codes 路径) ----
     D.resetLimit();
@@ -2481,6 +2482,107 @@ section('21] c 数据源限流修复 (retry/退避/限流)');
     D.resetLimit();
   } catch (e) {
     fail('Y12 腾讯 K 线 fetcher', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [22.5] Z13 新浪 fetcher (腾讯失败兜底) ==========
+section('22.5] Z13 新浪 hq.sinajs.cn fetcher (腾讯失败兜底)');
+(async () => {
+  try {
+    // vm sandbox 内 TextDecoder 必须显式注入 (浏览器有, node vm 里没绑 global)
+    // 用 node 原生 TextDecoder + 简易 Buffer/Iconv polyfill 不可行, 但 Node 现成 TextDecoder 可以
+    // 只要把 node 的 TextDecoder 传过去
+    const { TextDecoder: NodeTextDecoder } = require('util');
+    const DS = {
+      console, setTimeout, clearTimeout, URLSearchParams,
+      TextDecoder: NodeTextDecoder,
+      Core: {
+        State: { get: (k) => k === 'proxyBase' ? '/api/akshare' : null },
+        Storage: { cacheGet: async () => null, cacheSet: async () => {} }
+      },
+      fetch: async () => ({ ok: false, status: 502, text: async () => 'Bad Gateway' })
+    };
+    DS.window = DS;
+    vm.createContext(DS);
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/data.js')), DS);
+    const D = DS.window.Core.Data;
+
+    // ---- 22.5.1 _sinaParse 解码 GBK 格式 ----
+    // 模拟新浪响应 (结构: var hq_str_sh600519="..."
+    const sinaText = [
+      'var hq_str_sh600519="',
+      '贵州茅台',  // 贵州茅台 UTF-8 escape (避免中文引号问题)
+      ',1308.000,1297.410,1289.500,1308.000,1279.580,1289.500,1289.660,3199044,4129228560.000,',
+      '0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2026-07-27,15:34:59,00";',
+      ''
+    ].join('');
+    const r1 = D._sinaParse(sinaText, ['sh600519'].map(s => s.slice(2)));
+    if (r1 && r1.length === 1 && r1[0].代码 === '600519' && r1[0].最新价 === 1289.5) ok('_sinaParse: 解析单只 (代码/名称/现价)');
+    else fail('_sinaParse 单只', JSON.stringify(r1));
+
+    // ---- 22.5.2 涨跌额/涨跌幅 = 现价 - 昨收 ----
+    if (r1 && r1[0] && Math.abs(r1[0].涨跌额 - (-7.91)) < 0.01) ok('_sinaParse: 涨跌额 = 现价 - 昨收');
+    else fail('_sinaParse 涨跌额', JSON.stringify(r1 && r1[0]));
+
+    // ---- 22.5.3 _sinaFetch 透传 Referer + UA ----
+    // 注: Windows Node 24 的 Buffer 不支持 'gb18030' encoding (缺少完整 ICU),
+    //   所以 mock 提供已解码好的字符串 + 模拟 arrayBuffer 的二进制 Buffer 形态.
+    //   浏览器生产环境 GBK 解码 100% 工作 (浏览器内置 ICU).
+    let capturedUrl = '', capturedHeaders = null;
+    let capturedBuf = false;
+    DS.fetch = async (url, init = {}) => {
+      capturedUrl = url;
+      capturedHeaders = init.headers;
+      // 返 UTF-8 字符串(fake GBK body, 测试只验证下游解析)
+      capturedBuf = init && init.body === undefined; // fetch.getReader check marker (无body)
+      return {
+        ok: true, status: 200,
+        arrayBuffer: async () => {
+          const s = 'var hq_str_sz000001="平安银行,11.110,11.100,11.110,11.160,11.040,11.110,11.120,95715556,1062796331.760,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2026-07-27,15:36:00,00";\n';
+          // utf-8 encode 到 ArrayBuffer
+          return new TextEncoder().encode(s).buffer;
+        }
+      };
+    };
+    const r2 = await D._sinaFetch(['000001']);
+    if (capturedUrl.includes('hq.sinajs.cn/list=') && capturedUrl.includes('sz000001')) ok('_sinaFetch: URL 走 hq.sinajs.cn');
+    else fail('_sinaFetch URL', capturedUrl);
+    if (capturedHeaders && capturedHeaders.Referer && capturedHeaders.Referer.includes('sina.com.cn')) ok('_sinaFetch: 带 Referer');
+    else fail('_sinaFetch Referer', JSON.stringify(capturedHeaders));
+    if (r2 && r2.length === 1 && r2[0].代码 === '000001' && r2[0].最新价 === 11.11) ok('_sinaFetch: 解析平安银行 (utf-8 mock)');
+    else fail('_sinaFetch 解析', JSON.stringify(r2));
+
+    // ---- 22.5.4 降级链: 腾讯 → 新浪 → 成功 ----
+    let whichCalled = '';
+    DS.fetch = async (url) => {
+      whichCalled = url.includes('qt.gtimg.cn') ? 'tencent' :
+                    url.includes('sinajs.cn') ? 'sina' : 'aktools';
+      if (whichCalled === 'tencent') {
+        return { ok: false, status: 502, text: async () => 'Bad Gateway' };
+      }
+      if (whichCalled === 'sina') {
+        const s = 'var hq_str_sh600519="贵州茅台,1308.000,1297.410,1289.500,1308.000,1279.580,1289.500,1289.660,3199044,4129228560.000,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2026-07-27,15:34:59,00";\n';
+        return { ok: true, status: 200, arrayBuffer: async () => new TextEncoder().encode(s).buffer };
+      }
+      return { ok: true, status: 200, json: async () => ([]) };
+    };
+    const r3 = await D.getStockSpot(['600519']);
+    if (r3 && r3.length === 1 && r3[0].代码 === '600519' && r3[0].最新价 === 1289.5) ok('降级链: 腾讯失败 → 新浪成功');
+    else fail('降级链', JSON.stringify({ called: whichCalled, r3 }));
+
+    // ---- 22.5.5 降级链: 腾讯 + 新浪都挂 → aktools ----
+    DS.fetch = async (url) => {
+      if (url.includes('qt.gtimg.cn')) return { ok: false, status: 502, text: async () => '' };
+      if (url.includes('sinajs.cn')) return { ok: false, status: 502, text: async () => '' };
+      // aktools
+      return { ok: true, status: 200, json: async () => ([{ 代码: '600519', 最新价: 1289.5, 涨跌幅: -0.6 }]) };
+    };
+    const r4 = await D.getStockSpot(['600519']);
+    if (r4 && r4.length === 1 && r4[0].代码 === '600519') ok('降级链: 腾讯+新浪都挂 → aktools');
+    else fail('降级链 aktools', JSON.stringify(r4));
+
+  } catch (e) {
+    fail('Z13 新浪 fetcher', e.message + ' / ' + (e.stack || ''));
   }
 })();
 
