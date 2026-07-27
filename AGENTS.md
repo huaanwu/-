@@ -69,7 +69,7 @@ node scripts/daily_summary.mjs --verify-dry-run ./journals.json   # 事后验证
 node scripts/daily_summary.mjs --premarket   # Phase C 盘前简报 (隔夜外盘+日历+财新要闻 → LLM → 飞书; 建议 Windows 计划任务 交易日 08:30)
 ```
 
-`test/test_all.js` 36 节:JS 语法、域脚本接口完备性 (`DOMAINS` 字典)、Core 命名空间导出、index.html script 引用对账、Worker 结构、关键文件存在、Data 层方法签名、回测引擎 vm 沙箱实测、Vite external 对账、journal/market/fund/alerts 纯函数实测、daily_summary 单测 (含 --premarket 盘前简报)、5.1/5.2/5.3 互通闭环实测、数据源限流、Paper 模拟盘纯函数实测 (含 Phase C EOD 日终小结)、Discipline 纪律引擎实测、Phase D1 pre-mortem + 个股公告实测、Phase D2 回测前置 + 双模型实测、Phase E 待确认交易实测 (Pending 去重/上限/过期/状态机/建议仓位 + 接线)、Phase W 中长线盯盘实测 (horizon 打标/分层定时器起停注入断言/业绩预告 filter+lastNotifiedKeys 去重/regime 三态迁移/估值判定+进出阈值区去重/nextCheck 门控)。**改完域脚本或新增域方法必须先 `npm test`,并同步更新该文件的 `DOMAINS` 字典。**
+`test/test_all.js` 36 节:JS 语法、域脚本接口完备性 (`DOMAINS` 字典)、Core 命名空间导出、index.html script 引用对账、Worker 结构、关键文件存在、Data 层方法签名、回测引擎 vm 沙箱实测、Vite external 对账、journal/market/fund/alerts 纯函数实测、daily_summary 单测 (含 --premarket 盘前简报)、5.1/5.2/5.3 互通闭环实测、数据源限流、Paper 模拟盘纯函数实测 (含 Phase C EOD 日终小结)、Discipline 纪律引擎实测、Phase D1 pre-mortem + 个股公告实测、Phase D2 回测前置 + 双模型实测、Phase E 待确认交易实测 (Pending 去重/上限/过期/状态机/建议仓位 + 接线)、Phase W 中长线盯盘实测 (horizon 打标/短线定时器起停注入断言/交易时段守卫/通知冷却/事件驱动接线/业绩预告 filter+lastNotifiedKeys 去重/regime 三态迁移/估值判定+进出阈值区去重/nextCheck 门控)。**改完域脚本或新增域方法必须先 `npm test`,并同步更新该文件的 `DOMAINS` 字典。**
 
 `scripts/e2e.mjs` 注意:Chrome 路径硬编码 `C:\Program Files\Google\Chrome\Application\chrome.exe`,需要 Vite 已在 3003 端口跑着。
 
@@ -121,7 +121,7 @@ www/                        # Web 根 (= Capacitor webDir,Vite root)
 │   │   ├── seed.js         # seedRecommended / 基金 seed 数据
 │   │   └── weekly-report.js  # weeklyReportDialog (Phase H.2 AI 周报) / _wrCopy
 │   ├── backtest.js         # 策略回测 UI
-│   ├── alerts.js           # 提醒监控:中长线/短线双模式分层轮询(短线 1 分钟按需起停 / 中长线 30 分钟调度) + 业绩预告异动/大盘趋势/估值偏离 + 复盘联动
+│   ├── alerts.js           # 提醒监控:中长线/短线双模式(短线 1 分钟定时器按需起停+交易时段守卫 / 中长线事件驱动: app启动+页面展示触发 runLongChecks, nextCheck 门控) + 业绩预告异动/大盘趋势/估值偏离 + 复盘联动
 │   ├── account.js          # 资金账户:现金 + 资金流水 + 总览
 │   └── market-bar.js       # 顶部市场条
 ├── workers/backtest.worker.js  # 回测 Web Worker(双均线/突破/海龟;vite worker.format='es')
@@ -265,12 +265,15 @@ vite.config.js              # root=www,域脚本 external 列表,dev proxy
 
 | 子项 | 实现位置 | 关键方法 |
 |------|----------|----------|
-| W.1 规则打标 + 分层轮询 | `www/app/alerts.js` | `_horizonOf(type)` (价格/涨跌幅/成交量=short, 其余=long, 运行时按 type 分类, 行上 horizon 非索引字段仅供展示) / `_syncTimers` (幂等: 有启用的短线规则才起 1 分钟定时器, 有中长线规则才起 30 分钟调度定时器; save/toggle/remove 经 render() 自动重同步) / `_checkShort` (原 60s 行情类逻辑不变) / `_checkLong` (30 分钟 tick, `_nextCheckDue` 门控 + `_freqMs` 按规则频率推进 nextCheck); `_setInterval`/`_clearInterval` 可注入 (测试可断言) |
+| W.1 规则打标 + 分层轮询 | `www/app/alerts.js` | `_horizonOf(type)` (价格/涨跌幅/成交量=short, 其余=long, 运行时按 type 分类, 行上 horizon 非索引字段仅供展示) / `_syncTimers` (幂等: 有启用的短线规则才起 1 分钟定时器; 中长线不起定时器; save/toggle/remove 经 render() 自动重同步) / `_checkShort` (原 60s 行情类逻辑 + P0 交易时段守卫 + P2 通知冷却) / `_checkLong` (事件驱动, `_nextCheckDue` 门控 + `_freqMs` 按规则频率推进 nextCheck); `_setInterval`/`_clearInterval` 可注入 (测试可断言) |
+| W.1a P0 交易时段守卫 | `www/app/alerts.js` + `www/core/constants.js` | `_isTradingTime(now)` 纯函数 (周一~周五 且 09:30-11:30/13:00-15:00, 边界含端点, Constants.TRADING_WINDOWS); `_checkShort` 入口第一行守卫, 非交易时段直接 return 不发请求; 定时器常驻、守卫在检查入口 (判断成本为零) |
+| W.1b P1 中长线事件驱动 | `www/app/alerts.js` + `www/app.js` | 30 分钟调度定时器已删除; `runLongChecks()` (= `_checkLong` 安全包装, 异常不外抛) 两个触发点: app.js init (异步不阻塞) + `_onShow_pageAlerts`; 规则自带 nextCheck 门控 (日频/周频/双周频), 事件点触发频繁无副作用 |
+| W.1c P2 通知冷却 (防 flapping) | `www/app/alerts.js` + `www/core/constants.js` | Constants.ALERT_NOTIFY_COOLDOWN_MS(30分钟); 短线 hit && !triggered 时, lastHit 在冷却期内 → 只落 triggered 不发通知 (振荡价反复穿越不打扰), 超冷却期才 _notify + 更新 lastHit/hitCount; 价格回落复位分支不受影响 |
 | W.2 业绩预告异动 (earnings_warning, 周频) | `www/app/alerts.js` + `Core.Data.fetch('stock_yjyg_em')` | `_checkEarningsWarning`: 拉全市场业绩预告 (cache key 带日期 + 6h TTL) → `_filterEarningsWarnings` 纯函数 (负面名单=Constants.EARNINGS_WARNING_NEGATIVE_TYPES 预减/略减/首亏/续亏 + 半年新鲜度 + 命中实盘持仓 !isPaper, `_normalizeCode6` 容忍 SH 前后缀) → `_notifyLong` 带归因文案; 去重 `lastNotifiedKeys[code]` = key 数组 (`报告期_预告类型`, 同期修正公告是独立信号); 全局一条, 创建即首检 |
 | W.3 大盘趋势告警 (regime_change, 日频) | `www/app/alerts.js` + `Core.Regime.refresh()` | `_checkRegimeChange`: 与行上 `lastState` 对比, 状态迁移才通知 (`_regimeNotifyText` 纯函数, bear→放缓建仓/bull→转暖/range→维持原计划), 首次只记基线; 全局一条 |
 | W.4 估值偏离 (valuation, 双周频) | `www/app/alerts.js` + `Core.Data.fetch('stock_market_pe_lg')` | `_checkValuation` → `_judgeValuation` 纯函数: 指数 (上证/深证/创业板/科创50) PE-TTM 近5年分位 ≥ Constants.VALUATION_PERCENTILE_WARN(80) 命中; 复用 `ai_ctx_pe` 缓存 key 与 AI 上下文共享; 分位字段全缺 → 返 null 静默跳过 (宁缺毋假); `lastNotifiedKey`=超阈指数名单, 跌出阈值区清空, 重新进入再通知。**个股 PE 5 年分位无已验证数据源, 只做指数级** |
 | W.5 创建表单中长线优先 | `www/app/alerts.js` `addDialog`/`_onTypeChange`/`save` | optgroup 分组 (📅中长线在前 ⚡短线在后), `#alHorizonHint` 期限提示行 (短线显示"适合日内盯盘"), 全局规则禁输代码 + 唯一性校验 (valuation_drift 为 B 阶段占位名, `_normType` 并入 valuation), 新规则行写 horizon 字段 |
-| W.6 常量收口 | `www/core/constants.js` | ALERT_TICK_SHORT_MS(1分钟) / ALERT_TICK_LONG_MS(30分钟) / ALERT_LONG_FREQ_MS(财报日频/预告周频/regime日频/估值双周频) / ALERT_LONG_CACHE_TTL_MS(6h) / EARNINGS_WARNING_NEGATIVE_TYPES / EARNINGS_WARNING_FRESH_MS(半年) / VALUATION_PERCENTILE_WARN(80) / VALUATION_INDEX_NAMES |
+| W.6 常量收口 | `www/core/constants.js` | ALERT_TICK_SHORT_MS(1分钟) / ALERT_TICK_LONG_MS(30分钟, 仅作 _freqMs 兜底, 定时器已删除) / ALERT_LONG_FREQ_MS(财报日频/预告周频/regime日频/估值双周频) / ALERT_LONG_CACHE_TTL_MS(6h) / TRADING_WINDOWS(A股交易时段) / ALERT_NOTIFY_COOLDOWN_MS(30分钟) / EARNINGS_WARNING_NEGATIVE_TYPES / EARNINGS_WARNING_FRESH_MS(半年) / VALUATION_PERCENTILE_WARN(80) / VALUATION_INDEX_NAMES |
 
 ### Phase H AI 升级 (3 件, 单 commit 粒度可回滚)
 
@@ -324,7 +327,7 @@ vite.config.js              # root=www,域脚本 external 列表,dev proxy
 | 资金账户 | `www/app/account.js` | 现金 + 资金流水 + 账户总览 |
 | 基金专项 | `www/app/fund.js` | 7 按钮: 申购/AI 选基/再平衡/组合风险/新闻影响/导入推荐/添加 |
 | 策略回测 | `www/app/backtest.js` + `www/workers/backtest.worker.js` | 双均线/突破/海龟 3 策略 + 多指标 (夏普/最大回撤/年化) |
-| 提醒监控 | `www/app/alerts.js` | 中长线默认:业绩预告异动(周频)/大盘趋势(日频)/估值偏离(双周频)/再平衡/财报日历 + 短线价格类(1 分钟按需轮询) + 复盘联动 |
+| 提醒监控 | `www/app/alerts.js` | 中长线默认:业绩预告异动(周频)/大盘趋势(日频)/估值偏离(双周频)/再平衡/财报日历 (事件驱动: app启动+页面展示触发) + 短线价格类(1 分钟按需轮询, 仅交易时段+前台) + 复盘联动 |
 | 顶部市场条 | `www/app/market-bar.js` | 指数滚动条 |
 
 ### Dexie 数据表 (`stockmaster`, DB_VERSION 1)
