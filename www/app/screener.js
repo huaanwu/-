@@ -436,10 +436,14 @@ ${candidates}
         }
         if (parsed.ok) {
           const obj = parsed.obj;
-          const picks = obj.picks || [];
+          let picks = obj.picks || [];
           // 5.1.3: 把 AI 选股结果 (含 reasons/risks) 暂存, 给"加自选"按钮写入 journal 用
           this._lastAiPicks = picks;
           this._lastAiContext = { marketView: obj.marketView || '', policyView: obj.policyView || '', risks: obj.risks || [], conditions };
+          // Bug H 修复 (选股 picks ⊆ top30): AI 可能编出候选池外代码 (类似 Bug G),
+          // 渲染前用 _lastResults.top 前 30 提 Set, 给每个 pick 标 outOfTop, UI 灰按钮禁入库
+          const top30Codes = new Set((top || []).slice(0, 30).map(s => s && s.代码).filter(Boolean));
+          picks = (picks || []).map(p => Object.assign({}, p, { outOfTop: p && p.code && !top30Codes.has(p.code) }));
           let html = '';
           if (obj.marketView) html += `<div class="ai-macro-view"><strong>📈 大盘视角</strong>: ${escapeHtml(obj.marketView)}</div>`;
           if (obj.policyView) html += `<div class="ai-policy-view"><strong>📰 政策/新闻</strong>: ${escapeHtml(obj.policyView)}</div>`;
@@ -453,16 +457,21 @@ ${candidates}
             // Phase D2: 回测前置的"假设"文本 = 理由 + bullCase, 供策略映射 (技术突破→突破策略等)
             const bullTxt = Array.isArray(p.bullCase) ? p.bullCase.join(' ') : (p.bullCase || '');
             const assumptionTxt = escapeHtml((p.reasons || []).join(' ') + ' ' + bullTxt);
+            // Bug H 修复: outOfTop 标 [未在候选池] 红字; 禁"加自选"按钮
+            const outTag = p.outOfTop ? `<span style="color:var(--down);font-size:11px;margin-left:6px;">[未在候选池]</span>` : '';
+            const addBtnHtml = p.outOfTop
+              ? `<button class="btn btn-sm" data-code="${escapeHtml(p.code)}" data-action="add" disabled style="opacity:0.5;cursor:not-allowed;" title="不在 top30 候选池, 拒绝加入">⛔ ${escapeHtml(p.code)} 未在候选池</button>`
+              : `<button class="btn btn-sm btn-primary" data-code="${escapeHtml(p.code)}" data-name="${escapeHtml(p.name || '')}" data-riskscore="${p.riskScore || ''}" data-reasons="${reasonsJson}" data-falsify="${escapeHtml(p.falsifyCondition || '')}" data-invalidation="${escapeHtml(p.invalidation || '')}" data-action="add">📌 加入自选</button>`;
             return `
               <div class="ai-pick">
                 <div class="ai-pick-head">
-                  <strong>${escapeHtml(p.code)} ${escapeHtml(p.name || '')}</strong>
+                  <strong>${escapeHtml(p.code)} ${escapeHtml(p.name || '')}</strong>${outTag}
                   <span class="ai-risk-score" style="color:${riskColor};">风险 ${p.riskScore || '?'}/5</span>
                 </div>
                 <ul class="ai-pick-reasons">${reasons}</ul>
                 ${Core.Premortem.renderBlock(p)}
                 <div style="margin-top:6px;">
-                  <button class="btn btn-sm btn-primary" data-code="${escapeHtml(p.code)}" data-name="${escapeHtml(p.name || '')}" data-riskscore="${p.riskScore || ''}" data-reasons="${reasonsJson}" data-falsify="${escapeHtml(p.falsifyCondition || '')}" data-invalidation="${escapeHtml(p.invalidation || '')}" data-action="add">📌 加入自选</button>
+                  ${addBtnHtml}
                   <button class="btn btn-sm" data-code="${escapeHtml(p.code)}" data-name="${escapeHtml(p.name || '')}" data-action="kline">📈 K线</button>
                   <button class="btn btn-sm" data-code="${escapeHtml(p.code)}" data-assumption="${assumptionTxt}" data-action="backtest">📊 历史验证</button>
                 </div>
@@ -483,8 +492,13 @@ ${candidates}
               const name = btn.dataset.name;
               const action = btn.dataset.action;
               if (action === 'add') {
-                // 5.1.3: 改名为 addWatchlistFromPick, 复用 reasons 写 journal
-                btn.onclick = () => this._addWatchlistFromPick(btn, code, name);
+                if (btn.disabled) {
+                  // Bug H 守卫: 即便绕过 disabled 也再判一次 outOfTop → 拒绝
+                  btn.onclick = () => toastError(`${code} 不在 top30 候选池, 拒绝加入`);
+                } else {
+                  // 5.1.3: 改名为 addWatchlistFromPick, 复用 reasons 写 journal
+                  btn.onclick = () => this._addWatchlistFromPick(btn, code, name);
+                }
               } else if (action === 'kline') {
                 btn.onclick = () => Watchlist.showKLine(code, name);
               } else if (action === 'backtest') {
@@ -632,6 +646,14 @@ ${candidates}
      */
     async _addWatchlistFromPick(btn, code, name) {
       try {
+        // Bug H 守卫: pick.code 必须 ∈ _lastResults.top 前 30, 否则拒绝
+        if (this._lastResults && Array.isArray(this._lastResults.top)) {
+          const top30Codes = new Set(this._lastResults.top.slice(0, 30).map(s => s && s.代码).filter(Boolean));
+          if (!top30Codes.has(code)) {
+            toastError(`${code} 不在 top30 候选池, 拒绝加入`);
+            return;
+          }
+        }
         const exists = await Core.Storage.get('watchlist', code);
         if (exists) { toastWarning(`${code} 已在自选`); return; }
 
