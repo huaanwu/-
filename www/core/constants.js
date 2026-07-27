@@ -157,6 +157,37 @@
   /** 校准分桶边界 (probability 百分比, lo 含 hi 不含): <40 / 40-60 / 60-80 / ≥80 */
   const CALIBRATION_BUCKET_EDGES = [0, 40, 60, 80, 101];
 
+  // ==================== AI 短线操盘手 T2: 盘前计划 ====================
+
+  /** 盘前计划 KV 保留条数 (kv paper_morning_plan, 滚动截断最旧) */
+  const PLAN_LIMIT = 10;
+
+  /** 单份盘前计划允许的最大候选条件单数 (LLM 一次最多输出的条数) */
+  const PLAN_CANDIDATES_MAX = 3;
+
+  /** 盘前计划 prompt 注入的最近 lessons 条数 (T4 闭环, lessons 不足时取全部) */
+  const PLAN_LESSON_INJECT_MAX = 7;
+
+  // ==================== AI 短线操盘手 T4: 短线学习环 ====================
+
+  /** 学习环 KV 保留条数 (kv paper_short_lessons, 滚动截断最旧) */
+  const LESSON_LIMIT = 50;
+
+  /** 一次学习环提炼的最大 lessons 数 (LLM 一次输出 ≤5 条) */
+  const LESSON_EXTRACT_MAX = 5;
+
+  /** 学习环触发器当日去重 KV (存 'YYYY-MM-DD' 字符串, 当天已有则跳过自动触发) */
+  const LESSON_LAST_RUN_DATE_KEY = 'paper_short_lessons_lastDate';
+
+  /** 默认认为"值得学习"的最短持有分钟数 (过滤掉 1 分钟逃命单) */
+  const LESSON_MIN_HOLD_MIN = 30;
+
+  /** lesson category 白名单 (T4 prompt 提示用, 落库清洗做兜底) */
+  const LESSON_CATEGORIES = ['assumption', 'entry-timing', 'exit-timing', 'position-size', 'discipline'];
+
+  /** lesson severity 枚举 (按权重排序, T2 注入时 critical > warning > info) */
+  const LESSON_SEVERITIES = ['info', 'warning', 'critical'];
+
   // ==================== 调试辅助 ====================
 
   /** 给 console.log 打 tag 用: 让日志快速定位模块 */
@@ -201,6 +232,15 @@
     SCORECARD_CACHE_TTL_MS,
     BRIER_MIN_SAMPLES,
     CALIBRATION_BUCKET_EDGES,
+    PLAN_LIMIT,
+    PLAN_CANDIDATES_MAX,
+    PLAN_LESSON_INJECT_MAX,
+    LESSON_LIMIT,
+    LESSON_EXTRACT_MAX,
+    LESSON_LAST_RUN_DATE_KEY,
+    LESSON_MIN_HOLD_MIN,
+    LESSON_CATEGORIES,
+    LESSON_SEVERITIES,
     MODULE_TAG
   };
 })();
