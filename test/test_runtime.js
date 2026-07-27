@@ -535,6 +535,45 @@ if (!fs.existsSync(AI_PATH)) {
   }
 }
 
+// ========== [11] Core.Data 财报日历 (Phase U) ==========
+section('11] Core.Data 财报日历 (Phase U)');
+const DATA_PATH = path.join(ROOT, 'www', 'core', 'data.js');
+if (!fs.existsSync(DATA_PATH)) {
+  fail('data load', 'data.js 不存在');
+} else {
+  // 注: data.js IIFE 依赖 Storage, 这里只测纯函数逻辑(无法直接调接口, 但能确认挂载)
+  const dataCtx = vm.createContext({
+    window: ctx.window,
+    console,
+    setTimeout, clearTimeout,
+    Date, Math, JSON, Array, Object,
+    Promise, parseFloat, parseInt, isNaN
+  });
+  // 注入 mock Storage
+  dataCtx.window.Core = {
+    State: { get: () => ({ proxyBase: '' }) },
+    Storage: {
+      cacheGet: async () => null,
+      cacheSet: async () => {}
+    }
+  };
+  try {
+    vm.runInContext(fs.readFileSync(DATA_PATH, 'utf-8'), dataCtx, { filename: DATA_PATH });
+  } catch (e) {
+    fail('data load', e.message);
+  }
+  const Data = dataCtx.window.Core.Data;
+  if (!Data) {
+    fail('Core.Data', '未挂载');
+  } else {
+    ok('data.js loaded → Core.Data 已挂载');
+    if (typeof Data.getFinancialCalendar === 'function') ok('Data.getFinancialCalendar 是函数');
+    else fail('Data.getFinancialCalendar', '缺失');
+    if (typeof Data.getStockNextDisclosure === 'function') ok('Data.getStockNextDisclosure 是函数');
+    else fail('Data.getStockNextDisclosure', '缺失');
+  }
+}
+
 // ========== 总结 ==========
 console.log('');
 console.log(`\x1b[1m结果:\x1b[0m 通过 ${passed}, 失败 ${failed}`);

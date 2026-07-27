@@ -68,7 +68,8 @@
         change_above: '涨幅 ≥',
         change_below: '跌幅 ≥',
         volume_above: '成交 ≥',
-        rebalance_quarterly: '季度再平衡'
+        rebalance_quarterly: '季度再平衡',
+        earnings_disclosure: '📅 财报披露'
       }[t] || t;
     },
 
@@ -83,6 +84,8 @@
           return a.value + '%';
         case 'rebalance_quarterly':
           return (a.intervalDays || 90) + ' 天';
+        case 'earnings_disclosure':
+          return '提前 ' + (a.leadDays ?? 3) + ' 天';
       }
       return a.value;
     },
@@ -109,12 +112,18 @@
                 <option value="change_below">跌幅达到(≥)</option>
                 <option value="volume_above">成交量异常(≥)</option>
                 <option value="rebalance_quarterly">季度再平衡(基金)</option>
+                <option value="earnings_disclosure">📅 财报披露前 N 天</option>
               </select>
             </div>
             <div class="form-row" id="alValueRow">
               <label>阈值</label>
               <input type="number" id="alValue" step="0.01" placeholder="例: 1700 或 5">
               <span id="alUnit" style="font-size:11px;color:var(--text-muted);">元</span>
+            </div>
+            <div class="form-row" id="alLeadDaysRow" style="display:none;">
+              <label>提前天数</label>
+              <input type="number" id="alLeadDays" step="1" value="3" min="1" max="30">
+              <span style="font-size:11px;color:var(--text-muted);">披露日前 N 天提醒 (默认 3)</span>
             </div>
             <div class="form-row" id="alIntervalRow" style="display:none;">
               <label>提醒周期(天)</label>
@@ -178,11 +187,14 @@
 
       // 切换 row 显示
       const isRebalance = t === 'rebalance_quarterly';
+      const isEarnings = t === 'earnings_disclosure';  // Phase U
       const valRow = document.getElementById('alValueRow');
       const intRow = document.getElementById('alIntervalRow');
+      const leadRow = document.getElementById('alLeadDaysRow');  // Phase U
       const hint = document.getElementById('alRebalanceTarget');
-      if (valRow) valRow.style.display = isRebalance ? 'none' : '';
+      if (valRow) valRow.style.display = (isRebalance || isEarnings) ? 'none' : '';
       if (intRow) intRow.style.display = isRebalance ? '' : 'none';
+      if (leadRow) leadRow.style.display = isEarnings ? '' : 'none';  // Phase U
       if (hint) hint.style.display = isRebalance ? '' : 'none';
 
       // 再平衡不需要代码
@@ -215,6 +227,27 @@
         await Core.Storage.add('alerts', data);
         this.closeModal();
         toastSuccess(`已添加: 每 ${intervalDays} 天提醒再平衡`);
+        this.render();
+        return;
+      }
+
+      // Phase U: 财报披露类型
+      if (type === 'earnings_disclosure') {
+        if (!code || !/^\d{6}$/.test(code)) { toastError('代码必须 6 位'); return; }
+        const leadDays = parseInt(document.getElementById('alLeadDays').value) || 3;
+        if (leadDays < 1 || leadDays > 30) { toastError('提前天数 1-30'); return; }
+        const data = {
+          id: uuid(),
+          code, name, type, leadDays,
+          active: true,
+          hitCount: 0,
+          triggered: false,
+          _hitKey: null,  // 幂等 key, 同周期不重复触发
+          createdAt: Date.now()
+        };
+        await Core.Storage.add('alerts', data);
+        this.closeModal();
+        toastSuccess(`已添加: ${name || code} 财报披露前 ${leadDays} 天提醒`);
         this.render();
         return;
       }
@@ -268,11 +301,12 @@
       const list = await Core.Storage.where('alerts', 'active', true);
       if (!list.length) return;
 
-      // 分离股票类 vs 再平衡类
-      const stockAlerts = list.filter(a => a.type !== 'rebalance_quarterly');
+      // 分离: 行情类 / 再平衡类 / 财报日历类
+      const stockAlerts = list.filter(a => a.type !== 'rebalance_quarterly' && a.type !== 'earnings_disclosure');
       const rebalanceAlerts = list.filter(a => a.type === 'rebalance_quarterly');
+      const earningsAlerts = list.filter(a => a.type === 'earnings_disclosure');
 
-      // 1. 股票类: 一次拉行情
+      // 1. 行情类: 一次拉行情
       if (stockAlerts.length > 0) {
         let spotMap = {};
         try {
@@ -309,7 +343,38 @@
         }
       }
 
-      // 2. 再平衡类: 检查 nextCheck
+      // 2. 财报日历类 (Phase U): 拉单股下次披露日, 距今 ≤ N 天触发
+      for (const a of earningsAlerts) {
+        try {
+          const next = await Core.Data.getStockNextDisclosure(a.code);
+          if (!next || !next.noticeDate) continue;
+          const today = new Date(); today.setHours(0, 0, 0, 0);
+          const notice = new Date(next.noticeDate); notice.setHours(0, 0, 0, 0);
+          const daysLeft = Math.round((notice - today) / 86400000);
+          // 触发条件: 距披露日 <= N 天 (默认 3), 且未触发过这次披露
+          const leadDays = a.leadDays ?? 3;
+          const shouldHit = daysLeft >= 0 && daysLeft <= leadDays;
+          // 用 reportPeriod + noticeDate 做幂等 key, 同一披露周期只触发一次
+          const hitKey = `${next.reportPeriod || ''}_${next.noticeDate}`;
+          if (shouldHit && a._hitKey !== hitKey) {
+            a.triggered = true;
+            a._hitKey = hitKey;
+            a.hitCount = (a.hitCount || 0) + 1;
+            a.lastHit = Date.now();
+            await Core.Storage.put('alerts', a);
+            this._notifyEarnings(a, next, daysLeft);
+          } else if (!shouldHit && a.triggered) {
+            // 披露日已过, 重置 (等下一季度)
+            a.triggered = false;
+            a._hitKey = null;
+            await Core.Storage.put('alerts', a);
+          }
+        } catch (e) {
+          console.warn('[Alerts] 财报日历检查失败:', a.code, e);
+        }
+      }
+
+      // 3. 再平衡类: 检查 nextCheck
       for (const a of rebalanceAlerts) {
         const nextCheck = a.nextCheck || (a.createdAt + (a.intervalDays || 90) * 86400000);
         if (Date.now() < nextCheck) continue;
@@ -328,6 +393,25 @@
         a.lastHit = Date.now();
         await Core.Storage.put('alerts', a);
       }
+    },
+
+    /**
+     * Phase U: 财报披露提醒 (toast + 浏览器通知 + AI 上下文)
+     */
+    _notifyEarnings(a, next, daysLeft) {
+      const code = a.code;
+      const name = a.name || code;
+      const period = next.reportPeriod || '本季度';
+      const date = next.noticeDate;
+      const title = `📅 ${name} 财报 ${daysLeft} 天后披露`;
+      const body = `${period} 报告 (${date}), 请关注.`;
+      if (window.toastInfo) toastInfo(`${title} · ${body}`);
+      // 浏览器通知 (Phase U 拓展)
+      if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+        try { new Notification(title, { body }); } catch (e) { /* ignore */ }
+      }
+      // 触发后顺手拉一次财报历史 (Phase R 联动)
+      Core.Data.getStockFinancialHistory(code).catch(e => { /* best effort */ });
     },
 
     /**

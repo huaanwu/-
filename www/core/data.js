@@ -430,6 +430,72 @@
     return Array.isArray(raw) ? raw : [];
   }
 
+  // ============ 财报披露日历 (Phase U) ============
+  // 缓存: 本季度日历 (key = year-Qx), 1 天 (季度披露计划基本不变, 但临近披露日时可能有更新)
+  const _calCache = new Map();
+  const _CAL_TTL = 24 * 60 * 60 * 1000;
+
+  /**
+   * 拉某个季度的全市场财报披露日历 (东方财富)
+   * @param {number} year
+   * @param {number} quarter 1-4
+   * @returns {Promise<Array<{code, name, noticeDate, reportPeriod}>>}
+   */
+  async function getFinancialCalendar(year, quarter) {
+    const key = `${year}-Q${quarter}`;
+    const now = Date.now();
+    const cached = _calCache.get(key);
+    if (cached && now - cached.at < _CAL_TTL) return cached.list;
+    const raw = await fetchWithCache(
+      `fin_calendar_${key}`,
+      'stock_financial_calendar_em',
+      { year, quarter },
+      _CAL_TTL
+    );
+    const list = _normalizeCalendar(Array.isArray(raw) ? raw : []);
+    _calCache.set(key, { at: now, list });
+    return list;
+  }
+
+  /**
+   * 容错多种 AKShare 字段名 (agent 回报字段可能是 stock_code / 股票代码 等)
+   */
+  function _normalizeCalendar(rows) {
+    const out = [];
+    for (const row of rows) {
+      const code = row.stock_code || row['股票代码'] || row.code;
+      const name = row.stock_name || row['股票简称'] || row.name || '';
+      const noticeDate = row.notice_date || row['财报披露日期'] || row['披露日期'] || row.date || row['公告日期'];
+      const reportPeriod = row.report_period || row['报告期'] || '';
+      if (code && noticeDate) {
+        out.push({ code: String(code).padStart(6, '0'), name: String(name), noticeDate: String(noticeDate).slice(0, 10), reportPeriod: String(reportPeriod) });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 当前季度 (基于当前日期)
+   */
+  function _currentQuarter(d = new Date()) {
+    const m = d.getMonth() + 1;
+    return { year: d.getFullYear(), quarter: m <= 3 ? 1 : (m <= 6 ? 2 : (m <= 9 ? 3 : 4)) };
+  }
+
+  /**
+   * 个股的下次财报披露日期 (Phase U 给 alerts.js 用)
+   * 在当季日历里查 code, 没找到返回 null
+   * @param {string} code 6 位
+   * @returns {Promise<{noticeDate, reportPeriod}|null>}
+   */
+  async function getStockNextDisclosure(code) {
+    const c = String(code || '').padStart(6, '0');
+    const q = _currentQuarter();
+    const list = await getFinancialCalendar(q.year, q.quarter);
+    const hit = list.find(r => r.code === c);
+    return hit ? { noticeDate: hit.noticeDate, reportPeriod: hit.reportPeriod } : null;
+  }
+
   /**
    * 给 6 位代码补市场后缀 (Phase R)
    * 6/9: SH (沪市主板 + B 股)
@@ -1139,6 +1205,7 @@
     getStockSpotTencent,    // C: 腾讯 fetcher (codes 参数, 实时)
     getStockSpotEfinance,  // C: 东方财富 fetcher (全市场, screener 用)
     getStockFinancialHistory,  // Phase R: 近 N 期财报对比
+    getFinancialCalendar, getStockNextDisclosure,  // Phase U: 财报披露日历
     // 基金
     getFundSpot, getFundHistory, getFundPortfolio,
     // 指数
