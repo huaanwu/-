@@ -286,11 +286,15 @@ ${candidatesText}
       }
       if (parsed.ok) {
         const obj = parsed.obj;
-        const picks = obj.picks || [];
+        let picks = obj.picks || [];
         const macroView = obj.macroView || '';
         const allocation = obj.allocation || '';
         const summary = obj.summary || '';
         const risks = obj.risks || [];
+        // Bug G 修复 (选基 code ∈ seed): 候选池是事实来源, AI 可能幻觉出池外代码
+        // 渲染时标记 outOfSeed (灰按钮 + 标 [未在候选池]), 不影响其它 in-seed 选基
+        const seedCodes = new Set((seed.candidates || []).map(c => c && c.code).filter(Boolean));
+        picks = (picks || []).map(p => Object.assign({}, p, { outOfSeed: p && p.code && !seedCodes.has(p.code) }));
 
         let html = '';
         if (macroView) {
@@ -307,10 +311,12 @@ ${candidatesText}
           const pct = p.pct || (((p.amount || 0) / amount) * 100);
           const riskColor = p.riskScore >= 4 ? 'var(--down)' : (p.riskScore <= 2 ? 'var(--up)' : 'var(--text-muted)');
           const reasons = (p.reasons || []).map(r => `<li>${escapeHtml(r)}</li>`).join('');
+          // Bug G 修复: outOfSeed 标 [未在候选池] 红字
+          const outTag = p.outOfSeed ? `<span style="color:var(--down);font-size:11px;margin-left:6px;">[未在候选池]</span>` : '';
           return `
             <div class="ai-pick">
               <div class="ai-pick-head">
-                <strong>${escapeHtml(p.code)} ${escapeHtml(p.name || '')}</strong>
+                <strong>${escapeHtml(p.code)} ${escapeHtml(p.name || '')}</strong>${outTag}
                 <span class="ai-pick-amt">${fmtMoney(p.amount || 0)} · ${pct.toFixed ? pct.toFixed(0) : pct}%</span>
               </div>
               <div class="ai-pick-meta">
@@ -327,14 +333,17 @@ ${candidatesText}
         }
         streamEl.innerHTML = html;
 
-        // 操作按钮
+        // 操作按钮 (Bug G 修复: outOfSeed 标红 + 禁按钮)
         const actions = document.getElementById('aiAdvisorActions');
-        actions.innerHTML = picks.map((p, idx) => `
-          <button class="btn btn-primary" data-idx="${idx}">📥 加入自选: ${escapeHtml(p.code)}</button>
-        `).join(' ') + `<button class="btn btn-ghost" onclick="Fund.aiAdvisorRun()">🔄 再来一次</button>`;
-        actions.querySelectorAll('button[data-idx]').forEach(btn => {
+        actions.innerHTML = picks.map((p, idx) => {
+          const disabled = p.outOfSeed ? 'disabled style="opacity:0.5;cursor:not-allowed;"' : '';
+          const label = p.outOfSeed ? `⛔ ${p.code} 未在候选池` : `📥 加入自选: ${escapeHtml(p.code)}`;
+          return `<button class="btn btn-primary" data-idx="${idx}" ${disabled}>${label}</button>`;
+        }).join(' ') + `<button class="btn btn-ghost" onclick="Fund.aiAdvisorRun()">🔄 再来一次</button>`;
+        actions.querySelectorAll('button[data-idx]:not([disabled])').forEach(btn => {
           btn.onclick = async () => {
             const p = picks[parseInt(btn.dataset.idx)];
+            if (p.outOfSeed) { toastError(`${p.code} 不在候选池, 拒绝加入`); return; }
             const exists = await Core.Storage.get('funds', p.code);
             if (exists) { toastWarning(`${p.code} 已在自选`); return; }
             const seedCand = seed.candidates.find(c => c.code === p.code);
