@@ -77,7 +77,12 @@
       '',
       '【KB 引用】如有相关条目, 引用条目号: "..., 参考 KB-VAL-002 PB-ROE 匹配"',
       '',
-      '【硬性】不许编造数字; 没有的数据说"无"; 总长度 250-450 字'
+      '【硬性】不许编造数字; 没有的数据说"无"; 总长度 250-450 字',
+      '',
+      '【Phase P 多视角辩论】在 📌 动作建议 之前, 增加:',
+      '  📈 多方观点 (80 字): 看多的依据 (估值/资金/政策)',
+      '  📉 空方观点 (80 字): 看空的依据 (估值/行业/技术)',
+      '  ⚖️ 综合判断 (40 字): 权衡后倾向'
     ].join('\n');
 
     const prompt = `单股简评请求:\n${JSON.stringify(data, null, 2)}\n\n请按上面 4 段结构输出。`;
@@ -94,7 +99,27 @@
         }
       });
       const finalText = (el && el.textContent) || '';
-      if (el) el.innerHTML = escapeHtml(finalText);
+      if (el) el.innerHTML = window.Core.Util.renderWithSources(finalText);
+
+      // Phase P 反向 self-check (后台)
+      const checkEl = document.createElement('div');
+      checkEl.style.cssText = 'margin-top:12px;padding:8px 12px;background:var(--bg-base);border-radius:6px;font-size:12px;line-height:1.6;border-left:3px solid var(--accent);';
+      checkEl.innerHTML = '🔍 self-check 中...';
+      if (el && el.parentElement) el.parentElement.appendChild(checkEl);
+      try {
+        const critique = await Core.AI.selfCheck({
+          originalOutput: finalText,
+          originalPrompt: JSON.stringify(data).slice(0, 500),
+          maxTokens: 250
+        });
+        const passThrough = critique.includes('✓ self-check 通过');
+        checkEl.innerHTML = passThrough
+          ? `<strong>✓ self-check 通过</strong> · 无幻觉/过度自信/漏判`
+          : `<strong>⚠ self-check 反馈</strong><br>${escapeHtml(critique)}`;
+        checkEl.style.borderLeftColor = passThrough ? 'var(--up)' : 'var(--down)';
+      } catch (e) {
+        checkEl.textContent = '⚠ self-check 失败: ' + e.message;
+      }
     } catch (e) {
       console.warn('[sa] AI 调用失败:', e);
       if (ld) ld.remove();

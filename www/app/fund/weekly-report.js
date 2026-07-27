@@ -143,7 +143,12 @@
       '  - 如果有"国际形势"段, 重要事件或下周关注必须提美股/美元/原油方向',
       '  - 如果有"市场上下文"段, 综合估值分位/北向/板块轮动',
       '  - 如果有"上周 AI 判断"段, 必须点评上周判断的兑现情况',
-      '  - 总长度 500-800 字 (因 Action 段可能更长)'
+      '  - 总长度 500-800 字 (因 Action 段可能更长)',
+      '',
+      '【Phase P 多视角辩论】在 📌 本周动作 之前, 增加 2 段简短辩论:',
+      '  📈 多方观点 (100 字): 看多的依据 + 标的',
+      '  📉 空方观点 (100 字): 看空的依据 + 风险',
+      '  ⚖️ 综合判断 (50 字): 权衡后倾向哪一方, 为什么'
     ].join('\n');
     const prompt = `基金周报数据:\n${JSON.stringify(data, null, 2)}\n\n请生成给小白看的本周小结。`;
 
@@ -159,9 +164,29 @@
         }
       });
       const finalText = (el && el.textContent) || '';
-      if (el) el.innerHTML = window.Core.Util.escapeHtml(finalText);
+      if (el) el.innerHTML = window.Core.Util.renderWithSources(finalText);
       // 保存到 Dexie (Phase N: 历史复盘)
       _saveWeeklyReport(finalText, data).catch(e => console.warn('[weekly] 保存历史失败:', e));
+
+      // Phase P 反向 self-check (后台, 不阻塞 UI)
+      const checkEl = document.createElement('div');
+      checkEl.style.cssText = 'margin-top:12px;padding:8px 12px;background:var(--bg-base);border-radius:6px;font-size:12px;line-height:1.6;border-left:3px solid var(--accent);';
+      checkEl.innerHTML = '🔍 self-check 中...';
+      if (el && el.parentElement) el.parentElement.appendChild(checkEl);
+      try {
+        const critique = await Core.AI.selfCheck({
+          originalOutput: finalText,
+          originalPrompt: JSON.stringify(data).slice(0, 500),
+          maxTokens: 300
+        });
+        const passThrough = critique.includes('✓ self-check 通过');
+        checkEl.innerHTML = passThrough
+          ? `<strong>✓ self-check 通过</strong> · 输出无幻觉/过度自信/漏判`
+          : `<strong>⚠ self-check 反馈</strong><br>${escapeHtml(critique)}`;
+        checkEl.style.borderLeftColor = passThrough ? 'var(--up)' : 'var(--down)';
+      } catch (e) {
+        checkEl.textContent = '⚠ self-check 失败: ' + e.message;
+      }
     } catch (e) {
       console.warn('[weekly] AI 调用失败:', e);
       if (ld) ld.remove();

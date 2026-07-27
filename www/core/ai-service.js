@@ -295,6 +295,45 @@
     }
   }
 
+  /**
+   * selfCheck (Phase P 反向 self-check)
+   * 拿之前的 AI 输出, 让 LLM 自己挑刺
+   * @param {object} opts - { originalOutput, originalSystemPrompt, originalPrompt, onChunk, maxTokens=400 }
+   * @returns {string} self-check 结果 (若无问题: "✓ self-check 通过")
+   */
+  async function selfCheck(opts) {
+    if (!opts || !opts.originalOutput) throw new Error('selfCheck: 缺少 originalOutput');
+    const criticSystemPrompt = [
+      '你是一名严格的 AI 输出质检员 (Phase P 反向 self-check)。',
+      '',
+      '【任务】对原 AI 输出做挑刺, 找出以下 4 类问题:',
+      '  1) 幻觉: 编造了不存在的数字/事件/标的/基金代码',
+      '  2) 过度自信: 用了绝对化表述 ("一定涨", "稳赚", "绝对")',
+      '  3) 漏判: 用户场景的关键风险/机会, 输出完全没提到',
+      '  4) 逻辑漏洞: 前后矛盾, 推理链断裂',
+      '',
+      '【输出格式】',
+      '  - 若全部无问题: 输出 "✓ self-check 通过, 无明显问题"',
+      '  - 若有问题: 列出 1-3 条, 每条 "[严重度] 问题描述"',
+      '  - 严重度: 高 (幻觉/漏判) / 中 (过度自信) / 低 (表述瑕疵)',
+      '',
+      '【硬性规则】',
+      '  - 不要重复原文',
+      '  - 不要给替代答案, 只指出问题',
+      '  - 总长度 < 200 字'
+    ].join('\n');
+
+    const criticPrompt = `【原 AI 输出】\n${opts.originalOutput}\n\n【原 prompt 上下文 (供你理解原任务)】\n${(opts.originalPrompt || '').slice(0, 500)}\n\n请按上面格式输出 self-check 结果。`;
+
+    return await call({
+      systemPrompt: criticSystemPrompt,
+      prompt: criticPrompt,
+      stream: !!opts.onChunk,
+      onChunk: opts.onChunk,
+      maxTokens: opts.maxTokens ?? 400
+    });
+  }
+
   window.Core = window.Core || {};
   window.Core.AI = {
     call,
@@ -302,6 +341,7 @@
     getConfig,
     getProviderConfig,
     resolveEndpoint,
+    selfCheck,
     PROVIDERS
   };
 })();

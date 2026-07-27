@@ -144,6 +144,33 @@
   window.Core.Util = {
     escapeHtml, safeHTML, fmtNum, fmtPct, fmtMoney, pctClass,
     stockCodePrefix, fmtDate, fmtDateTime, clone, debounce, uuid,
-    parseStockInput
+    parseStockInput,
+    renderWithSources
   };
+
+  /**
+   * renderWithSources (Phase P) - 把 AI 输出里的"数据源标记"渲染为可点击 chip
+   * 识别模式:
+   *   - KB-XXX-NNN  → 知识库条目 (例 KB-VAL-001, KB-POS-003)
+   *   - data.<key> §N  → 数据源段落 (例 data.context §3, data.intl §1)
+   * 其余文本经 escapeHtml 转义防 XSS
+   * @param {string} text - AI 原始输出
+   * @returns {string} safe HTML
+   */
+  function renderWithSources(text) {
+    if (!text || typeof text !== 'string') return '';
+    // 先按行 split, 行内先 escape 再替换
+    const lines = text.split('\n');
+    const kbRe = /\bKB-[A-Z]{2,5}-\d{3}\b/g;
+    const dataRe = /\bdata\.[a-zA-Z_]+(?:\s*§\d+)?\b/g;
+    const parts = lines.map(line => {
+      let safe = escapeHtml(line);
+      // 把 KB 编号包成 chip
+      safe = safe.replace(kbRe, m => `<span class="src-chip" data-src="${m}" title="知识库条目 ${m}">📎 ${m}</span>`);
+      // 把 data.* 包成 chip
+      safe = safe.replace(dataRe, m => `<span class="src-chip" data-src="${m}" title="数据源 ${m}">📊 ${m}</span>`);
+      return safe;
+    });
+    return parts.join('<br>');
+  }
 })();
