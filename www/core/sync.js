@@ -421,7 +421,8 @@
           if (row.payload.assumption) local.assumption = row.payload.assumption;
           if (row.payload.emotion) local.emotion = row.payload.emotion;
           if (row.payload.verify) local.verify = row.payload.verify;
-          await Core.Storage.add('journals', local);
+          // Y8: add → put (upsert), 避免主键冲突 (本地可能已部分更新)
+          await Core.Storage.put('journals', local);
           jApplied++;
         }
       } else if (row.kind === 'alert_hit' && row.payload?.id) {
@@ -432,7 +433,8 @@
           if (Array.isArray(row.payload.hitHistory) && row.payload.hitHistory.length > 0) {
             local.hitHistory = row.payload.hitHistory;
           }
-          await Core.Storage.add('alerts', local);
+          // Y8: add → put (upsert)
+          await Core.Storage.put('alerts', local);
           aApplied++;
         }
       }

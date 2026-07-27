@@ -608,14 +608,31 @@
     // 走标准 aktools 通道
     const data = await Core.Data.fetch('ak_gold_benchmark', 'spot_golden_benchmark_sge', {}, _GOLD_TTL);
     if (!Array.isArray(data) || data.length === 0) return null;
-    // akshare 字段: 中文乱码问题, 用位置 0/1/2 推断 (date, open, close)
-    // 已知输出是 3 列: 第 1 列日期, 第 2 列开盘价, 第 3 列收盘价
+    // Y4: 先按字段名取 (date/open/close/latest/price), 找不到再按位置 fallback
+    const pickField = (obj, names) => {
+      for (const n of names) {
+        for (const k of Object.keys(obj || {})) {
+          if (k && k.toLowerCase().includes(n.toLowerCase())) return obj[k];
+        }
+      }
+      return undefined;
+    };
     const rows = data.slice(-90).map((r, i) => {
-      const vals = Object.values(r || {});
-      if (vals.length < 3) return null;
-      const dateRaw = vals[0];
-      const open = parseFloat(vals[1]);
-      const close = parseFloat(vals[2]);
+      if (!r || typeof r !== 'object') return null;
+      // 字段名优先
+      let dateRaw = pickField(r, ['date', '日期', '统计日期']);
+      let openRaw = pickField(r, ['open', '开盘', '开盘价']);
+      let closeRaw = pickField(r, ['close', 'latest', '最新', '收盘', '收盘价', 'price', '现价']);
+      // 位置 fallback (aktools 中文乱码常见)
+      if (closeRaw == null) {
+        const vals = Object.values(r);
+        if (vals.length < 3) return null;
+        dateRaw = dateRaw != null ? dateRaw : vals[0];
+        openRaw = openRaw != null ? openRaw : vals[1];
+        closeRaw = vals[2];
+      }
+      const close = parseFloat(closeRaw);
+      const open = parseFloat(openRaw);
       if (isNaN(close)) return null;
       let dateStr;
       if (typeof dateRaw === 'string') {
@@ -732,13 +749,16 @@
       const n = (r.货币名称 || r['货币名称'] || r.name || '').toString();
       return n.includes('美元');
     }) || data[0];
-    return {
+    const out = {
       name: row['货币名称'] || row.货币名称 || '美元/人民币',
       buy: parseFloat(row['现汇买入价'] || row.现汇买入价),
       sell: parseFloat(row['现汇卖出价'] || row.现汇卖出价),
       mid: parseFloat(row['中行折算价'] || row.中行折算价),
       date: row['发布时间'] || row.发布时间 || ''
     };
+    // Y3: 任一关键字段 NaN 时整段返回 null, 避免 NaN 进 prompt 污染 AI 输出
+    if (isNaN(out.mid) || isNaN(out.buy) || isNaN(out.sell)) return null;
+    return out;
   }
 
   /**
@@ -755,10 +775,11 @@
   }
 
   /**
-   * 原油 WTI 主力合约 - aktools: energy_oil_hist  → 列表
+   * 原油主力合约 - aktools: energy_oil_hist → 列表
+   * Y5: 默认 symbol='SC' (上海原油主连), aktools 实际不接受 WTI/Brent 等 CME 代码
    */
   async function _fetchCrudeOil() {
-    const data = await Core.Data.fetch('intl_oil_wti', 'energy_oil_hist', { symbol: 'WTI' }, _INTL_TTL);
+    const data = await Core.Data.fetch('intl_oil_sc', 'energy_oil_hist', { symbol: 'SC' }, _INTL_TTL);
     if (!Array.isArray(data) || data.length === 0) return null;
     const tail = data.slice(-30);
     const last = tail[tail.length - 1];
@@ -768,7 +789,7 @@
     if (isNaN(lastClose)) return null;
     const changePct = isNaN(prevClose) ? null : ((lastClose - prevClose) / prevClose) * 100;
     return {
-      name: 'WTI 原油',
+      name: '上海原油 (SC 主连)',
       last: lastClose,
       changePct,
       date: (last && (last['日期'] || last.日期 || last.date)) || '',
@@ -837,7 +858,7 @@
         const lo = Math.min(...hist);
         range = `, 近 30 日区间 ${hi.toFixed(2)} - ${lo.toFixed(2)}`;
       }
-      lines.push(`- **WTI 原油**: ${snap.oil.last.toFixed(2)} 美元/桶 (${pct}${range})`);
+      lines.push(`- **上海原油 (SC 主连)**: ${snap.oil.last.toFixed(2)} 元/桶 (${pct}${range})`);
     }
 
     return lines.join('\n');
@@ -881,8 +902,13 @@
   }
 
   /**
-   * 2) 业绩预告 + 财报披露日历
-   * aktools: stock_yjyg_em (业绩预告), stock_report_disclosure (披露日历)
+   * 2) 业绩预告 + 财报披露日历 (Phase X.Y1: 带日期过滤, 防止陈旧数据)
+   * aktools: stock_yjyg_em (业绩预告, date 参数 = 报告期截止日, 传最近一期)
+   *         stock_report_disclosure (披露日历, 不带日期)
+   *
+   * 数据陈旧风险:
+   *   - aktools 默认 date 是最近一期, 但若本地缓存了 1 周前的响应, AI 上下文里就出现过时预告
+   *   - 防御: 缓存 key 加日期后缀 (每天自动失效), 客户端再过滤一次半年内的数据
    */
   async function _fetchEarningsCalendar() {
     let upcoming = [], surprise = [];
@@ -899,16 +925,28 @@
     } catch (e) { console.warn('[Ctx] 财报披露日历失败:', e.message); }
 
     try {
-      const yjyg = await Core.Data.fetch('ai_ctx_yjyg', 'stock_yjyg_em', {}, _CTX_TTL);
+      // Y1: 缓存 key 加日期, 强制每日失效 (避免 1 周前的陈旧预告喂给 AI)
+      const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+      const yjyg = await Core.Data.fetch(`ai_ctx_yjyg_${today}`, 'stock_yjyg_em', {}, _CTX_TTL);
       if (Array.isArray(yjyg)) {
+        // Y1: 客户端再加一道半年内过滤 (aktools 可能返历史回填数据)
+        const halfYearAgo = Date.now() - 180 * 24 * 60 * 60 * 1000;
         surprise = yjyg.slice(0, 50).filter(r => {
           const t = (r['业绩预告类型'] || r['预告类型'] || '').toString();
-          return /增|减|扭亏|首亏|续亏|续盈/.test(t);
+          if (!/增|减|扭亏|首亏|续亏|续盈/.test(t)) return false;
+          // 提取公告日期 (多种字段名容错)
+          const dStr = r['公告日期'] || r['最新公告日期'] || r['报告日期'] || r['发布日期'];
+          if (dStr) {
+            const ts = Date.parse(dStr);
+            if (!isNaN(ts) && ts < halfYearAgo) return false;  // 半年外丢弃
+          }
+          return true;
         }).slice(0, 10).map(r => ({
           code: r['股票代码'] || r.code,
           name: r['股票简称'] || r.name,
           type: r['业绩预告类型'] || r['预告类型'],
-          summary: r['业绩预告摘要'] || r.summary || ''
+          summary: r['业绩预告摘要'] || r.summary || '',
+          reportDate: r['公告日期'] || r['最新公告日期'] || r['报告日期'] || r['发布日期'] || ''
         }));
       }
     } catch (e) { console.warn('[Ctx] 业绩预告失败:', e.message); }
@@ -1046,15 +1084,23 @@
       if (Array.isArray(szse) && szse.length > 0) {
         const last = szse[szse.length - 1];
         const bal = parseFloat(last['融资余额'] || last['融资余额(元)'] || last.rzye);
-        if (!isNaN(bal)) { total += bal; count++; date = last['日期'] || last.date || date; }
+        if (!isNaN(bal)) { total += bal; count++; date = date || last['日期'] || last.date; }
       }
     } catch (e) { console.warn('[Ctx] 深市两融失败:', e.message); }
+    // Y2: 日期容错 — aktools 字段名若是 'trade_date'/'统计日期'/'数据日期' 等都接不住时, 用今天兜底
+    if (!date) date = new Date().toISOString().slice(0, 10);
     return count > 0 ? { total_yi: total / 1e8, date } : null;  // 元 → 亿
   }
 
   /**
-   * 9) 财经日历 (本地静态) - 国常会 / LPR / PMI / CPI / FOMC
-   * 不依赖 akshare, 直接算"未来 7 天有没有重大事件"
+   * 财经日历 (本地静态规则) - 基于公开统计规律, 不预测实际事件
+   * Y6: 删除"周二/周五国常会"硬编码 (国常会无公开日程, 编造会误导 AI)
+   * 保留有公开日期规则的:
+   *   - LPR 报价: 每月 20 号 (央行公开)
+   *   - MLF 续作/到期: 每月 15 号左右 (央行公开)
+   *   - PMI: 每月最后一天 (统计局公开)
+   *   - CPI/PPI: 每月 10-12 号 (统计局公开)
+   *   - 季报披露密集期: 1/4/7/10 月下旬 (交易所规则)
    */
   function _fetchEconomicCalendar() {
     const now = new Date();
@@ -1062,29 +1108,21 @@
     for (let i = 0; i < 14; i++) {
       const d = new Date(now); d.setDate(d.getDate() + i);
       const day = d.getDate();
-      const dow = d.getDay();  // 0=Sun, 1-5=Mon-Fri, 6=Sat
-      const md = (d.getMonth() + 1) + '-' + day;
+      const month = d.getMonth() + 1;
+      const md = month + '-' + day;
 
-      // 国常会: 周二/周五下午 (周二 5, 周五 5) - 经验值
-      if (dow === 2 || dow === 5) {
-        events.push(`${md} 国常会 (周二/周五, 可能出政策)`);
-      }
       // LPR 报价: 每月 20 号
-      if (day === 20) {
-        events.push(`${md} LPR 报价 (1Y/5Y)`);
-      }
+      if (day === 20) events.push(`${md} LPR 报价 (1Y/5Y)`);
       // MLF 中期借贷便利: 每月 15 号
-      if (day === 15) {
-        events.push(`${md} MLF 续作/到期`);
-      }
+      if (day === 15) events.push(`${md} MLF 续作/到期`);
       // PMI: 每月最后一天
       const lastDay = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
-      if (day === lastDay) {
-        events.push(`${md} 官方 PMI 公布`);
-      }
+      if (day === lastDay) events.push(`${md} 官方 PMI 公布`);
       // CPI / PPI: 每月 10-12 号
-      if (day >= 10 && day <= 12) {
-        events.push(`${md} CPI / PPI 同比 (估计)`);
+      if (day >= 10 && day <= 12) events.push(`${md} CPI / PPI 同比 (估计)`);
+      // 季报披露密集期 (1/4/7/10 月下旬)
+      if ([1, 4, 7, 10].includes(month) && day >= 20 && day <= 30) {
+        events.push(`${md} 季报披露密集期 (年报/一季报/中报/三季报)`);
       }
     }
     // 去重 + 取前 8
@@ -1140,8 +1178,9 @@
     if (snap.earnings) {
       const up = (snap.earnings.upcoming || []).slice(0, 3)
         .map(e => `${e.name}(${(e.date || '').slice(0, 10)})`).join('、');
+      // Y1: 业绩预告拐点带 reportDate 前缀 (YYYY-MM-DD), AI 知道是哪一期
       const sg = (snap.earnings.surprise || []).slice(0, 3)
-        .map(e => `${e.name} ${e.type}`).join('、');
+        .map(e => `${e.name}${e.reportDate ? ' [' + e.reportDate.slice(0, 10) + ']' : ''} ${e.type}`).join('、');
       if (up) lines.push(`- **近期财报披露**: ${up}`);
       if (sg) lines.push(`- **业绩预告拐点**: ${sg}`);
     }

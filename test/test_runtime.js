@@ -574,6 +574,110 @@ if (!fs.existsSync(DATA_PATH)) {
   }
 }
 
+// ========== [12] StockAdvisor._briefCacheKey (Phase W) ==========
+section('12] StockAdvisor._briefCacheKey (Phase W)');
+{
+  const SA_PATH = path.join(ROOT, 'www', 'app', 'stock-advisor.js');
+  if (!fs.existsSync(SA_PATH)) {
+    fail('stock-advisor load', 'stock-advisor.js 不存在');
+  } else {
+    const saCtx = vm.createContext({
+      window: {},
+      console,
+      setTimeout, clearTimeout,
+      Date, Math, JSON, Object, Array,
+      Number, String,
+      Promise,
+      // Core mock (Phase W 测试只关心纯函数 _briefCacheKey)
+      Core: {
+        State: { get: () => ({ proxyBase: '' }) },
+        Data: {
+          getStockFinancial: () => Promise.resolve(null),
+          getAiContextSnapshot: () => Promise.resolve(null),
+          getStockQuote: () => Promise.resolve(null),
+          getIntlSnapshot: () => Promise.resolve(null),
+          getStockFinancialHistory: () => Promise.resolve(null),
+          formatAiContextForPrompt: () => '',
+          formatIntlForPrompt: () => ''
+        },
+        KB: { pickRelevant: () => Promise.resolve([]), formatForPrompt: () => '' },
+        Util: { escapeHtml: (s) => s, renderWithSources: (s) => s },
+        AI: {
+          call: () => Promise.resolve(''),
+          selfCheck: () => Promise.resolve('✓ self-check 通过')
+        },
+        Storage: { all: () => Promise.resolve([]), cacheGet: () => Promise.resolve(null), cacheSet: () => Promise.resolve() }
+      },
+      toastError: () => {},
+      toastSuccess: () => {},
+      Fund: { closeModal: () => {} }
+    });
+    try {
+      vm.runInContext(fs.readFileSync(SA_PATH, 'utf-8'), saCtx, { filename: SA_PATH });
+    } catch (e) {
+      fail('stock-advisor load (Phase W)', `执行失败: ${e.message}`);
+    }
+    const SA = saCtx.window.StockAdvisor;
+    if (!SA || typeof SA._test_briefCacheKey !== 'function') {
+      fail('StockAdvisor._test_briefCacheKey', '未暴露');
+    } else {
+      ok('StockAdvisor._test_briefCacheKey 已暴露');
+
+      // 1. 输出格式: sa_brief_ 开头 + base36 hash
+      const k1 = SA._test_briefCacheKey('600519', 'ctx', 'intl');
+      if (typeof k1 === 'string' && k1.startsWith('sa_brief_') && /^sa_brief_[a-z0-9]+$/.test(k1)) {
+        ok('cacheKey: 格式 sa_brief_<base36>');
+      } else {
+        fail('cacheKey format', `实际=${k1}`);
+      }
+
+      // 2. 同输入 → 同键
+      const k2 = SA._test_briefCacheKey('600519', 'ctx', 'intl');
+      if (k1 === k2) ok('cacheKey: 同输入输出同键');
+      else fail('cacheKey stability', `${k1} vs ${k2}`);
+
+      // 3. 不同 code → 不同键
+      const k3 = SA._test_briefCacheKey('000001', 'ctx', 'intl');
+      if (k3 !== k1) ok('cacheKey: 不同 code 异键');
+      else fail('cacheKey code diff', `应不同但相等`);
+
+      // 4. context 变化 → 不同键
+      const k4 = SA._test_briefCacheKey('600519', 'ctx-different', 'intl');
+      if (k4 !== k1) ok('cacheKey: context 变化异键');
+      else fail('cacheKey ctx diff', `应不同但相等`);
+
+      // 5. intl 变化 → 不同键
+      const k5 = SA._test_briefCacheKey('600519', 'ctx', 'intl-different');
+      if (k5 !== k1) ok('cacheKey: intl 变化异键');
+      else fail('cacheKey intl diff', `应不同但相等`);
+
+      // 6. context 超过 50 字只取前 50, 截断后前缀相同 → 键相同
+      const longCtx = 'A'.repeat(50) + 'BBBBBBBBBB';
+      const ctxHalf = SA._test_briefCacheKey('600519', 'A'.repeat(50), 'intl');
+      const ctxLong = SA._test_briefCacheKey('600519', longCtx, 'intl');
+      if (ctxHalf === ctxLong) ok('cacheKey: context 超过 50 字截断到前 50');
+      else fail('cacheKey ctx truncate', `${ctxHalf} vs ${ctxLong}`);
+
+      // 7. intl 超过 50 字只取前 50
+      const intlHalf = SA._test_briefCacheKey('600519', 'ctx', 'I'.repeat(50));
+      const intlLong = SA._test_briefCacheKey('600519', 'ctx', 'I'.repeat(50) + 'XXXXXXXXXX');
+      if (intlHalf === intlLong) ok('cacheKey: intl 超过 50 字截断到前 50');
+      else fail('cacheKey intl truncate', `${intlHalf} vs ${intlLong}`);
+
+      // 8. 空 context / 空 intl 不崩
+      const k6 = SA._test_briefCacheKey('600519', '', '');
+      const k7 = SA._test_briefCacheKey('600519', null, null);
+      const k8 = SA._test_briefCacheKey('600519', undefined, undefined);
+      if (k6 === k7 && k7 === k8 && k6.length > 0) ok('cacheKey: 空/null/undefined 不崩且键相同');
+      else fail('cacheKey empty', `${k6} ${k7} ${k8}`);
+
+      // 9. hash 是 base36 (短键, 无符号)
+      if (k1.replace('sa_brief_', '').length <= 10) ok('cacheKey: base36 hash 长度 ≤ 10');
+      else fail('cacheKey length', `过长: ${k1}`);
+    }
+  }
+}
+
 // ========== 总结 ==========
 console.log('');
 console.log(`\x1b[1m结果:\x1b[0m 通过 ${passed}, 失败 ${failed}`);

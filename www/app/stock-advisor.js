@@ -156,17 +156,45 @@
     const prompt = `单股简评请求:\n${JSON.stringify(data, null, 2)}\n\n请按上面 4 段结构输出。`;
 
     try {
-      await Core.AI.call({
-        systemPrompt,
-        prompt,
-        stream: true,
-        maxTokens: 800,
-        onChunk: (delta, full) => {
-          if (ld) ld.remove();
-          if (el) el.textContent = full;
+      // Phase W: 缓存包装 — 24h 内重复访问同一只股直接命中
+      // 1) 命中缓存: 模拟流式 (30 字符/批, ~50ms)
+      // 2) 未命中: 走流式 AI.call, 完成后异步写缓存
+      // 缓存键: sa_brief_{code}_{context前50字}_{intl前50字} (FNV-1a hash)
+      // 注: 上层 data (基本面/行情) 不入缓存键, 因为基本面日级别刷新, 同一天同一股应该命中
+      const cacheKey = _briefCacheKey(code, data.context || '', data.intl || '');
+      let cachedText = null;
+      try { const c = await Core.Storage.cacheGet(cacheKey); if (c && c.text) cachedText = c.text; } catch (e) { /* ignore */ }
+
+      let finalText;
+      if (cachedText) {
+        if (ld) ld.textContent = '⚡ 24h 缓存命中, 立即显示';
+        const chunks = [];
+        for (let i = 0; i < cachedText.length; i += 30) chunks.push(cachedText.slice(i, i + 30));
+        let acc = '';
+        for (const c of chunks) {
+          acc += c;
+          if (el) el.textContent = acc;
+          await new Promise(r => setTimeout(r, 50));
         }
-      });
-      const finalText = (el && el.textContent) || '';
+        finalText = cachedText;
+      } else {
+        await Core.AI.call({
+          systemPrompt,
+          prompt,
+          stream: true,
+          maxTokens: 800,
+          onChunk: (delta, full) => {
+            if (ld) ld.remove();
+            if (el) el.textContent = full;
+          }
+        });
+        finalText = (el && el.textContent) || '';
+        // 异步写缓存 (24h TTL, 不阻塞当前 UI)
+        if (finalText) {
+          Core.Storage.cacheSet(cacheKey, { text: finalText, at: Date.now() }, 24 * 60 * 60 * 1000)
+            .catch(e => console.warn('[sa] 写缓存失败:', e));
+        }
+      }
       if (el) el.innerHTML = window.Core.Util.renderWithSources(finalText);
 
       // Phase P 反向 self-check (后台)
@@ -388,5 +416,30 @@
   // 测试钩子 (Phase R): 不影响业务, 仅供 test_runtime.js 调用
   if (typeof window !== 'undefined') {
     window.StockAdvisor._test_extractHistory = _extractHistory;
+  }
+
+  /**
+   * Phase W: AI 简评缓存键
+   * 键格式: sa_brief_{FNV-1a(code + context[:50] + intl[:50])}
+   * 入键字段:
+   *   - code: 决定是哪只股
+   *   - data.context[:50]: 市场上下文快照前 50 字 (估值分位/北向/板块变化大)
+   *   - data.intl[:50]: 国际形势前 50 字 (美元/原油/美股 1-3 天变化大)
+   * 不入键:
+   *   - 基本面 (PE/PB/ROE): 日级别变化, 24h 缓存期内应可复用
+   *   - KB 条目: 本地静态, 不影响输出
+   */
+  function _briefCacheKey(code, context, intl) {
+    const data = `brief_${code}_${(context || '').slice(0, 50)}_${(intl || '').slice(0, 50)}`;
+    let hash = 2166136261;
+    for (let i = 0; i < data.length; i++) {
+      hash ^= data.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return 'sa_brief_' + (hash >>> 0).toString(36);
+  }
+
+  if (typeof window !== 'undefined') {
+    window.StockAdvisor._test_briefCacheKey = _briefCacheKey;
   }
 })();

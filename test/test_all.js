@@ -1648,6 +1648,67 @@ try {
   const A = AG.window.Core.Agents;
   if (A && A._coerceList && A.runObserver && A.runPipeline) ok('agents 模块加载');
 
+  // Y9: _summarizeCtx 结构化摘要测试
+  if (typeof A._summarizeCtx !== 'function') {
+    fail('_summarizeCtx', '未暴露');
+  } else {
+    // 空 ctx → '(空)'
+    if (A._summarizeCtx({}) === '(无事实)') ok('_summarizeCtx: 空 ctx → (无事实)');
+    else fail('_summarizeCtx 空', A._summarizeCtx({}));
+
+    // null/undefined → '(空)'
+    if (A._summarizeCtx(null) === '(空)' && A._summarizeCtx(undefined) === '(空)') {
+      ok('_summarizeCtx: null/undefined → (空)');
+    } else fail('_summarizeCtx null', '应返 (空)');
+
+    // holdings 截断到 10 条 + 盈亏
+    const longHoldings = Array.from({length: 15}, (_, i) => ({ code: `60000${i}`, name: `股${i}`, profitLossPct: 0.05 + i * 0.01 }));
+    const out = A._summarizeCtx({ holdings: longHoldings });
+    if (out.includes('共 15 条') && out.includes('取前 10') && out.match(/- 600\d+ \S+ 盈亏/g).length === 10) {
+      ok('_summarizeCtx: holdings 截到 10');
+    } else fail('_summarizeCtx holdings', out.slice(0, 200));
+
+    // alerts 截断到 5
+    const longAlerts = Array.from({length: 8}, (_, i) => ({ code: `00000${i}`, type: 'price_above', condition: '>10' }));
+    const outA = A._summarizeCtx({ alerts: longAlerts });
+    if (outA.includes('共 8 条') && outA.includes('取前 5') && outA.match(/- 000\d+ price_above/g).length === 5) {
+      ok('_summarizeCtx: alerts 截到 5');
+    } else fail('_summarizeCtx alerts', outA.slice(0, 200));
+
+    // recentJournals 标题前 8 + assumption
+    const js = [
+      { date: '2026-07-01', title: '试仓 T', assumption: '业绩拐点' },
+      { date: '2026-07-02', code: '600519' }
+    ];
+    const outJ = A._summarizeCtx({ recentJournals: js });
+    if (outJ.includes('2026-07-01 试仓 T') && outJ.includes('(假设: 业绩拐点)')) {
+      ok('_summarizeCtx: recentJournals 标题 + assumption');
+    } else fail('_summarizeCtx journals', outJ);
+
+    // observations/findings 输出
+    const outO = A._summarizeCtx({ observations: [{ severity: 'warning', text: '估值高位' }] });
+    if (outO.includes('## 观察点') && outO.includes('[warning] 估值高位')) ok('_summarizeCtx: observations');
+    else fail('_summarizeCtx obs', outO);
+
+    const outF = A._summarizeCtx({ findings: [{ type: 'positive', confidence: 'high', text: '盈利改善' }] });
+    if (outF.includes('[high/positive] 盈利改善')) ok('_summarizeCtx: findings');
+    else fail('_summarizeCtx findings', outF);
+
+    // news 数组 + 字符串两种
+    const outN1 = A._summarizeCtx({ news: [{ title: 'PMI 跌破 50' }, { title: 'LPR 下调' }] });
+    if (outN1.includes('- PMI 跌破 50') && outN1.includes('- LPR 下调')) ok('_summarizeCtx: news 数组');
+    else fail('_summarizeCtx news 数组', outN1);
+
+    const outN2 = A._summarizeCtx({ news: '今日要闻: A, B, C' });
+    if (outN2.includes('## 新闻') && outN2.includes('今日要闻')) ok('_summarizeCtx: news 字符串');
+    else fail('_summarizeCtx news 字符串', outN2);
+
+    // market 字符串
+    const outM = A._summarizeCtx({ market: '沪指 3300 +0.5%' });
+    if (outM.includes('## 市场') && outM.includes('沪指 3300')) ok('_summarizeCtx: market 字符串');
+    else fail('_summarizeCtx market', outM);
+  }
+
   // 正常 JSON
   let r = A._coerceList('{"observations":[{"category":"holding","text":"x","severity":"info"}]}', 'observations', {
     category: A.ALLOWED.observationCategory, severity: A.ALLOWED.observationSeverity
@@ -1844,6 +1905,7 @@ try {
     return [];
   };
   SY.Core.Storage.add = async () => {};
+  SY.Core.Storage.put = async () => {};  // Y8: pullAIMemory 改用 put
   SY.Core.Storage.clear = async () => {};
 
   const pushR = await S.pushAIMemory();
@@ -1855,7 +1917,12 @@ try {
   else fail('pushAIMemory dryRun', JSON.stringify(pushDry));
 
   let jMerged = 0, aMerged = 0;
+  // Y8: 同时 mock add 和 put (pullAIMemory 改用 put)
   SY.Core.Storage.add = async (table, rec) => {
+    if (table === 'journals' && rec.id === 'j-1' && rec.aiSuggested?.x === 1) jMerged++;
+    if (table === 'alerts' && rec.id === 'a-1' && rec.hitCount === 5) aMerged++;
+  };
+  SY.Core.Storage.put = async (table, rec) => {
     if (table === 'journals' && rec.id === 'j-1' && rec.aiSuggested?.x === 1) jMerged++;
     if (table === 'alerts' && rec.id === 'a-1' && rec.hitCount === 5) aMerged++;
   };

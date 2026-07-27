@@ -57,6 +57,68 @@
     });
   }
 
+  /**
+   * Y9: ctx 结构化摘要 — 按字段类型分别截断, 拼成自然语言列表 (不是 JSON)
+   * 之前 JSON.stringify(ctx).slice(0, 6000) 会切到中间, 输出非法 JSON, LLM 必然解析失败
+   * 保留关键字段: holdings (前 10 条简码), alerts (前 5 条), recentJournals (标题前 8),
+   *   market/news/observations/findings (纯文本)
+   */
+  function _summarizeCtx(ctx) {
+    if (!ctx || typeof ctx !== 'object') return '(空)';
+    const lines = [];
+    if (Array.isArray(ctx.holdings) && ctx.holdings.length > 0) {
+      lines.push(`## 持仓 (共 ${ctx.holdings.length} 条, 取前 10)`);
+      ctx.holdings.slice(0, 10).forEach(h => {
+        const code = h.code || h['代码'] || '';
+        const name = h.name || h['名称'] || '';
+        const pl = h.profitLossPct != null ? (h.profitLossPct * 100).toFixed(1) + '%' : '';
+        lines.push(`- ${code} ${name}${pl ? ' 盈亏 ' + pl : ''}`);
+      });
+    }
+    if (Array.isArray(ctx.alerts) && ctx.alerts.length > 0) {
+      lines.push(`## 提醒 (共 ${ctx.alerts.length} 条, 取前 5)`);
+      ctx.alerts.slice(0, 5).forEach(a => {
+        const code = a.code || '';
+        const t = a.type || '';
+        const c = a.condition || a.threshold || '';
+        lines.push(`- ${code} ${t}${c ? ' ' + c : ''}`);
+      });
+    }
+    if (Array.isArray(ctx.recentJournals) && ctx.recentJournals.length > 0) {
+      lines.push(`## 近期复盘 (共 ${ctx.recentJournals.length} 条, 取标题前 8)`);
+      ctx.recentJournals.slice(0, 8).forEach(j => {
+        const d = j.date || '';
+        const t = j.title || j.code || '';
+        const a = j.assumption || '';
+        lines.push(`- ${d} ${t}${a ? ' (假设: ' + a + ')' : ''}`);
+      });
+    }
+    if (Array.isArray(ctx.observations) && ctx.observations.length > 0) {
+      lines.push(`## 观察点 (${ctx.observations.length} 条)`);
+      ctx.observations.slice(0, 12).forEach(o => {
+        lines.push(`- [${o.severity || '?'}] ${o.text || JSON.stringify(o)}`);
+      });
+    }
+    if (Array.isArray(ctx.findings) && ctx.findings.length > 0) {
+      lines.push(`## 诊断 (${ctx.findings.length} 条)`);
+      ctx.findings.slice(0, 10).forEach(f => {
+        lines.push(`- [${f.confidence || '?'}/${f.type || '?'}] ${f.text || JSON.stringify(f)}`);
+      });
+    }
+    if (typeof ctx.market === 'string' && ctx.market.length > 0) {
+      lines.push(`## 市场\n${ctx.market.slice(0, 800)}`);
+    } else if (ctx.market && typeof ctx.market === 'object') {
+      lines.push(`## 市场\n${JSON.stringify(ctx.market).slice(0, 800)}`);
+    }
+    if (typeof ctx.news === 'string' && ctx.news.length > 0) {
+      lines.push(`## 新闻\n${ctx.news.slice(0, 800)}`);
+    } else if (Array.isArray(ctx.news) && ctx.news.length > 0) {
+      lines.push(`## 新闻 (${ctx.news.length} 条, 取前 5)`);
+      ctx.news.slice(0, 5).forEach(n => lines.push(`- ${n.title || n.text || JSON.stringify(n)}`));
+    }
+    return lines.length > 0 ? lines.join('\n') : '(无事实)';
+  }
+
   // ===== 1. Observer =====
   // ctx: { holdings, alerts, recentJournals, market, news }
   // 产出: { observations: [{category, code, text, severity, source}] }
@@ -67,7 +129,7 @@
 每个事实一条, 最多 8 条. 没有值得说的就返回空数组.`;
 
     const prompt = `以下是我的事实, 请提取观察点:
-${JSON.stringify(ctx, null, 2).slice(0, 6000)}`;
+${_summarizeCtx(ctx)}`;
 
     try {
       const deps = opts.deps || { callLLM: null };
@@ -99,7 +161,7 @@ ${JSON.stringify(ctx, null, 2).slice(0, 6000)}`;
 最多 6 条. 只保留有意义的诊断, 没看出来就空数组.`;
 
     const prompt = `观察点如下, 请诊断:
-${JSON.stringify(ctx, null, 2).slice(0, 6000)}`;
+${_summarizeCtx(ctx)}`;
 
     try {
       const deps = opts.deps || { callLLM: null };
@@ -131,7 +193,7 @@ ${JSON.stringify(ctx, null, 2).slice(0, 6000)}`;
 最多 4 条 actions. 保守为先: 不确定就 hold. 行动必须对应到具体 code.`;
 
     const prompt = `诊断结论如下, 请给行动建议:
-${JSON.stringify(ctx, null, 2).slice(0, 6000)}`;
+${_summarizeCtx(ctx)}`;
 
     try {
       const deps = opts.deps || { callLLM: null };
@@ -249,6 +311,7 @@ ${JSON.stringify(ctx, null, 2).slice(0, 6000)}`;
     runPipeline,
     ALLOWED,
     _coerceList,
-    _summary
+    _summary,
+    _summarizeCtx
   };
 })();

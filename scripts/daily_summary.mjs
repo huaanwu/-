@@ -242,19 +242,33 @@ function applyVerifyReport(note, report) {
 }
 
 // ==================== 拉个股行情 (事后验证用) ====================
+/**
+ * Y7: 改用 stock_zh_a_hist (K 线接口, 接受 symbol), 取最后一根日线的收盘价 = 当前价
+ * 之前用 stock_zh_a_spot_em 是全市场接口, 不接受 symbol, data[0] 永远是按字典序第一只股票
+ */
 async function fetchStockQuote(code) {
   if (!code) return { error: 'no code' };
   try {
-    const url = `${AKTOOLS}/api/public/stock_zh_a_spot_em?symbol=${encodeURIComponent(code)}`;
+    // 取近 5 个交易日的 K 线 (足够拿到最新一根)
+    const end = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const startDate = new Date(); startDate.setDate(startDate.getDate() - 7);
+    const start = startDate.toISOString().slice(0, 10).replace(/-/g, '');
+    const url = `${AKTOOLS}/api/public/stock_zh_a_hist?symbol=${encodeURIComponent(code)}&period=daily&start_date=${start}&end_date=${end}&adjust=qfq`;
     const resp = await fetch(url, { timeout: 8000 });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
     if (!Array.isArray(data) || data.length === 0) return { error: 'no data' };
-    const row = data[0];
-    return {
-      price: parseFloat(row.最新价 ?? row.price ?? 0),
-      changePct: parseFloat(row.涨跌幅 ?? row.change_pct ?? 0)
-    };
+    // 取最后一根 (最新交易日)
+    const row = data[data.length - 1];
+    // 字段名容错: 收盘价/close, 涨跌幅/change_pct
+    const close = parseFloat(row['收盘价'] ?? row.收盘价 ?? row.close ?? row['最新价'] ?? 0);
+    // 涨跌幅: K 线不一定带, 用 (close - 昨收) / 昨收 算 (fallback)
+    let changePct = parseFloat(row['涨跌幅'] ?? row.涨跌幅 ?? row.change_pct ?? NaN);
+    if (isNaN(changePct) && data.length >= 2) {
+      const prevClose = parseFloat(data[data.length - 2]['收盘价'] ?? data[data.length - 2].收盘价 ?? 0);
+      if (prevClose > 0) changePct = ((close - prevClose) / prevClose) * 100;
+    }
+    return { price: close, changePct: isNaN(changePct) ? 0 : changePct };
   } catch (e) {
     return { error: e.message };
   }
