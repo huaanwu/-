@@ -6878,6 +6878,8 @@ section('[40] ShortTrader T4 学习环: _judgeClosedTrade 全分支 / verify 扫
       ]
     };
     const sumV = await ctxV.window.ShortTrader.verifyClosedTrades({
+      // 注入 nowMs=周日晚 22:00 (北京), 避开 Bug D 盘中跳过, 走正常 verify 路径
+      nowMs: new Date(2026, 6, 26, 22, 0, 0).getTime(),  // 2026-07-26 周日 22:00 北京
       getBars: async (code) => {
         if (code === '000001') throw new Error('K线接口超时');
         return barsByCode[code] || [];
@@ -7751,6 +7753,99 @@ section('[46] Bug B 现价锚定: _buildCandidatePool / _validatePlans 方向对
     } else fail('46.f', 'prompt 截取:\n' + prompt.split('候选池')[1].split('\n').slice(0, 3).join('\n'));
   } catch (e) {
     fail('46 Bug B 现价锚定', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+section('[47] Bug D verify 盘中跳过: 交易日 09:30~15:00 不写回 verifyOutcome');
+(async () => {
+  try {
+    const stSrc = readFileSafe(path.join(WWW, 'app', 'short-trader.js'));
+    if (!stSrc) throw new Error('short-trader.js 读不到');
+    const K = _loadRealConstants();
+    const buildCtx = () => {
+      const sctx = {
+        window: {},
+        console,
+        escapeHtml: (s) => String(s == null ? '' : s),
+        fmtNum: (n, d) => (typeof n === 'number' ? n.toFixed(d || 0) : '0'),
+        fmtDateTime: () => '2026-07-27 08:30',
+        confirm: () => true,
+        document: { getElementById: () => null }
+      };
+      sctx.window.Core = {
+        Constants: K,
+        Storage: {
+          kvGet: async () => null, kvSet: async () => {},
+          all: async () => [{
+            id: 'j-d', code: '000001', sleeve: 'short', auto: true, verifyOutcome: null,
+            content: '卖出日期: 2026-07-23\n原因: 止盈\n入场: 2026-07-15 @10.00\n出场: 12.50'
+          }],
+          put: async (t, row) => { sctx.__puts = sctx.__puts || []; sctx.__puts.push({ t, row }); }
+        },
+        Data: {
+          getStockKLine: async () => [
+            { 日期: '2026-07-23', 开盘: 12.0, 最高: 12.6, 最低: 11.9, 收盘: 12.5 },
+            { 日期: '2026-07-24', 开盘: 12.5, 最高: 13.2, 最低: 12.4, 收盘: 13.1 },
+            { 日期: '2026-07-25', 开盘: 13.1, 最高: 13.4, 最低: 13.0, 收盘: 13.2 }
+          ]
+        },
+        Premortem: { checkPick: () => [] },
+        AI: { parseJsonOutput: () => ({ ok: true, obj: {} }), callWithTimeout: async () => '' },
+        Regime: { get: async () => ({ state: 'range' }), gateMultipliers: () => ({ state: 'range', label: '震荡市', positionScale: 1 }) },
+        Discipline: { DEFAULT_CONFIG: { short: { maxDailyTrades: 3, cooldownHours: 48 } } }
+      };
+      sctx.Core = sctx.window.Core;
+      sctx.window.Paper = {
+        _roundLot: (s) => Math.floor((parseFloat(s) || 0) / 100) * 100,
+        _getAccountRaw: async () => ({ cash: 30000 }),
+        getPositions: async () => [], listCondOrders: async () => [],
+        addCondOrder: async (o) => ({ ok: true, order: o })
+      };
+      sctx.Paper = sctx.window.Paper;
+      sctx.window.document = sctx.document;
+      vm.createContext(sctx);
+      vm.runInContext(stSrc, sctx);
+      return sctx;
+    };
+
+    // 47.a 盘中 (交易日 10:30) → 直接返 deferred=trading-hours, 不读 journals / 不调 K 线 / 不写回
+    const ctxA = buildCtx();
+    const nowA = new Date(2026, 6, 27, 10, 30, 0).getTime();  // 周一 10:30 北京时间
+    const rA = await ctxA.window.ShortTrader.verifyClosedTrades({ nowMs: nowA });
+    if (rA && rA.deferred === 'trading-hours' && rA.verified === 0 && rA.pending === 0 && rA.skipped === 0
+      && (!ctxA.__puts || ctxA.__puts.length === 0)) {
+      ok('47.a 盘中 (周一 10:30) → deferred=trading-hours, 0 写回, 0 调 K 线');
+    } else fail('47.a', JSON.stringify(rA));
+
+    // 47.b 盘前 (交易日 09:00) → 正常 verify
+    const ctxB = buildCtx();
+    const nowB = new Date(2026, 6, 27, 9, 0, 0).getTime();  // 周一 09:00 北京时间, 开盘前
+    const rB = await ctxB.window.ShortTrader.verifyClosedTrades({ nowMs: nowB });
+    if (rB && rB.verified === 1 && !rB.deferred
+      && ctxB.__puts && ctxB.__puts.length === 1
+      && ctxB.__puts[0].row.verifyOutcome) {
+      ok('47.b 盘前 (周一 09:00) → 正常 verify 1 笔, 写回 verifyOutcome');
+    } else fail('47.b', JSON.stringify(rB) + ' puts=' + JSON.stringify(ctxB.__puts));
+
+    // 47.c 收盘后 (交易日 16:00) → 正常 verify
+    const ctxC = buildCtx();
+    const nowC = new Date(2026, 6, 27, 16, 0, 0).getTime();  // 周一 16:00 北京时间, 收盘后
+    const rC = await ctxC.window.ShortTrader.verifyClosedTrades({ nowMs: nowC });
+    if (rC && rC.verified === 1 && !rC.deferred
+      && ctxC.__puts && ctxC.__puts.length === 1) {
+      ok('47.c 收盘后 (周一 16:00) → 正常 verify 1 笔, 不 deferred');
+    } else fail('47.c', JSON.stringify(rC));
+
+    // 47.d 周末 (周日 10:30) → 正常 verify (周末 _isTradingDay=false, 不进盘中判断)
+    const ctxD = buildCtx();
+    const nowD = new Date(2026, 6, 26, 10, 30, 0).getTime();  // 周日 10:30 北京时间
+    const rD = await ctxD.window.ShortTrader.verifyClosedTrades({ nowMs: nowD });
+    if (rD && rD.verified === 1 && !rD.deferred
+      && ctxD.__puts && ctxD.__puts.length === 1) {
+      ok('47.d 周末 (周日 10:30) → _isTradingDay=false, 正常 verify 不跳过');
+    } else fail('47.d', JSON.stringify(rD));
+  } catch (e) {
+    fail('47 Bug D verify 盘中跳过', e.message + ' / ' + (e.stack || ''));
   }
 })();
 

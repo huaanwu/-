@@ -699,6 +699,21 @@
      * @returns {{ verified, pending, skipped } | null}
      */
     async verifyClosedTrades(deps = {}) {
+      // Bug D 修复 (盘中跳过): 当前是交易日 + 09:30~15:00 之间 → 直接返 skipped
+      // 原因: 当天 K 线还没走完, 此时 verify 写回会拿未收盘 bar 判定, 不可逆
+      // 与 settleCondOrders 同口径 (paper.js _isOutsideTradingHours)
+      // deps.nowMs 允许测试注入 (timestamp ms, 默认 Date.now()) — 用 ms 而非 Date
+      //   对象以避开 vm context 跨边界 Date instanceof 检测失败问题
+      const nowMs = Number.isFinite(deps.nowMs) ? deps.nowMs : Date.now();
+      const nowD = new Date(nowMs);
+      if (this._isTradingDay(nowD)) {
+        const mins = nowD.getHours() * 60 + nowD.getMinutes();
+        const MARKET_OPEN_M = 9 * 60 + 30;
+        const MARKET_CLOSE_M = 15 * 60;
+        if (mins >= MARKET_OPEN_M && mins < MARKET_CLOSE_M) {
+          return { verified: 0, pending: 0, skipped: 0, deferred: 'trading-hours' };
+        }
+      }
       const summary = { verified: 0, pending: 0, skipped: 0 };
       try {
         const rows = (await Core.Storage.all('journals')) || [];
