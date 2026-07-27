@@ -49,6 +49,7 @@
           ${j.tags && j.tags.length ? `<div style="margin-top:8px;">${j.tags.map(t => `<span class="tag">${escapeHtml(t)}</span>`).join(' ')}</div>` : ''}
           ${this._renderStructuredTags(j)}
           ${ctxHTML}
+          ${j.aiAppliedAt ? '<span class="tag" style="color:var(--accent);font-size:10px;margin-top:4px;display:inline-block;">✓ AI 已应用</span>' : `<button class="btn btn-sm btn-ghost" data-role="ai-attr-btn" style="font-size:10px;padding:2px 6px;margin-top:4px;" onclick="event.stopPropagation();Journal._runAttributeManually('${j.id}')">🪄 AI 归因</button>`}
         </div>
       `;
       }).join('');
@@ -849,6 +850,95 @@ ${content.slice(0, 800)}
           toastSuccess('已应用 AI 建议');
         };
         card.appendChild(btn);
+      }
+    },
+
+    /**
+     * Phase H.3: 用户点 🪄 AI 归因 按钮 → 主动触发 AI 归因流程
+     * 流程: 拿 note → 内联 _runAiAssistant 核心逻辑 → 复用 _showAiSuggestionToast(卡片加应用按钮)
+     * 防重: card.dataset.aiAttrRunning 在请求期间标记
+     */
+    async _runAttributeManually(noteId) {
+      const list = await Core.Storage.all('journals');
+      const note = (list || []).find(x => x.id === noteId);
+      if (!note) return;
+      const card = document.querySelector(`[data-journal-id="${noteId}"]`);
+      if (!card) return;
+
+      // 防重入 (用 card 上的 dataset, 不依赖按钮 class)
+      if (card.dataset.aiAttrRunning === '1') return;
+      card.dataset.aiAttrRunning = '1';
+      const btn = card.querySelector('[data-role="ai-attr-btn"]');
+      if (btn) {
+        btn.textContent = '⏳ AI 归因中...';
+        btn.disabled = true;
+      }
+      // scroll-into-view 让用户看到进度
+      try { card.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); } catch (e) {}
+
+      try {
+        const aiCfg = (window.Core && Core.AI) ? Core.AI.getConfig() : null;
+        if (!aiCfg || (!aiCfg.apiKey && aiCfg.provider !== 'custom')) {
+          if (window.toastError) toastError('未配置 AI,无法归因(请到设置页配 API Key 或本地 LLM)');
+          return;
+        }
+        const content = (note.content || '').trim();
+        if (!content || content.length < 10) {
+          if (window.toastWarning) toastWarning('正文太短(<10 字), 无法 AI 归因');
+          return;
+        }
+
+        const ASSUMPTIONS = ['业绩拐点', '估值修复', '题材催化', '技术突破', '分红套利', '其他'];
+        const EMOTIONS = ['理性建仓', '冲动追高', 'FOMO', '恐慌割肉', '计划内止盈', '计划内止损', '长期持有中', '其他'];
+        const VERIFIES = ['pending', '1w', '1m', '3m', 'verified'];
+
+        const systemPrompt = `你是一个严谨的 A 股个人投资复盘助手, 任务是从复盘笔记中提取结构化标签, 严格按用户提供的候选分类选择, 禁止编造。规则:
+1. 只能从下方候选值里选, 选最匹配的一个
+2. 输出严格 JSON, 三个字段分别选一个值
+3. 没把握的字段填 "其他" / "pending"
+4. 严禁自由发挥或解释`;
+
+        const userPrompt = `【复盘笔记】
+标题: ${note.title || '(无)'}
+关联股票: ${note.code || '(无)'}
+正文:
+${content.slice(0, 800)}
+
+【候选值】
+买入假设: ${ASSUMPTIONS.join(' / ')}
+情绪标签: ${EMOTIONS.join(' / ')}
+事后验证: pending(还没回头看) / 1w(1 周后回看) / 1m(1 月后回看) / 3m(3 月后回看) / verified(已验证)
+
+【输出 JSON】
+{"assumption":"...","emotion":"...","verify":"..."}`;
+
+        const text = await Core.AI.call({
+          systemPrompt, prompt: userPrompt, stream: false, maxTokens: 200
+        });
+        const m = text.match(/\{[\s\S]*?\}/);
+        if (!m) {
+          if (window.toastError) toastError('AI 返回非 JSON 格式');
+          return;
+        }
+        const obj = JSON.parse(m[0]);
+        const sugAssumption = ASSUMPTIONS.includes(obj.assumption) ? obj.assumption : '其他';
+        const sugEmotion = EMOTIONS.includes(obj.emotion) ? obj.emotion : '其他';
+        const sugVerify = VERIFIES.includes(obj.verify) ? obj.verify : 'pending';
+
+        note.aiSuggested = { assumption: sugAssumption, emotion: sugEmotion, verify: sugVerify };
+        await Core.Storage.put('journals', note);
+
+        // 走既有 toast + 卡片"应用 AI 建议"按钮(同一 _showAiSuggestionToast)
+        this._showAiSuggestionToast(note, note.aiSuggested);
+      } catch (e) {
+        console.warn('[Journal] _runAttributeManually 失败:', e);
+        if (window.toastError) toastError('AI 归因失败: ' + e.message);
+      } finally {
+        card.dataset.aiAttrRunning = '';
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = '🪄 AI 归因';
+        }
       }
     },
 
