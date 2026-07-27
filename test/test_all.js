@@ -7593,6 +7593,167 @@ section('[45] Bug F 空跑 lastSettleDate: codes.size===0 / 0 笔不写 lastSett
   }
 })();
 
+section('[46] Bug B 现价锚定: _buildCandidatePool / _validatePlans 方向对照 / _buildUserPrompt 渲染');
+(async () => {
+  try {
+    const stSrc = readFileSafe(path.join(WWW, 'app', 'short-trader.js'));
+    if (!stSrc) throw new Error('short-trader.js 读不到');
+    const K = _loadRealConstants();
+    // 真实 Core.Premortem (a2 校验依赖, checkPick 是纯函数)
+    const pmCtx = vm.createContext({ window: {}, console });
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/premortem.js')), pmCtx);
+    const realPremortem = pmCtx.window.Core.Premortem;
+    // ai-service 加载仅取 parseJsonOutput (纯函数)
+    const aiCtx = { console, setTimeout, clearTimeout, Core: { State: { get: () => ({}) } }, fetch: async () => ({ ok: false }) };
+    vm.createContext(aiCtx);
+    aiCtx.window = aiCtx;
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/ai-service.js')), aiCtx);
+    const realParseJsonOutput = aiCtx.Core.AI.parseJsonOutput;
+    if (!realParseJsonOutput) throw new Error('ai-service.parseJsonOutput 提取失败');
+
+    // vm sandbox: 真实常量 + 真实 Premortem + mock Core.Storage/Paper/Regime
+    const buildCtx = () => {
+      const sctx = {
+        window: {},
+        console,
+        escapeHtml: (s) => String(s == null ? '' : s),
+        fmtNum: (n, d) => (typeof n === 'number' ? n.toFixed(d || 0) : '0'),
+        fmtDateTime: () => '2026-07-27 08:30',
+        confirm: () => true,
+        document: { getElementById: () => null }
+      };
+      sctx.window.Core = {
+        Constants: K,
+        Storage: {
+          kvGet: async () => null,
+          kvSet: async () => {},
+          all: async () => []
+        },
+        Data: { getIndexSpot: async () => [] },
+        Util: { stockCodePrefix: () => 'sz' },
+        Premortem: realPremortem,
+        AI: { parseJsonOutput: realParseJsonOutput, callWithTimeout: async () => { throw new Error('no LLM'); } },
+        Regime: {
+          get: async () => ({ state: 'range' }),
+          gateMultipliers: () => ({ state: 'range', label: '震荡市', positionScale: 1 })
+        },
+        Discipline: { DEFAULT_CONFIG: { short: { maxDailyTrades: 3, cooldownHours: 48 } } }
+      };
+      sctx.Core = sctx.window.Core;
+      sctx.window.Paper = {
+        _roundLot: (s) => Math.floor((parseFloat(s) || 0) / 100) * 100,
+        _getAccountRaw: async () => ({ cash: 30000, initialCash: 30000, positionPct: 0.2 }),
+        getPositions: async () => [],
+        listCondOrders: async () => [],
+        addCondOrder: async (o) => ({ ok: true, order: { id: 'ord-x', ...o } })
+      };
+      sctx.Paper = sctx.window.Paper;
+      sctx.window.document = sctx.document;
+      vm.createContext(sctx);
+      vm.runInContext(stSrc, sctx);
+      return sctx;
+    };
+    const ST = buildCtx().window.ShortTrader;
+    if (!ST) throw new Error('ShortTrader 未挂到 window');
+
+    // 46.a _buildCandidatePool 默认 currentPrice=null (待 _buildPlanContext 异步注入)
+    const pool0 = ST._buildCandidatePool(
+      [{ code: '000001', name: '平安银行' }, { code: '600519', name: '贵州茅台' }],
+      [{ code: '000002', name: '万科A' }]
+    );
+    if (pool0.length === 3
+      && pool0.every(x => x.currentPrice === null && x.changePct === null)
+      && pool0[0].code === '000001' && pool0[2].code === '000002') {
+      ok('46.a _buildCandidatePool 输出去重保序 + 默认 currentPrice=null (待异步注入)');
+    } else fail('46.a', JSON.stringify(pool0));
+
+    // 46.b _validatePlans 没传 priceByCode → 不做方向对照 (向后兼容, 全部按原值通过)
+    const planGood = {
+      code: '000001', name: '平安银行',
+      triggerDirection: 'below', triggerPrice: 10, stopLoss: 9, targetPrice: 12,
+      positionPct: 0.2, probability: 70, confidence: '中',
+      assumption: '业绩拐点', reason: 'r', bullCase: 'b', bearCase: 'br',
+      falsifyCondition: 'f', invalidation: 'i'
+    };
+    const r46b = ST._validatePlans([planGood], {
+      pool: new Set(['000001']),
+      cash: 30000, quotaLeft: 3,
+      recentSellCodes: new Set(), regimeState: 'range', positionScale: 1
+      // 故意不传 priceByCode
+    });
+    if (r46b.passed.length === 1 && r46b.passed[0].aiPriceAnchored === true
+      && r46b.passed[0].currentPrice === null
+      && r46b.passed[0].triggerPrice === 10) {
+      ok('46.b _validatePlans 无 priceByCode → 不做方向对照, aiPriceAnchored=true (向后兼容)');
+    } else fail('46.b', JSON.stringify(r46b));
+
+    // 46.c below + AI 报的价格贴近 currentPrice (10.05 vs 10, 1% 容差内) → aiPriceAnchored=true, 不改价
+    const r46c = ST._validatePlans([planGood], {
+      pool: new Set(['000001']),
+      cash: 30000, quotaLeft: 3,
+      recentSellCodes: new Set(), regimeState: 'range', positionScale: 1,
+      priceByCode: new Map([['000001', 10]])  // 现价 10, AI 报 below 10.05 ≤ 10*1.01=10.1 → 通过
+    });
+    if (r46c.passed.length === 1 && r46c.passed[0].aiPriceAnchored === true
+      && r46c.passed[0].triggerPrice === 10
+      && r46c.passed[0].currentPrice === 10) {
+      ok('46.c below 容差内 → aiPriceAnchored=true, 价格保持原值');
+    } else fail('46.c', JSON.stringify(r46c));
+
+    // 46.d above + AI 报的价格远低于 currentPrice (8 vs 10, 偏离 20%) → 兜底替换 10*1.01=10.10, aiPriceAnchored=false
+    //   仍要满足 sl<tp<tg: sl=7, tp=8, tg=12 (8 < 12 ✓)
+    const planAbove = { ...planGood, triggerDirection: 'above', triggerPrice: 8, stopLoss: 7, targetPrice: 12 };
+    const r46d = ST._validatePlans([planAbove], {
+      pool: new Set(['000001']),
+      cash: 30000, quotaLeft: 3,
+      recentSellCodes: new Set(), regimeState: 'range', positionScale: 1,
+      priceByCode: new Map([['000001', 10]])
+    });
+    if (r46d.passed.length === 1
+      && r46d.passed[0].aiPriceAnchored === false
+      && Math.abs(r46d.passed[0].triggerPrice - 10.10) < 0.01  // cp*1.01
+      && r46d.passed[0].currentPrice === 10) {
+      ok('46.d above 偏离 >1% → 兜底替换 cp*1.01=10.10, aiPriceAnchored=false');
+    } else fail('46.d', JSON.stringify(r46d));
+
+    // 46.e below + AI 报的价格远高于 currentPrice (15 vs 10, 偏离 50%) → 兜底替换 10*0.99=9.90, aiPriceAnchored=false
+    //   仍要满足 sl<tp<tg: sl=14, tp=15, tg=17 (14<15<17 ✓)
+    const planBelow = { ...planGood, triggerDirection: 'below', triggerPrice: 15, stopLoss: 14, targetPrice: 17 };
+    const r46e = ST._validatePlans([planBelow], {
+      pool: new Set(['000001']),
+      cash: 30000, quotaLeft: 3,
+      recentSellCodes: new Set(), regimeState: 'range', positionScale: 1,
+      priceByCode: new Map([['000001', 10]])
+    });
+    if (r46e.passed.length === 1
+      && r46e.passed[0].aiPriceAnchored === false
+      && Math.abs(r46e.passed[0].triggerPrice - 9.90) < 0.01  // cp*0.99
+      && r46e.passed[0].stopLoss < 9.90 && r46e.passed[0].targetPrice > 9.90) {
+      ok('46.e below 偏离 >1% → 兜底替换 cp*0.99=9.90, sl/tg 按比例对齐 (仍满足 sl<tp<tg)');
+    } else fail('46.e', JSON.stringify(r46e));
+
+    // 46.f _buildUserPrompt 候选池带 currentPrice 时, 行格式含 @价格
+    const ctxWithPrice = {
+      today: '2026-07-27', cash: 30000, positions: [], pendingOrders: [],
+      recentJournals: [], regime: { state: 'range', label: '震荡市', positionScale: 1 },
+      marketText: '',
+      pool: [
+        { code: '000001', name: '平安银行', currentPrice: 10.50, changePct: 1.5 },
+        { code: '000002', name: '万科A', currentPrice: 5.20, changePct: -0.8 },
+        { code: '000003', name: '未知价', currentPrice: null, changePct: null }
+      ]
+    };
+    const prompt = ST._buildUserPrompt(ctxWithPrice);
+    if (prompt.includes('000001 平安银行 @10.50 (+1.50%)')
+      && prompt.includes('000002 万科A @5.20 (-0.80%)')
+      && prompt.includes('000003 未知价 @未知')) {
+      ok('46.f _buildUserPrompt 候选池行渲染 currentPrice + changePct + @未知 fallback');
+    } else fail('46.f', 'prompt 截取:\n' + prompt.split('候选池')[1].split('\n').slice(0, 3).join('\n'));
+  } catch (e) {
+    fail('46 Bug B 现价锚定', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
 // ========== 总结 ==========
 // 同步 section 的 ok() 已经在 console 打印;
 // async IIFE 里的 ok() 还在 microtask / setTimeout 队列里, 旧版本 setImmediate 只给一次机会,

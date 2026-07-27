@@ -114,7 +114,8 @@
         const code = this._normCode6(codeRaw);
         if (code && !seen.has(code)) {
           seen.add(code);
-          pool.push({ code, name: String(name || '') });
+          // Bug B 修复 (现价锚定): 候选池带 currentPrice (由 _buildPlanContext 异步注入, 测试可直接传)
+          pool.push({ code, name: String(name || ''), currentPrice: null, changePct: null });
         }
       };
       (watchRows || []).forEach(r => push(r && r.code, r && r.name));
@@ -178,8 +179,6 @@
         if (p.triggerDirection !== 'below' && p.triggerDirection !== 'above') {
           drop(code, 'schema', 'triggerDirection 必须是 below/above'); continue;
         }
-        const tp = parseFloat(p.triggerPrice), sl = parseFloat(p.stopLoss), tg = parseFloat(p.targetPrice);
-        if (!(tp > 0) || !(sl > 0) || !(tg > 0)) { drop(code, 'schema', '触发/止损/目标价必须 > 0'); continue; }
         const prob = Number(p.probability);
         if (!isFinite(prob) || prob < 0 || prob > 100) { drop(code, 'schema', 'probability 必填 (0-100)'); continue; }
         if (!['低', '中', '高'].includes(p.confidence)) { drop(code, 'schema', 'confidence 必填 (低/中/高)'); continue; }
@@ -196,8 +195,37 @@
         // (b) 幻觉防护: 代码必须在候选池
         if (!ctx.pool.has(code)) { drop(code, 'hallucination', '代码不在候选池 (自选股+短线持仓), 疑似幻觉'); continue; }
         // (c) 价格关系: stopLoss < triggerPrice < targetPrice (双向统一, 与 T3 _checkCondOrder 同口径)
+        //     锚定兜底会重写 tp/sl/tg, 故用 let
+        let tp = parseFloat(p.triggerPrice), sl = parseFloat(p.stopLoss), tg = parseFloat(p.targetPrice);
+        if (!(tp > 0) || !(sl > 0) || !(tg > 0)) { drop(code, 'schema', '触发/止损/目标价必须 > 0'); continue; }
         if (!(sl < tp && tp < tg)) {
           drop(code, 'price', `价格关系不满足 止损 ${sl} < 触发 ${tp} < 目标 ${tg}`); continue;
+        }
+        // (c2) Bug B 修复 (现价锚定): 触发价必须贴近 currentPrice (1% 容差)
+        //   - below 触发 (回调买入) → tp 应 ≤ currentPrice * 1.01 (即略低于现价, 等回调)
+        //   - above 触发 (突破买入) → tp 应 ≥ currentPrice * 0.99 (即略高于现价, 等突破)
+        //   不满足 → 用容差后的兜底值, 并标 aiPriceAnchored:false 让 UI 标黄, 用户手动调整
+        let aiPriceAnchored = true;
+        const cp = (ctx.priceByCode && ctx.priceByCode.get(code)) || null;
+        if (cp && cp > 0) {
+          const cpLow = cp * 0.99, cpHigh = cp * 1.01;
+          const offBelow = p.triggerDirection === 'below' ? tp <= cpHigh : null;
+          const offAbove = p.triggerDirection === 'above' ? tp >= cpLow : null;
+          if (p.triggerDirection === 'below' && !(tp <= cpHigh)) {
+            tp = +(cp * 0.99).toFixed(2);
+            aiPriceAnchored = false;
+          } else if (p.triggerDirection === 'above' && !(tp >= cpLow)) {
+            tp = +(cp * 1.01).toFixed(2);
+            aiPriceAnchored = false;
+          }
+          // 同步对齐 sl/tg: tp 改后维持原比例
+          if (!aiPriceAnchored) {
+            const ratio = parseFloat(p.targetPrice) / parseFloat(p.triggerPrice);  // 原 tg/tp 比例
+            tg = +(tp * ratio).toFixed(2);
+            sl = +(tp * (parseFloat(p.stopLoss) / parseFloat(p.triggerPrice))).toFixed(2);
+            // 重新校验价格关系
+            if (!(sl < tp && tp < tg)) { drop(code, 'price', `现价锚定兜底后仍不满足 sl<tp<tg`); continue; }
+          }
         }
         // (d) 短线纪律
         if (passed.length >= (ctx.quotaLeft || 0)) {
@@ -228,7 +256,11 @@
           confidence: p.confidence,
           reason: String(p.reason || '').slice(0, 200),
           bullCase: p.bullCase,
-          bearCase: p.bearCase
+          bearCase: p.bearCase,
+          // Bug B 修复 (现价锚定): aiPriceAnchored=true 表示 AI 报的价格贴近 currentPrice (通过对照),
+          // false 表示 AI 报得离谱, 系统用 currentPrice 容差兜底替换, UI 标黄提示用户手动调整
+          aiPriceAnchored,
+          currentPrice: cp || null
         });
       }
       return { passed, dropped };
@@ -314,9 +346,16 @@
       lines.push('## 指数快照');
       lines.push(ctx.marketText || '(市场数据不可用, 按常识谨慎判断)');
       lines.push('');
-      lines.push('## 候选池 (只能从这里选 code)');
+      lines.push('## 候选池 (只能从这里选 code, 价格为当前快照)');
       if (ctx.pool.length) {
-        lines.push(ctx.pool.map(x => `${x.code} ${x.name}`.trim()).join(' / '));
+        // Bug B 修复 (现价锚定): 候选池每只带 currentPrice, AI 报 triggerPrice 时以此为锚
+        lines.push(ctx.pool.map(x => {
+          if (x.currentPrice && x.currentPrice > 0) {
+            const ch = x.changePct != null ? ` (${(x.changePct >= 0 ? '+' : '')}${x.changePct.toFixed(2)}%)` : '';
+            return `${x.code} ${x.name} @${x.currentPrice.toFixed(2)}${ch}`.trim();
+          }
+          return `${x.code} ${x.name} @未知`.trim();
+        }).join(' / '));
       } else {
         lines.push('(候选池为空 → 必须输出 plans: [])');
       }
@@ -387,7 +426,30 @@
       try {
         const wl = (await Core.Storage.all('watchlist')) || [];
         ctx.pool = this._buildCandidatePool(wl, ctx.positions);
-      } catch (e) { console.warn('[ShortTrader] ctx 读自选股失败:', e); }
+        // Bug B 修复 (资料注入 - 候选池 currentPrice): 异步拉每只的现价注入 ctx.pool,
+        //   并组装 ctx.priceByCode (Map) 给 _validatePlans 方向对照用.
+        //   - 数据源: Core.Data.getStockQuote (60s 缓存, 失败容错, 单只 5s 超时)
+        //   - 失败 code: currentPrice=null → 不影响 _validatePlans (没 cp 时跳过方向对照)
+        ctx.priceByCode = new Map();
+        if (Array.isArray(ctx.pool) && ctx.pool.length) {
+          const quoteResults = await Promise.allSettled(
+            ctx.pool.map(c => Core.Data.getStockQuote(c.code).catch(() => null))
+          );
+          for (let i = 0; i < ctx.pool.length; i++) {
+            const r = quoteResults[i];
+            if (r && r.status === 'fulfilled' && r.value) {
+              const q = r.value;
+              const cp = parseFloat(q['最新价'] || q.price || q.last || q.close);
+              const ch = parseFloat(q['涨跌幅'] || q.changePct || q.change);
+              if (cp > 0) {
+                ctx.pool[i].currentPrice = cp;
+                ctx.pool[i].changePct = isFinite(ch) ? ch : null;
+                ctx.priceByCode.set(ctx.pool[i].code, cp);
+              }
+            }
+          }
+        }
+      } catch (e) { console.warn('[ShortTrader] ctx 读自选股/注入现价失败:', e); }
       // 同代码 48h 冷却集合 (transactions 表短线卖出)
       try {
         const txs = (await Core.Storage.all('transactions')) || [];
