@@ -7849,6 +7849,107 @@ section('[47] Bug D verify 盘中跳过: 交易日 09:30~15:00 不写回 verifyO
   }
 })();
 
+section('[48] Bug E 跳空跌破止损: bar.open<stopLoss+有成本价 → 取消仓位 (不入止损成交)');
+(async () => {
+  try {
+    const paperSrc = readFileSafe(path.join(WWW, 'app', 'paper.js'));
+    if (!paperSrc) throw new Error('paper.js 读不到');
+    const K = _loadRealConstants();
+    const storeE = { kv: {}, tables: { paper_holdings: [] }, quotes: {}, indexSpot: [], klineByCode: {} };
+    const buildCtx = () => {
+      const pctx = {
+        window: {}, console,
+        escapeHtml: (s) => String(s == null ? '' : s),
+        fmtMoney: (n) => (typeof n === 'number' ? n.toFixed(2) : '0.00'),
+        fmtNum: (n, d) => (typeof n === 'number' ? n.toFixed(d || 0) : '0'),
+        fmtPct: (n) => (typeof n === 'number' ? (n * 100).toFixed(2) + '%' : '-'),
+        pctClass: () => '',
+        fmtDate: () => '2026-07-27',
+        Date,
+        Math,
+        JSON,
+        setTimeout, clearTimeout,
+        Core: {
+          Constants: K,
+          Storage: {
+            kvGet: async (k) => storeE.kv[k],
+            kvSet: async (k, v) => { storeE.kv[k] = v; },
+            all: async (t) => storeE.tables[t] || [],
+            get: async (t, id) => (storeE.tables[t] || []).find(r => r && r.id === id),
+            put: async (t, row) => {
+              storeE.tables[t] = storeE.tables[t] || [];
+              const i = storeE.tables[t].findIndex(r => r && r.id === row.id);
+              if (i >= 0) storeE.tables[t][i] = row; else storeE.tables[t].push(row);
+            }
+          },
+          Data: {
+            getStockSpot: async (code) => storeE.quotes[code] || null,
+            getStockKLine: async (code) => storeE.klineByCode[code] || [],
+            getIndexSpot: async () => storeE.indexSpot
+          },
+          Discipline: { preBuyCheck: async () => ({ ok: true, blocks: [], warns: [] }) },
+          Util: { stockCodePrefix: () => 'sz' },
+          State: { get: () => ({ currentPage: 'pagePaper' }) }
+        }
+      };
+      pctx.Core = pctx.Core;
+      pctx.window.Core = pctx.Core;
+      vm.createContext(pctx);
+      vm.runInContext(paperSrc, pctx);
+      return pctx;
+    };
+    const PC = buildCtx();
+    const P = PC.window.Paper;
+
+    // 48.a 跳空低开 + 有 costPrice > stopLoss → 取消 (不写 exit)
+    const posA = { stopLoss: 9, targetPrice: 11, costPrice: 10, entryPrice: 10, code: '000001', shares: 100 };
+    const ecA = P._exitCheck(posA, { open: 8.5, high: 8.7, low: 8.3, close: 8.6, date: '2026-07-27' });
+    if (ecA.exit === false && ecA.cancelled === true && ecA.reason === '止损失效' && ecA.price === null) {
+      ok('48.a 跳空低开 (open 8.5 < stop 9) + cost 10 > stop 9 → cancelled=true, 取消仓位');
+    } else fail('48.a', JSON.stringify(ecA));
+
+    // 48.b 跳空低开 + costPrice <= stopLoss (破净成本) → 仍走止损(跳空) 老路径
+    //   场景: 加仓后摊薄成本已经低于止损 (罕见, 防御) — 视为正常止损
+    const posB = { stopLoss: 9, targetPrice: 11, costPrice: 8, entryPrice: 8, code: '000001', shares: 100 };
+    const ecB = P._exitCheck(posB, { open: 8.5, high: 8.7, low: 8.3, close: 8.6, date: '2026-07-27' });
+    if (ecB.exit === true && ecB.price === 8.5 && ecB.reason === '止损(跳空)') {
+      ok('48.b 跳空低开 + cost 8 < stop 9 → 走 _isGapDown 老路径, 仍按开盘价止损');
+    } else fail('48.b', JSON.stringify(ecB));
+
+    // 48.c 跳空低开 + 无 costPrice (历史数据缺失) → 走老路径 (向后兼容)
+    const posC = { stopLoss: 9, targetPrice: 11, code: '000001', shares: 100 };
+    const ecC = P._exitCheck(posC, { open: 8.5, high: 8.7, low: 8.3, close: 8.6, date: '2026-07-27' });
+    if (ecC.exit === true && ecC.price === 8.5 && ecC.reason === '止损(跳空)') {
+      ok('48.c 跳空低开 + 无 costPrice → 向后兼容, 走 _isGapDown 老路径');
+    } else fail('48.c', JSON.stringify(ecC));
+
+    // 48.d 盘中触及止损 (low <= stop) + 有成本 → 走正常止损 (不入取消路径)
+    const posD = { stopLoss: 9, targetPrice: 11, costPrice: 10, entryPrice: 10, code: '000001', shares: 100 };
+    const ecD = P._exitCheck(posD, { open: 9.5, high: 9.8, low: 8.9, close: 9.2, date: '2026-07-27' });
+    if (ecD.exit === true && ecD.price === 9 && ecD.reason === '止损') {
+      ok('48.d 盘中触及止损 (low 8.9 < stop 9) + cost 10 > stop 9 → 正常止损价卖, 不取消');
+    } else fail('48.d', JSON.stringify(ecD));
+
+    // 48.e open 略低于 stop 但实际不跳空 (open > close) 且 cost < stop → 仍走跳空止损
+    //   防御: 即使不"跳空" (open > close) 但 open 已击穿 stop, 仍是 stop 触发
+    //   此 case 覆盖 _isGapDown 永远 true (只判 open <= stop) 的实现
+    const posE = { stopLoss: 9, targetPrice: 11, costPrice: 8, entryPrice: 8, code: '000001', shares: 100 };
+    const ecE = P._exitCheck(posE, { open: 8.7, high: 9.0, low: 8.5, close: 8.9, date: '2026-07-27' });
+    if (ecE.exit === true && ecE.price === 8.7 && ecE.reason === '止损(跳空)') {
+      ok('48.e open 8.7 < stop 9 + cost 8 < stop 9 → 老路径, 跳空止损 (open <= stop)');
+    } else fail('48.e', JSON.stringify(ecE));
+
+    // 48.f 跳空高开 + 止盈 (与止损对称, 不应触发取消) — sanity check
+    const posF = { stopLoss: 9, targetPrice: 11, costPrice: 10, entryPrice: 10, code: '000001', shares: 100 };
+    const ecF = P._exitCheck(posF, { open: 11.5, high: 12, low: 11.2, close: 11.8, date: '2026-07-27' });
+    if (ecF.exit === true && ecF.price === 11.5 && ecF.reason === '止盈(跳空)') {
+      ok('48.f 跳空高开 (open 11.5 >= target 11) → 止盈(跳空) 路径不受 Bug E 影响');
+    } else fail('48.f', JSON.stringify(ecF));
+  } catch (e) {
+    fail('48 Bug E 跳空跌破止损', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
 // ========== 总结 ==========
 // 同步 section 的 ok() 已经在 console 打印;
 // async IIFE 里的 ok() 还在 microtask / setTimeout 队列里, 旧版本 setImmediate 只给一次机会,

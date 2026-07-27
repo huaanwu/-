@@ -860,7 +860,14 @@
      */
     _exitCheck(pos, bar) {
       const stop = parseFloat(pos && pos.stopLoss), target = parseFloat(pos && pos.targetPrice);
+      const cost = parseFloat(pos && pos.costPrice);
       if (!bar) return { exit: false, price: null, reason: '' };
+      // Bug E 修复 (跳空跌破止损): bar.open < stopLoss && 入场价 > stopLoss (即建仓后 stopLoss 有效)
+      //   → 该单本应止损, 但当天开盘直接击穿, 继续成交只会以更低价离场 (比止损亏更多)
+      //   → 取消该仓位 (不写 exit), 由 _settleExit 写 journal 说明 "止损失效"
+      if (stop > 0 && cost > stop && bar.open < stop) {
+        return { exit: false, price: null, reason: '止损失效', cancelled: true };
+      }
       if (this._isGapDown(bar, stop)) return { exit: true, price: bar.open, reason: '止损(跳空)' };
       if (stop > 0 && bar.low <= stop) return { exit: true, price: stop, reason: '止损' };
       if (this._isGapUp(bar, target)) return { exit: true, price: bar.open, reason: '止盈(跳空)' };
@@ -1139,6 +1146,30 @@
           if (p.lastSettleBarDate && bar.date <= p.lastSettleBarDate) continue;
 
           let act = this._exitCheck(p, bar);
+          // Bug E 修复 (跳空跌破止损): act.cancelled=true → 取消该仓位 (不入持仓 sell 流程),
+          //   写 journal 留痕并更新跟踪, summary.cancelled++ 计入当日结算
+          if (act.cancelled) {
+            p.closed = true;
+            p.exitDate = bar.date;
+            p.exitReason = act.reason;
+            p.lastSettleBarDate = bar.date;
+            posDirty = true;
+            summary.cancelled = (summary.cancelled || 0) + 1;
+            await this._writeCondJournal({
+              code: p.code, name: p.name,
+              title: `⚡ 短线${act.reason}: ${p.code} ${p.name || ''}`,
+              lines: [
+                `## ⚡ 短线${act.reason} - ${p.code} ${p.name || ''}`, '',
+                `**日期**: ${bar.date} (日 K 结算, 跳空开盘 ${bar.open} 跌破止损 ${p.stopLoss})`,
+                `**原因**: ${act.reason} — 该单按规则取消, 不按跳空开盘价离场 (避免比止损亏更多)`,
+                `**入场**: ${p.entryDate} @ ${p.entryPrice} → **拟出场**: 取消 (未成交)`,
+                `**止损/目标**: ${p.stopLoss} / ${p.targetPrice}`, '',
+                '---',
+                '*本条由 StockMaster 条件单引擎 (T3) 自动记录*'
+              ]
+            });
+            continue;
+          }
           if (!act.exit) {
             // 未触发止损/止盈 → 持有天数 +1, 满 SHORT_MAX_HOLD_DAYS 按收盘价强平
             p.holdDays = (p.holdDays || 0) + 1;
