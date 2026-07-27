@@ -709,6 +709,54 @@ try {
     // wide 那 5000 元在"减仓总额"里, 但没对应的"加仓"目标, 减≠加
     if (a10.warnings.some(w => /减仓.*≠.*加仓/.test(w))) ok('不平衡警告: 减 ≠ 加');
     else fail('不平衡警告', JSON.stringify(a10.warnings));
+
+    // Case 11: Bug I - 同 type 多只基金, drift 只算 type 级, 不重复判每只
+    // 总 60000, short_bond 2 只 (各 18000) = 60% 超配 40%, 应只 1 条 type 级建议, 而非 2 条单只级
+    const a11 = Fund._computeRebalanceAdvice([
+      { code: 'A1', name: '短债1', type: 'short_bond', currentNav: 1, value: 18000 },
+      { code: 'A2', name: '短债2', type: 'short_bond', currentNav: 1, value: 18000 },
+      { code: 'B', name: '纯债', type: 'pure_bond', currentNav: 1, value: 24000 }
+    ], { short_bond: 0.2, pure_bond: 0.8 });
+    const reduceShort = a11.suggestions.filter(s => s.action === 'reduce' && s.type === 'short_bond');
+    // type currentValue=36000, targetValue=60000*0.2=12000, diffValue=24000
+    if (a11.needRebalance && reduceShort.length === 1 && reduceShort[0].amount === 24000) ok('同 type 多只 → 1 条 type 级建议 (减 24000)');
+    else fail('type 级聚合', `suggestions=${JSON.stringify(a11.suggestions.map(s => ({type:s.type, action:s.action, amount:s.amount})))}`);
+    // drift 数组也按 type 聚合, 不该有 A1/A2 各 1 条
+    const shortDrift = a11.drift.find(d => d.type === 'short_bond');
+    if (shortDrift && shortDrift.holdingCount === 2 && Math.abs(shortDrift.currentPct - 0.6) < 0.001 && Math.abs(shortDrift.driftPct - 0.4) < 0.001) ok('drift 数组 type 级: holdingCount=2, currentPct=60%, driftPct=40%');
+    else fail('drift type 级', JSON.stringify(shortDrift));
+
+    // Case 12: Bug I - 总调仓 > 10% → 警告 (不强制缩减, 金额照算)
+    // 总 50000, short_bond 40% 偏 20%, pure_bond 60% 偏 20%: 总调仓 20000 = 40% > 10% 上限
+    const a12 = Fund._computeRebalanceAdvice([
+      { code: 'A', name: 'A', type: 'short_bond', currentNav: 1, value: 20000 },
+      { code: 'B', name: 'B', type: 'pure_bond', currentNav: 1, value: 30000 }
+    ], { short_bond: 0.2, pure_bond: 0.8 }, 0.05);
+    if (a12.totalAdjust === 20000 && a12.warnings.some(w => /分批调仓/.test(w) && /10%/.test(w))) ok('超 10% 上限 → 警告, 金额不缩减');
+    else fail('10% 上限警告', `totalAdjust=${a12.totalAdjust}, warnings=${JSON.stringify(a12.warnings)}`);
+
+    // Case 13: Bug I - 总调仓 < 10% → 无 10% 警告
+    // 总 100000, short_bond 28% 偏 8%, pure_bond 72% 偏 8%: 总调仓 16000 = 16% > 10%
+    // 调小一点: short_bond 24% 偏 4% (阈值 5%) → 不触发; 用 25% / 75% 偏 5% 也不触发
+    // → 用阈值 3%: short_bond 25% 偏 5% 触发; pure_bond 75% 偏 5% 触发; 总调仓 10000 = 10%, 边界 ≤ 算无警告
+    const a13 = Fund._computeRebalanceAdvice([
+      { code: 'A', name: 'A', type: 'short_bond', currentNav: 1, value: 25000 },
+      { code: 'B', name: 'B', type: 'pure_bond', currentNav: 1, value: 75000 }
+    ], { short_bond: 0.2, pure_bond: 0.8 }, 0.03);
+    // totalValue=100000, short_bond 25% 偏 5%, targetValue=20000, diff=5000; pure_bond 75% 偏 5%, targetValue=80000, diff=-5000; 总 10000 = 10%
+    if (a13.totalAdjust === 10000 && !a13.warnings.some(w => /分批调仓/.test(w))) ok('= 10% → 无分批调仓警告 (边界外不算超)');
+    else fail('无警告', `totalAdjust=${a13.totalAdjust}, warnings=${JSON.stringify(a13.warnings)}`);
+
+    // Case 14: Bug I - 同 type 多只时, 选当前最大那只作为代表持仓
+    const a14 = Fund._computeRebalanceAdvice([
+      { code: 'A1', name: '短债1', type: 'short_bond', currentNav: 1, value: 10000 },
+      { code: 'A2', name: '短债2', type: 'short_bond', currentNav: 1, value: 20000 },  // 减仓代表
+      { code: 'B', name: '纯债', type: 'pure_bond', currentNav: 1, value: 20000 }
+    ], { short_bond: 0.2, pure_bond: 0.8 }, 0.05);
+    const reduce14 = a14.suggestions.find(s => s.action === 'reduce');
+    // 当前 A2 (20000) > A1 (10000), 减仓代表应选 A2
+    if (reduce14 && reduce14.code === 'A2') ok('同 type 多只 → 减仓代表 = 当前最大');
+    else fail('代表选择', JSON.stringify(reduce14));
   })();
 } catch (e) {
   fail('RebalanceAdvice 测试', e.message + ' / ' + e.stack);

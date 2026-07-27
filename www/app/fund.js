@@ -193,6 +193,8 @@
                 </td>
                 <td>
                   <button class="btn btn-sm" onclick="Fund.showChart('${escapeHtml(r.f.code)}','${escapeHtml(r.f.name || '')}')">📈</button>
+                  <button class="btn btn-sm" onclick="Fund.buyDialog('${escapeHtml(r.f.code)}')" title="跳第三方平台申购">🛒</button>
+                  <button class="btn btn-sm" onclick="Fund.sellDialog('${escapeHtml(r.f.code)}')" title="跳第三方平台赎回 / 快速赎回登记">💰</button>
                   <button class="btn btn-sm" onclick="Fund.remove('${escapeHtml(r.f.code)}')">✕</button>
                 </td>
               </tr>
@@ -251,6 +253,163 @@
       if (!confirm(`确定从自选基金删除 ${code}?`)) return;
       await Core.Storage.remove('funds', code);
       toastSuccess('已删除');
+      this.render();
+    },
+
+    /**
+     * 基金账户余额对账
+     * 用户手动输入第三方 App (天天/支付宝/蛋卷) 显示的"基金市值总资产"
+     * app 跟自身计算 (按当日净值 × 份额) 对比
+     * 偏差 > 50 元 → 提示"可能有漏录的申购/赎回"
+     */
+    async reconcileDialog() {
+      const list = await Core.Storage.all('funds');
+      const cashflows = await Core.Storage.all('cashflow');
+
+      // app 自身计算: 拉最新净值 → 份额 × 当前净值
+      let appValue = 0, hasValue = false;
+      for (const f of (list || [])) {
+        const shares = parseFloat(f.shares) || 0;
+        if (shares <= 0) continue;
+        let nav = null;
+        try {
+          const spot = await Core.Data.getFundSpot(f.code);
+          if (Array.isArray(spot) && spot.length > 0) {
+            const latest = spot[spot.length - 1];
+            nav = parseFloat(latest.单位净值 || latest['单位净值'] || latest.value);
+          }
+        } catch (e) { console.warn('[Fund] 净值拉取失败:', f.code, e); }
+        if (nav) { appValue += shares * nav; hasValue = true; }
+      }
+
+      // 现金部分 (cashflow 中 target 是 6 位基金代码 或 type=transfer 涉及基金的)
+      // 简单口径: 所有 cashflow 净额 (正=入, 负=出). 跟股票口径分开, 用 key prefix 区分
+      // 这里只看基金相关 cashflow: target 形如 6 位基金代码 (不是股票代码)
+      let appCash = 0;
+      cashflows.forEach(f => {
+        const tgt = (f.target || '').toString();
+        const isFund = /^\d{6}$/.test(tgt) && (
+          tgt.startsWith('00') || tgt.startsWith('01') || tgt.startsWith('02') ||
+          tgt.startsWith('03') || tgt.startsWith('04') || tgt.startsWith('05')
+        );
+        // 简化: 只对 type='transfer' 且 target 是 6 位数字的, 视为基金资金流
+        if (isFund) appCash += parseFloat(f.amount) || 0;
+      });
+
+      const appTotal = appValue + appCash;
+      const last = await Core.Storage.kvGet('fund_last_reconcile') || {};
+
+      const html = `
+        <div class="modal-backdrop" onclick="if(event.target===this)Fund.closeModal()">
+          <div class="modal" style="max-width:480px;">
+            <h3>⚖️ 基金对账</h3>
+            <div style="font-size:12px;color:var(--text-muted);margin-bottom:12px;line-height:1.6;">
+              把第三方基金 App 显示的 <b>基金市值总资产</b> 数字输进来, app 自动对比自算值<br>
+              偏差大 → 提示可能有漏录的申购/赎回<br>
+              <span style="font-size:11px;">💡 跟股票对账分开存 (key 前缀不同), 互不干扰</span>
+            </div>
+
+            <div style="background:var(--bg-base);padding:10px;border-radius:6px;margin-bottom:12px;font-size:13px;line-height:1.7;">
+              <div>📊 <b>app 自算</b>: ${fmtMoney(appValue)} (持仓按今日净值)${hasValue ? '' : ' <span style="color:var(--down);">(净值未拉到)</span>'}</div>
+              <div>💵 <b>净流入</b>: ${fmtMoney(appCash)} (基金 cashflow 净额)</div>
+              <div style="border-top:1px solid var(--border);margin-top:6px;padding-top:6px;">
+                <b>总计</b>: <span style="color:var(--accent);font-size:15px;">${fmtMoney(appTotal)}</span>
+              </div>
+            </div>
+
+            <div class="form-row">
+              <label>第三方 App 基金总资产 (元)</label>
+              <input type="number" id="fReconcileBroker" step="0.01" placeholder="例: 82345.67">
+              <div style="font-size:11px;color:var(--text-muted);">打开天天基金 App → 资产总览 → 复制数字</div>
+            </div>
+            <div class="form-row">
+              <label>对账日期</label>
+              <input type="date" id="fReconcileDate" value="${new Date().toISOString().slice(0,10)}">
+            </div>
+            <div class="form-row">
+              <label>备注 (可选)</label>
+              <input type="text" id="fReconcileNote" placeholder="例: 周三定投 1000 已扣款">
+            </div>
+
+            <div id="fReconcilePreview" style="background:var(--bg-base);padding:10px;border-radius:4px;margin:8px 0;font-size:12px;line-height:1.6;">
+              填完数字自动算偏差
+            </div>
+
+            ${last.date ? `
+              <div style="font-size:11px;color:var(--text-muted);margin-top:8px;">
+                上次对账: ${escapeHtml(last.date)} · 当时偏差 ${fmtMoney(last.diff || 0)}
+              </div>
+            ` : ''}
+
+            <div class="modal-footer">
+              <button class="btn btn-ghost" onclick="Fund.closeModal()">取消</button>
+              <button class="btn btn-primary" onclick="Fund.reconcileSave()">✓ 保存对账</button>
+            </div>
+          </div>
+        </div>
+      `;
+      document.getElementById('modalRoot').innerHTML = html;
+      this._reconcileAppTotal = appTotal;
+      this._bindReconcileCalc();
+    },
+
+    _bindReconcileCalc() {
+      const upd = () => {
+        const broker = parseFloat(document.getElementById('fReconcileBroker')?.value);
+        const el = document.getElementById('fReconcilePreview');
+        if (!el) return;
+        if (isNaN(broker)) { el.textContent = '填完数字自动算偏差'; return; }
+        const diff = broker - this._reconcileAppTotal;
+        const absDiff = Math.abs(diff);
+        let status, color;
+        if (absDiff < 50) {
+          status = '✅ 完全对得上 (偏差 < 50 元, 可能是净值波动)';
+          color = 'var(--up)';
+        } else if (absDiff < 500) {
+          status = '⚠️ 轻微偏差, 可能是今日净值未及时刷新, 或小额定投漏录';
+          color = 'var(--text-muted)';
+        } else if (diff > 0) {
+          status = `❌ 第三方比 app 多 ${fmtMoney(diff)}, 可能漏录了 ${fmtMoney(diff)} 的申购或漏算定投`;
+          color = 'var(--down)';
+        } else {
+          status = `❌ 第三方比 app 少 ${fmtMoney(-diff)}, 可能多录了 ${fmtMoney(-diff)} 或漏算赎回`;
+          color = 'var(--down)';
+        }
+        el.innerHTML = `
+          <b>偏差</b>: <span style="color:${color};font-size:15px;">${fmtMoney(diff)}</span><br>
+          <span style="color:${color};">${status}</span>
+        `;
+      };
+      const input = document.getElementById('fReconcileBroker');
+      if (input) input.addEventListener('input', upd);
+      upd();
+    },
+
+    async reconcileSave() {
+      const broker = parseFloat(document.getElementById('fReconcileBroker').value);
+      const date = document.getElementById('fReconcileDate').value;
+      const note = document.getElementById('fReconcileNote').value.trim();
+      if (isNaN(broker)) { toastError('填第三方基金总资产数字'); return; }
+      if (!date) { toastError('填日期'); return; }
+      const diff = broker - this._reconcileAppTotal;
+
+      const rec = { date, brokerTotal: broker, appTotal: this._reconcileAppTotal, diff, note, createdAt: Date.now() };
+      // 基金侧独立 kv, 跟股票侧 holdings_reconcile_log 分开
+      const list = (await Core.Storage.kvGet('fund_reconcile_log')) || [];
+      list.push(rec);
+      if (list.length > 30) list.shift();
+      await Core.Storage.kvSet('fund_reconcile_log', list);
+      await Core.Storage.kvSet('fund_last_reconcile', { date, diff });
+
+      this.closeModal();
+      const abs = Math.abs(diff);
+      if (abs < 50) {
+        toastSuccess(`✅ 基金对账通过, 偏差 ${fmtMoney(diff)}`);
+      } else if (abs < 500) {
+        toastSuccess(`基金对账已记录, 偏差 ${fmtMoney(diff)}, 检查今日净值/定投`);
+      } else {
+        toastError(`基金偏差 ${fmtMoney(diff)} 较大, 已记录. 请检查申购/赎回是否漏录`);
+      }
       this.render();
     },
 
@@ -504,65 +663,80 @@
         return { ok: false, reason: '总市值为 0', drift: [], suggestions: [], warnings: [], expectedConfig: [] };
       }
 
-      // 1. 算每只当前 % 和 目标 % (按 type 聚合)
+      // Bug I 修复: 类型级 drift (恢复聚合语义)
+      // byType 聚合 type → { currentValue, currentPct, targetPct, driftPct, triggered }
+      // 原 bug: 之前按单只算 curPct vs type 级 targetPct, 同 type 多只时每只都被判 drift, 越调越歪
       const byType = {};
       for (const h of valid) {
         const t = h.type || 'other';
-        byType[t] = (byType[t] || 0) + h.value;
+        if (!byType[t]) byType[t] = { type: t, currentValue: 0, currentPct: 0, holdings: [] };
+        byType[t].currentValue += h.value;
+        byType[t].holdings.push(h);
       }
-      // 每只基金也单独算 % (用于建议展示)
-      const drift = valid.map(h => {
-        const curPct = h.value / totalValue;
-        // 找 type 对应的目标; type 不在 targets 里就保持当前% (不调)
-        const tgtPct = targets[h.type];
-        const driftPct = tgtPct !== undefined ? curPct - tgtPct : 0;
-        return {
-          code: h.code,
-          name: h.name,
-          type: h.type,
-          value: h.value,
-          currentNav: h.currentNav,
-          currentPct: curPct,
-          targetPct: tgtPct,
-          driftPct,
-          triggered: tgtPct !== undefined && Math.abs(driftPct) > threshold
-        };
-      });
+      for (const t of Object.keys(byType)) {
+        byType[t].currentPct = byType[t].currentValue / totalValue;
+        const tgt = targets[t];
+        byType[t].targetPct = tgt !== undefined ? tgt : null;
+        byType[t].driftPct = tgt !== undefined ? byType[t].currentPct - tgt : 0;
+        byType[t].triggered = tgt !== undefined && Math.abs(byType[t].driftPct) > threshold;
+      }
+      // drift 数组改成 type 级 (UI 展示用)
+      const drift = Object.values(byType).map(b => ({
+        type: b.type,
+        currentValue: b.currentValue,
+        currentPct: b.currentPct,
+        targetPct: b.targetPct,
+        driftPct: b.driftPct,
+        triggered: b.triggered,
+        holdingCount: b.holdings.length
+      }));
 
-      // 2. 检查整体是否需要调
+      // 1. 检查整体是否需要调
       const triggeredAny = drift.some(d => d.triggered);
       if (!triggeredAny) {
         return {
           ok: true,
           needRebalance: false,
-          reason: `所有持仓漂移 ≤ ${(threshold * 100).toFixed(0)}%, 无需调仓`,
+          reason: `所有类型漂移 ≤ ${(threshold * 100).toFixed(0)}%, 无需调仓`,
           totalValue,
           drift,
           suggestions: [],
           totalAdjust: 0,
           costEstimate: 0,
           warnings: [],
-          expectedConfig: drift.map(d => ({ code: d.code, currentPct: d.currentPct, targetPct: d.targetPct }))
+          expectedConfig: valid.map(h => ({ code: h.code, type: h.type, currentPct: h.value / totalValue, targetPct: targets[h.type] }))
         };
       }
 
-      // 3. 算调仓建议
-      // 思路: 把每只基金的 value 调到 totalValue * targetPct
-      // 减仓的钱 = 加仓的钱 (总额不变)
+      // 2. 算调仓建议 (类型级: 每条建议对应一个 type, 列出涉及的代表持仓)
       const suggestions = [];
       let totalAdjust = 0;
       let costEstimate = 0;
+      // 原始 delta 收集, 后面算上限警告
+      const rawDeltas = [];
 
       for (const d of drift) {
-        if (d.targetPct === undefined) continue;  // type 不在目标里, 不动
+        if (d.targetPct === null) continue;  // type 不在目标里, 不动
         if (!d.triggered) continue;  // 没超阈值, 不动
         const targetValue = totalValue * d.targetPct;
-        const diffValue = d.value - targetValue;  // >0 超配, <0 欠配
+        const diffValue = d.currentValue - targetValue;  // >0 超配, <0 欠配
         if (Math.abs(diffValue) < 100) continue;  // 太小不调 (< 100 元)
+        rawDeltas.push({ d, diffValue, targetValue });
+      }
+
+      // 3. 总调仓金额上限 10% totalValue (警告, 不强制缩减)
+      // 原始比例保留: 漂移严重时给用户警示, 但建议金额按差额照算, 让用户自己决定是否分批调
+      const MAX_TOTAL_ADJUST_RATIO = 0.10;
+      const totalRawAdjust = rawDeltas.reduce((s, x) => s + Math.abs(x.diffValue), 0);
+      const cap = totalValue * MAX_TOTAL_ADJUST_RATIO;
+      const overCap = totalRawAdjust > cap;
+
+      for (const { d, diffValue } of rawDeltas) {
         const action = diffValue > 0 ? 'reduce' : 'add';
         const amount = Math.abs(diffValue);
-        // 减仓份数按当前净值算 (近似)
-        const shares = d.currentNav ? amount / d.currentNav : null;
+        // 选代表持仓: add/reduce 都取当前最大 (加减大头)
+        const holdings = byType[d.type].holdings;
+        const pick = holdings.slice().sort((a, b) => b.value - a.value)[0];
         // 费率
         const feeRate = action === 'reduce' ? fees.redeem : fees.buy;
         const fee = amount * feeRate;
@@ -571,15 +745,16 @@
         const fromPct = d.currentPct;
         const toPct = d.targetPct;
         const reason = action === 'reduce'
-          ? `${d.type || ''} 当前 ${(fromPct * 100).toFixed(1)}% 超配 ${(Math.abs(d.driftPct) * 100).toFixed(1)}%, 减仓回到目标 ${(toPct * 100).toFixed(0)}%`
-          : `${d.type || ''} 当前 ${(fromPct * 100).toFixed(1)}% 欠配 ${(Math.abs(d.driftPct) * 100).toFixed(1)}%, 加仓回到目标 ${(toPct * 100).toFixed(0)}%`;
+          ? `${d.type} 当前 ${(fromPct * 100).toFixed(1)}% 超配 ${(Math.abs(d.driftPct) * 100).toFixed(1)}%, 减仓回到目标 ${(toPct * 100).toFixed(0)}%`
+          : `${d.type} 当前 ${(fromPct * 100).toFixed(1)}% 欠配 ${(Math.abs(d.driftPct) * 100).toFixed(1)}%, 加仓回到目标 ${(toPct * 100).toFixed(0)}%`;
         suggestions.push({
-          code: d.code,
-          name: d.name,
           type: d.type,
           action,
           amount,
-          shares: shares ? Math.round(shares * 100) / 100 : null,
+          code: pick.code,
+          name: pick.name,
+          currentNav: pick.currentNav,
+          shares: pick.currentNav ? Math.round((amount / pick.currentNav) * 100) / 100 : null,
           fromPct,
           toPct,
           fee,
@@ -589,7 +764,6 @@
 
       // 4. 警告
       const warnings = [];
-      // 检查调仓是否平衡 (减的钱 = 加的钱)
       const reduceSum = suggestions.filter(s => s.action === 'reduce').reduce((s, x) => s + x.amount, 0);
       const addSum = suggestions.filter(s => s.action === 'add').reduce((s, x) => s + x.amount, 0);
       if (Math.abs(reduceSum - addSum) > 1) {
@@ -601,16 +775,25 @@
       if (totalAdjust < 500) {
         warnings.push(`总调仓金额 < 500 元, 申赎费可能不划算`);
       }
+      if (overCap) {
+        warnings.push(`总调仓 ${totalRawAdjust.toFixed(0)} 元 > ${(MAX_TOTAL_ADJUST_RATIO * 100).toFixed(0)}% 上限 ${cap.toFixed(0)} 元, 建议分批调仓`);
+      }
 
-      // 5. 调后配置 (近似: 总市值不变)
-      const expectedConfig = drift.map(d => ({
-        code: d.code,
-        name: d.name,
-        type: d.type,
-        currentPct: d.currentPct,
-        targetPct: d.targetPct,
-        expectedPct: d.targetPct !== undefined ? d.targetPct : d.currentPct
-      }));
+      // 5. 调后配置 (按 type 推算): 加仓 type 实际% 上升, 减仓 type 实际% 下降
+      const expectedConfig = valid.map(h => {
+        const b = byType[h.type];
+        const expectedTypePct = b.targetPct !== null ? b.targetPct : b.currentPct;
+        // 按持仓在 type 内占比分配
+        const share = b.currentValue > 0 ? h.value / b.currentValue : 0;
+        return {
+          code: h.code,
+          name: h.name,
+          type: h.type,
+          currentPct: h.value / totalValue,
+          targetPct: targets[h.type],
+          expectedPct: expectedTypePct * share
+        };
+      });
 
       return {
         ok: true,
