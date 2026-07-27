@@ -17,23 +17,45 @@
   const CACHE_KEY = 'news_caixin_v1';
 
   // 相关性关键词 (含权重)
+  // super: 国务院/财政部/发改委等纯政策源, 政策密度大加分
+  // high:   央行/货币政策/降息/降准
+  // mid:    利率/债市/债券/基金/理财
+  // low:    通胀/CPI/PMI/经济
   const KEYWORDS = {
-    high: ['央行', 'PBOC', '货币政策', '降息', '降准', '加息', 'LPR', 'MLF', '逆回购', '公开市场', '货币政策'],
+    super: ['国务院', '国常会', '国务院常务会议', '财政部', '发改委', '国家发改委',
+            '中央政治局', '中央经济工作会议', '证监会', '银保监会', '金融委',
+            '央行', '中国人民银行', 'PBOC', '公开市场操作', '逆回购', 'MLF', 'PSL', 'SLF'],
+    high: ['降息', '降准', '加息', 'LPR', '货币政策', '财政政策', '结构性工具',
+           '利率走廊', '汇率', '人民币汇率', '外汇储备'],
     mid: ['利率', '债市', '债券', '国债', '城投', '信用', '基金', '公募', '理财', '债基', '纯债', '短债', '中短债'],
     low: ['通胀', 'CPI', '通缩', 'PMI', '经济', '房地产', '楼市', '稳增长', '政策', '监管', '财政']
   };
 
-  function _score(text) {
-    const t = text.toLowerCase();
+  // 东财公告加权关键词 (公司公告中监管/决议类, 提权 +2)
+  const EM_BOOST = ['公告', '决议', '通知', '决定', '管理办法', '指引', '批复', '意见', '公告书'];
+
+  function _score(item) {
+    const text = ((item.tag || '') + ' ' + (item.summary || '')).toLowerCase();
     let s = 0, hits = [];
+    for (const kw of KEYWORDS.super) {
+      if (text.includes(kw.toLowerCase())) { s += 5; hits.push(kw); }
+    }
     for (const kw of KEYWORDS.high) {
-      if (t.includes(kw)) { s += 3; hits.push(kw); }
+      if (text.includes(kw.toLowerCase())) { s += 3; hits.push(kw); }
     }
     for (const kw of KEYWORDS.mid) {
-      if (t.includes(kw)) { s += 2; hits.push(kw); }
+      if (text.includes(kw.toLowerCase())) { s += 2; hits.push(kw); }
     }
     for (const kw of KEYWORDS.low) {
-      if (t.includes(kw)) { s += 1; hits.push(kw); }
+      if (text.includes(kw.toLowerCase())) { s += 1; hits.push(kw); }
+    }
+    // 东财公告中含监管/决议类关键词 → 额外 +2
+    if (item.source === 'eastmoney') {
+      let emHits = 0;
+      for (const kw of EM_BOOST) {
+        if (text.includes(kw)) { s += 2; emHits++; }
+      }
+      if (emHits > 0) hits.push('东财公告');
     }
     return { score: s, hits: [...new Set(hits)] };
   }
@@ -94,6 +116,27 @@
     });
   }
 
+  /**
+   * 百度经济新闻 (aktools) → 当作政策密度补充源
+   * URL: stock_news_economic_baidu / news_economic_baidu
+   * 字段 (akshare 0.10+): { title, url,ptime }
+   */
+  async function _fetchBaiduPolicy() {
+    try {
+      const data = await Core.Data.fetch('news_baidu_policy', 'news_economic_baidu', {}, TTL_6H);
+      if (!Array.isArray(data) || data.length === 0) return [];
+      return data.slice(0, 30).map(d => ({
+        tag: '政策',
+        summary: d.title || d.content || '',
+        url: d.url || '',
+        source: 'baidu-policy'
+      }));
+    } catch (e) {
+      console.warn('[News] 百度经济新闻拉取失败:', e.message);
+      return [];
+    }
+  }
+
   async function _fetch() {
     const cacheKey = `${CACHE_KEY}_${Core.State.get('proxyBase')}`;
     const cached = await Core.Storage.cacheGet(cacheKey);
@@ -113,6 +156,18 @@
       }
     }
 
+    // 政策密度补充源: 百度经济新闻 (政策类关键词扫描)
+    // 即使主源有数据也合并进来, 由 super tier 关键词 (国务院/财政部/发改委 等) 提权
+    try {
+      const policyItems = await _fetchBaiduPolicy();
+      if (policyItems.length > 0) {
+        items = items.concat(policyItems);
+        console.log(`[News] 百度政策源并入 ${policyItems.length} 条`);
+      }
+    } catch (e) {
+      console.warn('[News] 百度政策源拉取失败:', e.message);
+    }
+
     if (items.length === 0) {
       // 两源都挂, 返空
       const empty = {
@@ -127,10 +182,9 @@
       return empty;
     }
 
-    // 关键词打分
+    // 关键词打分 (含政策密度加权 + 东财公告提权)
     const scored = items.map(d => {
-      const text = (d.tag || '') + ' ' + (d.summary || '');
-      const { score, hits } = _score(text);
+      const { score, hits } = _score(d);
       return {
         ...d,
         score,
