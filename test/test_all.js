@@ -105,7 +105,7 @@ section('2] 域脚本接口完备性');
 const DOMAINS = {
   'Watchlist': ['init', 'render', 'addDialog', 'add', 'remove', 'showKLine', 'closeModal', 'closeKLine'],
   'Holdings':  ['init', 'render', 'addDialog', 'editDialog', 'save', 'remove', 'addTxDialog', 'saveTx', 'closeModal', '_renderPending', 'confirmPending', 'ignorePending', '_markPendingConfirmed'],
-  'Paper':     ['init', 'buy', 'sell', 'getAccount', 'getPositions', 'resetAccount', 'snapshotIfNeeded', 'autoTradeFromPick', 'renderPage', 'buyFromForm', 'sellFromForm', 'sellAll', '_calcFee', '_roundLot', '_pushSnapshot', '_planAutoTrade', 'maybeGenerateEodReport', '_shouldGenerateEod', '_pushEodReport', '_appendDisciplineLog', '_logDisciplineBlock', '_buildEodReport', '_formatEodReportText', '_pushEodToFeishu', '_renderEodReport'],
+  'Paper':     ['init', 'buy', 'sell', 'getAccount', 'getPositions', 'resetAccount', 'snapshotIfNeeded', 'autoTradeFromPick', 'renderPage', 'buyFromForm', 'sellFromForm', 'sellAll', 'switchSleeve', '_getAccountRaw', '_saveAccountRaw', '_calcFee', '_roundLot', '_pushSnapshot', '_planAutoTrade', 'maybeGenerateEodReport', '_shouldGenerateEod', '_pushEodReport', '_appendDisciplineLog', '_logDisciplineBlock', '_buildEodReport', '_formatEodReportText', '_pushEodToFeishu', '_renderEodReport'],
   'Journal':   ['init', 'render', 'newDialog', 'editDialog', 'save', 'remove', 'closeModal', '_buildHoldingsContext', '_renderHoldingBadge', '_renderStructuredTags', '_runAiAssistant'],
   'Screener':  ['init', 'run', '_addWatchlistFromPick', '_runPreBacktest'],
   'Fund':      ['init', 'render', 'addDialog', 'save', 'remove', 'showChart', 'closeModal'],
@@ -5052,9 +5052,45 @@ section('36] 中长线盯盘: horizon 打标 / 分层轮询(短线定时器+中�
     } else fail('36.9c _checkValuation 估值 AI 接线', '源码未匹配 _aiValuationNarrative(a, verdict).then');
 
     // 36.9d hasCachedNarrative 把 valuation 类型纳入缓存路径
-    if (/hasCachedNarrative\s*=\s*\(\s*a\.type\s*===\s*'earnings_warning'\s*\|\|\s*a\.type\s*===\s*'valuation'\s*\)\s*&&\s*a\.aiNarrative/.test(alertsSrc)) {
+    if (/hasCachedNarrative\s*=\s*\(\s*a\.type\s*===\s*'earnings_warning'\s*\|\|\s*a\.type\s*===\s*'valuation'\s*(?:\|\|\s*a\.type\s*===\s*'regime_change'\s*)?\)\s*&&\s*a\.aiNarrative/.test(alertsSrc)) {
       ok('36.9d AI 解读默认缓存: valuation 类型纳入 hasCachedNarrative (源码对账)');
     } else fail('36.9d hasCachedNarrative 估值缓存', '源码未匹配 valuation 类型');
+
+    // ---- 36.10 B-2+: 大盘状态切换 AI 归因 (同步纯函数测, 避开 36.3g setTimeout 截断) ----
+    // 36.10a _aiRegimeNarrative / _fallbackRegimeNarrative 暴露
+    if (typeof Alerts._aiRegimeNarrative !== 'function') {
+      fail('36.10a _aiRegimeNarrative 未注册');
+    } else if (typeof Alerts._fallbackRegimeNarrative !== 'function') {
+      fail('36.10a _fallbackRegimeNarrative 未注册');
+    } else {
+      ok('36.10a 状态切换 AI 归因方法注册: _aiRegimeNarrative + _fallbackRegimeNarrative');
+    }
+
+    // 36.10b 兜底模板: bull/neutral/bear 三态
+    const fbBull = Alerts._fallbackRegimeNarrative('neutral', 'bull');
+    if (fbBull.includes('bull') && fbBull.includes('站上 MA60') && fbBull.includes('中长线纪律')) {
+      ok('36.10b 状态切换 AI 兜底: neutral→bull 含站上 MA60 + 纪律提醒');
+    } else fail('36.10b 状态切换兜底 bull', fbBull.slice(0, 80));
+
+    const fbBear = Alerts._fallbackRegimeNarrative('bull', 'bear');
+    if (fbBear.includes('bear') && fbBear.includes('跌破 MA60') && fbBear.includes('中长线纪律')) {
+      ok('36.10c 状态切换 AI 兜底: bull→bear 含跌破 MA60 + 纪律提醒');
+    } else fail('36.10c 状态切换兜底 bear', fbBear.slice(0, 80));
+
+    const fbNeutral = Alerts._fallbackRegimeNarrative('bull', 'neutral');
+    if (fbNeutral.includes('方向不明') && fbNeutral.includes('中长线纪律')) {
+      ok('36.10d 状态切换 AI 兜底: 切到 neutral 走通用分支');
+    } else fail('36.10d 状态切换兜底 neutral', fbNeutral.slice(0, 80));
+
+    // 36.10e _checkRegimeChange 接线: 状态切换后 a.aiNarrative + aiNarrativeFrom/To 被赋值 (源码对账)
+    if (/this\._aiRegimeNarrative\(a,\s*a\.lastState,\s*cur\)\.then\(narrative\s*=>\s*\{[\s\S]*a\.aiNarrative\s*=\s*narrative[\s\S]*aiNarrativeFrom[\s\S]*aiNarrativeTo/.test(alertsSrc)) {
+      ok('36.10e _checkRegimeChange 接线: 状态切换后写 a.aiNarrative + from/to (源码对账)');
+    } else fail('36.10e _checkRegimeChange 状态 AI 接线', '源码未匹配 _aiRegimeNarrative(a, a.lastState, cur).then(...)');
+
+    // 36.10f hasCachedNarrative 把 regime_change 纳入缓存路径
+    if (/hasCachedNarrative\s*=\s*\(\s*a\.type\s*===\s*'earnings_warning'\s*\|\|\s*a\.type\s*===\s*'valuation'\s*\|\|\s*a\.type\s*===\s*'regime_change'\s*\)/.test(alertsSrc)) {
+      ok('36.10f AI 解读默认缓存: regime_change 类型纳入 hasCachedNarrative (源码对账)');
+    } else fail('36.10f hasCachedNarrative regime 缓存', '源码未匹配 regime_change');
 
     // _aiEarningsNarrative: AI 调通 → 写 alert.aiNarrative; AI 调失败 → 兜底
     notices.length = 0;

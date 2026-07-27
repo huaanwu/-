@@ -1013,6 +1013,16 @@
         a.triggered = true;
         a.hitCount = (a.hitCount || 0) + 1;
         a.lastHit = Date.now();
+        // Phase B-2+: 异步 AI 归因大盘状态切换 (与业绩预告/估值同口径, 不阻塞主通知)
+        this._aiRegimeNarrative(a, a.lastState, cur).then(narrative => {
+          try {
+            a.aiNarrative = narrative;
+            a.aiNarrativeAt = Date.now();
+            a.aiNarrativeFrom = a.lastState;
+            a.aiNarrativeTo = cur;
+            Core.Storage.put('alerts', a).catch(e => console.warn('[Alerts] 写 aiNarrative(regime) 失败:', e));
+          } catch (e) { console.warn('[Alerts] aiNarrative(regime) 落库失败:', e); }
+        }).catch(e => console.warn('[Alerts] AI 状态归因 promise reject:', e));
       }
       a.lastState = cur;
       return true;
@@ -1036,6 +1046,51 @@
         msg += '\n💡 市场方向不明: 维持原计划, 不追涨不杀跌, 等趋势明朗再加大动作。';
       }
       return msg;
+    },
+
+    /**
+     * Phase B-2+: 大盘状态切换 AI 归因 (异步, 与业绩预告/估值同口径)
+     *   失败 → fallback 模板, 不阻塞主通知
+     *   结果写 a.aiNarrative + aiNarrativeAt + aiNarrativeFrom / aiNarrativeTo
+     */
+    async _aiRegimeNarrative(a, fromState, toState) {
+      if (!window.Core || !Core.AI) return this._fallbackRegimeNarrative(fromState, toState);
+      const labels = (window.Core && Core.Regime && Core.Regime.GATES)
+        ? Object.fromEntries(Object.entries(Core.Regime.GATES).map(([k, g]) => [k, `${g.label} ${g.icon}`]))
+        : REGIME_LABELS;
+      const fromLabel = labels[fromState] || fromState;
+      const toLabel = labels[toState] || toState;
+      const systemPrompt = [
+        '你是「大盘状态切换归因助手」, 给小白用户解释一次状态迁移意味着什么。',
+        '- 100-200 字中文, 2 段: ⚡ 这条信号在说什么 / 📌 对中长线持仓的下一步动作',
+        '- 不要推荐具体买卖金额, 只解释逻辑、优先级',
+        '- 不要凭空举数字, 只引用用户实际数据 (从什么状态到什么状态)',
+        '- 不知道就明说 "需要看更多数据", 不要编'
+      ].join('\n');
+      const prompt = `事件:
+- 状态切换: ${fromState} (${fromLabel}) → ${toState} (${toLabel})
+- 触发条件: 沪深300 与 MA60 关系 + 趋势方向
+请输出归因。`;
+
+      try {
+        const text = await Core.AI.call({ systemPrompt, prompt, stream: false, maxTokens: 400 });
+        const narrative = String(text || '').trim();
+        if (!narrative) return this._fallbackRegimeNarrative(fromState, toState);
+        return narrative;
+      } catch (e) {
+        console.warn('[Alerts] AI 状态归因失败, 用硬编码兜底:', e.message || e);
+        return this._fallbackRegimeNarrative(fromState, toState);
+      }
+    },
+
+    /** AI 大盘状态切换兜底模板 (不调 AI) */
+    _fallbackRegimeNarrative(fromState, toState) {
+      if (toState === 'bear') {
+        return `⚡ 大盘从 ${fromState} 切入 bear: 沪深300 跌破 MA60 且趋势下行, 整体环境偏冷。\n📌 中长线纪律: 新建仓门槛提高, 节奏放缓; 已有持仓按各自止损线执行, 不必因状态切就清仓。`;
+      } else if (toState === 'bull') {
+        return `⚡ 大盘从 ${fromState} 切入 bull: 沪深300 站上 MA60 且均线上行, 整体环境转暖。\n📌 中长线纪律: 建仓环境转好, 可按计划正常执行, 仍须个股层面校验 (估值/题材/止损位)。`;
+      }
+      return `⚡ 大盘从 ${fromState} 切到 ${toState}: 方向不明, 多空均势。\n📌 中长线纪律: 维持原计划, 不追涨不杀跌, 等趋势明朗再加大动作。`;
     },
 
     // ==================== 中长线规则: 估值偏离 (双周频) ====================
@@ -1615,8 +1670,8 @@ ${lines}
       const all = await Core.Storage.all('alerts');
       const a = all.find(x => x.id === id);
       if (!a) { toastError('找不到这条规则'); return; }
-      // 业绩预告/估值偏离类规则有 aiNarrative 缓存 → 默认不调 AI (省 token + 速度快)
-      const hasCachedNarrative = (a.type === 'earnings_warning' || a.type === 'valuation') && a.aiNarrative;
+      // 业绩预告/估值偏离/大盘状态切换类规则有 aiNarrative 缓存 → 默认不调 AI (省 token + 速度快)
+      const hasCachedNarrative = (a.type === 'earnings_warning' || a.type === 'valuation' || a.type === 'regime_change') && a.aiNarrative;
       const willCallAI = forceRefresh || !hasCachedNarrative;
       const html = `
         <div class="modal-backdrop" onclick="if(event.target===this)Alerts.closeModal()">
