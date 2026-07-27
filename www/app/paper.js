@@ -2178,6 +2178,10 @@
       if (sleeve === 'short' && window.ShortTrader && ShortTrader.renderTodayPlan) {
         ShortTrader.renderTodayPlan().catch(e => console.warn('[Paper] ShortTrader 渲染失败:', e));
       }
+      // T4: 学习曲线区块 (2 行钩子, 渲染逻辑全在 ShortTrader.renderLearningCurve)
+      if (sleeve === 'short' && window.ShortTrader && ShortTrader.renderLearningCurve) {
+        ShortTrader.renderLearningCurve().catch(e => console.warn('[Paper] ShortTrader 学习曲线渲染失败:', e));
+      }
 
       // T3: 页面展示时异步触发每日结算 (当日已结算自动跳过; 有动作则重渲染刷新数据)
       this.settleCondOrders()

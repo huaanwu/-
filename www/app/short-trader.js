@@ -22,6 +22,22 @@
  *
  * 备注: 与 Paper.generateMorningPlan (T2 盘前计划, 手动确认流) 是两套独立实现,
  *   本模块走"自动生成 + 自动转条件单"路线, kv/逻辑互不干扰。
+ *
+ * T4 学习环 (本文档下半部分实现):
+ *   - verifyClosedTrades(): 扫描 journals 里 sleeve='short'+auto:true 的卖出退出行 (含退出信息且
+ *     verifyOutcome 缺失), 平仓满 SHORT_VERIFY_DELAY_DAYS 根后续日 K → 拉近 10 根日 K 机械判定
+ *     (不用 LLM): 止损收复→wrong/时机过早, 止损未收复→wrong/假设错误, 止盈续涨超 5%→partial,
+ *     强平盈利→correct / 强平亏损→partial/时机过早, 兜底按盈亏; 写回 verifyOutcome /
+ *     verifyFailureReason / verifiedAt / postExitNote (枚举复用 Core.Constants.VERIFY_OUTCOMES /
+ *     VERIFY_FAILURE_REASONS, 与 Z2 对齐); K 线拉不到跳过下轮再试, 不写失败态
+ *   - 成绩单: _linkVerifiedTrades (journal ↔ paper_short_positions ↔ paper_cond_orders 关联出
+ *     assumption/probability) → _buildTrackRecord 聚合 (按 assumption 分组/Top3 归因/最近 wrong),
+ *     样本 < SCORECARD_MIN_SAMPLES 不注入; generatePlan prompt 追加 【你的历史成绩单】+【我的教训】
+ *   - maybeDistillLessons(): 距上次 ≥7 天且新增已验证 ≥5 条 → LLM 提炼 2-3 条第一人称错误模式,
+ *     kv short_trader_lessons { items: [{text, createdAt, basedOn}], lastDistill } (上限 20);
+ *     JSON 校验失败只 console.warn 不动旧 lessons
+ *     (注: 与 paper.js 的 kv paper_short_lessons 数组结构是两套并存, key 不同互不干扰)
+ *   - UI: 短线 tab "📊 学习曲线" 区块 (Brier / 校准分桶 / 最近 10 条已验证 / 我的教训)
  */
 (function() {
   'use strict';
@@ -36,6 +52,22 @@
   // 短线纪律参数 (T1 在 Core.Discipline.DEFAULT_CONFIG.short 预留 {maxDailyTrades:3, cooldownHours:48}, 本期启用)
   const SHORT_RULES = (window.Core && Core.Discipline && Core.Discipline.DEFAULT_CONFIG
     && Core.Discipline.DEFAULT_CONFIG.short) || { maxDailyTrades: 3, cooldownHours: 48 };
+  // ---- T4 学习环常量 ----
+  const SHORT_LESSONS_KEY = 'short_trader_lessons';   // kv: { items:[{text,createdAt,basedOn}], lastDistill }
+  const VERIFY_DELAY = Core.Constants.SHORT_VERIFY_DELAY_DAYS;                 // 平仓后至少 N 根后续 K 才判定
+  const VERIFY_LOOKAHEAD = Core.Constants.SHORT_VERIFY_LOOKAHEAD_BARS;         // 出场后观察窗 (3)
+  const VERIFY_KLINE_BARS = Core.Constants.SHORT_VERIFY_KLINE_BARS;            // 拉近 10 根日 K
+  const RUNUP_PCT = Core.Constants.SHORT_TARGET_RUNUP_PCT;                     // 止盈续涨 5% 阈值
+  const TRACK_RECORD_MAX_LEN = Core.Constants.SHORT_TRACK_RECORD_MAX_LEN;      // 成绩单注入 ≤400 字
+  const LESSONS_LIMIT = Core.Constants.SHORT_LESSONS_LIMIT;                    // lessons items 上限 20
+  const DISTILL_INTERVAL = Core.Constants.SHORT_LESSONS_DISTILL_INTERVAL_MS;   // 提炼间隔 7 天
+  const DISTILL_MIN_NEW = Core.Constants.SHORT_LESSONS_MIN_NEW_SAMPLES;        // 新增已验证 ≥5 条
+  const DISTILL_FEED_MAX = Core.Constants.SHORT_LESSONS_FEED_MAX;              // 喂 LLM 最近 20 条
+  const DISTILL_MAX_ITEMS = Core.Constants.SHORT_LESSONS_PER_DISTILL_MAX;      // 单次 2-3 条
+  const LESSON_TEXT_MAX = Core.Constants.SHORT_LESSONS_TEXT_MAX_LEN;           // 每条 ≤40 字
+  const SCORECARD_MIN = Core.Constants.SCORECARD_MIN_SAMPLES;                  // 成绩单样本门槛 3
+  const BRIER_MIN = Core.Constants.BRIER_MIN_SAMPLES;                          // Brier 样本门槛 5
+  const RECENT_VERIFIED_UI = 10;                                               // UI 最近已验证交易条数
 
   const ShortTrader = {
 
@@ -367,6 +399,354 @@
       return ctx;
     },
 
+    // ========== T4 学习环: 纯函数 (机械判定 / 关联 / 聚合 / 校准, Node 沙箱可测) ==========
+
+    /** 日 K 行标准化 (与 Paper._barOf 同构, 本模块独立一份避免跨域耦合) */
+    _barOf(row) {
+      if (!row) return null;
+      const open = parseFloat(row.开盘), high = parseFloat(row.最高);
+      const low = parseFloat(row.最低), close = parseFloat(row.收盘);
+      const date = String(row.日期 || '').slice(0, 10);
+      if (!(open > 0) || !(high > 0) || !(low > 0) || !(close > 0) || !date) return null;
+      return { open, high, low, close, date };
+    },
+
+    /**
+     * 从 T3 结算写的退出 journal 行解析结构化信息 (纯函数)
+     * 只认"卖出成交"类 (content 含 卖出日期/原因/入场/出场 四要素), 买入/过期/取消行返 null
+     * @returns {{code, exitReason, exitDate, entryDate, entryPrice, exitPrice, pnl} | null}
+     *   pnl 为每股盈亏 (exitPrice-entryPrice), 判定只用符号
+     */
+    _extractExitInfo(row) {
+      if (!row || typeof row.content !== 'string') return null;
+      const c = row.content;
+      const mDate = c.match(/卖出日期\**\s*[:：]\s*(\d{4}-\d{2}-\d{2})/);
+      const mReason = c.match(/原因\**\s*[:：]\s*(.+)/);
+      const mEntry = c.match(/入场\**\s*[:：]\s*(\d{4}-\d{2}-\d{2})\s*@\s*([\d.]+)/);
+      const mExit = c.match(/出场\**\s*[:：]\s*([\d.]+)/);
+      if (!mDate || !mReason || !mEntry || !mExit) return null;
+      const entryPrice = parseFloat(mEntry[2]), exitPrice = parseFloat(mExit[1]);
+      if (!(entryPrice > 0) || !(exitPrice > 0)) return null;
+      return {
+        code: this._normCode6(row.code),
+        exitReason: mReason[1].trim(),
+        exitDate: mDate[1],
+        entryDate: mEntry[1],
+        entryPrice,
+        exitPrice,
+        pnl: +(exitPrice - entryPrice).toFixed(4)
+      };
+    },
+
+    /**
+     * 平仓机械判定 (纯函数, 不用 LLM, 确定性强)
+     * 判定表 (outcome/reason 枚举复用 Core.Constants.VERIFY_OUTCOMES / VERIFY_FAILURE_REASONS):
+     *   止损: 出场后 3 个交易日内收盘价收复入场价 → wrong + 时机过早 (被扫止损后回升);
+     *         未收复 → wrong + 假设错误
+     *   止盈: 出场后 3 日内 high 续涨超出场价 5% → partial (对但卖早, 归因留空); 否则 correct
+     *   到期强平: 盈利 → correct; 亏损 → partial + 时机过早
+     *   其他/未知退出: 盈利 → correct; 亏损 → wrong + 假设错误 (兜底)
+     * @param {{exitReason, pnl, entryPrice, exitPrice, exitDate, bars}} input
+     *   bars 为含出场日在内的日 K 序列, 函数内部只取 date > exitDate 的最多 3 根
+     * @returns {{outcome: string, reason: string|null, note: string}}
+     */
+    _judgeClosedTrade({ exitReason, pnl, entryPrice, exitPrice, exitDate, bars }) {
+      const after = (Array.isArray(bars) ? bars : [])
+        .filter(b => b && b.date && b.date > exitDate)
+        .slice(0, VERIFY_LOOKAHEAD);
+      const reason = String(exitReason || '');
+      const gain = (parseFloat(pnl) || 0) > 0;
+      if (reason.includes('止损')) {
+        const idx = after.findIndex(b => b.close >= entryPrice);
+        if (idx >= 0) {
+          return { outcome: 'wrong', reason: '时机过早', note: `止损后 ${idx + 1} 日收复入场价, 属时机过早` };
+        }
+        return { outcome: 'wrong', reason: '假设错误', note: `止损后 ${after.length} 日内未收复入场价, 假设不成立` };
+      }
+      if (reason.includes('止盈')) {
+        const runup = exitPrice * (1 + RUNUP_PCT);
+        const idx = after.findIndex(b => b.high >= runup);
+        if (idx >= 0) {
+          return { outcome: 'partial', reason: null, note: `止盈后 ${idx + 1} 日内续涨超 ${(RUNUP_PCT * 100).toFixed(0)}%, 方向对但卖早` };
+        }
+        return { outcome: 'correct', reason: null, note: '止盈后未续涨, 出场正确' };
+      }
+      if (reason.includes('强平')) {
+        if (gain) return { outcome: 'correct', reason: null, note: '到期强平仍盈利, 方向正确' };
+        return { outcome: 'partial', reason: '时机过早', note: '到期强平亏损, 入场时机偏早' };
+      }
+      if (gain) return { outcome: 'correct', reason: null, note: '平仓盈利' };
+      return { outcome: 'wrong', reason: '假设错误', note: '平仓亏损, 假设不成立' };
+    },
+
+    /**
+     * 已验证短线交易关联 (纯函数):
+     * journals (sleeve=short + auto + 有 verifyOutcome + 可解析退出信息)
+     *   ↔ paper_short_positions (code+exitDate 匹配出 planOrderId)
+     *   ↔ paper_cond_orders (取 assumption / probability, Brier 与分组的数据来源)
+     * @returns Array 按 exitDate 升序
+     */
+    _linkVerifiedTrades(journals, positions, orders) {
+      const orderById = {};
+      (Array.isArray(orders) ? orders : []).forEach(o => { if (o && o.id) orderById[o.id] = o; });
+      const out = [];
+      for (const j of (Array.isArray(journals) ? journals : [])) {
+        if (!j || (j.sleeve || '') !== 'short' || !j.auto || !j.verifyOutcome) continue;
+        const info = this._extractExitInfo(j);
+        if (!info) continue;
+        // 仓位跟踪行匹配: 同代码 + 同出场日 (多单同日出场的极端情况取入场日最新的一笔)
+        const pos = (Array.isArray(positions) ? positions : [])
+          .filter(p => p && p.closed && p.code === info.code && p.exitDate === info.exitDate)
+          .sort((a, b) => String(b.entryDate || '').localeCompare(String(a.entryDate || '')))[0];
+        const order = (pos && pos.planOrderId) ? (orderById[pos.planOrderId] || null) : null;
+        // 名称从 title 兜底解析 ("⚡ 短线止损: 600519 贵州茅台")
+        const mName = String(j.title || '').match(/\d{6}\s*(.+)$/);
+        out.push({
+          journalId: j.id,
+          code: info.code,
+          name: mName ? mName[1].trim() : '',
+          assumption: (order && order.assumption) || '',
+          probability: (order && order.probability != null && isFinite(order.probability)) ? Number(order.probability) : null,
+          outcome: j.verifyOutcome,
+          reason: j.verifyFailureReason || null,
+          note: j.postExitNote || '',
+          exitDate: info.exitDate,
+          entryDate: info.entryDate,
+          entryPrice: info.entryPrice,
+          exitPrice: info.exitPrice,
+          exitReason: info.exitReason,
+          pnl: info.pnl,
+          verifiedAt: j.verifiedAt || 0
+        });
+      }
+      return out.sort((a, b) => String(a.exitDate).localeCompare(String(b.exitDate)));
+    },
+
+    /**
+     * 短线成绩单聚合 (纯函数): 按 assumption 分组 + 全局 Top3 归因 + 最近 1 条 wrong 摘要
+     * 样本 < SCORECARD_MIN_SAMPLES (3) 返 null (不注入, 避免误导)
+     * correctRate 口径: correct=1 / partial=0.5 / wrong=0 的均值
+     */
+    _buildTrackRecord(trades) {
+      const list = (Array.isArray(trades) ? trades : []).filter(t => t && t.outcome);
+      if (list.length < SCORECARD_MIN) return null;
+      const score = (o) => this._outcomeScore(o);
+      const groups = {};
+      for (const t of list) {
+        const key = t.assumption || '未标注';
+        const g = groups[key] || (groups[key] = { assumption: key, total: 0, scoreSum: 0, reasons: {} });
+        g.total++;
+        g.scoreSum += score(t.outcome);
+        if (t.reason) g.reasons[t.reason] = (g.reasons[t.reason] || 0) + 1;
+      }
+      const topOf = (rs) => {
+        const e = Object.entries(rs).sort((a, b) => b[1] - a[1])[0];
+        return e ? e[0] : null;
+      };
+      const byAssumption = Object.values(groups)
+        .map(g => ({ assumption: g.assumption, total: g.total,
+          correctRate: +(g.scoreSum / g.total).toFixed(2), topReason: topOf(g.reasons) }))
+        .sort((a, b) => b.total - a.total);
+      const allReasons = {};
+      list.forEach(t => { if (t.reason) allReasons[t.reason] = (allReasons[t.reason] || 0) + 1; });
+      const topReasons = Object.entries(allReasons).sort((a, b) => b[1] - a[1]).slice(0, 3)
+        .map(([reason, count]) => ({ reason, count }));
+      const lastWrongT = [...list].reverse().find(t => t.outcome === 'wrong') || null;
+      const totalScore = list.reduce((s, t) => s + score(t.outcome), 0);
+      return {
+        total: list.length,
+        correctRate: +(totalScore / list.length).toFixed(2),
+        byAssumption,
+        topReasons,
+        lastWrong: lastWrongT ? { code: lastWrongT.code, assumption: lastWrongT.assumption || '',
+          note: lastWrongT.note || '', exitDate: lastWrongT.exitDate } : null
+      };
+    },
+
+    /** 成绩单 → prompt 注入文本 (纯函数, ≤ TRACK_RECORD_MAX_LEN 字) */
+    _formatTrackRecord(rec) {
+      if (!rec) return '';
+      const L = [];
+      L.push(`【你的历史成绩单】短线已验证 ${rec.total} 笔, 综合胜率 ${(rec.correctRate * 100).toFixed(0)}% (partial 计 0.5)`);
+      if (rec.byAssumption.length) {
+        L.push('分假设: ' + rec.byAssumption.map(g =>
+          `${g.assumption} ${g.total}笔 胜率${(g.correctRate * 100).toFixed(0)}%` +
+          (g.topReason ? ` 主因:${g.topReason}` : '')).join('; '));
+      }
+      if (rec.topReasons.length) {
+        L.push('常见错误: ' + rec.topReasons.map(r => `${r.reason}×${r.count}`).join(' / '));
+      }
+      if (rec.lastWrong) {
+        L.push(`最近错误: ${rec.lastWrong.code} ${rec.lastWrong.assumption || '-'} — ${rec.lastWrong.note || ''}`);
+      }
+      let text = L.join('\n');
+      if (text.length > TRACK_RECORD_MAX_LEN) text = text.slice(0, TRACK_RECORD_MAX_LEN - 1) + '…';
+      return text;
+    },
+
+    /** verifyOutcome → 数值 (Brier/校准共用): correct=1 / partial=0.5 / wrong=0 */
+    _outcomeScore(outcome) {
+      return outcome === 'correct' ? 1 : (outcome === 'partial' ? 0.5 : 0);
+    },
+
+    /** Brier score (纯函数): mean((prob/100 - outcomeScore)^2), 0 最好; 空样本返 null */
+    _brierScore(pairs) {
+      const list = (Array.isArray(pairs) ? pairs : []).filter(p => p && isFinite(p.probability) && p.outcome);
+      if (!list.length) return null;
+      const sum = list.reduce((s, p) => s + Math.pow(p.probability / 100 - this._outcomeScore(p.outcome), 2), 0);
+      return +(sum / list.length).toFixed(4);
+    },
+
+    /** 校准分桶 (纯函数): 按 CALIBRATION_BUCKET_EDGES (<40/40-60/60-80/≥80) 预测均值 vs 实际命中率 */
+    _calibrationBuckets(pairs) {
+      const edges = Core.Constants.CALIBRATION_BUCKET_EDGES || [0, 40, 60, 80, 101];
+      const labels = ['<40', '40-60', '60-80', '≥80'];
+      const list = (Array.isArray(pairs) ? pairs : []).filter(p => p && isFinite(p.probability) && p.outcome);
+      const buckets = [];
+      for (let i = 0; i < edges.length - 1; i++) {
+        const inBucket = list.filter(p => p.probability >= edges[i] && p.probability < edges[i + 1]);
+        buckets.push({
+          label: labels[i] || `${edges[i]}-${edges[i + 1]}`,
+          n: inBucket.length,
+          predMean: inBucket.length ? +(inBucket.reduce((s, p) => s + p.probability, 0) / inBucket.length).toFixed(1) : null,
+          hitRate: inBucket.length ? +(inBucket.reduce((s, p) => s + this._outcomeScore(p.outcome), 0) / inBucket.length * 100).toFixed(1) : null
+        });
+      }
+      return buckets;
+    },
+
+    // ========== T4 学习环: 业务入口 ==========
+
+    /** 已验证短线交易汇总 (journals + 仓位跟踪 + 条件单 三源关联, 各块独立降级) */
+    async _collectVerifiedTrades() {
+      const journals = (await Core.Storage.all('journals')) || [];
+      let positions = [], orders = [];
+      try { positions = (await Core.Storage.kvGet('paper_short_positions')) || []; }
+      catch (e) { console.warn('[ShortTrader] 读短线仓位跟踪失败:', e); }
+      try { orders = (await Core.Storage.kvGet('paper_cond_orders')) || []; }
+      catch (e) { console.warn('[ShortTrader] 读条件单失败:', e); }
+      return this._linkVerifiedTrades(journals, positions, orders);
+    },
+
+    /**
+     * 平仓后机械 verify (app init 异步调用, 不阻塞启动):
+     * 扫描 journals sleeve='short'+auto:true + 含退出信息 + verifyOutcome 缺失的行,
+     * 平仓满 VERIFY_DELAY 根后续日 K → 机械判定写回 verifyOutcome/verifyFailureReason/verifiedAt/postExitNote;
+     * K 线拉不到 → 跳过下轮再试 (不写失败态)
+     * @param {{ getBars?: function }} [deps] getBars(code) => [{open,high,low,close,date}] (测试注入)
+     * @returns {{ verified, pending, skipped } | null}
+     */
+    async verifyClosedTrades(deps = {}) {
+      const summary = { verified: 0, pending: 0, skipped: 0 };
+      try {
+        const rows = (await Core.Storage.all('journals')) || [];
+        const getBars = deps.getBars || (async (code) => {
+          const krows = await Core.Data.getStockKLine(code, 'daily', undefined, undefined, '');
+          return (krows || []).map(r => this._barOf(r)).filter(b => b).slice(-VERIFY_KLINE_BARS);
+        });
+        for (const row of rows) {
+          if (!row || (row.sleeve || '') !== 'short' || !row.auto || row.verifyOutcome) continue;
+          const info = this._extractExitInfo(row);
+          if (!info || !info.code) continue;
+          let bars = null;
+          try { bars = await getBars(info.code); }
+          catch (e) { console.warn(`[ShortTrader] verify 拉 K 失败, 本轮跳过 ${info.code}:`, e); }
+          if (!bars || !bars.length) { summary.skipped++; continue; }
+          const afterCnt = bars.filter(b => b.date > info.exitDate).length;
+          if (afterCnt < VERIFY_DELAY) { summary.pending++; continue; }   // 平仓未满观察期
+          const judged = this._judgeClosedTrade({ ...info, bars });
+          row.verifyOutcome = judged.outcome;
+          row.verifyFailureReason = judged.reason || null;
+          row.verifiedAt = Date.now();
+          row.postExitNote = judged.note;
+          row.updatedAt = Date.now();
+          await Core.Storage.put('journals', row);
+          summary.verified++;
+        }
+        return summary;
+      } catch (e) {
+        console.warn('[ShortTrader] 平仓 verify 失败:', e);
+        return null;
+      }
+    },
+
+    /**
+     * 周末错误模式提炼 (app init 异步调用):
+     * 距上次 ≥7 天 且 自上次以来新增已验证交易 ≥5 条 → LLM 提炼 2-3 条第一人称可执行错误模式;
+     * 严格 JSON {lessons:[...]} 走 parseJsonOutput, 校验失败只 console.warn 不动旧 lessons
+     * @param {{ callLLM?: function }} [deps] 测试注入
+     */
+    async maybeDistillLessons(now = new Date(), deps = {}) {
+      try {
+        const nowMs = now.getTime();
+        const data = (await Core.Storage.kvGet(SHORT_LESSONS_KEY)) || { items: [], lastDistill: 0 };
+        const items = Array.isArray(data.items) ? data.items : [];
+        const lastDistill = data.lastDistill || 0;
+        if (nowMs - lastDistill < DISTILL_INTERVAL) return { skipped: true, reason: 'interval' };
+        const trades = await this._collectVerifiedTrades();
+        const newSince = trades.filter(t => (t.verifiedAt || 0) > lastDistill);
+        if (newSince.length < DISTILL_MIN_NEW) return { skipped: true, reason: 'samples', count: newSince.length };
+        const feed = trades.slice(-DISTILL_FEED_MAX).map(t =>
+          `- ${t.code} ${t.assumption || '-'} 盈亏${t.pnl >= 0 ? '+' : ''}${t.pnl} (${t.outcome}${t.reason ? '/' + t.reason : ''}) ${t.note || ''}`);
+        const systemPrompt = [
+          '你是 A 股短线操盘手, 正在复盘自己的已验证交易记录, 提炼"我自己的系统性错误模式"。',
+          `【输出】严格 JSON: {"lessons": ["...", "..."]}, 2-${DISTILL_MAX_ITEMS} 条, 每条 ≤${LESSON_TEXT_MAX} 字,`,
+          '第一人称, 可执行 (含场景+频率+今后动作), 例: "我在放量突破日的追高买入 5 次亏 4 次, 今后突破单仓位减半"。',
+          '不要输出 JSON 以外的内容。'
+        ].join('\n');
+        const prompt = `# 最近已验证交易 (${feed.length} 笔)\n` + feed.join('\n');
+        const callLLM = (deps && deps.callLLM)
+          || (async ({ systemPrompt: sp, prompt: pr }) => Core.AI.callWithTimeout({ systemPrompt: sp, prompt: pr, timeout: LLM_TIMEOUT_MS }));
+        const text = await callLLM({ systemPrompt, prompt });
+        const parsed = Core.AI.parseJsonOutput(text, { required: ['lessons'], types: { lessons: 'array' } });
+        if (!parsed.ok) {
+          console.warn('[ShortTrader] 教训提炼 JSON 校验失败, 保留旧 lessons:', parsed.errors);
+          return { skipped: true, reason: 'invalid-json' };
+        }
+        const seen = new Set();
+        const lessons = (parsed.obj.lessons || [])
+          .map(s => String(s == null ? '' : s).trim().slice(0, LESSON_TEXT_MAX))
+          .filter(s => s && !seen.has(s) && seen.add(s))
+          .slice(0, DISTILL_MAX_ITEMS);
+        if (!lessons.length) {
+          console.warn('[ShortTrader] 教训提炼结果为空, 保留旧 lessons');
+          return { skipped: true, reason: 'empty' };
+        }
+        const today = this._todayStr(now);
+        const newItems = lessons.map(t => ({ text: t, createdAt: nowMs, basedOn: today }));
+        await Core.Storage.kvSet(SHORT_LESSONS_KEY, {
+          items: [...items, ...newItems].slice(-LESSONS_LIMIT),
+          lastDistill: nowMs
+        });
+        return { skipped: false, added: lessons.length };
+      } catch (e) {
+        console.warn('[ShortTrader] 教训提炼失败:', e);
+        return { skipped: true, reason: 'error' };
+      }
+    },
+
+    /** 盘前 prompt 注入文本: 【你的历史成绩单】(样本 ≥3 才有) +【我的教训】; 任何失败返 '' 不影响主流程 */
+    async _buildLearningPromptText() {
+      try {
+        const trades = await this._collectVerifiedTrades();
+        const parts = [];
+        const recText = this._formatTrackRecord(this._buildTrackRecord(trades));
+        if (recText) parts.push('', recText);
+        let lessons = null;
+        try { lessons = await Core.Storage.kvGet(SHORT_LESSONS_KEY); }
+        catch (e) { console.warn('[ShortTrader] 读 lessons 失败:', e); }
+        const items = lessons && Array.isArray(lessons.items) ? lessons.items : [];
+        if (items.length) {
+          parts.push('', '【我的教训】');
+          items.forEach((it, i) => parts.push(`${i + 1}. ${it.text}`));
+        }
+        return parts.join('\n');
+      } catch (e) {
+        console.warn('[ShortTrader] 学习上下文组装失败:', e);
+        return '';
+      }
+    },
+
     // ========== 业务入口 ==========
 
     /**
@@ -403,7 +783,9 @@
       const today = this._todayStr(now);
       const ctx = await this._buildPlanContext(now);
       const systemPrompt = this._buildSystemPrompt();
-      const prompt = this._buildUserPrompt({ ...ctx, today });
+      // T4: 既有上下文后追加成绩单 + 我的教训 (样本不足/读取失败自动为空串, 不影响主流程)
+      const learningText = await this._buildLearningPromptText();
+      const prompt = this._buildUserPrompt({ ...ctx, today }) + learningText;
       const callLLM = (opts.deps && opts.deps.callLLM)
         || (async ({ systemPrompt: sp, prompt: pr }) => Core.AI.callWithTimeout({ systemPrompt: sp, prompt: pr, timeout: LLM_TIMEOUT_MS }));
       const text = await callLLM({ systemPrompt, prompt });
@@ -556,6 +938,60 @@
       }
       html += `<div style="margin-top:8px;display:flex;gap:8px;align-items:center;">${retryBtn}` +
         `<span style="font-size:11px;color:var(--text-muted);">生成于 ${escapeHtml(fmtDateTime(new Date(plan.generatedAt || Date.now())))}</span></div>`;
+      el.innerHTML = html;
+    },
+
+    /** T4 UI: 短线 tab "📊 学习曲线" 区块 (Brier / 校准分桶 / 最近已验证 / 我的教训, 全 escapeHtml) */
+    async renderLearningCurve() {
+      const el = document.getElementById('shortTraderLearning');
+      if (!el) return;
+      let trades = [];
+      try { trades = await this._collectVerifiedTrades(); }
+      catch (e) { console.warn('[ShortTrader] 学习曲线数据读取失败:', e); }
+      const pairs = trades.filter(t => t.probability != null)
+        .map(t => ({ probability: t.probability, outcome: t.outcome }));
+      let html = '';
+      // Brier score (样本 < BRIER_MIN 显示积累中)
+      const brier = this._brierScore(pairs);
+      if (brier == null || pairs.length < BRIER_MIN) {
+        html += `<div style="font-size:13px;">📈 Brier 概率校准分: <span style="color:var(--text-muted);">积累中 (已有 ${pairs.length} 条, 还需 ${Math.max(0, BRIER_MIN - pairs.length)} 条)</span></div>`;
+      } else {
+        html += `<div style="font-size:13px;">📈 Brier 概率校准分: <strong>${brier.toFixed(3)}</strong> <span style="font-size:11px;color:var(--text-muted);">(0 最好, 样本 ${pairs.length})</span></div>`;
+      }
+      // 校准分桶表 (预测均值 vs 实际命中率)
+      const buckets = this._calibrationBuckets(pairs);
+      html += '<table style="width:100%;font-size:12px;margin-top:8px;border-collapse:collapse;">' +
+        '<tr style="color:var(--text-muted);"><th align="left">预测胜率</th><th align="right">样本</th><th align="right">预测均值</th><th align="right">实际命中</th></tr>' +
+        buckets.map(b => `<tr><td>${escapeHtml(b.label)}</td><td align="right">${b.n}</td>` +
+          `<td align="right">${b.predMean == null ? '-' : b.predMean + '%'}</td>` +
+          `<td align="right">${b.hitRate == null ? '-' : b.hitRate + '%'}</td></tr>`).join('') +
+        '</table>';
+      // 最近 10 条已验证交易对照表
+      const recent = trades.slice(-RECENT_VERIFIED_UI).reverse();
+      if (recent.length) {
+        const outcomeLabel = { correct: '✅对', partial: '🟡半对', wrong: '❌错' };
+        html += '<div style="margin-top:10px;font-size:12px;color:var(--text-muted);">最近已验证交易:</div>' +
+          '<table style="width:100%;font-size:12px;margin-top:4px;border-collapse:collapse;">' +
+          '<tr style="color:var(--text-muted);"><th align="left">代码</th><th align="left">假设</th><th align="right">预测</th><th align="left">结果</th><th align="left">归因/结论</th></tr>' +
+          recent.map(t => `<tr><td>${escapeHtml(t.code)}</td><td>${escapeHtml(t.assumption || '-')}</td>` +
+            `<td align="right">${t.probability == null ? '-' : escapeHtml(String(t.probability)) + '%'}</td>` +
+            `<td>${outcomeLabel[t.outcome] || escapeHtml(t.outcome)}</td>` +
+            `<td>${escapeHtml([t.reason, t.note].filter(Boolean).join(': ') || '-')}</td></tr>`).join('') +
+          '</table>';
+      } else {
+        html += '<div style="margin-top:10px;font-size:12px;color:var(--text-muted);">暂无已验证交易 (平仓后自动机械验证)</div>';
+      }
+      // 我的教训
+      let lessons = null;
+      try { lessons = await Core.Storage.kvGet(SHORT_LESSONS_KEY); }
+      catch (e) { console.warn('[ShortTrader] 读 lessons 失败:', e); }
+      const items = lessons && Array.isArray(lessons.items) ? lessons.items : [];
+      if (items.length) {
+        html += '<div style="margin-top:10px;font-size:12px;color:var(--text-muted);">【我的教训】</div>' +
+          '<ul style="font-size:12px;margin:4px 0;padding-left:18px;">' +
+          items.map(it => `<li>${escapeHtml(it.text)} <span style="color:var(--text-muted);font-size:11px;">(${escapeHtml(it.basedOn || '')})</span></li>`).join('') +
+          '</ul>';
+      }
       el.innerHTML = html;
     }
   };

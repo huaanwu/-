@@ -134,6 +134,13 @@ function updateMarketStatus() {
     if (window.ShortTrader && ShortTrader.maybeGeneratePlan) {
       ShortTrader.maybeGeneratePlan().catch(e => console.warn('[App] 短线今日计划生成失败:', e));
     }
+    // Phase T4 (ShortTrader 学习环): 平仓机械 verify + 周末教训提炼 (异步, 不阻塞启动)
+    if (window.ShortTrader && ShortTrader.verifyClosedTrades) {
+      ShortTrader.verifyClosedTrades().catch(e => console.warn('[App] 短线平仓 verify 失败:', e));
+    }
+    if (window.ShortTrader && ShortTrader.maybeDistillLessons) {
+      ShortTrader.maybeDistillLessons().catch(e => console.warn('[App] 短线教训提炼失败:', e));
+    }
     if (window.Journal && Journal.init) Journal.init();
     if (window.Screener && Screener.init) Screener.init();
     if (window.Fund && Fund.init) Fund.init();

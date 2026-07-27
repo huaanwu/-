@@ -124,7 +124,11 @@ const DOMAINS = {
   // T2 ShortTrader: 文件名 short-trader.js, key 用 'Short-Trader' (toLowerCase 后对得上)
   'Short-Trader': ['init', 'maybeGeneratePlan', 'generatePlan', 'regenerate', 'renderTodayPlan', '_saveFailure',
     '_isTradingDay', '_todayStr', '_normCode6', '_buildCandidatePool', '_hasRecentShortSell', '_scalePositionPct',
-    '_appendPlanLog', '_validatePlans', '_buildSystemPrompt', '_buildUserPrompt', '_buildPlanContext']
+    '_appendPlanLog', '_validatePlans', '_buildSystemPrompt', '_buildUserPrompt', '_buildPlanContext',
+    // T4 学习环
+    'verifyClosedTrades', '_extractExitInfo', '_judgeClosedTrade', '_barOf', '_linkVerifiedTrades',
+    '_buildTrackRecord', '_formatTrackRecord', '_outcomeScore', '_brierScore', '_calibrationBuckets',
+    '_collectVerifiedTrades', 'maybeDistillLessons', '_buildLearningPromptText', 'renderLearningCurve']
 };
 for (const [name, methods] of Object.entries(DOMAINS)) {
   const file = path.join(WWW, 'app', name.toLowerCase() + '.js');
@@ -6968,6 +6972,365 @@ section('[39] ShortTrader 盘前 AI 交易计划 (T2): 交易日判定 / prompt 
 
   } catch (e) {
     fail('39 ShortTrader T2', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [40] ShortTrader T4 学习环: 机械 verify / 成绩单 / 教训提炼 / 校准 ==========
+section('[40] ShortTrader T4 学习环: _judgeClosedTrade 全分支 / verify 扫描 / 成绩单 / distill / Brier');
+(async () => {
+  try {
+    const stSrc = readFileSafe(path.join(WWW, 'app', 'short-trader.js'));
+    if (!stSrc) throw new Error('short-trader.js 读不到');
+    const K = _loadRealConstants();
+
+    // 40.0 T4 常量进 Core.Constants
+    if (K.SHORT_VERIFY_DELAY_DAYS === 1 && K.SHORT_VERIFY_LOOKAHEAD_BARS === 3
+      && K.SHORT_VERIFY_KLINE_BARS === 10 && K.SHORT_TARGET_RUNUP_PCT === 0.05
+      && K.SHORT_LESSONS_LIMIT === 20 && K.SHORT_LESSONS_MIN_NEW_SAMPLES === 5
+      && K.SHORT_LESSONS_DISTILL_INTERVAL_MS === 7 * 24 * 3600 * 1000) {
+      ok('T4 常量: verify 延迟/观察窗/K线数/续涨阈值 + lessons 上限/门槛/间隔');
+    } else fail('T4 常量', JSON.stringify({
+      d: K.SHORT_VERIFY_DELAY_DAYS, la: K.SHORT_VERIFY_LOOKAHEAD_BARS, kb: K.SHORT_VERIFY_KLINE_BARS,
+      ru: K.SHORT_TARGET_RUNUP_PCT, ll: K.SHORT_LESSONS_LIMIT, mn: K.SHORT_LESSONS_MIN_NEW_SAMPLES
+    }));
+
+    // 真实 Core.AI.parseJsonOutput (distill JSON 校验用)
+    const aiCtx40 = { console, setTimeout, clearTimeout, Core: { State: { get: () => ({}) } }, fetch: async () => ({ ok: false }) };
+    vm.createContext(aiCtx40);
+    aiCtx40.window = aiCtx40;
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/ai-service.js')), aiCtx40);
+    const realParseJsonOutput40 = aiCtx40.Core.AI.parseJsonOutput;
+    if (!realParseJsonOutput40) throw new Error('ai-service.parseJsonOutput 提取失败');
+
+    // vm sandbox: mock Core.Storage (内存 kv/表/put) + Paper (generatePlan 接线用)
+    const buildCtx40 = (storageData) => {
+      storageData.puts = storageData.puts || [];
+      storageData.addedOrders = storageData.addedOrders || [];
+      const sctx = {
+        window: {},
+        console,
+        escapeHtml: (s) => String(s == null ? '' : s),
+        fmtNum: (n, d) => (typeof n === 'number' ? n.toFixed(d || 0) : '0'),
+        fmtDateTime: () => '2026-07-27 08:30',
+        confirm: () => true,
+        document: { getElementById: () => null }
+      };
+      sctx.window.Core = {
+        Constants: K,
+        Storage: {
+          kvGet: async (k) => (k in storageData.kv ? storageData.kv[k] : null),
+          kvSet: async (k, v) => { storageData.kv[k] = v; },
+          all: async (t) => storageData.tables[t] || [],
+          put: async (t, row) => { storageData.puts.push({ t, row }); }
+        },
+        Data: {
+          getIndexSpot: async () => [],
+          getStockKLine: async () => { throw new Error('测试应注入 deps.getBars'); }
+        },
+        Util: { stockCodePrefix: (c) => /^(60|68)/.test(c) ? 'sh' : 'sz' },
+        Premortem: { checkPick: () => [], PROMPT_SPEC: 'spec' },
+        AI: {
+          parseJsonOutput: realParseJsonOutput40,
+          callWithTimeout: async () => { throw new Error('测试不应走到真实 LLM'); }
+        },
+        Regime: {
+          get: async () => ({ state: 'range' }),
+          gateMultipliers: () => ({ state: 'range', label: '震荡市', positionScale: 1 })
+        },
+        Discipline: { DEFAULT_CONFIG: { short: { maxDailyTrades: 3, cooldownHours: 48 } } }
+      };
+      sctx.Core = sctx.window.Core;
+      const paperMock = {
+        _roundLot: (s) => Math.floor((parseFloat(s) || 0) / 100) * 100,
+        _getAccountRaw: async () => ({ cash: 30000, initialCash: 30000 }),
+        getPositions: async () => [],
+        listCondOrders: async () => [],
+        addCondOrder: async (o) => {
+          storageData.addedOrders.push(o);
+          return { ok: true, order: { id: 'ord-' + storageData.addedOrders.length, ...o } };
+        }
+      };
+      sctx.window.Paper = paperMock;
+      sctx.Paper = paperMock;
+      sctx.window.document = sctx.document;
+      vm.createContext(sctx);
+      vm.runInContext(stSrc, sctx);
+      return sctx;
+    };
+
+    const ctx40 = buildCtx40({ kv: {}, tables: {} });
+    const ST = ctx40.window.ShortTrader;
+    if (!ST) throw new Error('ShortTrader 未挂到 window');
+    const bar = (date, open, high, low, close) => ({ date, open, high, low, close });
+
+    // ---- 40.1 _judgeClosedTrade 全分支 ----
+    const J = (o) => ST._judgeClosedTrade(o);
+    // 兜底: 盈利 → correct / 亏损 → wrong+假设错误
+    let j = J({ exitReason: '手动卖出', pnl: 0.5, entryPrice: 10, exitPrice: 10.5, exitDate: '2026-07-20', bars: [] });
+    if (j.outcome === 'correct' && j.reason === null) ok('judge: 未知退出+盈利 → correct');
+    else fail('judge 兜底盈利', JSON.stringify(j));
+    j = J({ exitReason: '手动卖出', pnl: -0.5, entryPrice: 10, exitPrice: 9.5, exitDate: '2026-07-20', bars: [] });
+    if (j.outcome === 'wrong' && j.reason === '假设错误') ok('judge: 未知退出+亏损 → wrong/假设错误');
+    else fail('judge 兜底亏损', JSON.stringify(j));
+    // 止损: 第 2 根收复入场价 → wrong + 时机过早
+    const barsRecover = [
+      bar('2026-07-20', 10, 10.1, 9.4, 9.5),   // 出场日 (不计入观察窗)
+      bar('2026-07-21', 9.5, 9.7, 9.4, 9.6),
+      bar('2026-07-22', 9.8, 10.2, 9.7, 10.1), // close 10.1 ≥ 入场价 10 → 收复
+      bar('2026-07-23', 10.1, 10.3, 10, 10.2)
+    ];
+    j = J({ exitReason: '止损', pnl: -0.5, entryPrice: 10, exitPrice: 9.5, exitDate: '2026-07-20', bars: barsRecover });
+    if (j.outcome === 'wrong' && j.reason === '时机过早' && j.note.includes('2 日收复')) ok('judge: 止损后 2 日收复入场价 → wrong/时机过早');
+    else fail('judge 止损收复', JSON.stringify(j));
+    // 止损(跳空) 同口径; 3 日未收复 → wrong + 假设错误
+    const barsNoRecover = [
+      bar('2026-07-20', 10, 10.1, 9.4, 9.5),
+      bar('2026-07-21', 9.5, 9.7, 9.4, 9.6),
+      bar('2026-07-22', 9.6, 9.8, 9.5, 9.7),
+      bar('2026-07-23', 9.7, 9.9, 9.6, 9.8)
+    ];
+    j = J({ exitReason: '止损(跳空)', pnl: -0.5, entryPrice: 10, exitPrice: 9.5, exitDate: '2026-07-20', bars: barsNoRecover });
+    if (j.outcome === 'wrong' && j.reason === '假设错误') ok('judge: 止损(跳空) 3 日未收复 → wrong/假设错误');
+    else fail('judge 止损未收复', JSON.stringify(j));
+    // 止盈: 出场后第 2 日 high 续涨超 5% → partial (归因留空)
+    const barsRunup = [
+      bar('2026-07-20', 10.8, 11, 10.7, 11),
+      bar('2026-07-21', 11, 11.4, 10.9, 11.2),
+      bar('2026-07-22', 11.2, 11.6, 11.1, 11.5)  // high 11.6 ≥ 11×1.05=11.55
+    ];
+    j = J({ exitReason: '止盈', pnl: 1, entryPrice: 10, exitPrice: 11, exitDate: '2026-07-20', bars: barsRunup });
+    if (j.outcome === 'partial' && j.reason === null && j.note.includes('卖早')) ok('judge: 止盈后 2 日续涨超 5% → partial (卖早, 归因空)');
+    else fail('judge 止盈续涨', JSON.stringify(j));
+    // 止盈: 未续涨 → correct
+    const barsFlat = [
+      bar('2026-07-20', 10.8, 11, 10.7, 11),
+      bar('2026-07-21', 11, 11.4, 10.9, 11.2),
+      bar('2026-07-22', 11.2, 11.5, 11, 11.3)
+    ];
+    j = J({ exitReason: '止盈(跳空)', pnl: 1, entryPrice: 10, exitPrice: 11, exitDate: '2026-07-20', bars: barsFlat });
+    if (j.outcome === 'correct' && j.reason === null) ok('judge: 止盈后未续涨 → correct');
+    else fail('judge 止盈正确', JSON.stringify(j));
+    // 到期强平: 盈利 → correct; 亏损 → partial + 时机过早
+    j = J({ exitReason: '到期强平', pnl: 0.3, entryPrice: 10, exitPrice: 10.3, exitDate: '2026-07-20', bars: [] });
+    if (j.outcome === 'correct') ok('judge: 强平盈利 → correct');
+    else fail('judge 强平盈利', JSON.stringify(j));
+    j = J({ exitReason: '到期强平', pnl: -0.3, entryPrice: 10, exitPrice: 9.7, exitDate: '2026-07-20', bars: [] });
+    if (j.outcome === 'partial' && j.reason === '时机过早') ok('judge: 强平亏损 → partial/时机过早');
+    else fail('judge 强平亏损', JSON.stringify(j));
+
+    // ---- 40.2 _extractExitInfo 解析 ----
+    const exitContent = [
+      '## ⚡ 短线止损 - 600519 贵州茅台', '',
+      '**卖出日期**: 2026-07-24 (日 K 结算)',
+      '**原因**: 止损',
+      '**入场**: 2026-07-20 @ 10.5 → **出场**: 9.8 × 100 股 (浮动盈亏 ¥-70.00, 未扣费)',
+      '**持有**: 3 个交易日',
+      '**止损/目标**: 9.5 / 11.5'
+    ].join('\n');
+    const info = ST._extractExitInfo({ code: 'sh600519', content: exitContent });
+    if (info && info.code === '600519' && info.exitReason === '止损' && info.exitDate === '2026-07-24'
+      && info.entryDate === '2026-07-20' && info.entryPrice === 10.5 && info.exitPrice === 9.8
+      && Math.abs(info.pnl - (-0.7)) < 1e-9) ok('extract: 退出 journal 四要素解析 (含 sh 前缀归一/pnl 符号)');
+    else fail('extract 退出行', JSON.stringify(info));
+    if (ST._extractExitInfo({ code: '600519', content: '**成交日期**: 2026-07-20\n**成交价**: 10.5 × 100 股' }) === null
+      && ST._extractExitInfo({ code: '600519', content: '' }) === null
+      && ST._extractExitInfo(null) === null) ok('extract: 买入/空内容/null 行 → null (不误判)');
+    else fail('extract 排除项', '');
+
+    // ---- 40.3 verifyClosedTrades 扫描: 已验证/未到期/K线失败跳过, 合格行写回 ----
+    const mkExitRow = (id, code, over) => Object.assign({
+      id, title: '⚡ 短线止损: ' + code, code,
+      content: exitContent, date: '2026-07-24', sleeve: 'short', auto: true, createdAt: 1
+    }, over || {});
+    const storeV = {
+      kv: {},
+      tables: {
+        journals: [
+          mkExitRow('j1', '600519'),                                              // 合格 → 验证写回
+          mkExitRow('j2', '600519', { verifyOutcome: 'correct' }),                // 已验证 → 跳过
+          mkExitRow('j3', '600520'),                                              // 无出场后 K → 未到期
+          mkExitRow('j4', '000001'),                                              // 拉 K 抛错 → 跳过不写失败态
+          mkExitRow('j5', '600519', { content: '**成交日期**: 2026-07-20' }),      // 买入行 → 忽略
+          mkExitRow('j6', '600519', { sleeve: 'long' })                           // 长线 → 忽略
+        ]
+      }
+    };
+    const ctxV = buildCtx40(storeV);
+    const barsByCode = {
+      '600519': [
+        bar('2026-07-23', 10.4, 10.6, 10.3, 10.5),
+        bar('2026-07-24', 10.5, 10.6, 9.7, 9.8),   // 出场日
+        bar('2026-07-25', 9.8, 10, 9.7, 9.9),
+        bar('2026-07-27', 10.4, 10.7, 10.3, 10.6)  // 收复入场价 10.5
+      ],
+      '600520': [
+        bar('2026-07-23', 10.4, 10.6, 10.3, 10.5),
+        bar('2026-07-24', 10.5, 10.6, 9.7, 9.8)    // 只有出场日, 无后续
+      ]
+    };
+    const sumV = await ctxV.window.ShortTrader.verifyClosedTrades({
+      getBars: async (code) => {
+        if (code === '000001') throw new Error('K线接口超时');
+        return barsByCode[code] || [];
+      }
+    });
+    if (sumV && sumV.verified === 1 && sumV.pending === 1 && sumV.skipped === 1) ok('verify: 合格 1 / 未到期 1 / K线失败跳过 1');
+    else fail('verify 汇总', JSON.stringify(sumV));
+    if (storeV.puts.length === 1 && storeV.puts[0].t === 'journals') {
+      const wr = storeV.puts[0].row;
+      if (wr.id === 'j1' && wr.verifyOutcome === 'wrong' && wr.verifyFailureReason === '时机过早'
+        && wr.verifiedAt > 0 && typeof wr.postExitNote === 'string' && wr.postExitNote.includes('收复')) {
+        ok('verify: 写回 verifyOutcome/verifyFailureReason/verifiedAt/postExitNote (止损后 2 日收复 → wrong/时机过早)');
+      } else fail('verify 写回字段', JSON.stringify(wr));
+    } else fail('verify put 次数', 'puts=' + storeV.puts.length);
+    if (!storeV.tables.journals.find(r => r.id === 'j4').verifyOutcome) ok('verify: K线失败行不写失败态 (下轮再试)');
+    else fail('verify K线失败', '');
+
+    // ---- 40.4 _linkVerifiedTrades 关联 (journal ↔ positions ↔ orders) ----
+    const verifiedRow = Object.assign(mkExitRow('jv', '600519'), {
+      verifyOutcome: 'wrong', verifyFailureReason: '时机过早', verifiedAt: 123, postExitNote: '止损后 2 日收复入场价, 属时机过早'
+    });
+    const linked = ST._linkVerifiedTrades(
+      [verifiedRow, mkExitRow('jx', '600521', { verifyOutcome: 'correct' })],
+      [{ closed: true, code: '600519', exitDate: '2026-07-24', entryDate: '2026-07-20', planOrderId: 'o1' }],
+      [{ id: 'o1', assumption: '技术突破', probability: 60 }]
+    );
+    if (linked.length === 2 && linked[0].assumption === '技术突破' && linked[0].probability === 60
+      && linked[0].outcome === 'wrong' && linked[0].reason === '时机过早'
+      && linked[1].assumption === '' && linked[1].probability === null) {
+      ok('link: 关联出 assumption/probability; 无仓位行兜底 空/null');
+    } else fail('link', JSON.stringify(linked));
+
+    // ---- 40.5 _buildTrackRecord 分组/Top3/门槛 ----
+    if (ST._buildTrackRecord([{ outcome: 'correct' }, { outcome: 'wrong' }]) === null) {
+      ok('trackRecord: 样本 <3 → null (不注入)');
+    } else fail('trackRecord 门槛', '');
+    const recTrades = [
+      { code: '600519', assumption: '技术突破', outcome: 'correct', reason: null, note: 'n1', exitDate: '2026-07-01', probability: 60 },
+      { code: '600519', assumption: '技术突破', outcome: 'wrong', reason: '时机过早', note: '止损后 2 日收复', exitDate: '2026-07-02', probability: 70 },
+      { code: '000001', assumption: '题材催化', outcome: 'wrong', reason: '假设错误', note: 'n3', exitDate: '2026-07-03', probability: 55 },
+      { code: '000001', assumption: '题材催化', outcome: 'partial', reason: '时机过早', note: 'n4', exitDate: '2026-07-04', probability: 65 },
+      { code: '300750', assumption: '技术突破', outcome: 'correct', reason: null, note: 'n5', exitDate: '2026-07-05', probability: 80 }
+    ];
+    const rec = ST._buildTrackRecord(recTrades);
+    if (rec && rec.total === 5 && rec.correctRate === 0.5) ok('trackRecord: 全局 5 笔, 综合胜率 0.5 (partial 计 0.5)');
+    else fail('trackRecord 全局', JSON.stringify(rec));
+    const g0 = rec.byAssumption[0];
+    if (g0.assumption === '技术突破' && g0.total === 3 && g0.correctRate === 0.67 && g0.topReason === '时机过早') {
+      ok('trackRecord: 按 assumption 分组 (技术突破 3 笔 胜率 0.67 主因 时机过早)');
+    } else fail('trackRecord 分组', JSON.stringify(rec.byAssumption));
+    if (rec.topReasons.length === 2 && rec.topReasons[0].reason === '时机过早' && rec.topReasons[0].count === 2) {
+      ok('trackRecord: 全局 Top 归因排序 (时机过早×2 居首)');
+    } else fail('trackRecord Top3', JSON.stringify(rec.topReasons));
+    if (rec.lastWrong && rec.lastWrong.code === '000001' && rec.lastWrong.assumption === '题材催化') {
+      ok('trackRecord: 最近 1 条 wrong 摘要 (按 exitDate 取最新)');
+    } else fail('trackRecord lastWrong', JSON.stringify(rec.lastWrong));
+    const recText = ST._formatTrackRecord(rec);
+    if (recText.includes('【你的历史成绩单】') && recText.includes('技术突破') && recText.length <= K.SHORT_TRACK_RECORD_MAX_LEN) {
+      ok('trackRecord: prompt 文本格式 + ≤400 字');
+    } else fail('trackRecord 文本', recText.slice(0, 80));
+
+    // ---- 40.6 Brier / 校准分桶 ----
+    const b1 = ST._brierScore([{ probability: 60, outcome: 'correct' }, { probability: 40, outcome: 'wrong' }]);
+    if (b1 === 0.16) ok('brier: ((0.6-1)²+(0.4-0)²)/2 = 0.16');
+    else fail('brier 计算', 'b1=' + b1);
+    if (ST._brierScore([]) === null) ok('brier: 空样本 → null');
+    else fail('brier 空', '');
+    const buckets = ST._calibrationBuckets([
+      { probability: 30, outcome: 'correct' },
+      { probability: 50, outcome: 'wrong' },
+      { probability: 70, outcome: 'correct' },
+      { probability: 90, outcome: 'partial' }
+    ]);
+    if (buckets.length === 4
+      && buckets[0].n === 1 && buckets[0].predMean === 30 && buckets[0].hitRate === 100
+      && buckets[1].n === 1 && buckets[1].hitRate === 0
+      && buckets[2].n === 1 && buckets[2].hitRate === 100
+      && buckets[3].n === 1 && buckets[3].hitRate === 50) {
+      ok('calibration: 4 桶 (<40/40-60/60-80/≥80) 预测均值 vs 实际命中 (partial=0.5)');
+    } else fail('calibration', JSON.stringify(buckets));
+
+    // ---- 40.7 maybeDistillLessons 触发条件 + JSON 校验保护 ----
+    const NOW40 = new Date(2026, 6, 26, 10, 0).getTime();   // 周日
+    const verifiedRowsFor = (n) => Array.from({ length: n }, (_, i) =>
+      Object.assign(mkExitRow('vd' + i, '60051' + (i % 6), { verifyOutcome: i % 2 ? 'wrong' : 'correct', verifiedAt: NOW40 - 1000 + i, postExitNote: 'note' + i })));
+    // (a) 间隔未到 → skipped interval, LLM 不调用
+    const storeD1 = { kv: { short_trader_lessons: { items: [{ text: '旧教训', createdAt: 1, basedOn: '2026-07-01' }], lastDistill: NOW40 - 24 * 3600 * 1000 } }, tables: { journals: verifiedRowsFor(6) } };
+    let llmD1 = 0;
+    const rD1 = await buildCtx40(storeD1).window.ShortTrader.maybeDistillLessons(new Date(NOW40), { callLLM: async () => { llmD1++; return '{}'; } });
+    if (rD1.skipped === true && rD1.reason === 'interval' && llmD1 === 0) ok('distill: 距上次 <7 天 → skipped interval, 不调 LLM');
+    else fail('distill interval', JSON.stringify(rD1));
+    // (b) 新样本不足 → skipped samples
+    const storeD2 = { kv: {}, tables: { journals: verifiedRowsFor(2) } };
+    const rD2 = await buildCtx40(storeD2).window.ShortTrader.maybeDistillLessons(new Date(NOW40), { callLLM: async () => '{}' });
+    if (rD2.skipped === true && rD2.reason === 'samples' && rD2.count === 2) ok('distill: 新增已验证 <5 → skipped samples');
+    else fail('distill samples', JSON.stringify(rD2));
+    // (c) 成功: 6 条新样本, LLM 出 4 条 → 截 3 条, 写 kv + lastDistill
+    const storeD3 = { kv: {}, tables: { journals: verifiedRowsFor(6) } };
+    const rD3 = await buildCtx40(storeD3).window.ShortTrader.maybeDistillLessons(new Date(NOW40), {
+      callLLM: async ({ systemPrompt, prompt }) => {
+        if (!prompt.includes('已验证交易') || !systemPrompt.includes('第一人称')) throw new Error('distill prompt 要素缺失');
+        return JSON.stringify({ lessons: ['我在放量突破日追高 5 次亏 4 次, 今后突破单仓位减半', '教训二', '教训三', '教训四'] });
+      }
+    });
+    const kvD3 = storeD3.kv.short_trader_lessons;
+    if (rD3.skipped === false && rD3.added === 3 && kvD3 && kvD3.items.length === 3
+      && kvD3.items[0].text.includes('仓位减半') && kvD3.items[0].basedOn === '2026-07-26'
+      && kvD3.lastDistill === NOW40) ok('distill: 成功提炼, 4→3 条截断, kv items+lastDistill 落库');
+    else fail('distill 成功', JSON.stringify({ r: rD3, kv: kvD3 }));
+    // (d) JSON 校验失败 → 旧 lessons 原样保留
+    const oldItems = [{ text: '旧教训', createdAt: 1, basedOn: '2026-07-01' }];
+    const storeD4 = { kv: { short_trader_lessons: { items: oldItems, lastDistill: 0 } }, tables: { journals: verifiedRowsFor(6) } };
+    const rD4 = await buildCtx40(storeD4).window.ShortTrader.maybeDistillLessons(new Date(NOW40), { callLLM: async () => '我没法输出 JSON' });
+    const kvD4 = storeD4.kv.short_trader_lessons;
+    if (rD4.skipped === true && rD4.reason === 'invalid-json' && kvD4.items.length === 1 && kvD4.items[0].text === '旧教训') {
+      ok('distill: 非 JSON 输出 → 保留旧 lessons 不动');
+    } else fail('distill JSON 保护', JSON.stringify({ r: rD4, kv: kvD4 }));
+    // (e) items 上限 20: 19 旧 + 3 新 → 20 (最旧被挤掉)
+    const storeD5 = {
+      kv: { short_trader_lessons: { items: Array.from({ length: 19 }, (_, i) => ({ text: '旧' + i, createdAt: i, basedOn: '2026-07-01' })), lastDistill: 0 } },
+      tables: { journals: verifiedRowsFor(6) }
+    };
+    await buildCtx40(storeD5).window.ShortTrader.maybeDistillLessons(new Date(NOW40), { callLLM: async () => JSON.stringify({ lessons: ['新一', '新二'] }) });
+    const kvD5 = storeD5.kv.short_trader_lessons;
+    if (kvD5.items.length === 20 && kvD5.items[0].text === '旧1' && kvD5.items[19].text === '新二') {
+      ok('distill: items 上限 20, 新的挤掉最旧');
+    } else fail('distill 上限', 'len=' + kvD5.items.length);
+
+    // ---- 40.8 盘前 prompt 注入: 成绩单 + 我的教训 ----
+    const storeP = {
+      kv: {
+        short_trader_lessons: { items: [{ text: '我在放量突破日追高易亏', createdAt: 1, basedOn: '2026-07-26' }], lastDistill: NOW40 },
+        paper_cond_orders: recTrades.map((t, i) => ({ id: 'po' + i, assumption: t.assumption, probability: t.probability })),
+        paper_short_positions: recTrades.map((t, i) => ({ closed: true, code: t.code, exitDate: t.exitDate, entryDate: '2026-07-01', planOrderId: 'po' + i }))
+      },
+      tables: {
+        watchlist: [{ code: '600519', name: '贵州茅台' }],
+        transactions: [],
+        journals: recTrades.map((t, i) => Object.assign(
+          mkExitRow('pj' + i, t.code, {
+            content: exitContent.replace('2026-07-24', t.exitDate),
+            verifyOutcome: t.outcome, verifyFailureReason: t.reason, verifiedAt: NOW40 - 100 + i, postExitNote: t.note
+          })))
+      }
+    };
+    const ctxP = buildCtx40(storeP);
+    let capturedPrompt = '';
+    await ctxP.window.ShortTrader.generatePlan({
+      now: new Date(2026, 6, 27, 8, 30),
+      deps: { callLLM: async ({ prompt }) => { capturedPrompt = prompt; return JSON.stringify({ marketView: 'm', plans: [] }); } }
+    });
+    if (capturedPrompt.includes('【你的历史成绩单】') && capturedPrompt.includes('技术突破')
+      && capturedPrompt.includes('【我的教训】') && capturedPrompt.includes('放量突破日追高')) {
+      ok('inject: 盘前 prompt 追加 成绩单 + 我的教训');
+    } else fail('inject prompt', capturedPrompt.slice(-300));
+    // 样本不足 → 不注入 (空串)
+    const learnEmpty = await ctx40.window.ShortTrader._buildLearningPromptText();
+    if (learnEmpty === '') ok('inject: 无已验证样本 → 注入文本为空 (不影响主流程)');
+    else fail('inject 空样本', learnEmpty.slice(0, 60));
+
+  } catch (e) {
+    fail('40 ShortTrader T4', e.message + ' / ' + (e.stack || ''));
   }
 })();
 

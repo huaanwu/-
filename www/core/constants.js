@@ -176,6 +176,43 @@
   /** ShortTrader 盘前计划 prompt 注入的近 N 天短线 journal 摘要天数 */
   const SHORT_PLAN_JOURNAL_DAYS = 3;
 
+  // ==================== AI 短线操盘手 T4 (ShortTrader): 学习环 ====================
+  // 注: 与下方 paper.js 的 LESSON_* (T4 短线学习环, kv paper_short_lessons 数组结构) 是两套并存实现,
+  //   本套走"平仓机械 verify → 成绩单 → 周末教训提炼"路线, kv short_trader_lessons, 互不干扰
+
+  /** 平仓机械 verify: 平仓后至少 N 根后续日 K 才判定 (默认 1, 配合 10 根 K 窗口最多等 3 天数据齐) */
+  const SHORT_VERIFY_DELAY_DAYS = 1;
+
+  /** 平仓机械 verify: 出场后观察窗口 (止损收复 / 止盈续涨判定看的后续 K 线数) */
+  const SHORT_VERIFY_LOOKAHEAD_BARS = 3;
+
+  /** 平仓机械 verify: 每次拉取的日 K 根数 (只读, 不复权) */
+  const SHORT_VERIFY_KLINE_BARS = 10;
+
+  /** 止盈出场判定"卖早"的续涨阈值: 出场后观察窗内 high 超出场价 ×(1+N) → partial */
+  const SHORT_TARGET_RUNUP_PCT = 0.05;
+
+  /** 成绩单 prompt 注入文本上限 (字) */
+  const SHORT_TRACK_RECORD_MAX_LEN = 400;
+
+  /** 教训 items 上限 (kv short_trader_lessons.items, 新的挤掉最旧) */
+  const SHORT_LESSONS_LIMIT = 20;
+
+  /** 教训提炼间隔: 距上次 ≥7 天才再提炼 (周末错误模式提炼) */
+  const SHORT_LESSONS_DISTILL_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+
+  /** 教训提炼触发门槛: 自上次以来新增已验证交易 ≥N 条 */
+  const SHORT_LESSONS_MIN_NEW_SAMPLES = 5;
+
+  /** 教训提炼喂给 LLM 的最近已验证交易条数 */
+  const SHORT_LESSONS_FEED_MAX = 20;
+
+  /** 单次提炼输出的教训条数上限 (2-3 条) */
+  const SHORT_LESSONS_PER_DISTILL_MAX = 3;
+
+  /** 单条教训文本上限 (字) */
+  const SHORT_LESSONS_TEXT_MAX_LEN = 40;
+
   // ==================== AI 短线操盘手 T4: 短线学习环 ====================
 
   /** 学习环 KV 保留条数 (kv paper_short_lessons, 滚动截断最旧) */
@@ -245,6 +282,17 @@
     PLAN_LESSON_INJECT_MAX,
     SHORT_PLAN_LOG_LIMIT,
     SHORT_PLAN_JOURNAL_DAYS,
+    SHORT_VERIFY_DELAY_DAYS,
+    SHORT_VERIFY_LOOKAHEAD_BARS,
+    SHORT_VERIFY_KLINE_BARS,
+    SHORT_TARGET_RUNUP_PCT,
+    SHORT_TRACK_RECORD_MAX_LEN,
+    SHORT_LESSONS_LIMIT,
+    SHORT_LESSONS_DISTILL_INTERVAL_MS,
+    SHORT_LESSONS_MIN_NEW_SAMPLES,
+    SHORT_LESSONS_FEED_MAX,
+    SHORT_LESSONS_PER_DISTILL_MAX,
+    SHORT_LESSONS_TEXT_MAX_LEN,
     LESSON_LIMIT,
     LESSON_EXTRACT_MAX,
     LESSON_LAST_RUN_DATE_KEY,

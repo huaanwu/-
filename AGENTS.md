@@ -69,7 +69,7 @@ node scripts/daily_summary.mjs --verify-dry-run ./journals.json   # 事后验证
 node scripts/daily_summary.mjs --premarket   # Phase C 盘前简报 (隔夜外盘+日历+财新要闻 → LLM → 飞书; 建议 Windows 计划任务 交易日 08:30)
 ```
 
-`test/test_all.js` 36 节:JS 语法、域脚本接口完备性 (`DOMAINS` 字典)、Core 命名空间导出、index.html script 引用对账、Worker 结构、关键文件存在、Data 层方法签名、回测引擎 vm 沙箱实测、Vite external 对账、journal/market/fund/alerts 纯函数实测、daily_summary 单测 (含 --premarket 盘前简报)、5.1/5.2/5.3 互通闭环实测、数据源限流、Paper 模拟盘纯函数实测 (含 Phase C EOD 日终小结 + 23b T1 sleeve 分账户: 双账户独立现金/过滤/重置/快照 shortTotal/纪律锚点分 sleeve/向后兼容)、Discipline 纪律引擎实测、Phase D1 pre-mortem + 个股公告实测、Phase D2 回测前置 + 双模型实测、Phase E 待确认交易实测 (Pending 去重/上限/过期/状态机/建议仓位 + 接线)、Phase W 中长线盯盘实测 (horizon 打标/短线定时器起停注入断言/交易时段守卫/通知冷却/事件驱动接线/业绩预告 filter+lastNotifiedKeys 去重/regime 三态迁移/估值判定+进出阈值区去重/nextCheck 门控)、ShortTrader T2 盘前计划实测 (39 节: 交易日边界/prompt 要素/校验管线全分支/丢弃留痕/空仓合法/整手换算/regime 缩放/当日防重复/addCondOrder 接线)。**改完域脚本或新增域方法必须先 `npm test`,并同步更新该文件的 `DOMAINS` 字典。**
+`test/test_all.js` 36 节:JS 语法、域脚本接口完备性 (`DOMAINS` 字典)、Core 命名空间导出、index.html script 引用对账、Worker 结构、关键文件存在、Data 层方法签名、回测引擎 vm 沙箱实测、Vite external 对账、journal/market/fund/alerts 纯函数实测、daily_summary 单测 (含 --premarket 盘前简报)、5.1/5.2/5.3 互通闭环实测、数据源限流、Paper 模拟盘纯函数实测 (含 Phase C EOD 日终小结 + 23b T1 sleeve 分账户: 双账户独立现金/过滤/重置/快照 shortTotal/纪律锚点分 sleeve/向后兼容)、Discipline 纪律引擎实测、Phase D1 pre-mortem + 个股公告实测、Phase D2 回测前置 + 双模型实测、Phase E 待确认交易实测 (Pending 去重/上限/过期/状态机/建议仓位 + 接线)、Phase W 中长线盯盘实测 (horizon 打标/短线定时器起停注入断言/交易时段守卫/通知冷却/事件驱动接线/业绩预告 filter+lastNotifiedKeys 去重/regime 三态迁移/估值判定+进出阈值区去重/nextCheck 门控)、ShortTrader T2 盘前计划实测 (39 节: 交易日边界/prompt 要素/校验管线全分支/丢弃留痕/空仓合法/整手换算/regime 缩放/当日防重复/addCondOrder 接线)、ShortTrader T4 学习环实测 (40 节: _judgeClosedTrade 全分支/verify 扫描跳过未到期+已验证+K线失败/_linkVerifiedTrades 关联/_buildTrackRecord 分组+Top3+门槛/distill 触发条件+JSON 失败保护+items 上限/Brier+校准分桶/prompt 注入)。**改完域脚本或新增域方法必须先 `npm test`,并同步更新该文件的 `DOMAINS` 字典。**
 
 `scripts/e2e.mjs` 注意:Chrome 路径硬编码 `C:\Program Files\Google\Chrome\Application\chrome.exe`,需要 Vite 已在 3003 端口跑着。
 
@@ -266,6 +266,19 @@ vite.config.js              # root=www,域脚本 external 列表,dev proxy
 | T2-ST.4 校验管线 | `www/app/short-trader.js` `_validatePlans` (纯函数) | a. JSON schema (`Core.AI.parseJsonOutput` Phase T 模式) + `Core.Premortem.checkPick`; b. 幻觉防护 code∈候选池; c. 价格关系 stopLoss<trigger<target; d. 短线纪律: 今日已建+本轮 ≤maxDailyTrades(3) (quota) / 同代码 48h 短线卖出冷却 (`_hasRecentShortSell`) / positionPct 超 PAPER_SHORT_POSITION_PCT **收敛不丢弃** (`_scalePositionPct`) / regime bear ×gate.positionScale; e. 每条丢弃写 kv `paper_plan_log` {date,code,stage,reason} 上限 100 (`_appendPlanLog`) |
 | T2-ST.5 落地 | `www/app/short-trader.js` `generatePlan` | 通过的 plans 逐条 `Paper.addCondOrder({..., source:'ai', sleeve:'short'})`; shares = `Paper._roundLot(短线现金×positionPct/triggerPrice)`, 不足一手丢弃留痕; 整轮存 kv `paper_short_plan` {date, marketView, plans(含 condOrderId), dropped, generatedAt}; LLM 走 `Core.AI.callWithTimeout` (60s), 测试注入 `opts.deps.callLLM` |
 | T2-ST.6 UI | `www/index.html` + `www/app/short-trader.js` + `www/app/paper.js` | 短线 tab `#shortTraderSection` "🤖 今日计划": marketView + plans 卡片 (方向/触发/止损/目标/仓位/胜率/信心/reason + pre-mortem 块 + 已转条件单徽标) + dropped 折叠区 + "🔄 重新生成" (`regenerate`, confirm 后覆盖今日记录); 渲染全在 ShortTrader.renderTodayPlan (全 escapeHtml), paper.js renderPage 仅 3 行挂载 |
+
+### Phase T4 (ShortTrader) 学习环 (平仓机械 verify → 成绩单 → 周末教训提炼 → 校准)
+
+> 与 paper.js 的 T4 短线学习环 (kv `paper_short_lessons` 数组, 每日 15:31 触发) **两套并存**, kv/逻辑互不干扰:
+> 本套 kv `short_trader_lessons` `{items:[{text,createdAt,basedOn}], lastDistill}` (上限 20), 走"平仓机械判定 (不用 LLM) + 概率校准"路线。
+
+| 子项 | 实现位置 | 关键方法 |
+|------|----------|----------|
+| T4-ST.0 常量 | `www/core/constants.js` | SHORT_VERIFY_DELAY_DAYS(1, 平仓后至少 N 根后续日 K 才判定) / SHORT_VERIFY_LOOKAHEAD_BARS(3, 出场后观察窗) / SHORT_VERIFY_KLINE_BARS(10) / SHORT_TARGET_RUNUP_PCT(0.05, 止盈续涨阈值) / SHORT_TRACK_RECORD_MAX_LEN(400) / SHORT_LESSONS_LIMIT(20) / SHORT_LESSONS_DISTILL_INTERVAL_MS(7天) / SHORT_LESSONS_MIN_NEW_SAMPLES(5) / SHORT_LESSONS_FEED_MAX(20) / SHORT_LESSONS_PER_DISTILL_MAX(3) / SHORT_LESSONS_TEXT_MAX_LEN(40); verify 结论/归因枚举复用 VERIFY_OUTCOMES/VERIFY_FAILURE_REASONS (Z2) |
+| T4-ST.1 机械 verify | `www/app/short-trader.js` + `www/app.js` | `verifyClosedTrades(deps)`: 扫描 journals sleeve='short'+auto:true+含退出信息+verifyOutcome 缺失的行 (`_extractExitInfo` 纯函数解析 T3 退出行 content 四要素), 平仓满 DELAY 根后续 K → 拉近 10 根日 K (只读) → `_judgeClosedTrade` 纯函数机械判定 (止损收复→wrong/时机过早, 止损未收复→wrong/假设错误, 止盈续涨超 5%→partial 归因空, 强平盈利→correct/亏损→partial+时机过早, 兜底按盈亏), 写回 verifyOutcome/verifyFailureReason/verifiedAt/postExitNote; K 线拉不到跳过下轮再试不写失败态; app init 异步调用不阻塞 |
+| T4-ST.2 成绩单注入 | `www/app/short-trader.js` | `_linkVerifiedTrades` 纯函数 (journals ↔ paper_short_positions code+exitDate ↔ paper_cond_orders 关联出 assumption/probability) → `_buildTrackRecord` (按 assumption 分组 {total,correctRate,topReason} + 全局 Top3 归因 + 最近 1 条 wrong, 样本 <SCORECARD_MIN_SAMPLES 返 null) → `_formatTrackRecord` (≤400 字); `generatePlan` prompt 在既有上下文后追加 【你的历史成绩单】+【我的教训】(`_buildLearningPromptText`, 失败/样本不足返空串不影响主流程) |
+| T4-ST.3 周末教训提炼 | `www/app/short-trader.js` + `www/app.js` | `maybeDistillLessons(now, deps)`: 距 lastDistill ≥7 天 且 新增已验证 ≥5 条 → LLM 喂最近 20 条已验证摘要 (code/assumption/盈亏/归因/note) 提炼 2-3 条第一人称可执行错误模式, 严格 JSON `{lessons:[...]}` 走 parseJsonOutput, 失败只 console.warn 不动旧 lessons; app init 异步调用 |
+| T4-ST.4 UI 学习曲线 | `www/index.html` + `www/app/short-trader.js` | 短线 tab `#shortTraderLearning` "📊 学习曲线" (`renderLearningCurve`, paper.js renderPage 2 行挂载): Brier score (`_brierScore`, correct=1/partial=0.5/wrong=0, 样本 <BRIER_MIN_SAMPLES 显示积累中) + 校准分桶表 (`_calibrationBuckets`, CALIBRATION_BUCKET_EDGES <40/40-60/60-80/≥80) + 最近 10 条已验证对照表 + 【我的教训】列表, 全 escapeHtml |
 
 ### Phase D AI 建议"高手化" (D1)
 
