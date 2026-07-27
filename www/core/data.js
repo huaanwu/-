@@ -576,6 +576,170 @@
     return lines.join('\n');
   }
 
+  // ===== Phase L: 国际形势 4 维 =====
+  // 1) 美股 3 大指数 (道指/纳指/标普), 2) 美元指数 (DXY), 3) 离岸人民币/美元, 4) 原油 WTI
+  // 全部走 aktools (dev-proxy → :8088), 24h 缓存, fail-safe 返 null
+
+  const _INTL_CACHE = 'intl_snapshot_v1';
+  const _INTL_TTL = 24 * 60 * 60 * 1000;
+
+  async function _safeIntlFetch(name, fetcher) {
+    try {
+      const data = await fetcher();
+      return data || null;
+    } catch (e) {
+      console.warn(`[Intl] ${name} 失败:`, e.message || e);
+      return null;
+    }
+  }
+
+  /**
+   * 美股 3 大指数 (道指/纳指/标普 500)
+   * aktools: index_us_stock_sina  → 字段 (代码/名称/最新价/涨跌额/涨跌幅)
+   */
+  async function _fetchUsIndices() {
+    const data = await Core.Data.fetch('intl_us_idx', 'index_us_stock_sina', {}, _INTL_TTL);
+    if (!Array.isArray(data)) return null;
+    const wanted = ['道琼斯', '纳斯达克', '标普500'];
+    const out = {};
+    for (const row of data) {
+      const name = (row.名称 || row.name || '').trim();
+      for (const w of wanted) {
+        if (name.includes(w)) {
+          out[w] = {
+            name,
+            price: parseFloat(row.最新价 ?? row.price),
+            changePct: parseFloat(row.涨跌幅 ?? row.change_pct),
+            date: row.日期 || row.date || ''
+          };
+        }
+      }
+    }
+    return Object.keys(out).length > 0 ? out : null;
+  }
+
+  /**
+   * 美元指数 / 人民币参考价 (中行外汇牌价)
+   * aktools: macro_china_fx_gold → 字段 (货币名称/现汇买入价/现汇卖出价/中行折算价/发布时间)
+   */
+  async function _fetchUsdIndex() {
+    const data = await Core.Data.fetch('intl_usd_cny', 'macro_china_fx_gold', {}, _INTL_TTL);
+    if (!Array.isArray(data) || data.length === 0) return null;
+    const row = data.find(r => {
+      const n = (r.货币名称 || r['货币名称'] || r.name || '').toString();
+      return n.includes('美元');
+    }) || data[0];
+    return {
+      name: row['货币名称'] || row.货币名称 || '美元/人民币',
+      buy: parseFloat(row['现汇买入价'] || row.现汇买入价),
+      sell: parseFloat(row['现汇卖出价'] || row.现汇卖出价),
+      mid: parseFloat(row['中行折算价'] || row.中行折算价),
+      date: row['发布时间'] || row.发布时间 || ''
+    };
+  }
+
+  /**
+   * 离岸人民币 (USD/CNH 在岸价近似)
+   */
+  async function _fetchCnh() {
+    const usd = await _fetchUsdIndex();
+    if (!usd) return null;
+    return {
+      usd_cny_mid: usd.mid,
+      date: usd.date,
+      source: 'boc_inland_approx'
+    };
+  }
+
+  /**
+   * 原油 WTI 主力合约 - aktools: energy_oil_hist  → 列表
+   */
+  async function _fetchCrudeOil() {
+    const data = await Core.Data.fetch('intl_oil_wti', 'energy_oil_hist', { symbol: 'WTI' }, _INTL_TTL);
+    if (!Array.isArray(data) || data.length === 0) return null;
+    const tail = data.slice(-30);
+    const last = tail[tail.length - 1];
+    const prev = tail.length >= 2 ? tail[tail.length - 2] : null;
+    const lastClose = parseFloat((last && (last['收盘价'] || last.收盘价 || last.close)) || NaN);
+    const prevClose = parseFloat((prev && (prev['收盘价'] || prev.收盘价 || prev.close)) || NaN);
+    if (isNaN(lastClose)) return null;
+    const changePct = isNaN(prevClose) ? null : ((lastClose - prevClose) / prevClose) * 100;
+    return {
+      name: 'WTI 原油',
+      last: lastClose,
+      changePct,
+      date: (last && (last['日期'] || last.日期 || last.date)) || '',
+      history: tail.map(r => parseFloat(r['收盘价'] || r.收盘价 || r.close)).filter(v => !isNaN(v))
+    };
+  }
+
+  /**
+   * 整合 4 维国际形势, 1 次调用拿到整快照
+   * 返回 { generated, us, usdIndex, cnh, oil } 都可能为 null (fail-safe)
+   */
+  async function getIntlSnapshot() {
+    const cached = await Core.Storage.cacheGet(_INTL_CACHE);
+    if (cached) return cached;
+    const [us, usd, cnh, oil] = await Promise.all([
+      _safeIntlFetch('usIndices', _fetchUsIndices),
+      _safeIntlFetch('usdIndex', _fetchUsdIndex),
+      _safeIntlFetch('cnh', _fetchCnh),
+      _safeIntlFetch('crude', _fetchCrudeOil)
+    ]);
+    const snap = {
+      generated: new Date().toISOString(),
+      us,
+      usdIndex: usd,
+      cnh,
+      oil
+    };
+    await Core.Storage.cacheSet(_INTL_CACHE, snap, _INTL_TTL);
+    return snap;
+  }
+
+  /**
+   * 格式化国际形势快照为 prompt 友好的中文
+   */
+  function formatIntlForPrompt(snap) {
+    if (!snap) return '⚠ 国际形势数据不可用';
+    const lines = [];
+    lines.push('## 国际形势 (生成于 ' + snap.generated.slice(0, 16).replace('T', ' ') + ')');
+
+    if (snap.us && typeof snap.us === 'object') {
+      const items = Object.keys(snap.us).map(k => {
+        const v = snap.us[k];
+        const sign = v.changePct > 0 ? '+' : '';
+        return `${k}: ${v.price} (${sign}${v.changePct.toFixed(2)}%)`;
+      });
+      lines.push(`- **美股**: ${items.join(' / ')}`);
+    } else {
+      lines.push('- **美股**: 数据拉取失败');
+    }
+
+    if (snap.usdIndex && typeof snap.usdIndex.mid === 'number') {
+      lines.push(`- **美元/人民币 (中行参考)**: 中间价 ${snap.usdIndex.mid.toFixed(4)} (买 ${snap.usdIndex.buy.toFixed(4)} / 卖 ${snap.usdIndex.sell.toFixed(4)}, ${snap.usdIndex.date})`);
+    }
+
+    if (snap.cnh && typeof snap.cnh.usd_cny_mid === 'number') {
+      lines.push(`- **人民币参考价**: ${snap.cnh.usd_cny_mid.toFixed(4)} (基于在岸价, 非离岸 CNH 实时)`);
+    }
+
+    if (snap.oil && typeof snap.oil.last === 'number') {
+      const sign = snap.oil.changePct !== null ? (snap.oil.changePct > 0 ? '+' : '') : '-';
+      const pct = snap.oil.changePct !== null ? `${sign}${snap.oil.changePct.toFixed(2)}%` : 'N/A';
+      const hist = snap.oil.history || [];
+      let range = '';
+      if (hist.length >= 5) {
+        const hi = Math.max(...hist);
+        const lo = Math.min(...hist);
+        range = `, 近 30 日区间 ${hi.toFixed(2)} - ${lo.toFixed(2)}`;
+      }
+      lines.push(`- **WTI 原油**: ${snap.oil.last.toFixed(2)} 美元/桶 (${pct}${range})`);
+    }
+
+    return lines.join('\n');
+  }
+
   // 暴露
   window.Core = window.Core || {};
   window.Core.Data = {
@@ -593,6 +757,9 @@
     getIndexSpot, getIndexSpotTencent,
     // 黄金 (Phase J)
     getGoldAu9999,
-    formatGoldForPrompt
+    formatGoldForPrompt,
+    // 国际形势 (Phase L)
+    getIntlSnapshot,
+    formatIntlForPrompt
   };
 })();

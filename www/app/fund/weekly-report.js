@@ -71,6 +71,11 @@
         const gold = await Core.Data.getGoldAu9999();
         data.gold = Core.Data.formatGoldForPrompt(gold, 30);
       } catch (e) { console.warn('[weekly] 拉黄金失败:', e); data.gold = '(黄金数据不可用)'; }
+      // 国际形势 (Phase L)
+      try {
+        const intl = await Core.Data.getIntlSnapshot();
+        data.intl = Core.Data.formatIntlForPrompt(intl);
+      } catch (e) { console.warn('[weekly] 拉国际形势失败:', e); data.intl = '(国际形势数据不可用)'; }
     } catch (e) {
       console.warn('[weekly] 数据拉取失败:', e);
       if (ld) ld.textContent = '❌ 数据拉取失败: ' + e.message;
@@ -84,6 +89,7 @@
       '结构强制 4 段: 📊 本周盈亏(数字) / 📰 重要事件(2-3 条) / 🎯 下周关注(2-3 条) / ⚠️ 风险提示(1-2 条)',
       '- 必须引用本周 % 变化数字(从 holdings 数据),不许编造',
       '- 如果数据中有"黄金 Au9999"段, 必须在风险提示里提及金价方向(涨/跌/区间)',
+      '- 如果数据中有"国际形势"段, 必须在重要事件或下周关注里提及美股/美元/原油方向',
       '- 不要推荐买卖动作,只汇总信息'
     ].join('\n');
     const prompt = `基金周报数据:\n${JSON.stringify(data, null, 2)}\n\n请生成给小白看的本周小结。`;
