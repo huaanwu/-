@@ -9,6 +9,8 @@
   if (!window.Fund) window.Fund = {};
 
   let _lastRebalanceAdvice = null;  // 给 _openRebalanceLinks 用
+  let _lastRebalanceHoldings = null;
+  let _lastRebalanceTargets = null;
 
   window.Fund.rebalanceDialog = async function() {
     // 1. 拉当前持仓 + 实时净值
@@ -38,6 +40,8 @@
     const targets = { short_bond: 0.20, pure_bond: 0.80 };
     const advice = this._computeRebalanceAdvice(holdings, targets);
     _lastRebalanceAdvice = advice;  // 缓存给 _openRebalanceLinks 用
+    _lastRebalanceHoldings = holdings;
+    _lastRebalanceTargets = targets;  // 给 _aiExplain 用
 
     // 3. 渲染
     const html = `
@@ -50,8 +54,10 @@
           ${this._renderRebalanceHTML(advice)}
           <div class="modal-footer">
             <button class="btn btn-ghost" onclick="Fund.closeModal()">关闭</button>
+            <button class="btn btn-ghost" id="rbAIBtn" onclick="Fund._aiExplain()">✨ AI 讲讲为什么</button>
             ${advice.suggestions.length > 0 ? '<button class="btn btn-primary" onclick="Fund._openRebalanceLinks()">🛒 跳第三方调仓</button>' : ''}
           </div>
+          <div id="rbAIExplain" style="margin-top:12px;padding:12px;background:var(--bg-base);border-radius:6px;font-size:12px;line-height:1.7;white-space:pre-wrap;display:none;"></div>
         </div>
       </div>
     `;
@@ -161,5 +167,77 @@
       }
     }
     toastSuccess(`已打开 ${list.suggestions.length} 个调仓链接`);
+  };
+
+  /**
+   * Phase H.1: 用本地 qwen3 把"再平衡表格"翻译成人话
+   * 流式输出到 #rbAIExplain。
+   */
+  window.Fund._aiExplain = async function() {
+    const btn = document.getElementById('rbAIBtn');
+    const panel = document.getElementById('rbAIExplain');
+    const advice = _lastRebalanceAdvice;
+    const holdings = _lastRebalanceHoldings || [];
+    const targets = _lastRebalanceTargets || {};
+    if (!advice) {
+      if (window.toastError) toastError('当前没有可讲解的建议');
+      return;
+    }
+    if (btn) btn.disabled = true;
+    if (panel) {
+      panel.style.display = 'block';
+      panel.textContent = '⏳ AI 思考中, 大约 10-30 秒...';
+    }
+
+    const totalValue = advice.totalValue || holdings.reduce((s, h) => s + (h.value || 0), 0);
+    const systemPrompt = [
+      '你是一名资深基金投资顾问,擅长把复杂的资产配置数字翻译成人话。',
+      '- 用户是 A 股 / 基金小额长期投资者(目标年化 3-5% 跑赢通胀)',
+      '- 不要给"具体买卖金额",只解释逻辑、风险、优先级',
+      '- 输出 200-400 字中文,使用 3 段: 📊 现在 / ⚖️ 调整原因 / ⚠️ 注意事项',
+      '- 引用用户实际数据(总市值、漂移 %、目标 %),不要凭空举数字'
+    ].join('\n');
+
+    const payload = {
+      持仓: holdings.map(h => ({
+        代码: h.code,
+        名称: h.name,
+        类型: this._typeLabel(h.type),
+        当前占比: totalValue > 0 ? ((h.value / totalValue) * 100).toFixed(1) + '%' : '-'
+      })),
+      目标配置: targets,
+      总市值: totalValue,
+      漂移: (advice.drift || []).map(d => ({
+        代码: d.code,
+        当前占比: ((d.currentPct || 0) * 100).toFixed(1) + '%',
+        目标占比: d.targetPct !== undefined ? ((d.targetPct) * 100).toFixed(0) + '%' : '-',
+        漂移: ((d.driftPct || 0) * 100).toFixed(1) + '%'
+      })),
+      调仓动作: (advice.suggestions || []).map(s => ({ 操作: s.action, 基金: s.code, 金额: s.amount })),
+      警告: advice.warnings || []
+    };
+    const prompt = `用户当前持仓 + 再平衡建议(JSON):\n${JSON.stringify(payload, null, 2)}\n\n请用通俗中文解释这份建议,采用上面 3 段格式。`;
+
+    try {
+      await Core.AI.call({
+        systemPrompt,
+        prompt,
+        stream: true,
+        maxTokens: 600,
+        onChunk: (delta, full) => {
+          if (panel) panel.textContent = full;
+        }
+      });
+      const finalText = panel ? panel.textContent : '';
+      if (panel) {
+        panel.innerHTML = '🤖 AI 讲解:\n\n' + window.Core.Util.escapeHtml(finalText);
+      }
+    } catch (e) {
+      console.warn('[Fund] AI 讲解失败:', e);
+      if (panel) panel.textContent = '❌ AI 讲解失败: ' + e.message;
+      if (window.toastError) toastError('AI 调用失败: ' + e.message);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
   };
 })();
