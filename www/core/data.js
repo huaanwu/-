@@ -810,6 +810,147 @@
   }
 
   /**
+   * 按 code 反查所属行业 (申万一级)
+   * 数据源 stock_board_industry_cons_em 全市场一次, 24h 缓存命中, 后续调用 0 成本
+   * @param {string} code 6 位代码
+   * @returns {Promise<string|null>} 行业名称, 未匹配/失败返 null
+   */
+  async function getStockIndustryByCode(code) {
+    const c = String(code || '').padStart(6, '0');
+    if (!/^\d{6}$/.test(c)) return null;
+    const cacheKey = 'industry_by_code_v1';
+    try {
+      let idx = await Core.Storage.cacheGet(cacheKey);
+      if (!idx || typeof idx !== 'object') {
+        const rows = await fetchWithCache(
+          cacheKey,
+          'stock_board_industry_cons_em',
+          { symbol: '申万一级' },
+          24 * 60 * 60 * 1000
+        ).catch(() => null);
+        if (!Array.isArray(rows)) return null;
+        idx = {};
+        for (const r of rows) {
+          const ind = r['板块名称'] || r.name || '';
+          const members = r['成分股代码'] || r['成分股'] || r.members;
+          const mArr = Array.isArray(members) ? members
+            : (typeof members === 'string' ? members.split(',') : []);
+          for (const m of mArr) {
+            const cc = String(m).padStart(6, '0');
+            if (!idx[cc]) idx[cc] = ind;
+          }
+        }
+        await Core.Storage.cacheSet(cacheKey, idx, 24 * 60 * 60 * 1000);
+      }
+      return idx[c] || null;
+    } catch (e) {
+      console.warn('[Data] getStockIndustryByCode 失败:', e.message);
+      return null;
+    }
+  }
+
+  /**
+   * 全市场公告 (stock_announcement_em), 6h 缓存
+   * 输出标准化: [{code, title, date}]
+   */
+  async function getStockAllAnnouncements() {
+    try {
+      const raw = await fetchWithCache(
+        'stock_announcement_em_v1',
+        'stock_announcement_em',
+        {},
+        6 * 60 * 60 * 1000
+      );
+      if (!Array.isArray(raw)) return [];
+      return raw.map(r => ({
+        code: String(r['股票代码'] || r.code || '').padStart(6, '0'),
+        title: r['公告标题'] || r.title || r['标题'] || '',
+        date: r['公告日期'] || r.date || r['发布日期'] || ''
+      })).filter(x => /^\d{6}$/.test(x.code));
+    } catch (e) {
+      console.warn('[Data] getStockAllAnnouncements 失败:', e.message);
+      return [];
+    }
+  }
+
+  /**
+   * 按 code 查近 N 天公告 (业绩预告 + 股东减持 + 全市场公告 三类合并)
+   * 复用 getStockEarningsForecastFresh / getStockHolderDecreases / getStockAllAnnouncements
+   * 三 fetcher 各自 6h 缓存, 单只成本几乎为 0
+   * @param {string} code 6 位
+   * @param {number} days 默认 7
+   * @returns {Promise<Array<{type,text,date}>>} 单只最多 5 条
+   */
+  async function getStockNoticesByCode(code, days = 7) {
+    const c = String(code || '').padStart(6, '0');
+    if (!/^\d{6}$/.test(c)) return [];
+    const out = [];
+    const cutoff = Date.now() - days * 24 * 3600 * 1000;
+    // 1) 业绩预告 (标准化格式 {code, type, summary, reportDate})
+    try {
+      const yj = await getStockEarningsForecastFresh();
+      for (const r of (yj || [])) {
+        if (r.code !== c) continue;
+        const t = Date.parse(r.reportDate || '');
+        if (isNaN(t) || t < cutoff) continue;
+        out.push({ type: '业绩预告', text: `${r.type} ${r.summary || ''}`.trim(), date: r.reportDate });
+      }
+    } catch (e) { console.warn('[Data] 业绩预告过滤失败:', e.message); }
+    // 2) 股东减持 (raw 字段, 容错)
+    try {
+      const dec = await getStockHolderDecreases();
+      const list = Array.isArray(dec) ? dec : [];
+      for (const r of list) {
+        const dcode = String(r['股票代码'] || r.code || '').padStart(6, '0');
+        if (dcode !== c) continue;
+        const d = r['公告日期'] || r['减持日期'] || r.date || '';
+        const t = d ? Date.parse(d) : NaN;
+        if (!isNaN(t) && t < cutoff) continue;
+        const text = `${r['股东名称'] || r['名称'] || ''} ${r['减持股数'] || r['减持数量'] || r['数量'] || ''}`.trim();
+        out.push({ type: '股东减持', text, date: d });
+      }
+    } catch (e) { console.warn('[Data] 减持过滤失败:', e.message); }
+    // 3) 全市场公告
+    try {
+      const all = await getStockAllAnnouncements();
+      for (const r of (all || [])) {
+        if (r.code !== c) continue;
+        const t = Date.parse(r.date || '');
+        if (!isNaN(t) && t < cutoff) continue;
+        out.push({ type: '公告', text: r.title || '', date: r.date });
+      }
+    } catch (e) { console.warn('[Data] 全市场公告过滤失败:', e.message); }
+    return out.slice(0, 5);
+  }
+
+  /**
+   * 量能异动: 今日成交量 / 20 日均量
+   * 复用 getStockKLine (24h 缓存命中), 不新增端点
+   * @param {string} code 6 位
+   * @returns {Promise<{volRatio, todayVol, avg20Vol}|null>}
+   */
+  async function getStockVolumeAnomaly(code) {
+    try {
+      const bars = await getStockKLine(code, 'daily', '', '', 'qfq');
+      if (!Array.isArray(bars) || bars.length < 21) return null;
+      const last = bars[bars.length - 1];
+      const todayVol = parseFloat(last['成交量'] || last.volume || 0) || 0;
+      const n = Math.min(20, bars.length - 1);
+      const avg20Vol = bars.slice(-n - 1, -1)
+        .reduce((s, b) => s + (parseFloat(b['成交量'] || b.volume || 0) || 0), 0) / n;
+      if (!(avg20Vol > 0)) return null;
+      return {
+        volRatio: +(todayVol / avg20Vol).toFixed(2),
+        todayVol: Math.round(todayVol),
+        avg20Vol: Math.round(avg20Vol)
+      };
+    } catch (e) {
+      console.warn('[Data] getStockVolumeAnomaly 失败:', e.message);
+      return null;
+    }
+  }
+
+  /**
    * 给 6 位代码补市场后缀 (Phase R)
    * 6/9: SH (沪市主板 + B 股)
    * 0/3: SZ (深市主板 + 创业板)
@@ -1634,6 +1775,9 @@
     // 排雷 (Phase Y.1)
     getStockGoodwillRanks, getStockHolderDecreases,  // 商誉 / 减持
     getStockEarningsForecastFresh, getStockCapitalFlight,  // 业绩亏损 / 主力出逃
+    // 短线两阶段选品资料 (阶段 1: 行业映射 + 公告 + 量比)
+    getStockIndustryByCode, getStockNoticesByCode, getStockAllAnnouncements,
+    getStockVolumeAnomaly,
     // 基金
     getFundSpot, getFundHistory, getFundPortfolio,
     // 指数

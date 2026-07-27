@@ -285,7 +285,9 @@ const dataContent = readFileSafe(path.join(WWW, 'core/data.js'));
 const DATA_METHODS = ['getStockSpot', 'getStockQuote', 'getStockKLine', 'getStockFinancial', 'getStockList',
   'getFundSpot', 'getFundHistory', 'getFundPortfolio', 'getIndexSpot', 'health', 'fetch',
   // Phase Y.1 排雷 4 fetcher
-  'getStockGoodwillRanks', 'getStockHolderDecreases', 'getStockEarningsForecastFresh', 'getStockCapitalFlight'];
+  'getStockGoodwillRanks', 'getStockHolderDecreases', 'getStockEarningsForecastFresh', 'getStockCapitalFlight',
+  // 短线两阶段选品: 行业映射 + 公告 + 量比 (阶段 1)
+  'getStockIndustryByCode', 'getStockNoticesByCode', 'getStockAllAnnouncements', 'getStockVolumeAnomaly'];
 for (const m of DATA_METHODS) {
   if (new RegExp(`\\b${m}\\b`).test(dataContent)) ok(`Data.${m}`);
   else fail(`Data.${m}`, '缺失');
@@ -8082,6 +8084,37 @@ section('[49] Bug J KB 匹配: tags 兜底 + ai-advisor 调用方注释');
     else fail('keywords 优先', `r2=${JSON.stringify(r2.map(e => e.id))}`);
   } catch (e) {
     fail('Bug J 测试', e.message + ' / ' + e.stack);
+  }
+})();
+
+// ========== [50] 短线两阶段选品 资料接口 (Commit 1) ==========
+section('[50] data.js 行业映射 + 公告 + 量比');
+(async () => {
+  try {
+    const dataSrc = readFileSafe(path.join(WWW, 'core', 'data.js'));
+    if (!dataSrc) throw new Error('data.js 读不到');
+
+    // 50.a getStockIndustryByCode: 24h cache + 反向 idx 写法
+    if (/getStockIndustryByCode[\s\S]{0,300}industry_by_code_v1[\s\S]{0,200}stock_board_industry_cons_em/.test(dataSrc))
+      ok('50.a getStockIndustryByCode 24h cache + stock_board_industry_cons_em 反查');
+    else fail('50.a 行业映射', '源码未匹配预期实现');
+
+    // 50.b getStockNoticesByCode: 三类合并 + 单只 5 条上限
+    if (/getStockNoticesByCode[\s\S]*?业绩预告[\s\S]*?股东减持[\s\S]*?getStockAllAnnouncements\(\)[\s\S]*?slice\(0, 5\)/.test(dataSrc))
+      ok('50.b getStockNoticesByCode 业绩预告+减持+全市场公告 三类合并 + 5 条上限');
+    else fail('50.b 公告查询', '源码未匹配三类合并 + 5 条上限');
+
+    // 50.c getStockVolumeAnomaly: 复用 getStockKLine + volRatio 计算
+    if (/getStockVolumeAnomaly[\s\S]{0,800}avg20Vol[\s\S]{0,300}volRatio/.test(dataSrc))
+      ok('50.c getStockVolumeAnomaly 复用 K线 + volRatio = todayVol/avg20Vol');
+    else fail('50.c 量比', '源码未匹配 volRatio 计算');
+
+    // 50.d 暴露: window.Core.Data 含 3 个方法 (DATA_METHODS 已自动覆盖, 此处只验不在 DATA_METHODS 时补漏)
+    const exposeLine = dataSrc.match(/getStockIndustryByCode,\s*getStockNoticesByCode,\s*getStockAllAnnouncements,\s*getStockVolumeAnomaly/);
+    if (exposeLine) ok('50.d window.Core.Data 暴露 3 个新接口');
+    else fail('50.d 暴露', 'window.Core.Data 未导出 4 个新方法');
+  } catch (e) {
+    fail('50 data.js 接口', e.message + ' / ' + (e.stack || ''));
   }
 })();
 
