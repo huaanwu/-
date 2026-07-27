@@ -190,9 +190,11 @@
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${apiKey}`
         },
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
+        signal: opts.signal  // Phase Q: AbortController 支持
       });
     } catch (e) {
+      if (e.name === 'AbortError') throw e;  // 让外层区分超时
       throw new Error('网络请求失败 (可能是 CORS 或断网): ' + e.message);
     }
 
@@ -334,9 +336,87 @@
     });
   }
 
+  /**
+   * cachedCall (Phase Q) - 同 (systemPrompt + prompt) 24h 内不重算
+   * 仅适合非流式调用. 流式场景直接用 call(), 自己在业务层缓存结果即可.
+   * @param {object} opts - { systemPrompt, prompt, maxTokens, ttl, contextHash }
+   * @returns {string} AI 输出
+   */
+  async function cachedCall(opts) {
+    if (opts && opts.stream) {
+      console.warn('[AI] cachedCall 不支持 stream, 自动转 call()');
+      return await call(opts);
+    }
+    const ttl = (opts && opts.ttl) ?? 24 * 60 * 60 * 1000;  // 默认 24h
+    // 生成 cache key (基于内容 hash)
+    const keyRaw = JSON.stringify({
+      sp: opts.systemPrompt || '',
+      p: opts.prompt || '',
+      ch: opts.contextHash || '',
+      mt: opts.maxTokens || 0
+    });
+    // 简单 hash (FNV-1a)
+    let hash = 2166136261;
+    for (let i = 0; i < keyRaw.length; i++) {
+      hash ^= keyRaw.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    const cacheKey = 'ai_cache_' + (hash >>> 0).toString(36);
+
+    try {
+      const cached = await Core.Storage.cacheGet(cacheKey);
+      if (cached && typeof cached.text === 'string') {
+        if (opts.onChunk) {
+          // 非流式缓存, 但用户给了 onChunk → 一次性回放 (分块模拟流)
+          const text = cached.text;
+          const chunks = Math.ceil(text.length / 100);
+          for (let i = 0; i < chunks; i++) {
+            const slice = text.slice(i * 100, (i + 1) * 100);
+            if (opts.onChunk) opts.onChunk(slice, text.slice(0, (i + 1) * 100));
+          }
+        }
+        return cached.text;
+      }
+    } catch (e) { console.warn('[AI] cacheGet 失败:', e); }
+
+    // 缓存未命中, 调 call()
+    const text = await call(opts);
+
+    // 写入缓存
+    try {
+      await Core.Storage.cacheSet(cacheKey, { text, at: Date.now() }, ttl);
+    } catch (e) { console.warn('[AI] cacheSet 失败:', e); }
+
+    return text;
+  }
+
+  /**
+   * callWithTimeout (Phase Q) - 给 call() 加 AbortController 超时
+   * opts: 同 call(), 额外:
+   *   - timeout: 毫秒 (默认 60000)
+   * @returns {string} AI 输出
+   */
+  async function callWithTimeout(opts) {
+    const timeout = (opts && opts.timeout) ?? 60000;
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort('timeout'), timeout);
+    try {
+      return await call({ ...opts, signal: ac.signal });
+    } catch (e) {
+      if (e && (e.name === 'AbortError' || String(e.message || e).includes('abort'))) {
+        throw new Error(`AI 调用超时 (${Math.round(timeout / 1000)}s)`);
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   window.Core = window.Core || {};
   window.Core.AI = {
     call,
+    cachedCall,
+    callWithTimeout,
     testConnection,
     getConfig,
     getProviderConfig,
