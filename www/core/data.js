@@ -493,6 +493,89 @@
     }
   }
 
+  /**
+   * 上海黄金交易所 Au9999 基准价 (Phase J)
+   * 走标准 aktools 通道 (dev-proxy 转发 → akshare Python → spot_golden_benchmark_sge),
+   * 24h 缓存。如果 aktools 离线 → fail-safe 返 null (调用方降级为不接黄金段)。
+   */
+  const _GOLD_CACHE = 'gold_au9999_v1';
+  const _GOLD_TTL = 24 * 60 * 60 * 1000;
+
+  async function _fetchSgeAu9999() {
+    // 走标准 aktools 通道
+    const data = await Core.Data.fetch('ak_gold_benchmark', 'spot_golden_benchmark_sge', {}, _GOLD_TTL);
+    if (!Array.isArray(data) || data.length === 0) return null;
+    // akshare 字段: 中文乱码问题, 用位置 0/1/2 推断 (date, open, close)
+    // 已知输出是 3 列: 第 1 列日期, 第 2 列开盘价, 第 3 列收盘价
+    const rows = data.slice(-90).map((r, i) => {
+      const vals = Object.values(r || {});
+      if (vals.length < 3) return null;
+      const dateRaw = vals[0];
+      const open = parseFloat(vals[1]);
+      const close = parseFloat(vals[2]);
+      if (isNaN(close)) return null;
+      let dateStr;
+      if (typeof dateRaw === 'string') {
+        dateStr = dateRaw.replace(/-/g, '').slice(0, 8);
+        if (dateStr.length === 8) dateStr = dateStr.slice(0, 4) + '-' + dateStr.slice(4, 6) + '-' + dateStr.slice(6, 8);
+      } else if (dateRaw && dateRaw.toISOString) {
+        dateStr = dateRaw.toISOString().slice(0, 10);
+      } else {
+        dateStr = String(dateRaw || '');
+      }
+      return { date: dateStr, open: isNaN(open) ? null : open, close };
+    }).filter(Boolean);
+    if (rows.length === 0) return null;
+    const last = rows[rows.length - 1];
+    return {
+      generated: new Date().toISOString(),
+      unit: '元/克',
+      current: { date: last.date, open: last.open, close: last.close },
+      history: rows
+    };
+  }
+
+  async function getGoldAu9999() {
+    const cached = await Core.Storage.cacheGet(_GOLD_CACHE);
+    if (cached) return cached;
+    try {
+      const snap = await _fetchSgeAu9999();
+      if (!snap) return null;
+      await Core.Storage.cacheSet(_GOLD_CACHE, snap, _GOLD_TTL);
+      return snap;
+    } catch (e) {
+      console.warn('[Gold] aktools SGE 拉取失败:', e.message || e);
+      return null;
+    }
+  }
+
+  /**
+   * 格式化黄金快照为 prompt 友好的中文
+   * 输入: getGoldAu9999() 的返回值 (可能为 null → 返 '⚠ 黄金数据拉取失败')
+   */
+  function formatGoldForPrompt(snap, historyDays = 30) {
+    if (!snap || !snap.current) {
+      return '⚠ 黄金 Au9999 数据拉取失败 (SGE 公开接口不可达或离线)';
+    }
+    const cur = snap.current;
+    const hist = (snap.history || []).slice(-historyDays);
+    let changeInfo = '';
+    if (hist.length >= 2) {
+      const first = hist[0].close;
+      const chg = ((cur.close - first) / first) * 100;
+      changeInfo = `, 近 ${historyDays} 日 ${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%`;
+    }
+    let lines = [];
+    lines.push(`## 黄金 Au9999 基准价 (生成于 ${snap.generated.slice(0, 16).replace('T', ' ')})`);
+    lines.push(`- **当前**: ${cur.close} 元/克 (开盘 ${cur.open !== null ? cur.open : '-'} 元/克, 数据日 ${cur.date})${changeInfo}`);
+    if (hist.length >= 5) {
+      const high = Math.max(...hist.map(h => h.close));
+      const low = Math.min(...hist.map(h => h.close));
+      lines.push(`- **区间**: 近 ${historyDays} 日最高 ${high.toFixed(2)} 元/克, 最低 ${low.toFixed(2)} 元/克`);
+    }
+    return lines.join('\n');
+  }
+
   // 暴露
   window.Core = window.Core || {};
   window.Core.Data = {
@@ -507,6 +590,9 @@
     // 基金
     getFundSpot, getFundHistory, getFundPortfolio,
     // 指数
-    getIndexSpot, getIndexSpotTencent
+    getIndexSpot, getIndexSpotTencent,
+    // 黄金 (Phase J)
+    getGoldAu9999,
+    formatGoldForPrompt
   };
 })();
