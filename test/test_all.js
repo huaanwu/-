@@ -5020,6 +5020,42 @@ section('36] 中长线盯盘: horizon 打标 / 分层轮询(短线定时器+中�
     if (fb2.includes('略减') && fb2.includes('中度')) ok('36.3f 兜底归因: 略减 → 中度');
     else fail('36.3f 兜底', fb2);
 
+    // ---- 36.9 B-3+: 估值偏离 AI 归因 (同步纯函数测, 避开 36.3g setTimeout 后被掐的 harness 限制) ----
+    // 36.9a _aiValuationNarrative / _fallbackValuationNarrative 暴露
+    if (typeof Alerts._aiValuationNarrative !== 'function') {
+      fail('36.9a _aiValuationNarrative 未注册');
+    } else if (typeof Alerts._fallbackValuationNarrative !== 'function') {
+      fail('36.9a _fallbackValuationNarrative 未注册');
+    } else {
+      ok('36.9a 估值 AI 归因方法注册: _aiValuationNarrative + _fallbackValuationNarrative');
+    }
+
+    // 36.9b 兜底模板 (同步纯函数)
+    const vVal = { hits: [{ name: '深证', pe: 28.7, percentile: 92, historyLen: 60 }] };
+    const fallback = Alerts._fallbackValuationNarrative(vVal);
+    if (typeof fallback === 'string' && fallback.includes('深证') &&
+        fallback.includes('92') && fallback.includes('80') &&
+        fallback.includes('中长线纪律')) {
+      ok('36.9b 估值 AI 兜底模板: 含指数名/分位/阈值/纪律提醒');
+    } else fail('36.9b 估值 AI 兜底模板', fallback ? fallback.slice(0, 80) : 'undefined');
+
+    // 36.9b2 兜底模板对空 verdict 容错 (无 hits)
+    const emptyFallback = Alerts._fallbackValuationNarrative({ hits: [] });
+    if (typeof emptyFallback === 'string' && emptyFallback.includes('80') &&
+        emptyFallback.includes('目标指数') && emptyFallback.includes('?')) {
+      ok('36.9b2 估值 AI 兜底模板: 空 verdict 用占位符容错');
+    } else fail('36.9b2 估值 AI 兜底空 verdict', emptyFallback.slice(0, 80));
+
+    // 36.9c _checkValuation 接线: 触发后 a.aiNarrative 被赋值 (源码对账, 避开 vm 异步截断)
+    if (/this\._aiValuationNarrative\(a,\s*verdict\)\.then\(narrative\s*=>\s*\{[\s\S]*a\.aiNarrative\s*=\s*narrative/.test(alertsSrc)) {
+      ok('36.9c _checkValuation 接线: 估值触发后写 a.aiNarrative (源码对账)');
+    } else fail('36.9c _checkValuation 估值 AI 接线', '源码未匹配 _aiValuationNarrative(a, verdict).then');
+
+    // 36.9d hasCachedNarrative 把 valuation 类型纳入缓存路径
+    if (/hasCachedNarrative\s*=\s*\(\s*a\.type\s*===\s*'earnings_warning'\s*\|\|\s*a\.type\s*===\s*'valuation'\s*\)\s*&&\s*a\.aiNarrative/.test(alertsSrc)) {
+      ok('36.9d AI 解读默认缓存: valuation 类型纳入 hasCachedNarrative (源码对账)');
+    } else fail('36.9d hasCachedNarrative 估值缓存', '源码未匹配 valuation 类型');
+
     // _aiEarningsNarrative: AI 调通 → 写 alert.aiNarrative; AI 调失败 → 兜底
     notices.length = 0;
     failFetch = false;

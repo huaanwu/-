@@ -1071,6 +1071,15 @@
         a.triggered = true;
         a.hitCount = (a.hitCount || 0) + 1;
         a.lastHit = Date.now();
+        // Phase B-3+: 异步 AI 归因估值偏离 (与业绩预告同口径, 不阻塞主通知)
+        this._aiValuationNarrative(a, verdict).then(narrative => {
+          try {
+            a.aiNarrative = narrative;
+            a.aiNarrativeAt = Date.now();
+            a.aiNarrativeVerdict = verdict;
+            Core.Storage.put('alerts', a).catch(e => console.warn('[Alerts] 写 aiNarrative(valuation) 失败:', e));
+          } catch (e) { console.warn('[Alerts] aiNarrative(valuation) 落库失败:', e); }
+        }).catch(e => console.warn('[Alerts] AI 估值归因 promise reject:', e));
       }
       a.lastNotifiedKey = verdict.hits.length > 0 ? key : null;  // 跌回阈值下 → 清空, 下次进入再通知
       return true;
@@ -1121,6 +1130,50 @@
       const lines = verdict.hits.map(h => `${h.name} PE-TTM ${h.pe.toFixed(1)} (近5年分位 ${Math.round(h.percentile)}%)`);
       return '📈 大盘估值偏离\n' + lines.join('\n') +
         `\n💡 分位 ≥ ${Core.Constants.VALUATION_PERCENTILE_WARN}% 说明市场整体偏贵, 与"低估值买入"逻辑相悖: 新建仓建议更挑剔(提高选股标准/缩小仓位), 已有持仓按各自逻辑持有, 不必因指数贵而单独卖出。`;
+    },
+
+    /**
+     * Phase B-3+: 估值偏离 AI 归因 (异步, 与业绩预告同口径)
+     *   失败 → fallback 模板, 不阻塞主通知
+     *   结果写 a.aiNarrative + aiNarrativeAt + aiNarrativeVerdict
+     */
+    async _aiValuationNarrative(a, verdict) {
+      if (!window.Core || !Core.AI) return this._fallbackValuationNarrative(verdict);
+      const lines = verdict.hits.map(h =>
+        `${h.name}: 当前 PE-TTM ${h.pe.toFixed(1)}, 近 ${h.historyLen} 月分位 ${Math.round(h.percentile)}%`
+      ).join('\n');
+      const systemPrompt = [
+        '你是「大盘估值归因助手」, 给小白用户解释一条估值偏离信号意味着什么。',
+        '- 100-200 字中文, 2 段: ⚡ 这条信号在说什么 / 📌 对中长线持仓的下一步动作',
+        '- 不要推荐具体买卖金额, 只解释逻辑、优先级',
+        '- 不要凭空举数字, 只引用用户实际数据 (指数/PE/分位/历史长度)',
+        '- 不知道就明说 "需要看更多数据", 不要编'
+      ].join('\n');
+      const prompt = `事件:
+- 命中指数: ${verdict.hits.map(h => h.name).join(' / ')}
+- 当前 PE / 分位:
+${lines}
+- 触发阈值: 分位 ≥ ${Core.Constants.VALUATION_PERCENTILE_WARN}%
+请输出归因。`;
+
+      try {
+        const text = await Core.AI.call({ systemPrompt, prompt, stream: false, maxTokens: 400 });
+        const narrative = String(text || '').trim();
+        if (!narrative) return this._fallbackValuationNarrative(verdict);
+        return narrative;
+      } catch (e) {
+        console.warn('[Alerts] AI 估值归因失败, 用硬编码兜底:', e.message || e);
+        return this._fallbackValuationNarrative(verdict);
+      }
+    },
+
+    /** AI 估值归因兜底模板 (不调 AI) */
+    _fallbackValuationNarrative(verdict) {
+      const hit = verdict.hits[0];
+      const name = hit ? hit.name : '目标指数';
+      const pct = hit ? Math.round(hit.percentile) : '?';
+      const pe = hit ? hit.pe.toFixed(1) : '?';
+      return `⚡ ${name} PE-TTM ${pe}, 近 5 年分位 ${pct}%, 已高于 ${Core.Constants.VALUATION_PERCENTILE_WARN}% 阈值。\n📌 中长线纪律: 大盘估值偏贵时新建仓门槛提高, 可收紧选股标准或缩小仓位; 已有持仓按个股逻辑持有, 不必因指数贵而单独清仓。`;
     },
 
     /**
@@ -1562,8 +1615,8 @@
       const all = await Core.Storage.all('alerts');
       const a = all.find(x => x.id === id);
       if (!a) { toastError('找不到这条规则'); return; }
-      // 业绩预告类规则有 aiNarrative 缓存 → 默认不调 AI (省 token + 速度快)
-      const hasCachedNarrative = a.type === 'earnings_warning' && a.aiNarrative;
+      // 业绩预告/估值偏离类规则有 aiNarrative 缓存 → 默认不调 AI (省 token + 速度快)
+      const hasCachedNarrative = (a.type === 'earnings_warning' || a.type === 'valuation') && a.aiNarrative;
       const willCallAI = forceRefresh || !hasCachedNarrative;
       const html = `
         <div class="modal-backdrop" onclick="if(event.target===this)Alerts.closeModal()">
