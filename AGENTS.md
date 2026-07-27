@@ -62,13 +62,14 @@ cd android && ./gradlew assembleDebug   # 产物: android/app/build/outputs/apk/
 ### 测试与类型检查
 
 ```bash
-npm test                    # = node test/test_runtime.js && node test/test_all.js,纯 Node 无浏览器,24 节 500+ 断言
+npm test                    # = node test/test_runtime.js && node test/test_all.js,纯 Node 无浏览器,24 节 560+ 断言
 npm run typecheck           # tsc --noEmit
 node scripts/e2e.mjs        # 端到端冒烟:Chrome headless + CDP(不依赖 puppeteer),9 项断言 + 截图到 e2e_screenshots/
 node scripts/daily_summary.mjs --verify-dry-run ./journals.json   # 事后验证 dry-run
+node scripts/daily_summary.mjs --premarket   # Phase C 盘前简报 (隔夜外盘+日历+财新要闻 → LLM → 飞书; 建议 Windows 计划任务 交易日 08:30)
 ```
 
-`test/test_all.js` 24 节:JS 语法、域脚本接口完备性 (`DOMAINS` 字典)、Core 命名空间导出、index.html script 引用对账、Worker 结构、关键文件存在、Data 层方法签名、回测引擎 vm 沙箱实测、Vite external 对账、journal/market/fund/alerts 纯函数实测、daily_summary 单测、5.1/5.2/5.3 互通闭环实测、数据源限流、Paper 模拟盘纯函数实测、Discipline 纪律引擎实测。**改完域脚本或新增域方法必须先 `npm test`,并同步更新该文件的 `DOMAINS` 字典。**
+`test/test_all.js` 24 节:JS 语法、域脚本接口完备性 (`DOMAINS` 字典)、Core 命名空间导出、index.html script 引用对账、Worker 结构、关键文件存在、Data 层方法签名、回测引擎 vm 沙箱实测、Vite external 对账、journal/market/fund/alerts 纯函数实测、daily_summary 单测 (含 --premarket 盘前简报)、5.1/5.2/5.3 互通闭环实测、数据源限流、Paper 模拟盘纯函数实测 (含 Phase C EOD 日终小结)、Discipline 纪律引擎实测。**改完域脚本或新增域方法必须先 `npm test`,并同步更新该文件的 `DOMAINS` 字典。**
 
 `scripts/e2e.mjs` 注意:Chrome 路径硬编码 `C:\Program Files\Google\Chrome\Application\chrome.exe`,需要 Vite 已在 3003 端口跑着。
 
@@ -111,7 +112,7 @@ scripts/
 ├── dev-proxy.mjs           # Express 代理 :8089:/api/akshare→aktools,:8088;/api/llm/{provider}→LLM
 ├── copy-libs.mjs           # UMD 库复制
 ├── build-web.mjs           # dist/ 合并回 www/
-├── daily_summary.mjs       # 盘后 AI 总结 + 飞书推送 + --verify 事后验证(环境变量:DEEPSEEK_API_KEY/DEEPSEEK_BASE_URL/DEEPSEEK_MODEL/FEISHU_WEBHOOK/AKTOOLS_BASE)
+├── daily_summary.mjs       # 盘后 AI 总结 + 飞书推送 + --verify 事后验证 + --premarket 盘前简报 (Phase C; 环境变量:DEEPSEEK_API_KEY/DEEPSEEK_BASE_URL/DEEPSEEK_MODEL/FEISHU_WEBHOOK/AKTOOLS_BASE)
 ├── e2e.mjs / e2e_local_llm.mjs  # 端到端测试
 ├── supabase_schema.sql     # 可选云同步的 Postgres schema
 └── *.py                    # 离线数据采集/AI seed 工具(宏观/新闻/基金筛选等)
@@ -197,13 +198,21 @@ vite.config.js              # root=www,域脚本 external 列表,dev proxy
 | 实盘接入 | `www/app/holdings.js` | 新建持仓/买入交易表单加假设+止损价, `save`/`saveTx` 买入前 await preBuyCheck, assumption/stopLoss 写 holdings+transactions 行(非索引字段) |
 | 模拟盘接入 | `www/app/paper.js` | `buyFromForm` 同款校验; `autoTradeFromPick` blocks 命中 console.warn 跳过, warns 写交易行 `disciplineWarns` (AI 场景假设固定'题材催化', 止损=成交价×0.92) |
 
+### Phase C 决策自动化流水线 (瘦身版)
+
+| 子项 | 实现位置 | 关键方法 |
+|------|----------|----------|
+| C.1 盘前简报 (Node 侧) | `scripts/daily_summary.mjs` | `--premarket` CLI; `runPremarket(deps)` / `fetchUsIndices` (index_us_stock_sina) / `buildEconomicCalendar` (本地公开日期规则: LPR/MLF/PMI/CPI/季报密集期, 无事件不编造) / `fetchCaixinNews` (stock_news_main_cx) / `formatPremarketRaw` / `buildPremarketPrompt`; 每块失败独立降级"本节数据不可用", LLM 失败降级原始罗列版; 不含持仓数据 (Node 读不到 IndexedDB) |
+| C.2 模拟盘日终小结 (浏览器侧) | `www/app/paper.js` | `Paper.maybeGenerateEodReport(now)` (工作日 ≥15:30 且当日无记录才生成, `_shouldGenerateEod` 纯函数可注入时间) / `_buildEodReport` (现金/市值/总资产/当日盈亏对照昨日快照 + 当日成交 🤖=AI 自动 + 纪律拦截 + 持仓 Top/Bottom) / `_pushEodToFeishu` (kv `feishu_webhook`, 失败只 warn) / `_renderEodReport` (页面"日终小结"区块); kv `paper_eod_reports` 上限 60, kv `paper_discipline_log` 上限 100 (`_logDisciplineBlock`, autoTradeFromPick 被 blocks 时 append); AI 自动成交交易行带 `auto: true` 标记 |
+| C.3 启动钩子 | `www/app.js` | init 里 `Paper.init()` 后 `Paper.maybeGenerateEodReport().catch(...)` (不 await 不阻塞) |
+
 ### 8 大页面域 + Core 模块
 
 | 模块 | 域脚本 | 核心功能 |
 |------|--------|----------|
 | 行情看板 | `www/app/watchlist.js` | 自选股 + K 线 + 行情 |
 | 持仓管理 | `www/app/holdings.js` | 持仓 + 交易流水 + 持仓天数/浮盈 |
-| 模拟盘 | `www/app/paper.js` | 虚拟资金 + isPaper 隔离持仓 + AI 选股自动成交 + 每日快照 (kv: `paper_account` / `paper_snapshots`) |
+| 模拟盘 | `www/app/paper.js` | 虚拟资金 + isPaper 隔离持仓 + AI 选股自动成交 + 每日快照 (kv: `paper_account` / `paper_snapshots`) + Phase C 日终小结 (kv: `paper_eod_reports` / `paper_discipline_log` / `feishu_webhook`) |
 | 复盘笔记 | `www/app/journal.js` | 结构化复盘 + 持仓上下文 + AI 助手 |
 | 选股筛选 | `www/app/screener.js` | 条件筛选 + AI 选股 + 一键加自选 |
 | 资金账户 | `www/app/account.js` | 现金 + 资金流水 + 账户总览 |

@@ -19,6 +19,17 @@
  *   - 拉当前行情 + 调 LLM 生成"当时判断 vs 当前市场反馈"对照报告
  *   - 写回 verified_journals.json (app 端可导入更新)
  *
+ * Phase C 盘前简报 (--premarket):
+ *   node scripts/daily_summary.mjs --premarket
+ *   - 三块内容 (每块拉取失败独立降级为"本节数据不可用", 不中断整体):
+ *     1. 隔夜外盘 (aktools index_us_stock_sina, 同 www/core/data.js 已验证接口)
+ *     2. 今日财经日历 (本地静态规则: LPR/MLF/PMI/CPI/季报密集期, 公开统计规律, 非编造)
+ *     3. 财新要闻 (aktools stock_news_main_cx, 同 www/core/news.js 已验证接口)
+ *   - LLM 生成 ≤300 字简报; LLM 失败时降级推送原始数据罗列版 (不推送失败)
+ *   - 不含用户持仓数据 (Node 脚本读不到浏览器 IndexedDB), 只做全市场维度
+ *   - Windows 计划任务建议: 交易日 08:30 跑 (盘前 30 分钟, 隔夜美股已收盘)
+ *     schtasks /create /tn "StockMaster盘前简报" /tr "node D:\get\stock-master\scripts\daily_summary.mjs --premarket" /sc weekly /d MON,TUE,WED,THU,FRI /st 08:30
+ *
  * 配置 (环境变量):
  *   DEEPSEEK_API_KEY   必须
  *   DEEPSEEK_BASE_URL  可选, 默认 https://api.deepseek.com
@@ -28,7 +39,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -49,7 +60,11 @@ function parseArgs() {
     err('用法:');
     err('  盘后总结:  node scripts/daily_summary.mjs <snapshot.json>');
     err('  事后验证:  node scripts/daily_summary.mjs --verify <journals.json> [--dry-run]');
+    err('  盘前简报:  node scripts/daily_summary.mjs --premarket');
     process.exit(1);
+  }
+  if (args[0] === '--premarket') {
+    return { mode: 'premarket' };
   }
   if (args[0] === '--verify' || args[0] === '--verify-dry-run') {
     const dryRun = args[0] === '--verify-dry-run';
@@ -119,7 +134,8 @@ async function callLLM(prompt, systemPrompt) {
 // ==================== 推飞书 ====================
 async function pushFeishu(text) {
   if (!FEISHU) {
-    log('FEISHU_WEBHOOK 未设置, 跳过推送');
+    log('FEISHU_WEBHOOK 未设置, 跳过推送, 内容打印到 stdout:');
+    console.log(text);
     return false;
   }
   try {
@@ -147,6 +163,187 @@ async function pushFeishu(text) {
     err('飞书推送失败:', e.message);
     return false;
   }
+}
+
+// ==================== 盘前简报 (Phase C --premarket) ====================
+// 只读全市场维度数据 (Node 脚本读不到浏览器 IndexedDB, 不含用户持仓)
+// 数据接口全部照抄 www/core/data.js / www/core/news.js 已验证的 aktools 接口, 不发明新接口
+
+/**
+ * 隔夜外盘: 美股 3 大指数 (道琼斯/纳斯达克/标普500)
+ * aktools: index_us_stock_sina (同 data.js _fetchUsIndices) → 字段 (名称/最新价/涨跌幅/日期)
+ * 失败返 null (调用方降级 "本节数据不可用")
+ */
+async function fetchUsIndices() {
+  try {
+    const url = `${AKTOOLS}/api/public/index_us_stock_sina`;
+    const resp = await fetch(url, { timeout: 10000 });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    if (!Array.isArray(data)) return null;
+    const wanted = ['道琼斯', '纳斯达克', '标普500'];
+    const out = [];
+    for (const row of data) {
+      const name = (row.名称 || row.name || '').trim();
+      if (!wanted.some(w => name.includes(w))) continue;
+      const price = parseFloat(row.最新价 ?? row.price);
+      if (isNaN(price)) continue;
+      const changePct = parseFloat(row.涨跌幅 ?? row.change_pct);
+      out.push({
+        name,
+        price,
+        changePct: isNaN(changePct) ? null : changePct,
+        date: row.日期 || row.date || ''
+      });
+    }
+    return out.length > 0 ? out : null;
+  } catch (e) {
+    err('隔夜外盘拉取失败:', e.message);
+    return null;
+  }
+}
+
+/**
+ * 今日财经日历 (本地静态规则) - 基于公开统计规律, 不预测实际事件
+ * 同 data.js _fetchEconomicCalendar 的规则集, 只取"今天"这一天:
+ *   - LPR 报价: 每月 20 号 (央行公开)
+ *   - MLF 续作/到期: 每月 15 号 (央行公开)
+ *   - PMI: 每月最后一天 (统计局公开)
+ *   - CPI/PPI: 每月 10-12 号 (统计局公开, 估计窗口)
+ *   - 季报披露密集期: 1/4/7/10 月下旬 (交易所规则)
+ * 没有命中事件 → 返 [] (调用方输出"今日无已知日历事件", 不编造)
+ */
+function buildEconomicCalendar(now = new Date()) {
+  const d = now instanceof Date ? now : new Date(now);
+  if (isNaN(d.getTime())) return [];
+  const day = d.getDate();
+  const month = d.getMonth() + 1;
+  const md = `${month}-${day}`;
+  const events = [];
+  if (day === 20) events.push(`${md} LPR 报价 (1Y/5Y)`);
+  if (day === 15) events.push(`${md} MLF 续作/到期`);
+  const lastDay = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+  if (day === lastDay) events.push(`${md} 官方 PMI 公布`);
+  if (day >= 10 && day <= 12) events.push(`${md} CPI / PPI 同比 (估计窗口)`);
+  if ([1, 4, 7, 10].includes(month) && day >= 20 && day <= 30) {
+    events.push(`${md} 季报披露密集期 (年报/一季报/中报/三季报)`);
+  }
+  return events;
+}
+
+/**
+ * 财新要闻
+ * aktools: stock_news_main_cx (同 news.js _fetchCaixin) → 字段 (tag/summary/url)
+ * 失败返 null (调用方降级 "本节数据不可用")
+ */
+async function fetchCaixinNews(limit = 10) {
+  try {
+    const url = `${AKTOOLS}/api/public/stock_news_main_cx`;
+    const resp = await fetch(url, { timeout: 10000 });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    if (!Array.isArray(data)) return null;
+    const items = data.slice(0, limit).map(d => ({
+      tag: d.tag || '',
+      summary: d.summary || '',
+      url: d.url || ''
+    })).filter(x => x.summary);
+    return items.length > 0 ? items : null;
+  } catch (e) {
+    err('财新要闻拉取失败:', e.message);
+    return null;
+  }
+}
+
+/**
+ * 原始数据罗列版 (LLM 失败时的降级输出, 保证不推送失败)
+ * data = { date, us, calendar, news } (us/news 可能为 null)
+ */
+function formatPremarketRaw(data) {
+  const lines = [`🌅 盘前简报 ${data.date}`, ''];
+  lines.push('【隔夜外盘】');
+  if (data.us && data.us.length > 0) {
+    for (const it of data.us) {
+      const pct = it.changePct === null ? 'N/A' : `${it.changePct > 0 ? '+' : ''}${it.changePct.toFixed(2)}%`;
+      lines.push(`- ${it.name}: ${it.price} (${pct})`);
+    }
+  } else {
+    lines.push('- 本节数据不可用');
+  }
+  lines.push('');
+  lines.push('【今日财经日历】');
+  if (data.calendar && data.calendar.length > 0) {
+    for (const ev of data.calendar) lines.push(`- ${ev}`);
+  } else {
+    lines.push('- 今日无已知日历事件 (仅含公开日期规则: LPR/MLF/PMI/CPI/季报密集期)');
+  }
+  lines.push('');
+  lines.push('【财新要闻】');
+  if (data.news && data.news.length > 0) {
+    data.news.forEach((n, i) => lines.push(`- [${i + 1}] [${n.tag}] ${n.summary}`));
+  } else {
+    lines.push('- 本节数据不可用');
+  }
+  return lines.join('\n');
+}
+
+/**
+ * 拼盘前简报 prompt (≤300 字, 保守严谨, 不预测不推荐)
+ */
+function buildPremarketPrompt(data) {
+  const systemPrompt = `你是一个严谨的 A 股个人投资助理, 任务是基于提供的盘前数据生成一段"盘前简报"。规则:
+1. 严禁编造数据, 只能引用下方提供的数字和新闻标题
+2. 保守严谨, 不预测涨跌, 不推荐买卖
+3. ≤ 300 字, 3 段结构:
+   - 隔夜外盘: 1-2 句
+   - 今日日历: 1 句 (无事件就说无)
+   - 要闻提要: 挑 2-3 条最重要的, 各 1 句
+4. 某节标注"本节数据不可用"时如实说明, 不要编造
+5. 纯文本, 不用 markdown 标题`;
+
+  const userPrompt = `日期: ${data.date}
+
+${formatPremarketRaw(data)}
+
+请生成盘前简报 (≤300 字, 不含上面的 emoji 小标题格式, 直接行文)。`;
+  return { systemPrompt, userPrompt };
+}
+
+/**
+ * 盘前简报主流程
+ * 三块数据独立拉取, 单块失败降级 "本节数据不可用", 不中断整体;
+ * LLM 失败降级推送原始数据罗列版 (不推送失败)
+ * @param {object} [deps] 注入依赖便于测试: { now, fetchUs, fetchNews, callLLM, pushFeishu }
+ */
+async function runPremarket(deps = {}) {
+  const now = deps.now || new Date();
+  const fetchUs = deps.fetchUs || fetchUsIndices;
+  const fetchNews = deps.fetchNews || fetchCaixinNews;
+  const llmCaller = deps.callLLM || callLLM;
+  const pusher = deps.pushFeishu || pushFeishu;
+
+  const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  log('生成盘前简报:', date);
+
+  // 1) 三块独立拉取 (日历是本地纯函数, 不会失败)
+  const [us, news] = await Promise.all([
+    Promise.resolve().then(() => fetchUs()).catch(e => { err('外盘异常:', e.message); return null; }),
+    Promise.resolve().then(() => fetchNews()).catch(e => { err('要闻异常:', e.message); return null; })
+  ]);
+  const calendar = buildEconomicCalendar(now);
+  const data = { date, us, calendar, news };
+  log(`外盘: ${us ? us.length + ' 条' : '不可用'} / 日历: ${calendar.length} 条 / 要闻: ${news ? news.length + ' 条' : '不可用'}`);
+
+  // 2) LLM 生成简报, 失败降级原始罗列
+  const { systemPrompt, userPrompt } = buildPremarketPrompt(data);
+  const summary = await llmCaller(userPrompt, systemPrompt);
+  if (!summary) log('LLM 未返回, 降级为原始数据罗列版');
+  const text = summary || formatPremarketRaw(data);
+
+  // 3) 推飞书 (未配置 FEISHU_WEBHOOK 时 pushFeishu 自己打印到 stdout)
+  await pusher(text);
+  log('✅ 盘前简报完成');
+  return { data, summary, text };
 }
 
 // ==================== 事后验证 (5.2 c) ====================
@@ -351,6 +548,11 @@ async function main() {
     return runVerify(args.journalsPath, args.dryRun);
   }
 
+  // Phase C: --premarket 盘前简报模式
+  if (args.mode === 'premarket') {
+    return runPremarket();
+  }
+
   // 盘后总结模式 (原逻辑)
   const { snapshotPath } = args;
 
@@ -468,8 +670,8 @@ ${summary || '⚠ LLM 未调用 (检查 DEEPSEEK_API_KEY)'}
   log('✅ 全部完成');
 }
 
-// 仅当直接执行时跑
-if (import.meta.url === `file://${process.argv[1]}`) {
+// 仅当直接执行时跑 (Windows 下 argv[1] 是反斜杠路径, 用 pathToFileURL 归一化再比较)
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   main().catch(e => {
     err('未捕获错误:', e);
     process.exit(1);
@@ -487,5 +689,11 @@ export {
   buildVerifyPrompt,
   applyVerifyReport,
   runVerify,
+  fetchUsIndices,
+  buildEconomicCalendar,
+  fetchCaixinNews,
+  formatPremarketRaw,
+  buildPremarketPrompt,
+  runPremarket,
   main
 };

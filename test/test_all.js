@@ -56,7 +56,7 @@ section('2] 域脚本接口完备性');
 const DOMAINS = {
   'Watchlist': ['init', 'render', 'addDialog', 'add', 'remove', 'showKLine', 'closeModal', 'closeKLine'],
   'Holdings':  ['init', 'render', 'addDialog', 'editDialog', 'save', 'remove', 'addTxDialog', 'saveTx', 'closeModal'],
-  'Paper':     ['init', 'buy', 'sell', 'getAccount', 'getPositions', 'resetAccount', 'snapshotIfNeeded', 'autoTradeFromPick', 'renderPage', 'buyFromForm', 'sellFromForm', 'sellAll', '_calcFee', '_roundLot', '_pushSnapshot', '_planAutoTrade'],
+  'Paper':     ['init', 'buy', 'sell', 'getAccount', 'getPositions', 'resetAccount', 'snapshotIfNeeded', 'autoTradeFromPick', 'renderPage', 'buyFromForm', 'sellFromForm', 'sellAll', '_calcFee', '_roundLot', '_pushSnapshot', '_planAutoTrade', 'maybeGenerateEodReport', '_shouldGenerateEod', '_pushEodReport', '_appendDisciplineLog', '_logDisciplineBlock', '_buildEodReport', '_formatEodReportText', '_pushEodToFeishu', '_renderEodReport'],
   'Journal':   ['init', 'render', 'newDialog', 'editDialog', 'save', 'remove', 'closeModal', '_buildHoldingsContext', '_renderHoldingBadge', '_renderStructuredTags', '_runAiAssistant'],
   'Screener':  ['init', 'run', '_addWatchlistFromPick'],
   'Fund':      ['init', 'render', 'addDialog', 'save', 'remove', 'showChart', 'closeModal'],
@@ -1638,6 +1638,69 @@ section('19] 5.2 c 事后验证 (daily_summary.mjs --verify)');
     try { fs.unlinkSync(tmpJournals2); } catch (e) {}
     try { fs.rmdirSync(tmpDir); } catch (e) {}
 
+    // ---- 19.6 Phase C 盘前简报 (--premarket) ----
+    const {
+      buildEconomicCalendar, buildPremarketPrompt, formatPremarketRaw, runPremarket
+    } = mod;
+
+    // parseArgs 识别 --premarket
+    process.argv = ['node', 'daily_summary.mjs', '--premarket'];
+    const a4 = parseArgs();
+    if (a4.mode === 'premarket') ok('parseArgs: --premarket 模式');
+    else fail('parseArgs premarket', JSON.stringify(a4));
+    process.argv = origArgv;
+
+    // buildEconomicCalendar: 公开日期规则
+    const cal1 = buildEconomicCalendar(new Date(2026, 6, 20));  // 7-20: LPR + 季报密集期
+    if (cal1.some(e => e.includes('LPR')) && cal1.some(e => e.includes('季报'))) ok('calendar: 7-20 → LPR + 季报密集期');
+    else fail('calendar 7-20', JSON.stringify(cal1));
+    const cal2 = buildEconomicCalendar(new Date(2026, 1, 5));   // 2-5: 无事件
+    if (Array.isArray(cal2) && cal2.length === 0) ok('calendar: 2-5 → 无事件 (不编造)');
+    else fail('calendar 2-5', JSON.stringify(cal2));
+    const cal3 = buildEconomicCalendar(new Date(2026, 3, 30));  // 4-30: 月末 PMI
+    if (cal3.some(e => e.includes('PMI'))) ok('calendar: 4-30 → PMI');
+    else fail('calendar 4-30', JSON.stringify(cal3));
+
+    // runPremarket: LLM 失败 → 降级原始数据罗列版
+    let pushedText = null;
+    const pm1 = await runPremarket({
+      now: new Date(2026, 6, 27),
+      fetchUs: async () => [{ name: '道琼斯', price: 44000, changePct: 1.2, date: '2026-07-24' }],
+      fetchNews: async () => [{ tag: '要闻', summary: '央行开展逆回购操作', url: '' }],
+      callLLM: async () => null,
+      pushFeishu: async (text) => { pushedText = text; return true; }
+    });
+    if (pm1.summary === null && pm1.text.includes('隔夜外盘') && pm1.text.includes('道琼斯')
+      && pm1.text.includes('央行开展逆回购操作')) ok('premarket: LLM 失败 → 原始罗列版');
+    else fail('premarket LLM 降级', pm1.text.slice(0, 200));
+    if (pushedText === pm1.text) ok('premarket: 降级版照样推送 (不推送失败)');
+    else fail('premarket 推送', '');
+
+    // runPremarket: 数据块失败独立降级 "本节数据不可用", 不中断整体
+    let pushedText2 = null;
+    const pm2 = await runPremarket({
+      now: new Date(2026, 6, 27),
+      fetchUs: async () => { throw new Error('aktools down'); },
+      fetchNews: async () => null,
+      callLLM: async () => 'AI 简报内容',
+      pushFeishu: async (text) => { pushedText2 = text; return true; }
+    });
+    if (pm2.data.us === null && pm2.data.news === null && pm2.summary === 'AI 简报内容') ok('premarket: 数据块失败不中断, LLM 正常走');
+    else fail('premarket 数据降级', JSON.stringify({ us: pm2.data.us, news: pm2.data.news }));
+    if (pushedText2 === 'AI 简报内容') ok('premarket: LLM 成功时推送 LLM 版');
+    else fail('premarket LLM 推送', pushedText2 && pushedText2.slice(0, 100));
+    const raw2 = formatPremarketRaw(pm2.data);
+    if (raw2.includes('本节数据不可用')) ok('premarket: 失败块降级文案 "本节数据不可用"');
+    else fail('premarket 降级文案', raw2.slice(0, 200));
+
+    // buildPremarketPrompt: 数据进 prompt + 降级文案进 prompt
+    const { systemPrompt: pmSys, userPrompt: pmUser } = buildPremarketPrompt(pm1.data);
+    if (pmSys.includes('300') && pmUser.includes('道琼斯') && pmUser.includes('央行开展逆回购操作')) ok('premarket prompt: 外盘/要闻进 userPrompt');
+    else fail('premarket prompt', pmUser.slice(0, 200));
+    const { userPrompt: pmUserErr } = buildPremarketPrompt(pm2.data);
+    if (pmUserErr.includes('本节数据不可用')) ok('premarket prompt: 不可用块如实进 prompt');
+    else fail('premarket prompt 降级', pmUserErr.slice(0, 200));
+
   } catch (e) {
     fail('5.2 c 事后验证', e.message + ' / ' + (e.stack || ''));
   }
@@ -2357,7 +2420,9 @@ section('23] Paper 模拟盘纯函数实测');
           return m ? { code: m[1], name: String(t).slice(6).trim() } : null;
         },
         toastSuccess: () => {}, toastError: () => {}, toastWarning: () => {},
-        confirm: () => true
+        confirm: () => true,
+        // Phase C: EOD 飞书推送用 (测试里可覆盖 ctx.fetch 捕获 POST)
+        fetch: async () => ({ ok: true, json: async () => ({ code: 0 }) })
       };
       pctx.window.Core = {
         Storage: {
@@ -2529,6 +2594,117 @@ section('23] Paper 模拟盘纯函数实测');
     const accAuto = await P2.getAccount();
     if (Math.abs(accAuto.cash - (100000 - 10005)) < 0.01) ok(`autoTradeFromPick: 现金扣 10005 (=10000+费5)`);
     else fail('autoTradeFromPick 现金', JSON.stringify(accAuto));
+
+    // autoTradeFromPick 成交后交易行带 auto 标记 (Phase C)
+    const txAuto = (store2.tables.transactions || []).filter(t => t.isPaper && t.auto === true);
+    if (txAuto.length === 1) ok('autoTradeFromPick: 交易行带 auto=true 标记');
+    else fail('auto 标记', JSON.stringify(store2.tables.transactions));
+
+    // ---- Phase C: EOD 日终小结 ----
+    // _shouldGenerateEod 纯函数: 工作日 ≥15:30 且今日无记录 (fmtDate mock 恒返 '2026-07-27', 2026-07-27 是周一)
+    if (Paper._shouldGenerateEod(new Date(2026, 6, 27, 16, 0), []) === true) ok('eod: 周一 16:00 无记录 → 生成');
+    else fail('eod 应生成', '');
+    if (Paper._shouldGenerateEod(new Date(2026, 6, 27, 15, 29), []) === false
+      && Paper._shouldGenerateEod(new Date(2026, 6, 27, 10, 0), []) === false) ok('eod: 15:30 前不生成');
+    else fail('eod 15:30 前', '');
+    if (Paper._shouldGenerateEod(new Date(2026, 6, 25, 16, 0), []) === false
+      && Paper._shouldGenerateEod(new Date(2026, 6, 26, 16, 0), []) === false) ok('eod: 周末不生成');
+    else fail('eod 周末', '');
+    if (Paper._shouldGenerateEod(new Date(2026, 6, 27, 16, 0), [{ date: '2026-07-27' }]) === false) ok('eod: 当日已存在不重复生成');
+    else fail('eod 去重', '');
+    if (Paper._shouldGenerateEod('not-a-date', []) === false) ok('eod: 非法时间不生成');
+    else fail('eod 非法时间', '');
+
+    // _pushEodReport: 同日去重 + 上限 60
+    let eodList = Paper._pushEodReport([], { date: '2026-07-27', totalAssets: 1 });
+    eodList = Paper._pushEodReport(eodList, { date: '2026-07-27', totalAssets: 2 });
+    if (eodList.length === 1 && eodList[0].totalAssets === 1) ok('eod: push 同日去重');
+    else fail('eod push 去重', JSON.stringify(eodList));
+    let eodBig = [];
+    for (let i = 0; i < 70; i++) eodBig = Paper._pushEodReport(eodBig, { date: `2026-e${String(i).padStart(3, '0')}` });
+    if (eodBig.length === 60 && eodBig[0].date === '2026-e010') ok('eod: 上限 60 条滚动截断');
+    else fail('eod 上限', `${eodBig.length}`);
+
+    // _appendDisciplineLog: 上限 100
+    let dlBig = [];
+    for (let i = 0; i < 110; i++) dlBig = Paper._appendDisciplineLog(dlBig, { date: '2026-07-27', code: `c${i}`, reasons: ['r'] });
+    if (dlBig.length === 100 && dlBig[0].code === 'c10') ok('eod: 纪律日志上限 100 条滚动截断');
+    else fail('eod 纪律日志上限', `${dlBig.length}`);
+
+    // maybeGenerateEodReport 集成: 内容聚合正确
+    const store3 = {
+      kv: {
+        paper_account: { initialCash: 100000, cash: 80000, createdAt: 1, positionPct: 0.10 },
+        paper_snapshots: [{ date: '2026-07-24', paperTotal: 99000, realTotal: 0, csi300: 3900 }],
+        paper_discipline_log: [
+          { date: '2026-07-27', code: '000002', reasons: ['单票仓位超限'] },
+          { date: '2026-07-26', code: '000003', reasons: ['昨天的不算'] }
+        ],
+        paper_eod_reports: []
+      },
+      tables: {
+        holdings: [{ id: 'ph1', code: '600519', name: '贵州茅台', shares: 100, costPrice: 10, isPaper: true }],
+        transactions: [
+          { id: 'pt1', code: '600519', type: 'buy', date: '2026-07-27', price: 10, shares: 100, fee: 5, isPaper: true, auto: true, createdAt: 1 },
+          { id: 'pt2', code: '600519', type: 'sell', date: '2026-07-27', price: 12, shares: 100, fee: 5.6, isPaper: true, createdAt: 2 },
+          { id: 'pt3', code: '000001', type: 'buy', date: '2026-07-26', price: 13, shares: 100, fee: 5, isPaper: true, createdAt: 0 },
+          { id: 'pt4', code: '000001', type: 'buy', date: '2026-07-27', price: 13, shares: 100, fee: 5, createdAt: 3 }
+        ]
+      },
+      quotes: { '600519': { 代码: '600519', 名称: '贵州茅台', 最新价: 12 } },
+      indexSpot: []
+    };
+    const ctx3 = buildCtx(store3);
+    const P3 = ctx3.window.Paper;
+    const eod1 = await P3.maybeGenerateEodReport(new Date(2026, 6, 27, 16, 0));
+    if (eod1 && eod1.date === '2026-07-27') ok('eod: 16:00 生成报告');
+    else fail('eod 生成', JSON.stringify(eod1));
+    if (eod1 && eod1.cash === 80000 && eod1.mktValue === 1200 && eod1.totalAssets === 81200) ok('eod: 现金/市值/总资产聚合 (100 股 × 12 = 1200)');
+    else fail('eod 资产聚合', JSON.stringify(eod1));
+    if (eod1 && eod1.dayPnl === -17800 && eod1.prevDate === '2026-07-24') ok('eod: 当日盈亏 -17800 (对照 07-24 快照 99000)');
+    else fail('eod 当日盈亏', JSON.stringify({ dayPnl: eod1 && eod1.dayPnl, prevDate: eod1 && eod1.prevDate }));
+    if (eod1 && eod1.trades.length === 2 && eod1.trades[0].auto === true && eod1.trades[1].auto === false) ok('eod: 当日成交 2 笔 (排除昨天/真实盘), AI 成交标 🤖');
+    else fail('eod 成交聚合', JSON.stringify(eod1 && eod1.trades));
+    if (eod1 && eod1.discipline.length === 1 && eod1.discipline[0].code === '000002') ok('eod: 纪律拦截只取当日 1 笔');
+    else fail('eod 纪律拦截', JSON.stringify(eod1 && eod1.discipline));
+    if (eod1 && eod1.top && eod1.top.code === '600519' && Math.abs(eod1.top.plPct - 0.2) < 1e-9 && eod1.bottom === null) ok('eod: 持仓 Top +20% (单持仓 Bottom 省略)');
+    else fail('eod top/bottom', JSON.stringify({ top: eod1 && eod1.top, bottom: eod1 && eod1.bottom }));
+    if (store3.kv.paper_eod_reports.length === 1) ok('eod: 写 kv paper_eod_reports');
+    else fail('eod 写 kv', JSON.stringify(store3.kv.paper_eod_reports));
+
+    // 重复调用不重复生成
+    const eodDup = await P3.maybeGenerateEodReport(new Date(2026, 6, 27, 17, 0));
+    if (eodDup === null && store3.kv.paper_eod_reports.length === 1) ok('eod: 当日已有 → 不重复生成');
+    else fail('eod 重复', JSON.stringify(eodDup));
+
+    // 15:30 前不生成 (空记录也不写)
+    const store4 = { kv: { paper_account: { initialCash: 100000, cash: 100000, createdAt: 1, positionPct: 0.10 }, paper_eod_reports: [] }, tables: {}, quotes: {}, indexSpot: [] };
+    const ctx4 = buildCtx(store4);
+    const P4 = ctx4.window.Paper;
+    const eodEarly = await P4.maybeGenerateEodReport(new Date(2026, 6, 27, 10, 0));
+    if (eodEarly === null && store4.kv.paper_eod_reports.length === 0) ok('eod: 15:30 前 maybeGenerate 返回 null 不写 kv');
+    else fail('eod 早间', JSON.stringify(eodEarly));
+
+    // 飞书推送: kv feishu_webhook 配置后 POST msg_type=text, 文本含 🤖 标注
+    let feishuPosts = [];
+    store3.kv.feishu_webhook = 'https://open.feishu.cn/test-hook';
+    store3.kv.paper_eod_reports = [];
+    ctx3.fetch = async (url, opts) => {
+      feishuPosts.push({ url, body: JSON.parse(opts.body) });
+      return { ok: true, json: async () => ({ code: 0 }) };
+    };
+    const eod2 = await P3.maybeGenerateEodReport(new Date(2026, 6, 27, 16, 30));
+    if (eod2 && feishuPosts.length === 1 && feishuPosts[0].url === 'https://open.feishu.cn/test-hook'
+      && feishuPosts[0].body.msg_type === 'text' && feishuPosts[0].body.content.text.includes('日终小结')
+      && feishuPosts[0].body.content.text.includes('🤖')) ok('eod: 飞书推送 msg_type=text + 🤖 标注');
+    else fail('eod 飞书', JSON.stringify(feishuPosts));
+
+    // 飞书推送失败 (CORS/网络) 不影响报告生成
+    store3.kv.paper_eod_reports = [];
+    ctx3.fetch = async () => { throw new Error('CORS blocked'); };
+    const eod3 = await P3.maybeGenerateEodReport(new Date(2026, 6, 27, 16, 45));
+    if (eod3 && store3.kv.paper_eod_reports.length === 1) ok('eod: 飞书失败只 warn, 报告照常生成');
+    else fail('eod 飞书失败降级', JSON.stringify(eod3));
 
   } catch (e) {
     fail('Paper 模拟盘', e.message + ' / ' + (e.stack || ''));

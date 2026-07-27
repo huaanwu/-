@@ -11,6 +11,9 @@
  *   - A股整手: 买入股数向下取整到 100 的倍数
  *   - 隔离: 真实视图 (holdings/account/journal/app.js) 读取时 .filter(h => !h.isPaper)
  *   - Phase B: 手动/AI 自动买入前走 Core.Discipline.preBuyCheck (isPaper=true, 模拟口径独立锚定)
+ *   - Phase C: 日终小结 (kv paper_eod_reports, 上限 60 条): 工作日 15:30 后自动生成
+ *     (app 启动 + 页面展示时检查); 纪律拦截日志 kv paper_discipline_log (上限 100 条);
+ *     kv feishu_webhook 配置后自动推送飞书
  */
 (function() {
   'use strict';
@@ -20,6 +23,9 @@
   const STAMP_TAX_RATE = 0.0005;       // 印花税万五 (仅卖出)
   const LOT_SIZE = 100;                // A股一手
   const SNAPSHOT_LIMIT = 365;          // 快照上限
+  const EOD_LIMIT = 60;                // 日终小结上限 (kv paper_eod_reports)
+  const DISCIPLINE_LOG_LIMIT = 100;    // 纪律拦截日志上限 (kv paper_discipline_log)
+  const EOD_MINUTES = 15 * 60 + 30;    // 日终小结生成时间: 工作日 15:30 后
   const DEFAULT_CASH = 100000;         // 默认初始虚拟资金
   const DEFAULT_POSITION_PCT = 0.10;   // AI 自动成交单次仓位比例
 
@@ -88,6 +94,38 @@
       return null;
     },
 
+    // ---- Phase C: 日终小结 (EOD) 纯函数 ----
+
+    /**
+     * 是否该生成日终小结: 工作日 (周一至周五) 且 ≥15:30 且今日无记录
+     * 纯函数, 时间/已有记录都注入 (节假日判断本期不做, 周末硬排除)
+     * @param {Date|number|string} now
+     * @param {Array} existing kv paper_eod_reports 当前值
+     */
+    _shouldGenerateEod(now, existing) {
+      const d = now instanceof Date ? now : new Date(now);
+      if (isNaN(d.getTime())) return false;
+      const wd = d.getDay();
+      if (wd === 0 || wd === 6) return false;  // 周末
+      if (d.getHours() * 60 + d.getMinutes() < EOD_MINUTES) return false;  // 15:30 前
+      const today = fmtDate(d);
+      return !(Array.isArray(existing) && existing.some(r => r && r.date === today));
+    },
+
+    /** 日终小结 append: 同日去重, 上限 EOD_LIMIT 条 (滚动截断最旧), 纯函数 */
+    _pushEodReport(list, entry) {
+      const arr = Array.isArray(list) ? [...list] : [];
+      if (entry && entry.date && !arr.some(r => r.date === entry.date)) arr.push(entry);
+      return arr.slice(-EOD_LIMIT);
+    },
+
+    /** 纪律拦截日志 append: 上限 DISCIPLINE_LOG_LIMIT 条, 纯函数 */
+    _appendDisciplineLog(list, entry) {
+      const arr = Array.isArray(list) ? [...list] : [];
+      if (entry && entry.code) arr.push(entry);
+      return arr.slice(-DISCIPLINE_LOG_LIMIT);
+    },
+
     // ========== 账户与持仓 ==========
 
     /** 模拟账户 (kv 'paper_account', 不存在时返回默认值) */
@@ -142,8 +180,9 @@
      * @param {string} name 名称 (可空)
      * @param {string} market sh/sz (可空, 自动按代码前缀推导)
      * @param {number} shares 股数 (自动向下取整到整手)
-     * @param {{ assumption?: string, stopLoss?: number, disciplineWarns?: string[] }} [opts]
-     *        Phase B 纪律信息: 非索引字段, 写到 holdings/transactions 行上 (不改 schema)
+     * @param {{ assumption?: string, stopLoss?: number, disciplineWarns?: string[], auto?: boolean }} [opts]
+     *        Phase B 纪律信息: 非索引字段, 写到 holdings/transactions 行上 (不改 schema);
+     *        auto=true 标记 AI 自动成交 (Phase C 日终小结 🤖 标注用)
      * @returns 持仓行 | null (失败 toast + 返回 null)
      */
     async buy(code, name, market, shares, opts = {}) {
@@ -201,6 +240,7 @@
         if (opts.assumption) tx.assumption = opts.assumption;
         if (opts.stopLoss) tx.stopLoss = opts.stopLoss;
         if (opts.disciplineWarns && opts.disciplineWarns.length) tx.disciplineWarns = opts.disciplineWarns;
+        if (opts.auto) tx.auto = true;  // Phase C: AI 自动成交标记 (日终小结 🤖)
         await Core.Storage.add('transactions', tx);
         acc.cash = +(acc.cash - amount - fee.total).toFixed(2);
         await Core.Storage.kvSet('paper_account', acc);
@@ -365,16 +405,232 @@
           });
           if (!chk.ok) {
             console.warn(`[Paper] 自动成交被纪律引擎拦截 ${pick.code}:`, chk.blocks.join('；'));
+            // Phase C: 拦截写 kv paper_discipline_log, 日终小结回溯用 (console.warn 无法回溯)
+            await this._logDisciplineBlock(pick.code, chk.blocks);
             return null;
           }
           return await this.buy(pick.code, pick.name || '', pick.market || '', shares,
-            { assumption, stopLoss, disciplineWarns: chk.warns });
+            { assumption, stopLoss, disciplineWarns: chk.warns, auto: true });
         }
-        return await this.buy(pick.code, pick.name || '', pick.market || '', shares);
+        return await this.buy(pick.code, pick.name || '', pick.market || '', shares, { auto: true });
       } catch (e) {
         console.warn('[Paper] 自动成交失败:', e);
         return null;
       }
+    },
+
+    // ========== Phase C: 日终小结 (EOD) ==========
+
+    /**
+     * 纪律拦截日志: AI 自动成交被 blocks 跳过时 append kv paper_discipline_log
+     * { date, code, reasons }, 上限 100 条; 写失败只 warn 不影响交易流程
+     */
+    async _logDisciplineBlock(code, reasons) {
+      try {
+        const log = (await Core.Storage.kvGet('paper_discipline_log')) || [];
+        const next = this._appendDisciplineLog(log, {
+          date: fmtDate(new Date()),
+          code,
+          reasons: Array.isArray(reasons) ? reasons : [String(reasons)]
+        });
+        await Core.Storage.kvSet('paper_discipline_log', next);
+      } catch (e) {
+        console.warn('[Paper] 纪律拦截日志写入失败:', e);
+      }
+    },
+
+    /**
+     * 日终小结入口: app 启动 (init 后不 await) + 模拟盘页面展示时调用
+     * 条件: 工作日 且 ≥15:30 且 kv paper_eod_reports 无今日记录 (_shouldGenerateEod)
+     * 生成失败只 warn 返回 null, 不 throw 不阻塞启动/页面
+     * @param {Date} [now] 可注入 (测试用)
+     * @returns 报告对象 | null
+     */
+    async maybeGenerateEodReport(now = new Date()) {
+      try {
+        const reports = (await Core.Storage.kvGet('paper_eod_reports')) || [];
+        if (!this._shouldGenerateEod(now, reports)) return null;
+        const report = await this._buildEodReport(now);
+        await Core.Storage.kvSet('paper_eod_reports', this._pushEodReport(reports, report));
+        // 飞书推送 (kv feishu_webhook 已配置才推; 失败只 warn 不影响功能)
+        await this._pushEodToFeishu(report);
+        return report;
+      } catch (e) {
+        console.warn('[Paper] 日终小结生成失败:', e);
+        return null;
+      }
+    },
+
+    /**
+     * 汇总当日小结数据 (纯数据, 不调 LLM):
+     *   现金/持仓市值/总资产/当日盈亏 (对照昨日快照) + 当日成交 (🤖=AI 自动) + 纪律拦截 + 持仓盈亏 Top/Bottom
+     */
+    async _buildEodReport(now) {
+      const today = fmtDate(now);
+      const acc = await this.getAccount();
+      const positions = await this.getPositions();
+      const mktValue = +(positions.reduce((s, p) => s + (p.mkt || 0), 0)).toFixed(2);
+      const totalAssets = +(acc.cash + mktValue).toFixed(2);
+
+      // 当日盈亏 = 当前总资产 - 最近一条早于今日的快照 paperTotal (无快照则 null)
+      const snaps = (await Core.Storage.kvGet('paper_snapshots')) || [];
+      const prev = [...snaps].reverse().find(s => s.date && s.date < today) || null;
+      const dayPnl = prev && typeof prev.paperTotal === 'number'
+        ? +(totalAssets - prev.paperTotal).toFixed(2)
+        : null;
+
+      // 当日成交 (isPaper 且 date=今天; AI 自动成交: auto 标记, 兼容旧数据用 assumption='题材催化' 推断)
+      const allTx = (await Core.Storage.all('transactions')) || [];
+      const trades = allTx
+        .filter(t => t.isPaper && t.date === today)
+        .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))
+        .map(t => ({
+          type: t.type, code: t.code,
+          price: t.price, shares: t.shares, fee: t.fee,
+          auto: t.auto === true || t.assumption === '题材催化'
+        }));
+
+      // 当日纪律拦截 (kv paper_discipline_log 里今天的部分)
+      const dlog = (await Core.Storage.kvGet('paper_discipline_log')) || [];
+      const discipline = dlog.filter(x => x && x.date === today);
+
+      // 持仓盈亏 Top/Bottom 各 1 (按 plPct; 只有 1 只持仓时 Bottom 省略)
+      const sorted = positions.filter(p => p.plPct !== null).sort((a, b) => b.plPct - a.plPct);
+      const pickPl = p => p ? { code: p.code, name: p.name || '', pl: +p.pl.toFixed(2), plPct: p.plPct } : null;
+      const top = pickPl(sorted[0]);
+      const bottom = sorted.length > 1 ? pickPl(sorted[sorted.length - 1]) : null;
+
+      return {
+        date: today,
+        generatedAt: Date.now(),
+        cash: +acc.cash.toFixed(2),
+        mktValue,
+        totalAssets,
+        prevDate: prev ? prev.date : null,
+        dayPnl,
+        trades,
+        discipline,
+        top,
+        bottom
+      };
+    },
+
+    /** 小结纯文本版 (飞书推送用) */
+    _formatEodReportText(report) {
+      const L = [`📋 模拟盘日终小结 ${report.date}`];
+      L.push(`💵 现金 ${report.cash} | 📊 持仓市值 ${report.mktValue} | 💰 总资产 ${report.totalAssets}`);
+      L.push(report.dayPnl !== null
+        ? `📈 当日盈亏 ${report.dayPnl >= 0 ? '+' : ''}${report.dayPnl} (对照 ${report.prevDate} 快照)`
+        : '📈 当日盈亏: 无昨日快照可对照');
+      if (report.trades.length > 0) {
+        L.push(`💸 当日成交 ${report.trades.length} 笔:`);
+        for (const t of report.trades) {
+          L.push(`  ${t.auto ? '🤖 ' : ''}${t.type === 'buy' ? '买入' : '卖出'} ${t.code} @${t.price} ×${t.shares} 费${t.fee}`);
+        }
+      } else {
+        L.push('💸 当日无成交');
+      }
+      if (report.discipline.length > 0) {
+        L.push(`🛡 纪律拦截 ${report.discipline.length} 笔:`);
+        for (const d of report.discipline) {
+          L.push(`  ${d.code}: ${(d.reasons || []).join('；')}`);
+        }
+      }
+      if (report.top) L.push(`🏆 最佳持仓 ${report.top.code} ${report.top.name} ${(report.top.plPct * 100).toFixed(2)}%`);
+      if (report.bottom) L.push(`📉 最差持仓 ${report.bottom.code} ${report.bottom.name} ${(report.bottom.plPct * 100).toFixed(2)}%`);
+      return L.join('\n');
+    },
+
+    /**
+     * 飞书推送小结: kv feishu_webhook 已配置才 POST
+     * CORS/网络失败 console.warn 返回 false, 不影响功能
+     */
+    async _pushEodToFeishu(report) {
+      let webhook = null;
+      try {
+        webhook = await Core.Storage.kvGet('feishu_webhook');
+      } catch (e) {
+        console.warn('[Paper] 读 feishu_webhook 失败:', e);
+      }
+      if (!webhook) return false;
+      try {
+        const resp = await fetch(webhook, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            msg_type: 'text',
+            content: { text: this._formatEodReportText(report) }
+          })
+        });
+        if (!resp.ok) {
+          console.warn('[Paper] 飞书推送 HTTP', resp.status);
+          return false;
+        }
+        return true;
+      } catch (e) {
+        console.warn('[Paper] 飞书推送失败 (CORS/网络):', e);
+        return false;
+      }
+    },
+
+    /** 模拟盘页面"日终小结"区块: 展示最近一条 + 飞书配置提示 */
+    async _renderEodReport() {
+      const el = document.getElementById('paperEod');
+      if (!el) return;
+      const hint = `<div style="margin-top:8px;font-size:11px;color:var(--text-muted);">配置飞书 webhook 可自动推送 (控制台执行 Core.Storage.kvSet('feishu_webhook','https://open.feishu.cn/...'))</div>`;
+      const reports = (await Core.Storage.kvGet('paper_eod_reports')) || [];
+      const r = reports[reports.length - 1];
+      if (!r) {
+        el.innerHTML = `
+          <div class="card-title">📋 日终小结</div>
+          <div class="empty" style="padding:16px;">工作日 15:30 后自动生成当日小结</div>
+          ${hint}
+        `;
+        return;
+      }
+      const tradesHtml = r.trades.length > 0
+        ? r.trades.map(t => `
+            <tr>
+              <td>${t.auto ? '🤖 ' : ''}${t.type === 'buy' ? '买入' : '卖出'}</td>
+              <td><span class="code">${escapeHtml(t.code)}</span></td>
+              <td>${fmtNum(t.price, 2)}</td>
+              <td>${fmtNum(t.shares, 0)}</td>
+              <td>${fmtMoney(t.fee)}</td>
+            </tr>
+          `).join('')
+        : '<tr><td colspan="5" style="color:var(--text-muted);">当日无成交</td></tr>';
+      const disciplineHtml = r.discipline.length > 0
+        ? `<div style="margin-top:8px;font-size:12px;">🛡 纪律拦截 ${r.discipline.length} 笔: ${r.discipline.map(d =>
+            `<span class="code">${escapeHtml(d.code)}</span> (${escapeHtml((d.reasons || []).join('；'))})`
+          ).join(' / ')}</div>`
+        : '';
+      const plHtml = (r.top || r.bottom)
+        ? `<div style="margin-top:8px;font-size:12px;">
+            ${r.top ? `🏆 最佳 <span class="code">${escapeHtml(r.top.code)}</span> ${escapeHtml(r.top.name)} <span class="${pctClass(r.top.plPct)}">${fmtPct(r.top.plPct)}</span>` : ''}
+            ${r.bottom ? `&nbsp;&nbsp;📉 最差 <span class="code">${escapeHtml(r.bottom.code)}</span> ${escapeHtml(r.bottom.name)} <span class="${pctClass(r.bottom.plPct)}">${fmtPct(r.bottom.plPct)}</span>` : ''}
+          </div>`
+        : '';
+      el.innerHTML = `
+        <div class="card-title">📋 日终小结 ${escapeHtml(r.date)}</div>
+        <div class="summary-cards" style="margin-top:8px;">
+          <div class="summary-card"><div class="label">💵 现金</div><div class="value">${fmtMoney(r.cash)}</div></div>
+          <div class="summary-card"><div class="label">📊 持仓市值</div><div class="value">${fmtMoney(r.mktValue)}</div></div>
+          <div class="summary-card"><div class="label">💰 总资产</div><div class="value">${fmtMoney(r.totalAssets)}</div></div>
+          <div class="summary-card">
+            <div class="label">📈 当日盈亏</div>
+            ${r.dayPnl !== null
+              ? `<div class="value ${pctClass(r.dayPnl)}">${fmtMoney(r.dayPnl)}</div><div class="delta" style="font-size:11px;color:var(--text-muted);">对照 ${escapeHtml(r.prevDate)} 快照</div>`
+              : `<div class="value">-</div><div class="delta" style="font-size:11px;color:var(--text-muted);">无昨日快照</div>`}
+          </div>
+        </div>
+        <table style="margin-top:8px;">
+          <thead><tr><th>成交</th><th>代码</th><th>价格</th><th>股数</th><th>费用</th></tr></thead>
+          <tbody>${tradesHtml}</tbody>
+        </table>
+        ${disciplineHtml}
+        ${plHtml}
+        ${hint}
+      `;
     },
 
     // ========== 页面 UI ==========
@@ -515,6 +771,12 @@
       }
 
       await this._renderChart();
+
+      // Phase C: 页面展示时也检查是否该生成日终小结 (工作日 15:30 后, 今日无记录才生成)
+      this.maybeGenerateEodReport()
+        .then(r => { if (r) this._renderEodReport(); })
+        .catch(e => console.warn('[Paper] EOD 检查失败:', e));
+      await this._renderEodReport();
     },
 
     _chart: null,

@@ -93,6 +93,10 @@ function updateMarketStatus() {
     if (window.Watchlist && Watchlist.init) Watchlist.init();
     if (window.Holdings && Holdings.init) Holdings.init();
     if (window.Paper && Paper.init) Paper.init();
+    // Phase C: 模拟盘日终小结 (异步, 不阻塞启动, 参照上面 Data.health 的写法)
+    if (window.Paper && Paper.maybeGenerateEodReport) {
+      Paper.maybeGenerateEodReport().catch(e => console.warn('[App] EOD 小结生成失败:', e));
+    }
     if (window.Journal && Journal.init) Journal.init();
     if (window.Screener && Screener.init) Screener.init();
     if (window.Fund && Fund.init) Fund.init();
