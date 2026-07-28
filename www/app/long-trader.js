@@ -286,6 +286,22 @@
           return `[${i}] ${code} ${name} | 涨跌幅=${chg}% | 换手=${turn}% | 市值=${mcapStr}${finPart}`;
         }).join('\n');
 
+        // SKL v1.4: 长线 sleeve 默认 trigger 全部 3 类方法论 (紫苏叶瓶颈 / NAV 折价 / 反共识)
+        // 让 LLM 同时看到产业链卡脖子、母子折价、大客户换供应商三种选股视角
+        let kbBlock = '';
+        try {
+          if (window.Core && Core.KB && Core.KB.pickRelevant) {
+            const kbPicks = await Core.KB.pickRelevant({
+              holdings: stocks.slice(0, 20).map(s => ({ name: s.名称, type: 'stock' })),
+              context: { skill: ['chokepoint', 'nav_discount', 'contrarian'] },
+              maxN: 4
+            });
+            if (kbPicks && kbPicks.length > 0) {
+              kbBlock = Core.KB.formatForPrompt(kbPicks);
+            }
+          }
+        } catch (e) { console.warn('[LongTrader] KB 注入失败:', e); }
+
         // H3 大盘状态机 (commit 6): 仅一行提示, 不影响 schema (只返 {code, name, reason})
         // 长线 sleeve 也没自动仓位系数 (acc.positionPct 是固定的), 只供 LLM 在趋势/下跌市收紧
         let regimeLine = '【大盘状态】默认震荡市';
@@ -310,6 +326,7 @@
           '\n- 避免选高负债率（> 70%）且 ROE < 5% 的（价值陷阱）' +
           '\n- 硬筛已排除: ROE < 5%、毛利率 < 10% 的股票' +
           '\n- 排除 ST/退市风险股' +
+          '\n' + (kbBlock || '') +
           '\n' + regimeLine +
           (poolText ? '\n- 【全系统学习池】' + poolText.replace(/\n/g, ' ').slice(0, 200) : '') +
           '\n- 输出严格 JSON, 不要其他文字';

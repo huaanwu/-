@@ -108,6 +108,21 @@
     // Tier 3B: reasonTag 6 类直接 trigger (screener/short-trader 注入 prompt 时附带)
     // Phase 5: volume_price 量价触发器
     if (context.volume_price) queries.push('量价', '放量', '缩量', '量比', '成交量');
+    // SKL v1.4: 长线 sleeve 选股方法论 trigger (白毛股神 + Stock-Analysis-Skill)
+    //   context.skill = ['chokepoint','nav_discount','contrarian'] 任一
+    //   → 触发对应 SKL-001~004 关键词进 queries
+    if (context.skill && Array.isArray(context.skill)) {
+      const SKILL_QUERY = {
+        chokepoint: ['chokepoint', '瓶颈', '不可替代', '产业链', '上游', '供应商', 'BOM', '紫苏叶'],
+        nav_discount: ['NAV', '折价', '母子', '子公司', '分拆', '维权', '激进投资者', '回购', '价值陷阱', '安全边际'],
+        contrarian: ['反共识', '坚守', '换供应商', '替换', '周期', '大客户', '传闻', '利空'],
+        nav_trap: ['NAV', '折价', '价值陷阱', '成长', '无成长', '治理']
+      };
+      for (const sk of context.skill) {
+        const qs = SKILL_QUERY[sk];
+        if (qs) queries.push(...qs);
+      }
+    }
     if (context.reasonTags && Array.isArray(context.reasonTags)) {
       const TAG_QUERY = {
         surge: ['涨幅异动', '涨停', '强势'],

@@ -11488,6 +11488,54 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
     else fail('92.5 概念拉取缺失', '');
   } catch (e) { fail('92.x Concept Board', e.message); }
 
+  // ===== 94.x: KB v1.4 SKL 注入 long-trader (白毛股神 + Stock-Analysis-Skill) =====
+  try {
+    const kbJson = fs.readFileSync(path.join(__dirname, '..', 'www', 'kb_data', 'investment_kb.json'), 'utf8');
+    const kbData = JSON.parse(kbJson);
+    // 94.1: investment_kb.json _meta.version = "1.4"
+    if (kbData._meta && kbData._meta.version === '1.4')
+      ok('94.1 KB _meta.version = 1.4');
+    else fail('94.1 KB version 应为 1.4', 'got: ' + (kbData._meta && kbData._meta.version));
+
+    // 94.2: 4 条 SKL 条目存在
+    const sklIds = ['SKL-001', 'SKL-002', 'SKL-003', 'SKL-004'];
+    const sklEntries = (kbData.entries || []).filter(e => sklIds.includes(e.id));
+    if (sklEntries.length === 4)
+      ok('94.2 SKL-001~004 共 4 条存在');
+    else fail('94.2 SKL 条目缺失', 'got: ' + sklEntries.length);
+
+    // 94.3: SKL-001 含 chokepoint 关键词
+    const skl1 = (kbData.entries || []).find(e => e.id === 'SKL-001');
+    if (skl1 && Array.isArray(skl1.keywords) && skl1.keywords.includes('chokepoint'))
+      ok('94.3 SKL-001 关键词含 chokepoint');
+    else fail('94.3 SKL-001 keywords 缺 chokepoint', '');
+
+    // 94.4: SKL-002 含 NAV 关键词
+    const skl2 = (kbData.entries || []).find(e => e.id === 'SKL-002');
+    if (skl2 && Array.isArray(skl2.keywords) && skl2.keywords.includes('NAV'))
+      ok('94.4 SKL-002 关键词含 NAV');
+    else fail('94.4 SKL-002 keywords 缺 NAV', '');
+
+    // 94.5: long-trader.js 含 skill trigger 调用
+    const lt94 = fs.readFileSync(path.join(__dirname, '..', 'www', 'app', 'long-trader.js'), 'utf8');
+    if (/Core\.KB\.pickRelevant/.test(lt94) && /context:\s*{\s*skill/.test(lt94))
+      ok('94.5 long-trader 注入 skill trigger');
+    else fail('94.5 long-trader 未注入 skill', '');
+
+    // 94.6: kb.js 含 SKILL_QUERY 表
+    const kbJs = fs.readFileSync(path.join(__dirname, '..', 'www', 'core', 'kb.js'), 'utf8');
+    if (/SKILL_QUERY/.test(kbJs) && /chokepoint/.test(kbJs) && /nav_discount/.test(kbJs) && /contrarian/.test(kbJs))
+      ok('94.6 kb.js 含 SKILL_QUERY 三类 trigger');
+    else fail('94.6 kb.js SKILL_QUERY 不全', '');
+
+    // 94.7: long-trader.js systemPrompt 含 kbBlock 拼接
+    if (/kbBlock/.test(lt94) && /formatForPrompt/.test(lt94))
+      ok('94.7 long-trader systemPrompt 拼接 kbBlock');
+    else fail('94.7 kbBlock 未进 systemPrompt', '');
+  } catch (e) { fail('94.x SKL 注入', e.message); }
+
+
+
 
 
 
