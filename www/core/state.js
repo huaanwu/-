@@ -16,6 +16,9 @@ const _isNative = (typeof window !== 'undefined'
   && typeof window.Capacitor.isNativePlatform === 'function'
   && window.Capacitor.isNativePlatform());
 
+  // V14: Electron 打包成 portable exe 后 UA 含有 Electron/
+  const _isElectron = (typeof navigator !== 'undefined' && /Electron\//.test(navigator.userAgent || ''));
+
   // V9: 标记 init() 完成后是否需要打"未配 LAN IP"的引导 toast
   //   供 app.js 在 Core.State.on('initComplete') 时读
   let _needProxyToast = false;
@@ -24,9 +27,10 @@ const _isNative = (typeof window !== 'undefined'
     currentPage: 'pageWatchlist',
     // proxyBase 启动时按平台 + kv 值自动填:
     //   - 浏览器 dev (vite) 无 kv → '/api/akshare' (走 vite proxy)
+    //   - Electron 无 kv → '/api/akshare' (走内置 HTTP 服务器 proxy → dev-proxy)
     //   - APK 无 kv → '' (空, 等用户在设置页点「🔍 找 PC 上的 dev-proxy」)
     //   - 有合法绝对 URL 的 kv → 直接信任, 任何 LAN IP / 域名 / 端口
-    proxyBase: _isNative ? '' : '/api/akshare',
+    proxyBase: (_isNative ? '' : '/api/akshare'),
     apiKeys: {
       tushare: ''                // 付费 Tushare token(可选)
     },

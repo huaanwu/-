@@ -93,6 +93,56 @@ async function _ensureAktools() {
   }
 }
 
+/** V14: 启动内置静态 HTTP 服务器 (避免 file:// fetch CORS 问题) */
+function _startStaticServer(port) {
+  const http = require('http');
+  const expressDir = path.join(RESOURCES, 'node_modules', 'express');
+  let staticDir;
+  if (IS_DEV) {
+    staticDir = path.join(ROOT, 'www');
+  } else {
+    staticDir = path.join(RESOURCES, 'www');
+  }
+  if (!fs.existsSync(staticDir)) {
+    process.stderr.write(`[static] www 目录不存在: ${staticDir}\n`);
+    return;
+  }
+  // 用 Node 内置 http + fs 做极简静态文件服务器 (不依赖 express, 打包体积小)
+  // 所有 /api/* 请求转发到 dev-proxy (localhost:8089)
+  const DEVO_PROXY_TARGET = 'http://127.0.0.1:8089';
+  const server = http.createServer((req, res) => {
+    // API 代理 (同源解决 CORS)
+    if (req.url.startsWith('/api/') || req.url === '/health') {
+      const options = {
+        hostname: '127.0.0.1',
+        port: 8089,
+        path: req.url,
+        method: req.method,
+        headers: { ...req.headers, host: '127.0.0.1:8089' }
+      };
+      const proxyReq = http.request(options, (proxyRes) => {
+        res.writeHead(proxyRes.statusCode, proxyRes.headers);
+        proxyRes.pipe(res);
+      });
+      proxyReq.on('error', (e) => { res.writeHead(502); res.end(JSON.stringify({ error: 'dev-proxy 不通', detail: e.message })); });
+      req.pipe(proxyReq);
+      return;
+    }
+    // 静态文件
+    let filePath = path.join(staticDir, req.url === '/' ? 'index.html' : req.url);
+    if (!fs.existsSync(filePath)) filePath = path.join(staticDir, 'index.html');  // SPA fallback
+    const ext = path.extname(filePath).toLowerCase();
+    const mime = { '.html': 'text/html', '.js': 'application/javascript', '.css': 'text/css', '.json': 'application/json', '.png': 'image/png', '.ico': 'image/x-icon', '.svg': 'image/svg+xml', '.webmanifest': 'application/manifest+json' };
+    res.writeHead(200, { 'Content-Type': mime[ext] || 'application/octet-stream' });
+    res.end(fs.readFileSync(filePath));
+  });
+  server.listen(port, '127.0.0.1', () => process.stdout.write(`[static] 静态文件服务器 → http://127.0.0.1:${port}/\n`));
+  server.on('error', (e) => process.stderr.write(`[static] 启动失败: ${e.message}\n`));
+  const cleanup = () => { try { server.close(); } catch (_) {} };
+  children.push({ kill: cleanup });
+  process.on('exit', cleanup);
+}
+
 async function startBackend() {
   // 0) 自动拉起 aktools (生产/开发 都一样)
   await _ensureAktools();
@@ -108,17 +158,17 @@ async function startBackend() {
     await waitForUrl('http://127.0.0.1:3003', 15000);
     await waitForUrl('http://127.0.0.1:8089/health', 5000).catch(() => null);
   } else {
-    // 生产模式: 启动 dev-proxy (用户需本机跑 aktools :8088, 否则前端会显示降级)
+    // 生产模式: 启动 dev-proxy (端口 8089, 已由 extraResources 打包进 exe)
     const proxyScript = path.join(RESOURCES, 'dev-proxy.mjs');
     if (fs.existsSync(proxyScript)) {
-      // 把 extraResources 里的 node_modules 加到 NODE_PATH, 让 dev-proxy 找得到 express
-      const proxyModules = path.join(RESOURCES, 'node_modules');
-      spawnChild('proxy', 'node',
-        [proxyScript],
-        RESOURCES,
-        '1');
+      spawnChild('proxy', 'node', [proxyScript], RESOURCES, '1');
       await waitForUrl('http://127.0.0.1:8089/health', 8000).catch(() => null);
     }
+    // V14: 启动内置静态文件服务器 (serve www/index.html), 避免 file:// fetch CORS
+    //     file:// 协议下 fetch(http://127.0.0.1:8089/api/...) 被同源策略阻止 (opaque origin)
+    //     改用 http://localhost:29037 加载页面, api 请求变成同源可代理
+    _startStaticServer(29037);
+    await waitForUrl('http://127.0.0.1:29037', 3000);
   }
 }
 
@@ -167,13 +217,7 @@ function createWindow() {
     mainWindow.loadURL('http://127.0.0.1:3003');
     mainWindow.webContents.openDevTools({ mode: 'detach' });
   } else {
-    if (fs.existsSync(indexPath)) {
-      mainWindow.loadFile(indexPath);
-    } else {
-      dialog.showErrorBox('StockMaster 启动失败', `找不到入口: ${indexPath}\n请先 npm run build, 然后用 electron-builder 打包`);
-      app.quit();
-      return;
-    }
+    mainWindow.loadURL('http://127.0.0.1:29037');  // V14: 走内置 HTTP 服务器, 避 CORS
   }
 
   // 外链走系统默认浏览器
