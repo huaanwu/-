@@ -36,3 +36,11 @@ dist/
 # 临时调试/绕开脚本 (bash 魔改、调试探针)
 __*.mjs
 run*.mjs
+
+# 调研期临时产物 (AKShare / aktools 接口文档 + 实测 JSON)
+akshare_*.html
+aktools_*.html
+aktools_*.json
+zygc_*.json
+zyjs_*.json
+yjyg_*.json

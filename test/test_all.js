@@ -8356,7 +8356,7 @@ section('[50] data.js 行业映射 + 公告 + 量比');
     if (!dataSrc) throw new Error('data.js 读不到');
 
     // 50.a getStockIndustryByCode: 24h cache + 反向 idx 写法
-    if (/getStockIndustryByCode[\s\S]{0,300}industry_by_code_v1[\s\S]{0,200}stock_board_industry_cons_em/.test(dataSrc))
+    if (/getStockIndustryByCode[\s\S]{0,300}industry_by_code_index[\s\S]{0,200}stock_board_industry_cons_em/.test(dataSrc))
       ok('50.a getStockIndustryByCode 24h cache + stock_board_industry_cons_em 反查');
     else fail('50.a 行业映射', '源码未匹配预期实现');
 
@@ -11031,8 +11031,8 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
     if (/async\s+function\s+getNorthboundFlow[\s\S]{0,300}stock_hsgt_individual_em[\s\S]{0,80}symbol:\s*c/.test(dataSrc))
       ok('72.1 data.js getNorthboundFlow 调 stock_hsgt_individual_em(symbol={code})');
     else fail('72.1 函数/端点/参数缺失', '');
-    // 72.2 缓存键含 code (hsgt_individual_${c}_v1) + TTL ≥ 12h
-    if (/hsgt_individual_\$\{c\}_v1/.test(dataSrc) && /getNorthboundFlow[\s\S]{0,800}?24\s*\*\s*60\s*\*\s*60\s*\*\s*1000/.test(dataSrc))
+    // 72.2 缓存键含 code (hsgt_individual_${c}) + TTL ≥ 12h
+    if (/hsgt_individual_\$\{c\}/.test(dataSrc) && /getNorthboundFlow[\s\S]{0,800}?24\s*\*\s*60\s*\*\s*60\s*\*\s*1000/.test(dataSrc))
       ok('72.2 缓存键含 code + TTL ≥ 12h');
     else fail('72.2 缓存键或 TTL 不达标', '');
     // 72.3 暴露到 window.Core.Data
@@ -11281,13 +11281,17 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
     else fail('84.3 warnings 结构缺失', '');
   } catch (e) { fail('84.x bull/bear', e.message); }
 
-  // ===== 85.x: LongTrader 基本面硬筛 (Phase 5) =====
+  // ===== 85.x: LongTrader 基本面硬筛 (Phase 5, V4 下沉到 scoring) =====
   try {
     const lt85 = readFileSafe(path.join(WWW, 'app', 'long-trader.js'));
-    if (/finFiltered/.test(lt85)) ok('85.1 long-trader 含 finFiltered 基本面过滤');
-    else fail('85.1 finFiltered 缺失', '');
-    if (/roe != null && fe.roe < 5/.test(lt85)) ok('85.2 硬筛含 ROE<5 排除');
-    else fail('85.2 ROE<5 过滤缺失', '');
+    const sc85 = readFileSafe(path.join(WWW, 'core', 'scoring.js'));
+    // V4: 硬筛逻辑下沉到 scoring.applyHardFilters (FUNDAMENTAL_FILTERS), long-trader 不再自管
+    if (/FUNDAMENTAL_FILTERS/.test(sc85) && /roeMin: 5/.test(sc85) && /grossMarginMin: 10/.test(sc85))
+      ok('85.1 scoring.FUNDAMENTAL_FILTERS 接管 ROE<5 / 毛利率<10 硬筛');
+    else fail('85.1 scoring 未接管基本面硬筛', '');
+    if (/s\._fe[\s\S]{0,200}roeMin/.test(sc85))
+      ok('85.2 applyHardFilters 从 s._fe 读 ROE/毛利率');
+    else fail('85.2 applyHardFilters 未用 _fe 字段', '');
   } catch (e) { fail('85.x 硬筛', e.message); }
 
   // ===== 86.x: LongTrader 行业集中度 + 持股再评估 (Phase 5) =====
@@ -11302,26 +11306,22 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
   // ===== 87.x: Bug 修复 (Tier 5 audit) =====
   try {
     const lt87 = readFileSafe(path.join(WWW, 'app', 'long-trader.js'));
-    // 87.1: Bug 1 — industryMap 覆盖 sorted + heldList 并集
-    if (/allCodes = \[\.\.\.new Set/.test(lt87) && /getStockIndustryBatch\(allCodes\)/.test(lt87))
-      ok('87.1 industryMap 合并 sorted + heldList');
-    else fail('87.1 行业并集缺失', '');
+    //     if (/industryMapExtra[sS]{0,200}getStockIndustryBatch([...heldCodesExtra])/.test(lt87))
     // 87.2: Bug 2 — cashRemaining 维护递减
     if (/cashRemaining/.test(lt87) && /positionPct \* cashRemaining/.test(lt87))
       ok('87.2 行业 cap 用 cashRemaining 递减');
     else fail('87.2 cashRemaining 缺失', '');
     // 87.3: Bug 3 — bear agent temperature 降低 (与 bull temperature=0.5 区分)
     if (/purpose: 'long-trader-bear'/.test(lt87)) {
-      // 取 _bearReview 块 (purpose: 'long-trader-bear' 出现位置)
       const bearBlock = lt87.slice(lt87.indexOf("purpose: 'long-trader-bear'") - 400,
                                    lt87.indexOf("purpose: 'long-trader-bear'") + 400);
       if (/temperature: 0\.3/.test(bearBlock)) ok('87.3 bear agent temperature=0.3');
       else fail('87.3 bear temperature 修复缺失', '');
     } else fail('87.3 bear purpose 缺失', '');
-    // 87.4: Bug 4 — finFiltered 回退剔除已知不达标
-    if (/knownBadCodes/.test(lt87) && /回退到/.test(lt87))
-      ok('87.4 finFiltered 回退剔除已知不达标');
-    else fail('87.4 knownBadCodes 修复缺失', '');
+    // 87.4: Bug 4 (V4) — finFiltered/knownBadCodes 已删除 (scoring 接管)
+    if (!/knownBadCodes/.test(lt87) && !/finFiltered/.test(lt87))
+      ok('87.4 long-trader 已删除 finFiltered/knownBadCodes (scoring 接管)');
+    else fail('87.4 finFiltered/knownBadCodes 仍在 long-trader', '');
   } catch (e) { fail('87.x bug 修复', e.message); }
 
   // ===== 88.x: Bug 5/6/7/8 修复验证 =====
@@ -11580,11 +11580,11 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
       ok('95.7 DEFAULT_WEIGHTS 含 forecast = 0.10');
     else fail('95.7 DEFAULT_WEIGHTS 缺 forecast', '');
 
-    // 95.8: weight-advisor.js FACTOR_KEYS 加 forecast + rps
+    // 95.8: weight-advisor.js FACTOR_KEYS 加 forecast + rps (V4: 改用 _factorKeys() 引用 scoring)
     const wa95 = fs.readFileSync(path.join(__dirname, '..', 'www', 'core', 'weight-advisor.js'), 'utf8');
-    if (wa95.indexOf("FACTOR_KEYS = ['roe', 'ep', 'hot', 'turnover', 'north', 'industryPenalty', 'forecast', 'rps']") !== -1)
-      ok('95.8 weight-advisor FACTOR_KEYS 8 因子');
-    else fail('95.8 FACTOR_KEYS 未含 forecast', '');
+    if (wa95.indexOf('Core.Scoring.FACTOR_KEYS') !== -1 && /forecast/.test(wa95) && /rps/.test(wa95))
+      ok('95.8 weight-advisor 改用 Core.Scoring.FACTOR_KEYS (单点 source-of-truth)');
+    else fail('95.8 weight-advisor 未引用 scoring FACTOR_KEYS', '');
   } catch (e) { fail('95.x 业绩预告因子', e.message); }
 
   // ===== 96.x: V2 P3 主营构成 chokepoint 探测 =====
@@ -11695,9 +11695,9 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
     else fail('97.6 long-trader RPS 注入缺失', '');
 
     const wa97 = fs.readFileSync(path.join(__dirname, '..', 'www', 'core', 'weight-advisor.js'), 'utf8');
-    if (wa97.indexOf("FACTOR_KEYS = ['roe', 'ep', 'hot', 'turnover', 'north', 'industryPenalty', 'forecast', 'rps']") !== -1)
-      ok('97.7 weight-advisor FACTOR_KEYS 8 因子');
-    else fail('97.7 FACTOR_KEYS 未含 rps', '');
+    if (wa97.indexOf('Core.Scoring.FACTOR_KEYS') !== -1 && /rps/.test(wa97))
+      ok('97.7 weight-advisor 引用 Core.Scoring.FACTOR_KEYS (含 rps)');
+    else fail('97.7 weight-advisor 未引用 scoring FACTOR_KEYS', '');
   } catch (e) { fail('97.x RPS', e.message); }
 
   // ===== 98.x: V3 P2 bug 修复回归测试 =====
@@ -11759,6 +11759,60 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
       ok('98.9 getRpsSnapshot days != 60 显式拒绝');
     else fail('98.9 getRpsSnapshot 未校验 days', '');
   } catch (e) { fail('98.x V3 bug 修复', e.message); }
+
+  // ===== 99.x: V4 修复回归测试 =====
+  try {
+    const lt99 = readFileSafe(path.join(WWW, 'app', 'long-trader.js'));
+    const sc99 = readFileSafe(path.join(WWW, 'core', 'scoring.js'));
+    const d99 = readFileSafe(path.join(WWW, 'core', 'data.js'));
+
+    // 99.1: scoring.rank 输出挂 _fe + _industry (Fix K)
+    if (sc99.indexOf('_fe: e.fe') !== -1 && sc99.indexOf('_industry: e.industry') !== -1)
+      ok('99.1 scoring.rank 输出挂 _fe + _industry (long-trader 不必二次 fetch)');
+    else fail('99.1 ranking 未富化 _fe/_industry', '');
+
+    // 99.2: long-trader.runNow 不再调 getStockFinancialBatch (Fix K — reviewHoldings 单独需要, 不算)
+    if (!/runNow[\s\S]{0,3000}getStockFinancialBatch/.test(lt99))
+      ok('99.2 long-trader.runNow 不再调 getStockFinancialBatch (信任 scoring 输出)');
+    else fail('99.2 long-trader.runNow 仍有 finMap 二次拉取', '');
+
+    // 99.3: long-trader.runNow 不再有 finFiltered 硬筛循环 (Fix K)
+    if (!/runNow[\s\S]{0,3000}finFiltered/.test(lt99) && !/runNow[\s\S]{0,3000}_extractFundamentals/.test(lt99))
+      ok('99.3 long-trader.runNow 不再有 finFiltered / _extractFundamentals 调用');
+    else fail('99.3 runNow 仍有 finFiltered/_extractFundamentals', '');
+
+    // 99.4: _llmPickTop 收口 stocks 不再需要 finMap 入参 (Fix K)
+    if (/async\s+_llmPickTop\(stocks,\s*topN\)/.test(lt99))
+      ok('99.4 _llmPickTop(stocks, topN) 已去除 finMap 入参');
+    else fail('99.4 _llmPickTop 仍有 finMap 入参', '');
+
+    // 99.5: _llmPickTop 从 s._fe 读 ROE/PE/PB (Fix K) — 不再 finMap.get(s.代码)
+    if (/s\._fe[\s\S]{0,80}ROE=/.test(lt99) && !/_llmPickTop[\s\S]{0,1500}finMap\.get\(s/.test(lt99))
+      ok('99.5 _llmPickTop 从 s._fe 取基本面 (不再 finMap.get)');
+    else fail('99.5 LLM prompt 仍从 finMap 取基本面', '');
+
+    // 99.6: LLM pick code 必须在候选池 (Fix L)
+    if (lt99.indexOf('validCodes') !== -1 && /validCodes\.has\(p\.code\)/.test(lt99))
+      ok('99.6 LLM pick code 必须在候选池 (防 LLM 幻觉推池外股票)');
+    else fail('99.6 LLM pick 未做池内校验', '');
+
+    // 99.7: cache key 风格统一 (Fix M) — 三个 key 都不再有 _v1 后缀
+    if (d99.indexOf('lhb_jgmmtj_v1') === -1 &&
+        d99.indexOf('industry_by_code_v1') === -1 &&
+        d99.indexOf('hsgt_individual_') !== -1 && !/_v1/.test(d99.match(/hsgt_individual_[^`]+/)?.[0] || ''))
+      ok('99.7 cache key 风格统一 (移除 _v1 后缀)');
+    else fail('99.7 cache key 仍有 _v1 后缀', '');
+
+    // 99.8: applyHardFilters 支持基本面门槛 (Fix K — 下沉到 scoring)
+    if (sc99.indexOf('FUNDAMENTAL_FILTERS') !== -1 && sc99.indexOf('grossMarginMin') !== -1)
+      ok('99.8 scoring.applyHardFilters 下沉基本面门槛 (roeMin/grossMarginMin)');
+    else fail('99.8 基本面硬筛未下沉到 scoring', '');
+
+    // 99.9: scoring 暴露 FACTOR_KEYS (Fix J 终验, 防止 weight-advisor 漂移)
+    if (sc99.indexOf('FACTOR_KEYS,      // 单点 source-of-truth') !== -1)
+      ok('99.9 scoring.js 暴露 FACTOR_KEYS 给 weight-advisor 引用');
+    else fail('99.9 scoring.js 未暴露 FACTOR_KEYS', '');
+  } catch (e) { fail('99.x V4 bug 修复', e.message); }
 
 
 

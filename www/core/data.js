@@ -1168,7 +1168,7 @@
   async function getStockIndustryByCode(code) {
     const c = String(code || '').padStart(6, '0');
     if (!/^\d{6}$/.test(c)) return null;
-    const cacheKey = 'industry_by_code_v1';
+    const cacheKey = 'industry_by_code_index';
     try {
       let idx = await Core.Storage.cacheGet(cacheKey);
       if (!idx || typeof idx !== 'object') {
@@ -1990,7 +1990,7 @@
   async function getNorthboundFlow(code) {
     const c = String(code || '').padStart(6, '0');
     if (!/^\d{6}$/.test(c)) return null;
-    const cacheKey = `hsgt_individual_${c}_v1`;
+    const cacheKey = `hsgt_individual_${c}`;
     try {
       const raw = await fetchWithCache(
         cacheKey,
@@ -2055,7 +2055,7 @@
    * @returns {Promise<Map<string, LhbEntry> | null>} code → {name, lastDate, count, net, reasonTag, institutionNet, institutionRatio}
    */
   async function getLhbSnapshotMap() {
-    const cacheKey = 'lhb_jgmmtj_v1';
+    const cacheKey = 'lhb_jgmmtj_snapshot';
     try {
       const raw = await fetchWithCache(
         cacheKey,

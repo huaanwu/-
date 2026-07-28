@@ -118,6 +118,10 @@
             .sort((a, b) => parseFloat(b.涨跌幅) - parseFloat(a.涨跌幅))
             .slice(0, HARD_TOP);
         }
+        // Phase 5 Commit C/D V4: 不再二次拉基本面/行业 — scoring.rankCandidates 已把
+        //   _fe (ROE/PE/PB/毛利率) + _industry (行业名) 挂到每个候选上 (scoring.js 富化)。
+        //   finMap 逻辑已下沉到 scoring.applyHardFilters (ROE<5%/毛利率<10% 硬筛)。
+        // 行业集中度需要 heldList 持仓的行业归属, 单独补拉这一份 (sorted 内已含)
         if (sorted.length === 0) return;
         // Bug #5 修复 (跑空防护): 用 sorted 池中位价估算, 适配茅台/低价股
         const samplePrice = (() => {
@@ -130,69 +134,29 @@
           console.log(`[LongTrader] 现金 ${acc.cash} × ${acc.positionPct || 0.10} 买不起 1 手 ${samplePrice.toFixed(2)} 元股 (池中位价), 跳过`);
           return;
         }
-        // Phase 5: 预拉前 30 只基本面 (并发 5 逐批)
-        let finMap = new Map();
-        try {
-          finMap = await Core.Data.getStockFinancialBatch(sorted.map(s => s.代码));
-        } catch (e) { console.warn('[LongTrader] 基本面拉取失败:', e); }
-        // Phase 5 Commit D: 批量拉行业归属
-        let industryMap = new Map();
-        try {
-          industryMap = await Core.Data.getStockIndustryBatch(sorted.map(s => s.代码));
-        } catch (e) { console.warn('[LongTrader] 行业拉取失败:', e); }
-        // Phase 5 Commit C: 基本面硬筛 — 排除 ROE<5% 和毛利率<10%
-        const finFiltered = [];
-        for (const s of sorted) {
-          const raw = finMap.get(s.代码);
-          if (!raw) { finFiltered.push(s); continue; }
-          const fe = _extractFundamentals(raw);
-          if (!fe) { finFiltered.push(s); continue; }
-          if (fe.roe != null && fe.roe < 5) continue;
-          if (fe.grossProfitMargin != null && fe.grossProfitMargin < 10) continue;
-          finFiltered.push(s);
+        // Phase 5 Commit D: 行业集中度检测 — 复用 s._industry (scoring 已挂) + 单独补拉 heldList
+        const heldList = (await Paper._getPaperHoldings('long').catch(() => [])) || [];
+        const heldCodesExtra = new Set(heldList.map(h => h.code).filter(Boolean));
+        let industryMapExtra = new Map();
+        if (heldCodesExtra.size > 0 && Core.Data.getStockIndustryBatch) {
+          try {
+            industryMapExtra = await Core.Data.getStockIndustryBatch([...heldCodesExtra]);
+          } catch (e) { console.warn('[LongTrader] 持仓行业补拉失败:', e); }
         }
-        // Bug #4 修复: finFiltered < 3 只时, 不要再全部用 sorted 回退
-        // 至少剔除已确认不达标的 (有数据但 ROE<5%/毛利率<10%)
-        let pool;
-        if (finFiltered.length >= 3) {
-          pool = finFiltered;
-        } else {
-          const knownBadCodes = new Set();
-          for (const s of sorted) {
-            const raw = finMap.get(s.代码);
-            if (!raw) continue;
-            const fe = _extractFundamentals(raw);
-            if (fe && ((fe.roe != null && fe.roe < 5) || (fe.grossProfitMargin != null && fe.grossProfitMargin < 10)))
-              knownBadCodes.add(s.代码);
-          }
-          const filtered = sorted.filter(s => !knownBadCodes.has(s.代码));
-          console.warn(`[LongTrader] 基本面硬筛仅通过 ${finFiltered.length} 只, 回退到 ${filtered.length} 只 (剔除已知不达标 ${knownBadCodes.size} 只)`);
-          pool = filtered;
-        }
-        if (pool.length === 0) return;
-        // Phase 5 Commit D: 行业集中度检测
-        let heldList = [];
-        try {
-          heldList = (await Paper._getPaperHoldings('long')) || [];
-        } catch (e) { /* 无需处理 */ }
-        // Bug #1 修复: industryMap 必须覆盖 sorted + heldList 去重并集
-        // (否则已持仓但不在今日 top30 的股票, 行业市值会被漏算)
-        const allCodes = [...new Set([
-          ...sorted.map(s => s.代码),
-          ...heldList.map(h => h.code).filter(Boolean)
-        ])];
-        try {
-          industryMap = await Core.Data.getStockIndustryBatch(allCodes);
-        } catch (e) { console.warn('[LongTrader] 行业补拉失败:', e); }
         const heldByInd = {};
         for (const h of heldList) {
-          const ind = industryMap.get(h.code);
+          const ind = industryMapExtra.get(h.code);
           if (ind) heldByInd[ind] = (heldByInd[ind] || 0) + (h.mkt || 0);
         }
         const totalAssets = acc.cash + (acc.stockMkt || 0);
         const indCap = 0.25;                                    // 单个行业 ≤ 25%
-        // 5. LLM 挑 TOP_N (带基本面)
-        const picks = await this._llmPickTop(pool, TOP_N, finMap);
+        // 构造 pick.code → industryName 反查表 (scoring 已挂 s._industry, 这里 build 一份便于 O(1) 查询)
+        const pickIndMap = new Map();
+        for (const s of sorted) {
+          if (s && s._industry) pickIndMap.set(s.代码, s._industry);
+        }
+        // 5. LLM 挑 TOP_N (基本面已在 s._fe)
+        const picks = await this._llmPickTop(sorted, TOP_N);
         if (!picks || picks.length === 0) return;
         // 6. 自动成交到 long sleeve (纪律引擎自动卡)
         const cashBefore = acc.cash;
@@ -201,7 +165,7 @@
         let cashRemaining = acc.cash;
         for (const p of picks) {
           // Phase 5 Commit D: 行业集中度 cap 检测
-          const pInd = industryMap.get(p.code);
+          const pInd = pickIndMap.get(p.code);
           if (pInd) {
             const currentIndValue = heldByInd[pInd] || 0;
             const pMkt = acc.positionPct * cashRemaining;       // 估算单票买入市值 (用递减后的现金)
@@ -263,7 +227,7 @@
      * LLM 解读: 从硬筛池挑 TOP_N
      * @returns {Promise<Array<{code, name, reason}>|null>}
      */
-    async _llmPickTop(stocks, topN, finMap) {
+    async _llmPickTop(stocks, topN) {
       try {
         const list = stocks.map((s, i) => {
           const code = s.代码;
@@ -273,16 +237,11 @@
           const turn = (parseFloat(s.换手率) || 0).toFixed(2);
           const mcap = parseFloat(s.总市值) || 0;
           const mcapStr = mcap === 0 ? '?' : (mcap / 1e8).toFixed(1) + '亿';
-          // Phase 5: 基本面
+          // V4: 基本面直接从 s._fe 取 (scoring.rankCandidates 已富化)
           let finPart = '';
-          if (finMap && finMap instanceof Map) {
-            const raw = finMap.get(s.代码);
-            if (raw) {
-              const fe = _extractFundamentals(raw);
-              if (fe) {
-                finPart = ` | ROE=${fe.roe ?? '?'}% PE=${fe.pe ?? '?'} PB=${fe.pb ?? '?'} 毛利=${fe.grossProfitMargin ?? '?'}%`;
-              }
-            }
+          if (s._fe) {
+            const fe = s._fe;
+            finPart = ` | ROE=${fe.roe ?? '?'}% PE=${fe.pe ?? '?'} PB=${fe.pb ?? '?'} 毛利=${fe.grossProfitMargin ?? '?'}%`;
           }
           // V2 P3: chokepoint 标签 (主营构成: max(收入比例) > 40% = 单一产品依赖)
           let ckPart = '';
@@ -374,11 +333,13 @@
         const parsed = await Core.AI.parseJsonOutput(raw, 'long-trader');
         if (!parsed || !parsed.ok || !parsed.obj) return null;
         const arr = (parsed.obj.picks || []);
+        // V4 Fix L: 防 LLM 幻觉推池外股票 — 仅保留候选池 (stocks.map(s=>s.代码)) 内的 code
+        const validCodes = new Set(stocks.map(s => s.代码).filter(Boolean));
         const bullPicks = arr.slice(0, topN).map(p => ({
           code: String(p.code || '').padStart(6, '0'),
           name: String(p.name || ''),
           reason: String(p.reason || '').slice(0, 200)
-        })).filter(p => /^\d{6}$/.test(p.code));
+        })).filter(p => /^\d{6}$/.test(p.code) && validCodes.has(p.code));
         if (bullPicks.length === 0) return null;
 
         // Phase 5 Commit B: Bear agent 双视角辩论 — 质疑 bull 选股

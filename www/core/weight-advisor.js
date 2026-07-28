@@ -20,7 +20,12 @@
   'use strict';
 
   const KV_KEY = 'weight_advisor_this_week';
-  const FACTOR_KEYS = ['roe', 'ep', 'hot', 'turnover', 'north', 'industryPenalty', 'forecast', 'rps'];
+  // 单点 source-of-truth: 从 Core.Scoring.FACTOR_KEYS 取 (加新因子只需改 scoring.js)
+  function _factorKeys() {
+    return (window.Core && Core.Scoring && Core.Scoring.FACTOR_KEYS) || [
+      'roe', 'ep', 'hot', 'turnover', 'north', 'industryPenalty', 'forecast', 'rps'
+    ];
+  }
   const WEIGHT_MIN = 0.02;
   const WEIGHT_MAX = 0.35;
   const CHANGE_RATIO = 0.5;  // 单因子相对 DEFAULT 最大变化 ±50%
@@ -58,7 +63,8 @@
     try { obj = JSON.parse(raw.slice(i, j + 1)); } catch (e) { return null; }
     if (!obj || typeof obj !== 'object') return null;
 
-    // schema 校验: 8 因子必须全部存在, 数值合法
+    // schema 校验: 全部因子键必须存在, 数值合法
+    const FACTOR_KEYS = _factorKeys();
     const weights = {};
     let sum = 0;
     for (const k of FACTOR_KEYS) {
@@ -79,6 +85,7 @@
    * 关键修复: 缺失 key 默认值必须从 baseWeights 取, 不能写死 0.2 (避免与真实 DEFAULT 漂移)
    */
   function clamp(llmWeights, baseWeights) {
+    const FACTOR_KEYS = _factorKeys();
     const out = {};
     let sum = 0;
     for (const k of FACTOR_KEYS) {

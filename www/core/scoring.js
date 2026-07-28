@@ -25,6 +25,7 @@
   'use strict';
 
   // 静态默认权重 (LLM 调不通时 fallback)
+  const FACTOR_KEYS = ['roe', 'ep', 'hot', 'turnover', 'north', 'industryPenalty', 'forecast', 'rps'];
   const DEFAULT_WEIGHTS = {
     roe: 0.16,           // ROE/ROIC 质量
     ep: 0.14,            // EP (盈利收益率)
@@ -200,7 +201,14 @@
           w.industryPenalty * factors.industryPenalty +
           w.forecast * factors.forecast +
           w.rps * factors.rps;
-        return Object.assign({}, e.s, { _score: score, _factors: factors });
+        // V4: 把原始 _fe (ROE/PE/PB/毛利率) + industryName 一并挂上,
+        //     下游 long-trader 不必再二次 getStockFinancialBatch / getStockIndustryBatch
+        return Object.assign({}, e.s, {
+          _score: score,
+          _factors: factors,
+          _fe: e.fe,
+          _industry: e.industry
+        });
       })
       .sort((a, b) => b._score - a._score);
   }
@@ -347,7 +355,16 @@
   /**
    * 硬过滤: 新股/ST/一字板
    * V2 P2: + 业绩预告"首亏/续亏"硬剔除
+   * V4:   + 基本面 ROE/毛利率门槛 (从 long-trader 抽出, 避免重复拉 finMap)
+   *
+   * 调用方须保证 stocks 已被 rankCandidates 富化过 (带 _fe/_industry 字段) —
+   * 直接调用 applyHardFilters 时若 _fe 缺失, ROE/毛利率门槛会静默跳过 (降级)
    */
+  const FUNDAMENTAL_FILTERS = {
+    roeMin: 5,           // ROE < 5% 视为低质量盈利
+    grossMarginMin: 10   // 毛利率 < 10% 视为无定价能力
+  };
+
   function applyHardFilters(stocks, opts = {}, forecastMap) {
     const filters = Object.assign({}, HARD_FILTERS, opts.filters || {});
     const today = Date.now();
@@ -372,6 +389,11 @@
       if (forecastMap && forecastMap instanceof Map) {
         const f = forecastMap.get(s.代码);
         if (f && /首亏|续亏/.test(f.type || '')) return false;
+      }
+      // V4: 基本面 ROE/毛利率门槛 — rankCandidates 内已附 _fe (原始 _extractFundamentals 结果)
+      if (s._fe) {
+        if (s._fe.roe != null && s._fe.roe < FUNDAMENTAL_FILTERS.roeMin) return false;
+        if (s._fe.grossProfitMargin != null && s._fe.grossProfitMargin < FUNDAMENTAL_FILTERS.grossMarginMin) return false;
       }
       return true;
     });
@@ -438,6 +460,7 @@
     rank,             // 暴露纯函数便于测试
     applyHardFilters,
     DEFAULT_WEIGHTS,
+    FACTOR_KEYS,      // 单点 source-of-truth, 供 weight-advisor / test 引用
     NEW_STOCK_RULE_DAYS
   };
 })();
