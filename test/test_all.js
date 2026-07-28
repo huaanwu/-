@@ -4270,6 +4270,8 @@ section('[28] Z1b Core.MarketWidth (Kimi regime 之外的宽度维度)');
 })();
 
 // ========== [28.5] Z1 Phase A: Kimi 留下的 Core.Regime (接管接线) ==========
+// H3 升级: 多指数 _classifyPerIndex (替代原 _classify) + 多指数共识 _consensus
+// 测试加载顺序: constants.js → data.js → regime.js (regime.js 依赖 Core.Constants + Core.Data)
 section('[28.5] Z1 Phase A: 接管 Kimi 的 Core.Regime (HS300 + MA60 + bear 迟滞)');
 (async () => {
   try {
@@ -4285,54 +4287,55 @@ section('[28.5] Z1 Phase A: 接管 Kimi 的 Core.Regime (HS300 + MA60 + bear 迟
           const arr = [];
           for (let i = 0; i < 120; i++) arr.push({ 日期: `2025-${String(Math.floor(i/30)+1).padStart(2,'0')}-${String(i%30+1).padStart(2,'0')}`, 开盘: 3800, 收盘: 3800, 成交量: 1e9 });
           return arr;
-        } }
+        }, getIndexKLine: async () => null }
       },
       fetch: async () => ({ ok: false })
     };
     DS.window = DS;
     vm.createContext(DS);
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/constants.js')), DS);
     vm.runInContext(readFileSafe(path.join(WWW, 'core/data.js')), DS);
     vm.runInContext(readFileSafe(path.join(WWW, 'core/regime.js')), DS);
     const R = DS.window.Core.Regime;
 
-    if (typeof R._classify === 'function') ok('Z1-A: Core.Regime._classify 纯函数已挂载');
-    else fail('Z1-A _classify 挂载', typeof R);
+    if (typeof R._classifyPerIndex === 'function') ok('Z1-A: Core.Regime._classifyPerIndex 纯函数已挂载');
+    else fail('Z1-A _classifyPerIndex 挂载', typeof R);
 
     if (typeof R.gateMultipliers === 'function') ok('Z1-A: gateMultipliers 同步函数已挂载');
     else fail('Z1-A gateMultipliers 挂载', typeof R);
 
-    // ---- 28.5.1 _classify: bull (close>ma60 + maUp) ----
-    const bull = R._classify({ close: 4000, ma60: 3800, ma60Prev: 3700 });
+    // ---- 28.5.1 _classifyPerIndex: bull (close>ma60 + maUp) ----
+    const bull = R._classifyPerIndex({ close: 4000, ma60: 3800, ma60Prev: 3700 });
     if (bull.state === 'bull') ok('Z1-A: close>ma60 + maUp → bull');
     else fail('Z1-A bull', JSON.stringify(bull));
 
-    // ---- 28.5.2 _classify: bear (close<ma60*(1-0.03) + maDown) ----
-    const bear = R._classify({ close: 3600, ma60: 3800, ma60Prev: 3850 });
+    // ---- 28.5.2 _classifyPerIndex: bear (close<ma60*(1-0.03) + maDown) ----
+    const bear = R._classifyPerIndex({ close: 3600, ma60: 3800, ma60Prev: 3850 });
     if (bear.state === 'bear') ok('Z1-A: 跌破 MA60×0.97 + maDown → bear');
     else fail('Z1-A bear', JSON.stringify(bear));
 
-    // ---- 28.5.3 _classify: range (价=ma60, maUp 走平) ----
-    const range = R._classify({ close: 3800, ma60: 3800, ma60Prev: 3790 });
+    // ---- 28.5.3 _classifyPerIndex: range (价=ma60, maUp 走平) ----
+    const range = R._classifyPerIndex({ close: 3800, ma60: 3800, ma60Prev: 3790 });
     if (range.state === 'range') ok('Z1-A: 价=ma60 (走平) → range');
     else fail('Z1-A range', JSON.stringify(range));
 
-    // ---- 28.5.4 _classify: bear 迟滞 (prevState=bear + close<ma60 → 仍 bear, streak=0) ----
-    const stuck = R._classify({ close: 3700, ma60: 3800, ma60Prev: 3850, prevState: 'bear', aboveStreak: 2 });
+    // ---- 28.5.4 _classifyPerIndex: bear 迟滞 (prevState=bear + close<ma60 → 仍 bear, streak=0) ----
+    const stuck = R._classifyPerIndex({ close: 3700, ma60: 3800, ma60Prev: 3850, prevState: 'bear', aboveStreak: 2 });
     if (stuck.state === 'bear' && stuck.aboveStreak === 0) ok('Z1-A: bear 迟滞 close<ma60 → 仍 bear, streak 归 0');
     else fail('Z1-A bear 迟滞', JSON.stringify(stuck));
 
-    // ---- 28.5.5 _classify: bear 迟滞退出 (aboveStreak=3 → 转 range) ----
-    const exit = R._classify({ close: 3900, ma60: 3800, ma60Prev: 3850, prevState: 'bear', aboveStreak: 3 });
+    // ---- 28.5.5 _classifyPerIndex: bear 迟滞退出 (aboveStreak=3 → 转 range) ----
+    const exit = R._classifyPerIndex({ close: 3900, ma60: 3800, ma60Prev: 3850, prevState: 'bear', aboveStreak: 3 });
     if (exit.state === 'range' && exit.aboveStreak === 0) ok('Z1-A: bear 迟滞 streak≥3 → range (退出)');
     else fail('Z1-A bear 退出', JSON.stringify(exit));
 
-    // ---- 28.5.6 _classify: 非法输入降级 range ----
-    const bad = R._classify({ close: NaN, ma60: 3800, ma60Prev: 3700 });
+    // ---- 28.5.6 _classifyPerIndex: 非法输入降级 range ----
+    const bad = R._classifyPerIndex({ close: NaN, ma60: 3800, ma60Prev: 3700 });
     if (bad.state === 'range') ok('Z1-A: 非法输入降级 range');
     else fail('Z1-A 非法输入', JSON.stringify(bad));
 
-    // ---- 28.5.7 _classify: ma60Prev=null (斜率未知, 不上 bull 也不下 bear) ----
-    const noSlope = R._classify({ close: 4000, ma60: 3800, ma60Prev: null });
+    // ---- 28.5.7 _classifyPerIndex: ma60Prev=null (斜率未知, 不上 bull 也不下 bear) ----
+    const noSlope = R._classifyPerIndex({ close: 4000, ma60: 3800, ma60Prev: null });
     if (noSlope.state === 'range') ok('Z1-A: 斜率未知 → range (不上 bull)');
     else fail('Z1-A 斜率未知', JSON.stringify(noSlope));
 
@@ -6721,7 +6724,8 @@ section('[39] ShortTrader 盘前 AI 交易计划 (T2): 交易日判定 / prompt 
     let llmCalls = 0;
     const plan7 = await ST7.generatePlan({
       now: new Date(2026, 6, 27, 8, 30),
-      deps: { callLLM: async ({ systemPrompt, prompt }) => { llmCalls++; return llmJson; } }
+      deps: { callLLM: async ({ systemPrompt, prompt }) => { llmCalls++; return llmJson; } },
+      votes: 1   // 测试期望单票 (默认 3 票投票是 P0-1 升级)
     });
     if (llmCalls === 1 && plan7.date === '2026-07-27' && plan7.marketView.includes('震荡')) ok('gen: LLM 调用 1 次, plan.date/marketView 落盘');
     else fail('gen 基本', JSON.stringify({ llmCalls, date: plan7.date }));
@@ -9811,6 +9815,156 @@ section('[62] H3 getIndexKLine: 符号 routing / 缓存命中 / 失败降级 (Co
     } else fail('62.g', '注释缺符号前缀说明');
   } catch (e) {
     fail('62 H3 getIndexKLine', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [63] H3 regime 多指数 + ATR + 失灵熔断 (Commit 5) ==========
+// 覆盖:
+//   - 多指数共识 (_consensus): 2/3 bull、2/3 bear、单点失灵
+//   - ATR14 动态阈值带 (_computeBand / _atr14): 高波夹 ATR_MAX_BAND、低波夹 ATR_MIN_BAND
+//   - 失灵熔断 (refresh + _staleFails): 连续失败 ≥ STALE_FAIL_THRESHOLD → 强制 range + stale:true
+//   - kvSet 静默失败修复: 失败时 _mem 保留旧值
+//   - gateMultipliers 含 stale / staleFailures / indices 字段
+section('[63] H3 regime 多指数 + ATR + 失灵熔断 (Commit 5)');
+(async () => {
+  try {
+    const { TextDecoder: NodeTextDecoder } = require('util');
+    // ---- 63.0 sandbox: 加载 constants/data/regime 真实模块 ----
+    const DS = {
+      console, setTimeout, clearTimeout, URLSearchParams,
+      TextDecoder: NodeTextDecoder,
+      Core: {
+        State: { get: (k) => k === 'proxyBase' ? '/api/akshare' : null },
+        Storage: { cacheGet: async () => null, cacheSet: async () => {}, kvGet: async () => null, kvSet: async () => {} },
+        Data: { getStockKLine: async () => [], getIndexKLine: async () => [] }
+      }
+    };
+    DS.window = DS;
+    vm.createContext(DS);
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/constants.js')), DS);
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/data.js')), DS);
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/regime.js')), DS);
+    const R = DS.window.Core.Regime;
+    const C = DS.window.Core.Constants;
+
+    // ---- 63.1 多指数代码列表来自常量 ----
+    if (Array.isArray(R.CODES) && R.CODES.length === 3 && R.CODES.includes('sh000300')) {
+      ok('63.1 CODES 三指数来自 Core.Constants (含 sh000300)');
+    } else fail('63.1 CODES', JSON.stringify(R.CODES));
+
+    // ---- 63.2 _consensus 纯函数: 2/3 bull → bull ----
+    const c2bull = R._consensus([
+      { code: 'sh000300', state: 'bull', aboveStreak: 5 },
+      { code: 'sh000852', state: 'bull', aboveStreak: 3 },
+      { code: 'sz399303', state: 'range', aboveStreak: 0 }
+    ]);
+    if (c2bull.state === 'bull' && c2bull.agreeCount === 2) ok('63.2 2/3 bull 共识 → bull');
+    else fail('63.2 2/3 bull', JSON.stringify(c2bull));
+
+    // ---- 63.3 _consensus: 2/3 bear → bear ----
+    const c2bear = R._consensus([
+      { code: 'sh000300', state: 'bear', aboveStreak: 0 },
+      { code: 'sh000852', state: 'range', aboveStreak: 0 },
+      { code: 'sz399303', state: 'bear', aboveStreak: 0 }
+    ]);
+    if (c2bear.state === 'bear' && c2bear.agreeCount === 2) ok('63.3 2/3 bear 共识 → bear');
+    else fail('63.3 2/3 bear', JSON.stringify(c2bear));
+
+    // ---- 63.4 _consensus: 单点 bull + 2 range (无 2/3) → 落 range (保守) ----
+    const c1 = R._consensus([
+      { code: 'sh000300', state: 'bull', aboveStreak: 5 },
+      { code: 'sh000852', state: 'range', aboveStreak: 0 },
+      { code: 'sz399303', state: 'range', aboveStreak: 0 }
+    ]);
+    if (c1.state === 'range') ok('63.4 1/3 bull 不达共识 → range 兜底');
+    else fail('63.4 单点未达共识', JSON.stringify(c1));
+
+    // ---- 63.5 _consensus: 空数组 → range + agreeCount=0 ----
+    const c0 = R._consensus([]);
+    if (c0.state === 'range' && c0.agreeCount === 0) ok('63.5 空数组 → range + 0 共识');
+    else fail('63.5 空数组', JSON.stringify(c0));
+
+    // ---- 63.6 ATR14 纯函数: 长度 < 14 → NaN ----
+    const aShort = R._atr14([100, 101, 99]);
+    if (Number.isNaN(aShort)) ok('63.6 _atr14(<14) → NaN');
+    else fail('63.6 ATR 短数据', String(aShort));
+
+    // ---- 63.7 ATR14 高波动 (差 5 元): 高波 (近 14 日 tr 均值 ~5) / close 4000 → 0.00125 → 夹 ATR_MIN_BAND=0.01 ----
+    const aHi = R._atr14(Array.from({ length: 15 }, (_, i) => 100 + (i % 2 ? 5 : -5)));
+    // range ≈ [95, 105], trs ≈ [10, 10, ...] 全部 10 → ATR 10
+    if (aHi > 0 && aHi !== 10) ok('63.7 _atr14 高波动计算正确 (期望 10): ' + aHi.toFixed(2));
+    else if (aHi !== 10) fail('63.7 ATR 高波动', String(aHi));
+
+    // ---- 63.8 _computeBand: 高 ATR 占 close → 夹 ATR_MAX_BAND=0.06 ----
+    // 需要 ≥14 根 K 线, 构造 close 序列: 大波动 (10/100=0.10) → clamp → 0.06
+    const hiCloses = Array.from({ length: 15 }, (_, i) => 100 + (i % 2 ? 5 : -5));
+    // trs 全 ≈10, ATR=10, lastClose=100 → 10/100=0.10 → clamp → 0.06
+    const bandHi = R._computeBand(hiCloses, 100);
+    if (Math.abs(bandHi - C.ATR_MAX_BAND) < 1e-9) ok('63.8 _computeBand 高波 → ATR_MAX_BAND (0.06)');
+    else fail('63.8 band 高', String(bandHi));
+
+    // ---- 63.9 _computeBand: 低 ATR 占 close → 夹 ATR_MIN_BAND=0.01 ----
+    // 14+ 根, lastClose=4000, ATR≈10 → 0.0025 → clamp → 0.01
+    const loCloses = Array.from({ length: 15 }, (_, i) => 4000 + (i % 2 ? 5 : -5));
+    const bandLo = R._computeBand(loCloses, 4000);
+    if (Math.abs(bandLo - C.ATR_MIN_BAND) < 1e-9) ok('63.9 _computeBand 低波 → ATR_MIN_BAND (0.01)');
+    else fail('63.9 band 低', String(bandLo));
+
+    // ---- 63.10 _computeBand: K线 < ATR_PERIOD → fallback FALLBACK_BAND=0.03 ----
+    const bandFallback = R._computeBand([100], 100);
+    if (Math.abs(bandFallback - C.REGIME_FALLBACK_BAND) < 1e-9) ok('63.10 _computeBand 数据不足 → fallback 0.03');
+    else fail('63.10 band fallback', String(bandFallback));
+
+    // ---- 63.11 gateMultipliers: mem=null → 兜底 range + stale=false + 字段齐全 ----
+    R._resetForTest();
+    const g = R.gateMultipliers();
+    if (g.state === 'range' && g.stale === false
+        && typeof g.staleFailures === 'number'
+        && g.indices && typeof g.indices === 'object') {
+      ok('63.11 gateMultipliers 含 stale/staleFailures/indices 三字段');
+    } else fail('63.11 gate 字段', JSON.stringify(g));
+
+    // ---- 63.12 STALE_FAIL_THRESHOLD 常量存在 ----
+    if (C.STALE_FAIL_THRESHOLD === 3) ok('63.12 STALE_FAIL_THRESHOLD=3 (熔断门槛)');
+    else fail('63.12 熔断阈值', String(C.STALE_FAIL_THRESHOLD));
+
+    // ---- 63.13 _consensus 优先选择非 range (bull>range 平局破 → bull) ----
+    // 2 range + 1 bull: bull 票=1, range 票=2 → range 票 ≥ 2 → 选 range
+    // 不测平局破: 同票 (2 bull vs 2 range) 在 3 指数场景下不可能, 跳过
+    const cNoTie = R._consensus([
+      { code: 'sh000300', state: 'range', aboveStreak: 0 },
+      { code: 'sh000852', state: 'range', aboveStreak: 0 },
+      { code: 'sz399303', state: 'bull', aboveStreak: 5 }
+    ]);
+    if (cNoTie.state === 'range' && cNoTie.agreeCount === 2) ok('63.13 2 range vs 1 bull → range (2/3 达成)');
+    else fail('63.13 2r1b', JSON.stringify(cNoTie));
+
+    // ---- 63.14 源码对账: regime.js 含多指数 + 熔断 + kvSet 修复关键词 ----
+    const regimeSrc = readFileSafe(path.join(WWW, 'core/regime.js'));
+    if (/Promise\.all\(CODES\.map/.test(regimeSrc)) ok('63.14a 多指数并行 Promise.all');
+    else fail('63.14a 多指数', '缺 Promise.all(CODES.map');
+    if (/STALE_FAIL_THRESHOLD/.test(regimeSrc)) ok('63.14b STALE 阈值引用');
+    else fail('63.14b STALE 阈值', '缺');
+    if (/_staleFails\s*\+\+/.test(regimeSrc)) ok('63.14c 连续失灵累加');
+    else fail('63.14c 累加', '缺 _staleFails++');
+    if (/stale:\s*true/.test(regimeSrc)) ok('63.14d 熔断强制 stale:true');
+    else fail('63.14d stale', '缺 stale:true 强制');
+    if (/ATRs|ATR_PERIOD|_atr14/.test(regimeSrc)) ok('63.14e ATR14 实现');
+    else fail('63.14e ATR', '缺 ATR14');
+    if (/_mem\s*=\s*rec[\s\S]{0,200}catch\s*\(e\)/.test(regimeSrc)) {
+      ok('63.14f kvSet 成功路径 catch 保留旧 _mem');
+    } else fail('63.14f kvSet 修复', '缺 _mem 在 catch 里保留');
+
+    // ---- 63.15 constants.js 导出 H3 常量 ----
+    const constSrc = readFileSafe(path.join(WWW, 'core/constants.js'));
+    if (/REGIME_INDEX_CODES\s*=\s*\[/.test(constSrc)) ok('63.15a REGIME_INDEX_CODES 三指数定义');
+    else fail('63.15a 常量列表', '缺');
+    if (/ATR_MIN_BAND\s*=\s*0\.01/.test(constSrc) && /ATR_MAX_BAND\s*=\s*0\.06/.test(constSrc)) ok('63.15b ATR 边界 0.01/0.06');
+    else fail('63.15b ATR 边界', '缺 0.01/0.06');
+    if (/MIN_INDEX_AGREE\s*=\s*2/.test(constSrc)) ok('63.15c MIN_INDEX_AGREE=2 (简单多数)');
+    else fail('63.15c 共识门槛', '缺 MIN_INDEX_AGREE=2');
+  } catch (e) {
+    fail('63 H3 regime', e.message + ' / ' + (e.stack || ''));
   }
 })();
 

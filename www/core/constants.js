@@ -188,10 +188,13 @@
    *  与 daily_summary.mjs VERDICT_TO_OUTCOME 对齐: 对→correct / 错→wrong / 部分→partial */
   const VERIFY_OUTCOMES = ['correct', 'wrong', 'partial'];
 
-  /** AI 验证错误归因枚举 (journals.verifyFailureReason, 非索引字段)
-   *  与 daily_summary.mjs ATTRIBUTION_TO_REASON 对齐 */
-  const VERIFY_FAILURE_REASONS = ['追高', '假设错误', '时机过早', '大盘拖累', '黑天鹅'];
-
+  /** AI 验证归因枚举 (journals.verifyFailureReason, 非索引字段)
+   *  P0-2 升级: 从 5 类扩到 8 类, 区分选股/择时/仓位三环
+   *   - 选股错: 个股/行业问题, 同行业其他股票也跌 (说明入场时就该避开)
+   *   - 择时错: 入场时机早或晚 (持有期 < 1 个交易日 = 择时过短)
+   *   - 仓位过重: 单笔拖累 (亏损 > 资产 5% 但仓位占比 < 20%)
+   *   - 追高/假设错误/时机过早/过度分析/其他: 保留 (兼容历史) */
+  const VERIFY_FAILURE_REASONS = ['选股错', '择时错', '仓位过重', '追高', '假设错误', '时机过早', '过度分析', '其他'];
   /** 成绩单注入最少已验证样本数: 低于此数不注入, 避免误导 */
   const SCORECARD_MIN_SAMPLES = 3;
 
@@ -250,6 +253,37 @@
   /** 单条教训文本上限 (字) */
   const SHORT_LESSONS_TEXT_MAX_LEN = 40;
 
+  // ==================== 大盘状态机 (H3) ====================
+
+  /** 大盘状态机监控的 3 只指数 (H3: 多指数共识)
+   *  必须带 sh/sz 前缀 (data.js getIndexKLine 强制要求, 腾讯源规则)
+   *  沪深 300 (大盘蓝筹) + 中证 1000 (中盘成长) + 国证 2000 (小微盘)
+   *  2/3 多数共识 = MIN_INDEX_AGREE 决定最终 state */
+  const REGIME_INDEX_CODES = ['sh000300', 'sh000852', 'sz399303'];
+
+  /** 多指数共识门槛: 3 指数中至少 N 个同意, 才确认最终 state
+   *  MIN_INDEX_AGREE=2 = 简单多数 (3 进 2 即可)
+   *  兜底: 只剩 1 指数可用时 (其他失败), 该 1 指数本身即可决定 (1/1=100%) */
+  const MIN_INDEX_AGREE = 2;
+
+  /** 连续失灵熔断阈值 (H3: 数据源静默失效修复)
+   *  refresh 连续失败 N 次 → 强制降级 range + stale:true (不再相信旧 state)
+   *  成功一次 _staleFails = 0 (重置) */
+  const STALE_FAIL_THRESHOLD = 3;
+
+  /** ATR 计算回看周期 (与 _atr14 trueRange 均值一致) */
+  const ATR_PERIOD = 14;
+
+  /** ATR/close 动态阈值带边界 (H3: 替代固定 MA60×3% BAND)
+   *  clamp(ATR14/close, [ATR_MIN_BAND, ATR_MAX_BAND])
+   *  高波动市场 (ATR/close>6%) 上限夹 6%, 低波 (ATR/close<1%) 下限夹 1%
+   *  K 线根数 < 14 → fallback BAND=0.03 旧固定值 */
+  const ATR_MIN_BAND = 0.01;
+  const ATR_MAX_BAND = 0.06;
+
+  /** Regime legacy BAND 兜底值 (K 线 < 14 根时用, 与旧固定 MA60×(1-BAND) 等价) */
+  const REGIME_FALLBACK_BAND = 0.03;
+
   // ==================== 调试辅助 ====================
 
   /** 给 console.log 打 tag 用: 让日志快速定位模块 */
@@ -307,6 +341,13 @@
     SHORT_LESSONS_FEED_MAX,
     SHORT_LESSONS_PER_DISTILL_MAX,
     SHORT_LESSONS_TEXT_MAX_LEN,
+    REGIME_INDEX_CODES,
+    MIN_INDEX_AGREE,
+    STALE_FAIL_THRESHOLD,
+    ATR_PERIOD,
+    ATR_MIN_BAND,
+    ATR_MAX_BAND,
+    REGIME_FALLBACK_BAND,
     MODULE_TAG
   };
 })();
