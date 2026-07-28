@@ -34,17 +34,38 @@
     industryPenalty: 0.18 // 行业集中度惩罚
   };
 
-  // 板块涨幅 → 热度分 (非线性, 防过热)
-  //   < 3%   → 0      (无热点)
-  //   3-5%   → 0.05   (萌芽)
-  //   5-10%  → 0.15   (成长期, 加权)
-  //   > 10%  → 0.25   (强主题期, 但封顶)
-  function _hotScore(pctChange) {
-    const p = parseFloat(pctChange || 0);
-    if (p < 3) return 0;
-    if (p < 5) return 0.05;
-    if (p < 10) return 0.15;
-    return 0.25;
+  // 板块涨幅 → 热度分 (反向打分 — A 股热点大多是接盘陷阱)
+  //   长线 sleeve 应该避开主升浪追高, 等情绪降温后再进
+  //   涨幅越大 → 负权重越大 (追涨陷阱)
+  //   < -5%  → +0.10  错杀 (基本面好但被错杀, 可能是机会)
+  //   -5~0%  → +0.05  情绪低点
+  //   0~3%   → +0.10  平稳期 (主力建仓期)
+  //   3~5%   → -0.05  萌芽末期 (即将调整)
+  //   5~10%  → -0.15  主升浪 (接盘区, 必须避开)
+  //   > 10%  → -0.25  顶部区 (强接盘陷阱)
+  // Tier 6+: 同时看 行业(industryPct) + 概念(conceptPcts[]), 取较低者
+  //   (取较低者 = 只要任一维度进入接盘区就给负分, 更保守)
+  function _hotScore(industryPct, conceptPcts) {
+    const indP = parseFloat(industryPct || 0);
+    let ind = _hotOne(indP);
+    let cptMin = 0;  // 初始化 = 0 (表示无概念数据时不影响)
+    if (Array.isArray(conceptPcts) && conceptPcts.length > 0) {
+      cptMin = Infinity;
+      for (const cp of conceptPcts) {
+        const s = _hotOne(parseFloat(cp || 0));
+        if (s < cptMin) cptMin = s;
+      }
+    }
+    return Math.min(ind, cptMin);
+  }
+
+  function _hotOne(p) {
+    if (p < -5) return 0.10;
+    if (p < 0) return 0.05;
+    if (p < 3) return 0.10;
+    if (p < 5) return -0.05;
+    if (p < 10) return -0.15;
+    return -0.25;
   }
 
   // 硬过滤阈值
@@ -70,7 +91,7 @@
    * @param {Object} weights - 权重表 (来自 WeightAdvisor 或 fallback)
    * @returns {Array} sorted by _score desc
    */
-  function rank(stocks, finMap, industryMap, northMap, heldByInd, weights, sectorPerf) {
+  function rank(stocks, finMap, industryMap, northMap, heldByInd, weights, conceptMap, conceptPerf, sectorPerf) {
     if (!Array.isArray(stocks) || stocks.length === 0) return [];
     const w = Object.assign({}, DEFAULT_WEIGHTS, weights || {});
 
@@ -93,14 +114,28 @@
     const turnoverRanks = rankNormalize(turnoverVals, true);
     const northRanks = rankNormalize(northVals);
 
-    // 板块涨幅 → Map (industryName → pctChange)
+    // 行业板块涨幅 → Map (industryName → pctChange)
     const sectorMap = new Map();
     if (Array.isArray(sectorPerf)) {
       for (const sec of sectorPerf) {
         if (sec && sec.name) sectorMap.set(sec.name, parseFloat(sec.pctChange || 0));
       }
     }
-    const hotRanks = enriched.map(e => _hotScore(sectorMap.get(e.industry)));
+    // 概念板块涨幅 → Map (conceptName → pctChange)
+    const conceptBoardMap = new Map();
+    if (Array.isArray(conceptPerf)) {
+      for (const c of conceptPerf) {
+        if (c && c.name) conceptBoardMap.set(c.name, parseFloat(c.pctChange || 0));
+      }
+    }
+    // code → 该股所属概念板块名数组 (Tier 6+ 概念反查)
+    const conceptNameMap = conceptMap instanceof Map ? conceptMap : new Map();
+    const hotRanks = enriched.map(e => {
+      const industryPct = sectorMap.get(e.industry);
+      const conceptNames = conceptNameMap.get(e.s.代码) || [];
+      const conceptPcts = conceptNames.map(n => conceptBoardMap.get(n) || 0);
+      return _hotScore(industryPct, conceptPcts);
+    });
 
     // 行业惩罚
     const totalHeld = Object.values(heldByInd || {}).reduce((s, v) => s + v, 0);
@@ -178,6 +213,34 @@
       } catch (e) { console.warn('[Scoring] 板块涨幅拉取失败:', e); }
     }
 
+    // 3.6 拉概念板块涨幅 + 建 code → [概念名...] 反向索引 (Tier 6+ 概念热点)
+    let conceptPerf = [];
+    let conceptMap = new Map();
+    if (Core.Data.getConceptBoardPerformance && Core.Data.getConceptMembership) {
+      try {
+        conceptPerf = await Core.Data.getConceptBoardPerformance();
+        // 给当前批次所有 code 反查其所属概念 (复用 getConceptMembership 内部缓存)
+        const conceptBoardMap = new Map();
+        for (const c of conceptPerf) {
+          if (c && c.name) conceptBoardMap.set(c.name, parseFloat(c.pctChange || 0));
+        }
+        // 并发反查所有 code (限并发 10 避免雪崩)
+        const allCodes = all.map(s => s.代码).filter(Boolean);
+        const chunkSize = 10;
+        for (let i = 0; i < allCodes.length; i += chunkSize) {
+          const chunk = allCodes.slice(i, i + chunkSize);
+          const results = await Promise.all(
+            chunk.map(c => Core.Data.getConceptMembership(c).catch(() => []))
+          );
+          chunk.forEach((c, idx) => {
+            const names = results[idx] || [];
+            if (names.length > 0) conceptMap.set(c, names);
+          });
+        }
+        void conceptBoardMap;  // 留作未来 hotScore 内部使用, 当前 hotScore 已在 rank 里重建
+      } catch (e) { console.warn('[Scoring] 概念板块拉取失败:', e); }
+    }
+
     // 4. 拉动态权重 (LLM 周度) — 失败 fallback 默认
     let weights = DEFAULT_WEIGHTS;
     if (Core.WeightAdvisor && typeof Core.WeightAdvisor.getWeights === 'function') {
@@ -188,7 +251,7 @@
 
     // 5. 硬过滤 + 打分
     const filtered = applyHardFilters(all, opts);
-    const ranked = rank(filtered, finMap, industryMap, northMap, heldByInd, weights, sectorPerf);
+    const ranked = rank(filtered, finMap, industryMap, northMap, heldByInd, weights, conceptMap, conceptPerf, sectorPerf);
 
     return includeFiltered ? ranked : ranked.slice(0, topN);
   }

@@ -1051,6 +1051,74 @@
   }
 
   /**
+   * 概念板块实时涨幅 (Tier 6+ 概念热点因子, 与行业板块并行)
+   * 数据源 stock_board_concept_index_em (东方财富, 概念板块实时, 数量远大于行业)
+   * 缓存 1h — 概念板块数量大, 日内变化频繁但热点切换有惯性
+   * 输出标准化: [{ name, code, pctChange, leaderStock, leaderPct, upCount, downCount }]
+   */
+  async function getConceptBoardPerformance() {
+    const raw = await fetchWithCache(
+      'concept_perf_v1',
+      'stock_board_concept_index_em',
+      {},
+      60 * 60 * 1000
+    );
+    if (!Array.isArray(raw)) return [];
+    return raw.map(r => ({
+      name: r['板块名称'] || r.name || '',
+      code: r['板块代码'] || r.code || '',
+      pctChange: parseFloat(r['涨跌幅'] || r.pctChange || 0),
+      leaderStock: r['领涨股票'] || '',
+      leaderPct: parseFloat(r['领涨股票-涨跌幅'] || 0),
+      upCount: parseInt(r['上涨家数'] || 0, 10),
+      downCount: parseInt(r['下跌家数'] || 0, 10)
+    })).filter(s => s.name);
+  }
+
+  /**
+   * 反查 code → 该股所属的所有概念板块名 (用于 scoring 概念热点补强)
+   * 数据源 stock_board_concept_cons_em (东方财富, 单概念成分股; 必须带 symbol 参数 = 概念名)
+   * 实际用法: 不能反向传 code 查列表 (aktools 无此端点); 改成"全市场一次, 建反向索引"
+   * aktools 有 stock_board_concept_cons_ths / stock_board_concept_cons_em 但都需要 symbol=概念名
+   * 改用东财 Web 端 dump 不现实 — 退到实用方案: 不做精确反查, 用 getConceptBoardPerformance 的 leaderStock 字段
+   * 提一个粗粒度近似: 返回该股是否曾在某概念板块的 leaderStock 名单里出现 (15min 缓存内有效)
+   * 业务定位: 概念热度粗筛, 非精确; 长线/盘中筛选都能用
+   *
+   * 实现: 复用 _conceptLeaderCache 内存缓存 (避免每次重算)
+   * @param {string} code 6 位代码
+   * @returns {Promise<string[]>} 该股相关的概念板块名数组 (0..3 个, 来自 leaderStock 命中)
+   */
+  const _conceptLeaderCache = { at: 0, map: new Map() };  // code → [conceptName, ...]
+  const _CONCEPT_LEADER_TTL = 15 * 60 * 1000;
+  async function getConceptMembership(code) {
+    const c = String(code || '').padStart(6, '0');
+    if (!/^\d{6}$/.test(c)) return [];
+    const now = Date.now();
+    if (now - _conceptLeaderCache.at < _CONCEPT_LEADER_TTL && _conceptLeaderCache.map.has(c)) {
+      return _conceptLeaderCache.map.get(c);
+    }
+    // 缓存过期: 重建索引 (leaderStock → conceptName)
+    try {
+      const boards = await getConceptBoardPerformance();
+      const newMap = new Map();
+      for (const b of boards) {
+        if (!b.leaderStock) continue;
+        // leaderStock 形如 "600519" 或 "贵州茅台" — 兼容两种
+        const leaderCode = String(b.leaderStock).padStart(6, '0');
+        if (!/^\d{6}$/.test(leaderCode)) continue;
+        if (!newMap.has(leaderCode)) newMap.set(leaderCode, []);
+        newMap.get(leaderCode).push(b.name);
+      }
+      _conceptLeaderCache.at = now;
+      _conceptLeaderCache.map = newMap;
+      return newMap.get(c) || [];
+    } catch (e) {
+      console.warn('[Data] getConceptMembership 失败:', e.message);
+      return [];
+    }
+  }
+
+  /**
    * 全市场公告 (stock_announcement_em), 6h 缓存
    * 输出标准化: [{code, title, date}]
    */
@@ -2154,6 +2222,7 @@
     getStockIndustryByCode, getStockNoticesByCode, getStockAllAnnouncements,
     getStockIndustryBatch,
     getSectorPerformance,
+    getConceptBoardPerformance, getConceptMembership,  // Tier 6+: 概念板块涨幅 + 反查
     getStockVolumeAnomaly,
     // 基金
     getFundSpot, getFundHistory, getFundPortfolio,

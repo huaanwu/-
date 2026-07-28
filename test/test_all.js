@@ -11431,6 +11431,63 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
     else fail('91.5 板块涨幅拉取缺失', '');
   } catch (e) { fail('91.x Hot Theme', e.message); }
 
+  // ===== 93.x: Hot 因子反向打分 (追高陷阱) =====
+  try {
+    const sc93 = readFileSafe(path.join(WWW, 'core', 'scoring.js'));
+
+    // 93.1: 涨幅 > 10% 必须给负分 (接盘区)
+    if (/return -0\.25/.test(sc93) && /p < 10[\s\S]*return -0\.15/.test(sc93))
+      ok('93.1 涨幅 > 10% 给 -0.25 (顶部接盘区负分)');
+    else fail('93.1 顶部负分缺失', '');
+
+    // 93.2: 涨幅 < 0 (错杀) 必须给正分
+    if (/p < -5[\s\S]*return 0\.10/.test(sc93) && /p < 0[\s\S]*return 0\.05/.test(sc93))
+      ok('93.2 跌幅 < 0 给正分 (错杀机会)');
+    else fail('93.2 错杀正分缺失', '');
+
+    // 93.3: 概念取 min (任一概念进接盘区 → 总分负)
+    if (/cptMin = Infinity[\s\S]*Math\.min\(ind, cptMin\)/.test(sc93))
+      ok('93.3 概念取 min (保守: 任一进接盘区即负)');
+    else fail('93.3 概念 min 逻辑缺失', '');
+
+    // 93.4: 反向语义注释
+    if (/接盘|追高|陷阱|反向/.test(sc93))
+      ok('93.4 hot 因子含反向语义注释');
+    else fail('93.4 反向注释缺失', '');
+  } catch (e) { fail('93.x 反向 hot', e.message); }
+
+
+  // ===== 92.x: Tier 6+ 概念板块热点 =====
+  try {
+    const d92 = readFileSafe(path.join(WWW, 'core', 'data.js'));
+    const sc92 = readFileSafe(path.join(WWW, 'core', 'scoring.js'));
+
+    // 92.1: data.js 含 getConceptBoardPerformance
+    if (/getConceptBoardPerformance/.test(d92) && /stock_board_concept_index_em/.test(d92))
+      ok('92.1 data.js 含 getConceptBoardPerformance (概念板块涨幅 fetcher)');
+    else fail('92.1 getConceptBoardPerformance 缺失', '');
+
+    // 92.2: data.js 含 getConceptMembership (反查 code → 概念名)
+    if (/getConceptMembership/.test(d92))
+      ok('92.2 data.js 含 getConceptMembership (概念反查)');
+    else fail('92.2 getConceptMembership 缺失', '');
+
+    // 92.3: data.js 导出两个新方法
+    if (/getConceptBoardPerformance/.test(d92) && /getConceptMembership,/.test(d92))
+      ok('92.3 data.js 导出 getConceptBoardPerformance + getConceptMembership');
+    else fail('92.3 导出缺失', '');
+
+    // 92.4: scoring.js _hotScore 看概念 (同时看 行业 + 概念, 取较高者)
+    if (/_hotScore\(industryPct, conceptPcts\)/.test(sc92) || /Math\.max\(ind, cptMax\)/.test(sc92))
+      ok('92.4 scoring._hotScore 同时看概念');
+    else fail('92.4 _hotScore 未看概念', '');
+
+    // 92.5: rankCandidates 拉 concept 数据
+    if (/getConceptBoardPerformance/.test(sc92) && /getConceptMembership/.test(sc92))
+      ok('92.5 rankCandidates 拉概念涨幅 + 反查索引');
+    else fail('92.5 概念拉取缺失', '');
+  } catch (e) { fail('92.x Concept Board', e.message); }
+
 
 
 
