@@ -1,0 +1,2 @@
+# 强制所有文本文件在 git 中保持 LF, 不让 autocrlf 在 checkout 时改写
+* text=auto eol=lf

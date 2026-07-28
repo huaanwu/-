@@ -59,6 +59,8 @@ export default defineConfig({
         '/core/alerts-agent.js',
         '/core/util.js',
         '/core/risk-mine.js',  // Phase Y.1.2: 排雷数据聚合
+        '/core/scoring.js',     // Tier 6: 多因子打分
+        '/core/weight-advisor.js',  // Tier 6: LLM 周度动态权重
         '/core/user-profile.js'  // Commit 1: 用户画像 (7 字段 schema)
       ]
     }

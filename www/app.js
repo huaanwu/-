@@ -246,6 +246,12 @@ function hideRegimeAlertBanner() {
     if (window.LongTrader && LongTrader.init) {
       LongTrader.init();
     }
+    // Tier 6: LLM 周度动态权重调度 (周日 20:00 自动更新 Scoring 权重)
+    if (window.Core && Core.WeightAdvisor && Core.WeightAdvisor.scheduleWeekly) {
+      Core.WeightAdvisor.scheduleWeekly();
+      // 启动时跑一次, 失败不阻塞
+      Core.WeightAdvisor.adviseNow().catch(e => console.warn('[App] WeightAdvisor 启动失败:', e));
+    }
     if (window.Journal && Journal.init) Journal.init();
     if (window.Screener && Screener.init) Screener.init();
     if (window.Fund && Fund.init) Fund.init();

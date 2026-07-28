@@ -11356,6 +11356,51 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
     else fail('88.6 _indBatchCache 缺失', '');
   } catch (e) { fail('88.x bug 修复', e.message); }
 
+  // ===== 90.x: Tier 6 Scoring + WeightAdvisor =====
+  try {
+    const sc90 = readFileSafe(path.join(WWW, 'core', 'scoring.js'));
+    const wa90 = readFileSafe(path.join(WWW, 'core', 'weight-advisor.js'));
+    const lt90 = readFileSafe(path.join(WWW, 'app', 'long-trader.js'));
+
+    // 90.1: scoring.js 存在 + 5 因子定义
+    if (/Core\.Scoring\s*=/.test(sc90) && /DEFAULT_WEIGHTS/.test(sc90) && /roe:/.test(sc90) && /ep:/.test(sc90) && /turnover:/.test(sc90) && /north:/.test(sc90) && /industryPenalty:/.test(sc90))
+      ok('90.1 scoring.js 含 5 因子默认权重');
+    else fail('90.1 5 因子缺失', '');
+
+    // 90.2: rankNormalize 函数存在
+    if (/rankNormalize/.test(sc90) && /function rank\(/.test(sc90))
+      ok('90.2 scoring 含 rank + rankNormalize 纯函数');
+    else fail('90.2 纯函数缺失', '');
+
+    // 90.3: 硬过滤 (新股/ST/一字板)
+    if (/NEW_STOCK_RULE_DAYS/.test(sc90) && /applyHardFilters/.test(sc90) &&
+        sc90.indexOf("ST|\\*ST") >= 0 && /oneWordLimitUp/.test(sc90))
+      ok('90.3 scoring 含 3 硬过滤 (新股/ST/一字板)');
+    else fail('90.3 硬过滤缺失', '');
+
+    // 90.4: WeightAdvisor 三层兜底
+    if (/parseAndValidate/.test(wa90) && /clamp/.test(wa90) && /CHANGE_RATIO/.test(wa90))
+      ok('90.4 WeightAdvisor parseAndValidate + clamp + 变化上限');
+    else fail('90.4 WeightAdvisor 校验缺失', '');
+
+    // 90.5: WeightAdvisor 周度调度
+    if (/scheduleWeekly/.test(wa90) && sc90 && wa90.indexOf("getDay() === 0") >= 0 &&
+        wa90.indexOf("getHours() === 20") >= 0 || wa90.indexOf("getHour() === 20") >= 0)
+      ok('90.5 WeightAdvisor 周日 20:00 调度');
+    else fail('90.5 调度缺失', '');
+
+    // 90.6: WeightAdvisor 缓存 + fallback
+    if (/weight_advisor_this_week/.test(wa90) && /isThisWeek/.test(wa90) && /DEFAULT_WEIGHTS/.test(wa90))
+      ok('90.6 WeightAdvisor kv 缓存 + DEFAULT fallback');
+    else fail('90.6 缓存/fallback 缺失', '');
+
+    // 90.7: long-trader 调用 Scoring
+    if (/Core\.Scoring\.rankCandidates/.test(lt90))
+      ok('90.7 long-trader 调 Scoring.rankCandidates');
+    else fail('90.7 Scoring 调用缺失', '');
+  } catch (e) { fail('90.x Tier 6', e.message); }
+
+
 
 
 

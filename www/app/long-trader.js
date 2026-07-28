@@ -103,13 +103,21 @@
           const held = (await Paper._getPaperHoldings('long')) || [];
           heldCodes = new Set(held.map(h => h.code).filter(Boolean));
         } catch (e) { /* */ }
-        // 4. 简单硬筛: 换手率 ≥ 1% (有真实成交) + 不在已持仓
-        //    Bug #6 修复: 弃用'涨跌幅 > 0' (与长线理念冲突), 改用流动性指标
-        //    长线 sleeve 也要避免长期不动的僵尸股
-        const sorted = all
-          .filter(s => s && s.代码 && s.名称 && parseFloat(s.换手率 || 0) >= 1 && !heldCodes.has(s.代码))
-          .sort((a, b) => parseFloat(b.涨跌幅) - parseFloat(a.涨跌幅))
-          .slice(0, HARD_TOP);
+        // 4. Tier 6: 多因子打分排序 (替代涨跌幅单维, 候选质量决定 LLM pick 天花板)
+        //    硬过滤 (新股 < 5 日 / ST / 一字板) 已内置在 Scoring.applyHardFilters
+        //    换手率 ≥ 1% 也通过 Scoring 的 turn-over 因子隐式表达
+        let sorted;
+        try {
+          sorted = await Core.Scoring.rankCandidates({ topN: HARD_TOP });
+          // 排除已持仓 (跟 Bear 之前一样)
+          sorted = sorted.filter(s => s && s.代码 && !heldCodes.has(s.代码));
+        } catch (e) {
+          console.warn('[LongTrader] Scoring 失败, 降级为涨跌幅排序:', e);
+          sorted = all
+            .filter(s => s && s.代码 && s.名称 && parseFloat(s.换手率 || 0) >= 1 && !heldCodes.has(s.代码))
+            .sort((a, b) => parseFloat(b.涨跌幅) - parseFloat(a.涨跌幅))
+            .slice(0, HARD_TOP);
+        }
         if (sorted.length === 0) return;
         // Bug #5 修复 (跑空防护): 用 sorted 池中位价估算, 适配茅台/低价股
         const samplePrice = (() => {
