@@ -11416,7 +11416,7 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
     else fail('91.2 导出缺失', '');
 
     // 91.3: scoring.js 加 hot 因子 + _hotScore
-    if (/hot: 0\.14/.test(sc91) && /_hotScore/.test(sc91))
+    if (/hot: 0\.12/.test(sc91) && /_hotScore/.test(sc91))
       ok('91.3 scoring 含 hot 因子 + _hotScore');
     else fail('91.3 hot 因子缺失', '');
 
@@ -11580,10 +11580,10 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
       ok('95.7 DEFAULT_WEIGHTS 含 forecast = 0.10');
     else fail('95.7 DEFAULT_WEIGHTS 缺 forecast', '');
 
-    // 95.8: weight-advisor.js FACTOR_KEYS 加 forecast
+    // 95.8: weight-advisor.js FACTOR_KEYS 加 forecast + rps
     const wa95 = fs.readFileSync(path.join(__dirname, '..', 'www', 'core', 'weight-advisor.js'), 'utf8');
-    if (wa95.indexOf("FACTOR_KEYS = ['roe', 'ep', 'turnover', 'north', 'industryPenalty', 'forecast']") !== -1)
-      ok('95.8 weight-advisor FACTOR_KEYS 6 因子');
+    if (wa95.indexOf("FACTOR_KEYS = ['roe', 'ep', 'turnover', 'north', 'industryPenalty', 'forecast', 'rps']") !== -1)
+      ok('95.8 weight-advisor FACTOR_KEYS 7 因子');
     else fail('95.8 FACTOR_KEYS 未含 forecast', '');
   } catch (e) { fail('95.x 业绩预告因子', e.message); }
 
@@ -11655,6 +11655,52 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
       }
     }
   } catch (e) { fail('96.x chokepoint', e.message); }
+
+  // ===== 97.x: V2 P4 RPS 快照 + 8 因子打分 =====
+  try {
+    const dataJs97 = fs.readFileSync(path.join(__dirname, '..', 'www', 'core', 'data.js'), 'utf8');
+    if (dataJs97.indexOf('async function getRpsSnapshot') !== -1 &&
+        dataJs97.indexOf('60日涨跌幅') !== -1 &&
+        dataJs97.indexOf('stock_zh_a_spot_em') !== -1 &&
+        dataJs97.indexOf('24 * 60 * 60 * 1000') !== -1)
+      ok('97.1 data.js 含 getRpsSnapshot + 60 日涨幅 + 24h 缓存');
+    else fail('97.1 getRpsSnapshot 缺失', '');
+
+    if (dataJs97.indexOf('getRpsSnapshot,') !== -1)
+      ok('97.2 data.js 暴露 getRpsSnapshot');
+    else fail('97.2 未暴露', '');
+
+    const sc97 = fs.readFileSync(path.join(__dirname, '..', 'www', 'core', 'scoring.js'), 'utf8');
+    if (sc97.indexOf('getRpsSnapshot') !== -1 &&
+        sc97.indexOf('rpsMap = new Map()') !== -1 &&
+        sc97.indexOf('rpsFullRanks') !== -1 &&
+        sc97.indexOf('w.rps * factors.rps') !== -1)
+      ok('97.3 scoring 8 因子 (含 rps) 打分');
+    else fail('97.3 scoring 未接入 rps', '');
+
+    if (sc97.indexOf('rps: 0.10') !== -1)
+      ok('97.4 DEFAULT_WEIGHTS 含 rps = 0.10');
+    else fail('97.4 DEFAULT_WEIGHTS 缺 rps', '');
+
+    if (sc97.indexOf('r._rps = rs') !== -1)
+      ok('97.5 ranking 后附 _rps 给 long-trader');
+    else fail('97.5 未附 _rps', '');
+
+    const lt97 = fs.readFileSync(path.join(__dirname, '..', 'www', 'app', 'long-trader.js'), 'utf8');
+    if (lt97.indexOf('s._rps != null') !== -1 &&
+        lt97.indexOf('RPS=') !== -1 &&
+        lt97.indexOf('RPS ≥ 80') !== -1 &&
+        lt97.indexOf('RPS < 50') !== -1)
+      ok('97.6 long-trader 注入 RPS 标签 + 提示 RPS>=80 / RPS<50');
+    else fail('97.6 long-trader RPS 注入缺失', '');
+
+    const wa97 = fs.readFileSync(path.join(__dirname, '..', 'www', 'core', 'weight-advisor.js'), 'utf8');
+    if (wa97.indexOf("FACTOR_KEYS = ['roe', 'ep', 'turnover', 'north', 'industryPenalty', 'forecast', 'rps']") !== -1)
+      ok('97.7 weight-advisor FACTOR_KEYS 7 因子');
+    else fail('97.7 FACTOR_KEYS 未含 rps', '');
+  } catch (e) { fail('97.x RPS', e.message); }
+
+
 
 
 

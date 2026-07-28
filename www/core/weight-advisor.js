@@ -20,7 +20,7 @@
   'use strict';
 
   const KV_KEY = 'weight_advisor_this_week';
-  const FACTOR_KEYS = ['roe', 'ep', 'turnover', 'north', 'industryPenalty', 'forecast'];
+  const FACTOR_KEYS = ['roe', 'ep', 'turnover', 'north', 'industryPenalty', 'forecast', 'rps'];
   const WEIGHT_MIN = 0.02;
   const WEIGHT_MAX = 0.35;
   const CHANGE_RATIO = 0.5;  // 单因子相对 DEFAULT 最大变化 ±50%
@@ -129,18 +129,19 @@
       '本周宏观新闻: ' + (ctx.macro || '(无)').slice(0, 500) + '\n' +
       '本周政策事件: ' + (ctx.policy || '(无)').slice(0, 500) + '\n' +
       '本周板块表现 (top10): ' + (ctx.sectors || '(无)') + '\n\n' +
-      '当前 6 因子基础权重: ' + JSON.stringify(defaults) + '\n\n' +
-      '6 个因子说明:\n' +
+      '当前 7 因子基础权重: ' + JSON.stringify(defaults) + '\n\n' +
+      '7 个因子说明:\n' +
       '- roe: ROE 质量 (基本面优先)\n' +
       '- ep: EP 低估值 (价值)\n' +
       '- turnover: 换手率反转 (低换手加分)\n' +
       '- north: 北向资金流入 (外资偏好)\n' +
       '- industryPenalty: 行业集中度惩罚 (防单行业暴露)\n' +
-      '- forecast: 业绩预告预增 (利润断层/拐点信号, 季度性强)\n\n' +
+      '- forecast: 业绩预告预增 (利润断层/拐点信号, 季度性强)\n' +
+      '- rps: 60 日涨幅 vs 中位数 (强势股偏好, 趋势确认)\n\n' +
       '任务: 根据本周市场状态, 输出下周权重 (JSON):\n' +
-      '{ "roe": 0.18, "ep": 0.16, "turnover": 0.13, "north": 0.13, "industryPenalty": 0.16, "forecast": 0.10 }\n' +
+      '{ "roe": 0.16, "ep": 0.14, "turnover": 0.12, "north": 0.12, "industryPenalty": 0.14, "forecast": 0.10, "rps": 0.10 }\n' +
       '要求和 = 1.0 (±5% 容差), 每个因子 [0.02, 0.35]。\n' +
-      '熊市加重 industryPenalty/roe, 减 north; 政策利好期可加 north; AI/科技主题期可加 roe; 业绩预告披露期 (1/4/7/10 月) 可加 forecast。\n' +
+      '熊市加重 industryPenalty/roe, 减 north; 政策利好期可加 north; AI/科技主题期可加 roe; 业绩预告披露期 (1/4/7/10 月) 可加 forecast; 趋势确认期 (突破/主升) 可加 rps。\n' +
       '只输出 JSON, 不要其他文字。';
 
     const raw = await Core.AI.callWithTimeout({

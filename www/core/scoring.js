@@ -26,13 +26,14 @@
 
   // 静态默认权重 (LLM 调不通时 fallback)
   const DEFAULT_WEIGHTS = {
-    roe: 0.18,           // ROE/ROIC 质量
-    ep: 0.16,            // EP (盈利收益率)
-    hot: 0.14,           // 板块动量 (热点因子, Tier 6+)
-    turnover: 0.13,      // 换手率反转
-    north: 0.13,         // 20 日北向净流入
-    industryPenalty: 0.16, // 行业集中度惩罚
-    forecast: 0.10       // V2 P2: 业绩预告 (利润断层/拐点信号)
+    roe: 0.16,           // ROE/ROIC 质量
+    ep: 0.14,            // EP (盈利收益率)
+    hot: 0.12,           // 板块动量 (热点因子, Tier 6+)
+    turnover: 0.12,      // 换手率反转
+    north: 0.12,         // 20 日北向净流入
+    industryPenalty: 0.14, // 行业集中度惩罚
+    forecast: 0.10,      // V2 P2: 业绩预告 (利润断层/拐点信号)
+    rps: 0.10            // V2 P4: RPS 快照 (60 日涨幅 vs 中位数, 选强势股)
   };
 
   // 板块涨幅 → 热度分 (反向打分 — A 股热点大多是接盘陷阱)
@@ -92,7 +93,7 @@
    * @param {Object} weights - 权重表 (来自 WeightAdvisor 或 fallback)
    * @returns {Array} sorted by _score desc
    */
-  function rank(stocks, finMap, industryMap, northMap, heldByInd, weights, conceptMap, conceptPerf, sectorPerf, forecastMap) {
+  function rank(stocks, finMap, industryMap, northMap, heldByInd, weights, conceptMap, conceptPerf, sectorPerf, forecastMap, rpsMap) {
     if (!Array.isArray(stocks) || stocks.length === 0) return [];
     const w = Object.assign({}, DEFAULT_WEIGHTS, weights || {});
 
@@ -134,6 +135,13 @@
       return idx >= 0 ? (forecastRanks[idx] || 0) : 0;
     });
 
+    // V2 P4: RPS 百分位 (rpsMap 直接给 rank 0-100, 归一化到 0-1)
+    const rpsFullRanks = enriched.map(e => {
+      const r = rpsMap ? rpsMap.get(e.s.代码) : null;
+      if (!r || r.rank == null) return 0;
+      return r.rank / 100;
+    });
+
     // 行业板块涨幅 → Map (industryName → pctChange)
     const sectorMap = new Map();
     if (Array.isArray(sectorPerf)) {
@@ -165,7 +173,7 @@
       return Math.min(1, cur / (totalHeld * 0.25));
     };
 
-    // 打分 (7 因子)
+    // 打分 (8 因子)
     return enriched
       .map((e, i) => {
         const factors = {
@@ -175,7 +183,8 @@
           turnover: turnoverRanks[i] || 0,
           north: northRanks[i] || 0,
           industryPenalty: indPenalty(e.industry),
-          forecast: forecastFullRanks[i] || 0
+          forecast: forecastFullRanks[i] || 0,
+          rps: rpsFullRanks[i] || 0
         };
         const score =
           w.roe * factors.roe +
@@ -184,7 +193,8 @@
           w.turnover * factors.turnover +
           w.north * factors.north -
           w.industryPenalty * factors.industryPenalty +
-          w.forecast * factors.forecast;
+          w.forecast * factors.forecast +
+          w.rps * factors.rps;
         return Object.assign({}, e.s, { _score: score, _factors: factors });
       })
       .sort((a, b) => b._score - a._score);
@@ -287,9 +297,17 @@
       } catch (e) { console.warn('[Scoring] 主营构成拉取失败:', e); }
     }
 
+    // V2 P4: RPS 快照 (60 日涨幅 vs 中位数, 24h TTL, 失败降级)
+    let rpsMap = new Map();
+    if (Core.Data.getRpsSnapshot) {
+      try {
+        rpsMap = await Core.Data.getRpsSnapshot({ days: 60 });
+      } catch (e) { console.warn('[Scoring] RPS 快照拉取失败:', e); }
+    }
+
     // 5. 硬过滤 + 打分
     const filtered = applyHardFilters(all, opts, forecastMap);
-    const ranked = rank(filtered, finMap, industryMap, northMap, heldByInd, weights, conceptMap, conceptPerf, sectorPerf, forecastMap);
+    const ranked = rank(filtered, finMap, industryMap, northMap, heldByInd, weights, conceptMap, conceptPerf, sectorPerf, forecastMap, rpsMap);
 
     // V2 P3: 把 chokepoint 标签附加到 ranked 候选上 (供 long-trader LLM 决策)
     if (zygcMap && zygcMap.size > 0) {
@@ -300,6 +318,14 @@
           r._topProduct = z.topProduct;
           r._topProductPct = z.topProductPct;
         }
+      }
+    }
+
+    // V2 P4: 把 RPS 信息附加到 ranked 候选上
+    if (rpsMap && rpsMap.size > 0) {
+      for (const r of ranked) {
+        const rs = rpsMap.get(r.代码);
+        if (rs) r._rps = rs;
       }
     }
 

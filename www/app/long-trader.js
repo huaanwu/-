@@ -292,7 +292,13 @@
             const pct = (s._topProductPct * 100).toFixed(1);
             ckPart = ` | 产品分散: ${s._topProduct} ${pct}%`;
           }
-          return `[${i}] ${code} ${name} | 涨跌幅=${chg}% | 换手=${turn}% | 市值=${mcapStr}${finPart}${ckPart}`;
+          // V2 P4: RPS 标签 (60 日涨幅 vs 中位数, rank 0-100)
+          let rpsPart = '';
+          if (s._rps != null && s._rps.rank != null) {
+            const r = s._rps.rank.toFixed(0);
+            rpsPart = ` | RPS=${r}`;
+          }
+          return `[${i}] ${code} ${name} | 涨跌幅=${chg}% | 换手=${turn}% | 市值=${mcapStr}${finPart}${ckPart}${rpsPart}`;
         }).join('\n');
 
         // SKL v1.4: 长线 sleeve 默认 trigger 全部 3 类方法论 (紫苏叶瓶颈 / NAV 折价 / 反共识)
@@ -336,6 +342,7 @@
           '\n- 硬筛已排除: ROE < 5%、毛利率 < 10% 的股票' +
           '\n- 排除 ST/退市风险股' +
           '\n- 【紫苏叶瓶颈 SKL-001】优先选【单一产品依赖】标签 (主营产品占比 > 40%), 这是产业链卡脖子环节' +
+          '\n- 【RPS 强势股】优先 RPS ≥ 80 (前 20% 强势股), 避免 RPS < 50 (弱势股)。RPS=60 日涨幅 vs 全市场中位数的百分位排名' +
           '\n' + (kbBlock || '') +
           '\n' + regimeLine +
           (poolText ? '\n- 【全系统学习池】' + poolText.replace(/\n/g, ' ').slice(0, 200) : '') +

@@ -884,6 +884,57 @@
   }
 
   /**
+   * RPS 快照 (V2 P4: 长线 RPS 因子)
+   * 数据源: stock_zh_a_spot_em (东方财富, 一次返回 ~5500 只全市场行情)
+   *   - 字段: 60日涨跌幅, 年初至今涨跌幅
+   *   - 用 "60日涨跌幅" 作为 RPS-2 近似 (A 股长线常用 RPS-12 / RPS-250, 但自算 5500 只 K 线 IO 过大)
+   *   - 算全市场中位数/标准差 → 输出每只的 rank 百分位 (RPS 0-100, 越高越强)
+   *   - 缓存 24h (中位数短期变化小, 但接 stock 60s cache 链路)
+   */
+  async function getRpsSnapshot(opts = {}) {
+    const days = opts.days || 60;  // 默认 60 日 (RPS-2 近似)
+    const cacheKey = `rps_snapshot_${days}d`;
+    // 1) 内存缓存 (24h)
+    const cached = await Core.Storage.cacheGet(cacheKey);
+    if (cached && Date.now() - (cached._ts || 0) < 24 * 60 * 60 * 1000) {
+      return cached.results;
+    }
+    // 2) 拉全市场 spot (复用 60s 缓存)
+    const all = await getStockSpotEfinanceCached();
+    if (!Array.isArray(all) || all.length === 0) return new Map();
+    // 3) 取 60 日涨幅 (兼容两种字段名: "60日涨跌幅" 或 "60日涨幅")
+    const PCT_FIELD = days === 60 ? '60日涨跌幅' : null;
+    const items = [];
+    for (const s of all) {
+      const code = s['代码'] || s.代码;
+      if (!code) continue;
+      const pct = s[PCT_FIELD] != null ? parseFloat(s[PCT_FIELD]) : null;
+      if (pct == null || isNaN(pct)) continue;
+      items.push({ code, pct });
+    }
+    if (items.length === 0) return new Map();
+    // 4) 算中位数 + 标准差
+    const pcts = items.map(i => i.pct).sort((a, b) => a - b);
+    const median = pcts.length % 2 === 0
+      ? (pcts[pcts.length / 2 - 1] + pcts[pcts.length / 2]) / 2
+      : pcts[Math.floor(pcts.length / 2)];
+    const mean = pcts.reduce((s, v) => s + v, 0) / pcts.length;
+    const std = Math.sqrt(pcts.reduce((s, v) => s + (v - mean) ** 2, 0) / pcts.length);
+    // 5) 算每只 rank 百分位 (RPS 0-100) + z-score
+    const sortedCodes = items.slice().sort((a, b) => a.pct - b.pct);
+    const rankMap = new Map();
+    sortedCodes.forEach((it, i) => {
+      const rps = sortedCodes.length > 1 ? (i / (sortedCodes.length - 1)) * 100 : 50;
+      const z = std > 0 ? (it.pct - mean) / std : 0;
+      rankMap.set(it.code, { pct: it.pct, rank: rps, z, median, std });
+    });
+    // 6) 写缓存 (24h TTL, 带 _ts 时间戳)
+    const toCache = { _ts: Date.now(), results: rankMap };
+    await Core.Storage.cacheSet(cacheKey, toCache, 24 * 60 * 60 * 1000);
+    return rankMap;
+  }
+
+  /**
    * 业绩预告 (V2 P2: long-trader earnings forecast factor)
    * 数据源: stock_yjyg_em (东方财富, 季度预告)
    *   - date 必填 YYYYMMDD, 必须季度末 (0331/0630/0930/1231), 季度内不变 → TTL 7d
@@ -2378,6 +2429,7 @@
     getConceptBoardPerformance, getConceptMembership,  // Tier 6+: 概念板块涨幅 + 反查
     getStockEarningForecast, getStockEarningForecastBatch,  // V2 P2: 业绩预告
     getStockBusinessComposition, getStockBusinessCompositionBatch,  // V2 P3: 主营构成/chokepoint
+    getRpsSnapshot,  // V2 P4: RPS 快照 (60 日涨幅 vs 中位数)
     getStockVolumeAnomaly,
     // 基金
     getFundSpot, getFundHistory, getFundPortfolio,
