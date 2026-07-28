@@ -7109,7 +7109,7 @@ section('[40] ShortTrader T4 学习环: _judgeClosedTrade 全分支 / verify 扫
       ok('41.b settings UI 注入 selfCheckResult + selfCheckList 两个 ID');
     } else fail('41.b', 'settings UI 缺 selfCheck* 容器');
 
-    if (/fetch\([^)]*\/health/.test(appSrc) && /stock_zh_a_spot/.test(appSrc) && /Core\.AI\.discoverLocalLLM/.test(appSrc)) {
+    if (/_apiUrl\([^)]*['"]\/health['"]/.test(appSrc) && /stock_zh_a_spot/.test(appSrc) && /Core\.AI\.discoverLocalLLM/.test(appSrc)) {
       ok('41.c 三个探测项都在 (dev-proxy /health + aktools stock_zh_a_spot + 本地 LLM discoverLocalLLM)');
     } else fail('41.c', '三个探测项任一缺失');
 

@@ -29,4 +29,6 @@ android/
 .claude/
 www/sw.js
 www/version.json
+dp.log
+dp.err
 dist/

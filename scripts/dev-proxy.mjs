@@ -26,9 +26,135 @@ import express from 'express';
 import { createProxyMiddleware } from 'http-proxy-middleware';
 import http from 'node:http';
 import os from 'node:os';
+import { spawn, execFileSync } from 'node:child_process';
+import net from 'node:net';
 
 const PORT = process.env.PROXY_PORT || 8089;
 const AKSHARE_TARGET = process.env.AKSHARE_TARGET || 'http://127.0.0.1:8088';
+const NO_AKTOOLS_AUTOSTART = process.env.NO_AKTOOLS_AUTOSTART === '1';
+
+// ===== aktools 自动拉起 =====
+// 行为:
+//   - 启动时 ping ${AKSHARE_TARGET}, 3s 内 200 则认为外部有人跑, 不动
+//   - 否则尝试 spawn `python -m aktools --host 127.0.0.1 --port 8088` 子进程
+//   - 等最多 15s, 起来就当依赖用, 失败就降级到手动提示
+// 关掉: NO_AKTOOLS_AUTOSTART=1 node scripts/dev-proxy.mjs
+function _parseHostPort(url) {
+  try {
+    const u = new URL(url);
+    return { host: u.hostname, port: parseInt(u.port || '80', 10) };
+  } catch (e) {
+    console.warn('[aktools] AKSHARE_TARGET 解析失败:', e.message);
+    return null;
+  }
+}
+const _aktoolsParsed = _parseHostPort(AKSHARE_TARGET);
+
+function _probeOnce(target, timeoutMs = 3000) {
+  return new Promise((resolve) => {
+    const { host, port } = _parseHostPort(target) || { host: '127.0.0.1', port: 8088 };
+    // 用 /api/public/macro_china_lpr 探活 (aktools 0.0.91 + Py 3.14 上实测稳定 200, 不需参数)
+    const r = http.get({
+      host, port,
+      path: '/api/public/macro_china_lpr',
+      timeout: timeoutMs
+    }, (resp) => {
+      resp.resume();
+      resolve({ ok: resp.statusCode < 500, status: resp.statusCode, host, port });
+    });
+    r.on('timeout', () => { r.destroy(); resolve({ ok: false, status: 0, reason: 'timeout', host, port }); });
+    r.on('error', (e) => resolve({ ok: false, status: 0, reason: e.code || e.message, host, port }));
+  });
+}
+
+async function _waitForPort(port, host, maxMs = 15000, intervalMs = 500) {
+  const start = Date.now();
+  while (Date.now() - start < maxMs) {
+    const ok = await new Promise((resolve) => {
+      const s = net.connect(port, host, () => { s.end(); resolve(true); });
+      s.on('error', () => resolve(false));
+    });
+    if (ok) return Date.now() - start;
+    await new Promise(r => setTimeout(r, intervalMs));
+  }
+  return -1;
+}
+
+// 找 python 命令
+function _pickPython() {
+  for (const cmd of ['python', 'py', 'python3']) {
+    try {
+      const out = execFileSync(cmd, ['--version'], { stdio: ['ignore', 'pipe', 'ignore'] });
+      const v = (out.toString() || '').trim();
+      if (v) return { cmd, version: v };
+    } catch (e) { /* try next */ }
+  }
+  return null;
+}
+
+let _aktoolsChild = null;
+
+async function _ensureAktools() {
+  // 1) 先探一次, 通就直接用
+  const initial = await _probeOnce(AKSHARE_TARGET, 1500);
+  if (initial.ok && initial.status === 200) {
+    console.log(`[aktools] 已有外部进程在 ${AKSHARE_TARGET} (HTTP ${initial.status}), 不自动拉起`);
+    return { spawned: false, ok: true, probe: initial };
+  }
+  if (NO_AKTOOLS_AUTOSTART) {
+    console.log(`[aktools] ${AKSHARE_TARGET} ❌ 不通, NO_AKTOOLS_AUTOSTART=1 跳过自动拉起, 手动跑: pip install aktools && python -m aktools --host 127.0.0.1 --port 8088`);
+    return { spawned: false, ok: false, probe: initial };
+  }
+  // 2) 找 python
+  const py = _pickPython();
+  if (!py) {
+    console.log(`[aktools] ${AKSHARE_TARGET} ❌ 不通, 且没找到 python/python3, 请手动跑: pip install aktools && python -m aktools --host 127.0.0.1 --port 8088`);
+    return { spawned: false, ok: false, probe: initial, noPython: true };
+  }
+  // 3) 先确认 aktools 模块已装
+  try {
+    execFileSync(py.cmd, ['-c', 'import aktools'], { stdio: ['ignore', 'ignore', 'ignore'] });
+  } catch (e) {
+    console.log(`[aktools] ${AKSHARE_TARGET} ❌ 不通, ${py.cmd} (${py.version}) 在但 aktools 没装`);
+    console.log(`[aktools] → 安装: ${py.cmd} -m pip install aktools`);
+    console.log(`[aktools] → 然后: ${py.cmd} -m aktools --host 127.0.0.1 --port 8088`);
+    return { spawned: false, ok: false, probe: initial, noAktoolsPkg: true };
+  }
+  // 4) spawn aktools
+  console.log(`[aktools] ${AKSHARE_TARGET} 不通, 自动拉起: ${py.cmd} -m aktools --host 127.0.0.1 --port 8088`);
+  try {
+    const host = _aktoolsParsed?.host || '127.0.0.1';
+    const port = _aktoolsParsed?.port || 8088;
+    _aktoolsChild = spawn(py.cmd, ['-m', 'aktools', '--host', host, '--port', String(port)], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true
+    });
+    const tag = `[aktools pid=${_aktoolsChild.pid}]`;
+    _aktoolsChild.stdout.on('data', (c) => process.stdout.write(`${tag} ${c}`));
+    _aktoolsChild.stderr.on('data', (c) => process.stderr.write(`${tag} ${c}`));
+    _aktoolsChild.on('exit', (code) => {
+      console.log(`[aktools] 子进程 exit (code=${code})`);
+      _aktoolsChild = null;
+    });
+  } catch (e) {
+    console.log(`[aktools] spawn 失败: ${e.message}`);
+    return { spawned: false, ok: false, probe: initial };
+  }
+  // 5) 等待端口起来
+  const waitMs = await _waitForPort(_aktoolsParsed?.port || 8088, _aktoolsParsed?.host || '127.0.0.1', 15000);
+  if (waitMs < 0) {
+    console.log(`[aktools] 15s 内没起来, 请检查: ${py.cmd} -m aktools --host 127.0.0.1 --port 8088`);
+    return { spawned: true, ok: false, probe: initial };
+  }
+  // 6) 再探一次确认业务端点 (端口起来但服务还没就绪也会失败)
+  const settle = await _probeOnce(AKSHARE_TARGET, 5000);
+  if (settle.ok && settle.status === 200) {
+    console.log(`[aktools] ✅ 起来了 (端口等 ${waitMs}ms, 端点 HTTP ${settle.status})`);
+    return { spawned: true, ok: true, probe: settle };
+  }
+  console.log(`[aktools] ⚠️ 端口开了但端点没就绪 (HTTP ${settle.status}), 多等一会儿再试`);
+  return { spawned: true, ok: false, probe: settle };
+}
 
 // ===== LLM 代理 (解决浏览器 CORS) =====
 // 浏览器 → /api/llm/{provider}/v1/chat/completions
@@ -107,14 +233,55 @@ app.options('/health', (req, res) => {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.status(204).end();
 });
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
+  // 顺便 ping aktools (Python 后端), selfCheck 一次性拿到 dev-proxy + aktools 状态
+  // 探针用 /api/public/index (aktools 列表页, 0.0.91+ 必定存在, 不需参数)
+  const aktoolsCheck = await new Promise((resolve) => {
+    const req2 = http.get(AKSHARE_TARGET + '/api/public/macro_china_lpr', { timeout: 4000 }, (r2) => {
+      let body = '';
+      r2.on('data', (c) => { body += c; if (body.length > 4096) body = body.slice(0, 4096); });
+      r2.on('end', () => {
+        // 200/422 = ok (422 = 端点存在但参数不对); 404/500 = down
+        const ok = r2.statusCode === 200 || r2.statusCode === 422;
+        resolve({ ok, status: r2.statusCode, sample: body.slice(0, 200) });
+      });
+    });
+    req2.on('timeout', () => { req2.destroy(); resolve({ ok: false, status: 0, reason: 'timeout' }); });
+    req2.on('error', (e) => { resolve({ ok: false, status: 0, reason: e.code || e.message }); });
+  });
+  const akshare_status = aktoolsCheck.ok ? 'ok' : 'down';
   res.json({
     status: 'ok',
     akshare_target: AKSHARE_TARGET,
+    akshare_status,
+    akshare_check_detail: aktoolsCheck,
     timestamp: new Date().toISOString()
   });
 });
+
+// 启动时探测 aktools: 通则不动, 不通则自动 spawn 子进程
+let _aktoolsBootResult = { spawned: false, ok: false };
+(async () => {
+  // 50ms 等 express 起来再 ping (避免冷启动顺序问题)
+  await new Promise(r => setTimeout(r, 50));
+  _aktoolsBootResult = await _ensureAktools();
+  if (!_aktoolsBootResult.ok && !_aktoolsBootResult.spawned) {
+    // 降级到手动提示 (NO_AKTOOLS_AUTOSTART / 没 python / 没装 aktools)
+    console.log('[dev-proxy] → 备用手动启动: pip install aktools');
+    console.log('[dev-proxy] → 然后: python -m aktools --host 127.0.0.1 --port 8088');
+    console.log('[dev-proxy] → (aktools 0.0.91+ 已移除 http 子命令, 直接 --host/--port)');
+  }
+})();
+
+// 退出时清理 spawn 的 aktools 子进程 (仅本脚本拉的)
+function _killAktoolsChild() {
+  if (_aktoolsChild && !_aktoolsChild.killed) {
+    try { _aktoolsChild.kill(); } catch (e) { /* 静默退出 */ }
+  }
+}
+process.on('SIGINT', () => { _killAktoolsChild(); process.exit(0); });
+process.on('SIGTERM', () => { _killAktoolsChild(); process.exit(0); });
 
 // 自动发现本地大模型端点 (服务器端探, 避浏览器 CORS)
 app.get('/api/discover/local-llm', async (req, res) => {

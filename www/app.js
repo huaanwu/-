@@ -637,8 +637,18 @@ window.selfCheckServices = async function() {
   if (status) { status.textContent = '⏳ 自检中...'; status.style.color = 'var(--text-muted)'; }
   if (list) list.innerHTML = '';
 
-  const proxyBase = (Core.State.get().proxyBase || '/api/akshare').replace(/\/api\/.*$/, '');
-  // proxyBase 可能形如 http://192.168.x.x:8089/api/akshare → 截到 :8089
+  // 用 _apiUrl() 统一翻译 (APK 走 proxyBase, 浏览器走相对路径 → vite proxy)
+  const _apiUrl = (window.Core && Core.Data && Core.Data.apiUrl) ? Core.Data.apiUrl : (x) => x;
+
+  // 包一层带超时的 fetch: Android WebView fetch 没有超时, 长 scan 容易直接 reject "Failed to fetch"
+  const _fetchWithTimeout = async (url, opts = {}, ms = 8000) => {
+    const ctl = (typeof AbortController === 'function') ? new AbortController() : null;
+    if (ctl) opts.signal = ctl.signal;
+    const t = setTimeout(() => { try { ctl && ctl.abort(); } catch (e) {} }, ms);
+    try {
+      return await fetch(url, opts);
+    } finally { clearTimeout(t); }
+  };
 
   const checks = [
     {
@@ -646,9 +656,13 @@ window.selfCheckServices = async function() {
       desc: 'Node 代理 (行情/行业/LLM/扫描 都在这里)',
       test: async () => {
         const start = Date.now();
-        const r = await fetch(proxyBase + '/health', { cache: 'no-store' });
-        const j = await r.json();
-        return { ok: r.ok, latencyMs: Date.now() - start, detail: 'akshare_target=' + (j.akshare_target || '?') };
+        const url = _apiUrl('/health');
+        const r = await _fetchWithTimeout(url, { cache: 'no-store' }, 4000);
+        const t = await r.text();
+        let j = null;
+        try { j = JSON.parse(t); } catch (e) {}
+        const ok = r.ok && !!j;
+        return { ok, latencyMs: Date.now() - start, detail: 'GET ' + url + ' → ' + (j ? ('akshare_target=' + (j.akshare_target || '?')) : ('HTTP ' + r.status + ' (非 JSON): ' + t.slice(0, 80))) };
       }
     },
     {
@@ -656,11 +670,12 @@ window.selfCheckServices = async function() {
       desc: 'Python AKShare 后端 (深度财务/龙虎榜 等)',
       test: async () => {
         const start = Date.now();
-        // aktools /api/public 接口较多, 用 stock_zh_a_spot 单只代码做 probe
-        const r = await fetch(proxyBase + '/api/akshare/stock_zh_a_spot?symbol=000001', { cache: 'no-store' });
+        const url = _apiUrl('/api/akshare/stock_zh_a_spot?symbol=000001');
+        // aktools 真限流会卡很久, 8s 超时够了 (stock_zh_a_spot 正常 < 2s)
+        const r = await _fetchWithTimeout(url, { cache: 'no-store' }, 8000);
         const t = await r.text();
         const ok = r.ok && t.length > 100 && t.trim().startsWith('[');
-        return { ok, latencyMs: Date.now() - start, detail: t.length > 200 ? `${t.length} bytes` : t.slice(0, 80) };
+        return { ok, latencyMs: Date.now() - start, detail: 'GET ' + url + ' → HTTP ' + r.status + (t.length > 200 ? `, ${t.length} bytes` : `, ${t.slice(0, 80)}`) };
       }
     },
     {
@@ -668,26 +683,33 @@ window.selfCheckServices = async function() {
       desc: '扫描局域网 qwen/Ollama/LM Studio',
       test: async () => {
         const start = Date.now();
-        const r = await Core.AI.discoverLocalLLM();
+        const url = _apiUrl('/api/discover/local-llm');
+        // discoverLocalLLM 内部 fetch 没 timeout, 包一层避免 20 个 LAN 端点扫描卡死
+        const probe = await _fetchWithTimeout(url, { method: 'GET', cache: 'no-store' }, 10000)
+          .then(async r => ({ status: r.status, json: r.ok ? await r.json() : null }))
+          .catch(e => ({ status: 0, json: null, err: String(e) }));
+        if (probe.status !== 200 || !probe.json) {
+          throw new Error('HTTP ' + probe.status + (probe.err ? ' (' + probe.err + ')' : ''));
+        }
+        const j = probe.json;
+        const found = j.found || [];
         return {
-          ok: r.found.length > 0,
+          ok: found.length > 0,
           latencyMs: Date.now() - start,
-          detail: `${r.found.length} 个候选 (扫了 ${r.scanned} 个端点, dev-proxy 在 ${r.host})`
+          detail: 'GET ' + url + ' → ' + found.length + ' 个候选 (扫了 ' + (j.scanned || 0) + ' 个端点, dev-proxy 在 ' + (j.host || '127.0.0.1') + ')'
         };
       }
     }
   ];
 
-  const results = [];
-  for (const c of checks) {
+  const results = await Promise.all(checks.map(async (c) => {
     try {
       const r = await c.test();
-      results.push({ ...c, ...r, error: null });
+      return { ...c, ...r, error: null };
     } catch (e) {
-      results.push({ ...c, ok: false, latencyMs: 0, detail: '', error: e.message });
-      console.warn('[selfCheck] ' + c.name + ' 错误:', e);
+      return { ...c, ok: false, latencyMs: 0, detail: '', error: e.message };
     }
-  }
+  }));
 
   const allOk = results.every(r => r.ok);
   const someOk = results.some(r => r.ok);
