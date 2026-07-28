@@ -11176,6 +11176,31 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
     fail('78 3B-2', e.message);
   }
 
+  // ========== [79] Tier 4: 量价异动 — 预缓存 + 振幅/5日涨幅注入 ==========
+  section('79] Tier 4: 量价异动');
+  try {
+    const scSrc = readFileSafe(path.join(WWW, 'app/screener.js'));
+    // 79.1 预缓存触发: 不 await 的循环
+    if (/Tier 4: 量价预缓存/.test(scSrc))
+      ok('79.1 量价预缓存触发 (不 await 后台跑)');
+    else fail('79.1 预缓存缺失', '');
+    // 79.2 momentumLine 计算块 + 读 K 线
+    if (/momentumLine[\s\S]*getStockKLine/.test(scSrc))
+      ok('79.2 momentumLine 读 K 线算振幅+5日涨幅');
+    else fail('79.2 momentumLine 计算块缺失', '');
+    // 79.3 userPrompt 含【量价异动】段
+    if (/【量价异动/.test(scSrc))
+      ok('79.3 userPrompt 注入【量价异动】段');
+    else fail('79.3 量价段缺失', '');
+    // 79.4 systemPrompt 含量价异动 + 量价配合两条规则
+    if (/13\. \*\*量价异动/.test(scSrc) && /14\. \*\*量价配合/.test(scSrc))
+      ok('79.4 systemPrompt 规则 13/14 量价异动+量价配合');
+    else fail('79.4 规则 13/14 缺失', '');
+  } catch (e) {
+    fail('79 量价异动', e.message);
+  }
+
+
 waitForIIFEsDrain().then(() => {
   console.log(`\n\x1b[1m===== 测试结果 =====\x1b[0m`);
   console.log(`\x1b[32m通过: ${passed}\x1b[0m  |  \x1b[${failed > 0 ? '31' : '32'}]m失败: ${failed}\x1b[0m`);

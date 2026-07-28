@@ -335,6 +335,18 @@
         ? [...new Set([...lhbMap.values()].map(v => v.reasonTag).filter(Boolean))]
         : undefined;
 
+      // Tier 4: 量价预缓存 — 并发 5 逐批填 30 只 K 线 (24h 缓存), 不 await, 后台跑
+      // 等 pipeline 读到这一步时缓存已就位
+      (() => {
+        const codes = top.slice(0, 30).map(s => s.代码);
+        for (let i = 0; i < codes.length; i += 5) {
+          const chunk = codes.slice(i, i + 5);
+          Promise.allSettled(chunk.map(c =>
+            Core.Data.getStockKLine(c, 'daily', '', '', 'qfq').catch(() => null)
+          ));
+        }
+      })();
+
       // 并行加载宏观 + 新闻 + Phase O: 13 维上下文 + KB + Y.3 P-A 持仓
       const macroP = Core.Macro.get().catch(e => null);
       const newsP = Core.News.get().catch(e => null);
@@ -346,6 +358,32 @@
       const newsText = news ? Core.News.formatForPrompt(news, 8) : '[降级] 新闻数据不可用';
       const ctxText = ctx ? Core.Data.formatAiContextForPrompt(ctx) : '[降级] 市场上下文 (9 维) 不可用';
       const intlText = intl ? Core.Data.formatIntlForPrompt(intl) : '[降级] 国际形势不可用';
+
+      // Tier 4: 量价异动 — 从预填的 K 线缓存读振幅 + 5 日涨幅
+      let momentumLine = '(量价数据不可用)';
+      try {
+        const slice = top.slice(0, 30);
+        const barsArr = await Promise.allSettled(
+          slice.map(s => Core.Data.getStockKLine(s.代码, 'daily', '', '', 'qfq').catch(() => null))
+        );
+        const mlines = slice.map((s, i) => {
+          const bars = barsArr[i]?.status === 'fulfilled' ? barsArr[i].value : null;
+          if (!Array.isArray(bars) || bars.length < 6) return '[' + i + '] ' + s.代码 + ' ' + s.名称 + ' | 量价=[降级]';
+          const tail = bars.slice(-6);
+          const close5 = tail[tail.length - 1]['收盘'] || 0;
+          const close0 = tail[0]['收盘'] || 0;
+          const trend5pct = close0 > 0 ? ((close5 - close0) / close0 * 100).toFixed(2) : 'N/A';
+          const amplPcts = tail.slice(-5).map(d => {
+            const hi = d['最高'] || 0;
+            const lo = d['最低'] || 0;
+            const denom = lo > 0 ? lo : 1;
+            return (hi - lo) / denom * 100;
+          });
+          const maxAmpl = Math.max(...amplPcts, 0);
+          return '[' + i + '] ' + s.代码 + ' ' + s.名称 + ' | 5日=' + trend5pct + '% | 周振幅=' + maxAmpl.toFixed(2) + '%';
+        });
+        momentumLine = '\n' + mlines.join('\n');
+      } catch (e) { console.warn('[screener] 量价拉取失败:', e); }
 
       // KB 智能匹配 (Phase N+O) — 失败同样 [降级]
       let kbText = '';
@@ -457,7 +495,9 @@ ${Core.AI.formatUserProfile() || '长期稳健型 (年化 3-5%), 不追短期暴
 9. **排雷标签 ✓ 必须尊重**: 候选池中如已被前端标 [排雷] 的代码 (商誉偏高/股东减持/业绩亏损/主力出逃), 一律不进 picks, 除非 KB 经典模式能给出反转理由 (例如"高商誉但 ROE 持续 > 20% 的特例")
 10. 严禁绝对化表述 ("一定涨" 等)${poolBlock}${discBlock}
 11. **北向资金 (T+1 滞后)**: 个股北向 5 日净流入 + 当日净买 → 中线加分信号; 大额流出 → 减分
-12. **龙虎榜 (T+1 滞后)**: 上榜原因 6 类标签 — 涨幅异动/跌幅异动/换手异动/振幅异动/ST风险/其它上榜。机构主导(机构净额占成交 > 5%) = 加分信号(知情资金); ST 类 = 强制不进 picks; 跌幅/振幅异动 = 警示信号,谨慎进 picks`;
+12. **龙虎榜 (T+1 滞后)**: 上榜原因 6 类标签 — 涨幅异动/跌幅异动/换手异动/振幅异动/ST风险/其它上榜。机构主导(机构净额占成交 > 5%) = 加分信号(知情资金); ST 类 = 强制不进 picks; 跌幅/振幅异动 = 警示信号,谨慎进 picks
+13. **量价异动**: 5 日涨幅 > 15% → 涨幅异动(短线超买警示); 5 日跌幅 > 10% → 跌幅异动(超卖反弹可能); 周振幅(近 5 日最大单日振幅) > 8% → 高波动警示, 加仓需分批
+14. **量价配合**: 5 日涨幅正向但量比 > 1.5 → 量价齐升(信号加强); 涨幅正向但量比 < 0.6 → 缩量上涨(谨慎)`;
 
       const userPrompt = `【我的现有持仓 (前 10, Y.3 P-A)】
 ${portfolioLine}
@@ -488,6 +528,9 @@ ${lhbText ? '\n' + lhbText : ''}
 
 【行业归属】(24h 缓存, 单只失败标 [降级])
 ${industryLine}
+
+【量价异动 (近 5 日, 腾讯 K 线)】
+${momentumLine}
 
 【候选池 (按涨跌幅降序, 最多 30 只, 字段: 代码 名称 PE PB 换手率 量比 市值 涨跌幅)】
 ${candidates}
