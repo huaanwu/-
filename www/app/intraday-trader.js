@@ -239,6 +239,12 @@ ${trackText || '(样本不足, 不显示)'}
     },
 
     _buildSystemPrompt() {
+      // TODO H1 凯利 接入: 当前 LLM schema 只返 confidence (low/mid/high 类别),
+      // 没有 numeric probability 也没有 triggerPrice/stopLoss/targetPrice —
+      // 凯利公式 (Core.PositionSizing._kellyFraction) 需要 4 个数值字段。
+      // 等以后 schema 扩展 (LLM 报 probability 0-100 + 3 件套价格), 在这里
+      // 拼一段 schema 描述, 在 _aiDecide 出口前调 _kellyFraction 重算
+      // 决策仓位 (shares 或 trim% 而非 shares 数)。
       return `你是短线操盘手, 正在做"盘中实时盯盘"决策。
 
 【职责】

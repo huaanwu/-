@@ -343,6 +343,12 @@
       if (conditions.changeMin !== null) condsDesc.push(`涨跌幅 ≥ ${conditions.changeMin}%`);
       if (conditions.changeMax !== null) condsDesc.push(`涨跌幅 ≤ ${conditions.changeMax}%`);
 
+      // TODO H1 凯利 接入: 当前 LLM schema 只返 confidence (高/中/低 类别),
+      // 没有 numeric probability 也没有 triggerPrice/stopLoss/targetPrice —
+      // 凯利公式 (Core.PositionSizing._kellyFraction) 需要 4 个数值字段。
+      // 等以后 schema 扩展 (LLM 报 probability 0-100 + 3 件套价格),
+      // 在 picks[] 里加这些字段, 在落地前用 _kellyFraction 算 positionPct
+      // 替代当前按 confidence 类别硬映射。
       const systemPrompt = `你是 Phase O 高手版 A 股个股投资顾问, 风格稳健, 严守数据边界。
 
 【投资框架】价值 + 趋势 + 风险平价 混合:
