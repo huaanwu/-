@@ -141,11 +141,16 @@
      * 仓位比例归一 (纯函数):
      *   缺失/非法 → 默认上限; 超上限 → 收敛到上限 (不丢弃, 保住计划);
      *   regime bear → × positionScale (gateMultipliers().positionScale, 默认 0.5)
+     * @param {number} pct - 凯利原始仓位 (0-1) 或 LLM 报的 positionPct
+     * @param {string} regimeState - 'bull' | 'range' | 'bear'
+     * @param {number} positionScale - regime gate 系数 (bear 时 < 1)
+     * @param {number} [maxPct=MAX_POSITION_PCT] - 硬顶 (默认 Core.Constants.PAPER_SHORT_POSITION_PCT=0.20)
      */
-    _scalePositionPct(pct, regimeState, positionScale) {
+    _scalePositionPct(pct, regimeState, positionScale, maxPct) {
+      const cap = (typeof maxPct === 'number' && maxPct > 0 && maxPct <= 1) ? maxPct : MAX_POSITION_PCT;
       let v = parseFloat(pct);
-      if (!(v > 0)) v = MAX_POSITION_PCT;
-      v = Math.min(v, MAX_POSITION_PCT);
+      if (!(v > 0)) v = cap;
+      v = Math.min(v, cap);
       if (regimeState === 'bear') {
         const scale = parseFloat(positionScale);
         v = v * (isFinite(scale) && scale > 0 ? scale : 1);
@@ -238,8 +243,18 @@
         if (ctx.recentSellCodes.has(code)) {
           drop(code, 'cooldown', `${SHORT_RULES.cooldownHours}h 内有短线卖出记录, 冷却期`); continue;
         }
-        const positionPct = this._scalePositionPct(p.positionPct, ctx.regimeState, ctx.positionScale);
-        // (d2) 股数换算: 短线现金 × positionPct / triggerPrice → 整手, 不足一手丢弃留痕
+        // (d2) 凯利仓位 (H1): 用 probability + 三件套价格算半凯利 f, 作为 _scalePositionPct 的 pct 入参
+        //   - 凯利公式参考值 (LLM 报的 positionPct) 被覆盖, 让 AI 自评胜率真的影响下多少钱
+        //   - _scalePositionPct 内再叠 regime bear × positionScale + maxPct 硬顶
+        const kelly = Core.PositionSizing._kellyFraction({
+          probability: prob,
+          triggerPrice: tp,
+          stopLoss: sl,
+          targetPrice: tg
+        });
+        const kellyCapped = Core.PositionSizing._clampKelly(kelly.f, MAX_POSITION_PCT);
+        const positionPct = this._scalePositionPct(kellyCapped, ctx.regimeState, ctx.positionScale, MAX_POSITION_PCT);
+        // (d3) 股数换算: 短线现金 × positionPct / triggerPrice → 整手, 不足一手丢弃留痕
         const shares = roundLot(ctx.cash * positionPct / tp);
         if (shares < LOT_SIZE) {
           drop(code, 'shares', `按仓位 ${(positionPct * 100).toFixed(1)}% 换算不足一手 (${LOT_SIZE} 股)`); continue;
@@ -253,6 +268,10 @@
           targetPrice: +tg.toFixed(2),
           positionPct,
           shares,
+          // H1 凯利追溯字段 (UI 调试用): raw=全凯利 / capped=clamp 后 / payoffRatio=R
+          kellyRaw: kelly.rawKelly,
+          kellyCapped: kellyCapped,
+          payoffRatio: kelly.payoffRatio,
           assumption: p.assumption.trim(),
           falsifyCondition: String(p.falsifyCondition || '').trim(),
           invalidation: String(p.invalidation || '').trim(),
@@ -290,9 +309,9 @@
         '      "triggerPrice": 触发买入价 (数字),',
         '      "stopLoss": 止损价 (必须 < triggerPrice),',
         '      "targetPrice": 目标价 (必须 > triggerPrice),',
-        '      "positionPct": 仓位比例 (小数, ≤0.20),',
-        '      "assumption": "买入假设 (业绩拐点|估值修复|题材催化|技术突破|分红套利|其他)",',
-        '      "probability": 胜率自评 (0-100 整数, 必填),',
+        '      "positionPct": 参考仓位 (小数, ≤0.20; 系统会按 probability + 三件套价格用凯利公式重算, 这里只是参考),',
+        '      "probability": 胜率自评 (0-100 整数, 必填; 系统用此算凯利仓位 + 盈亏比 R),',
+        '      "assumption": "买入假设 (业绩拐点|估值修复|题材催化|技术突破|分红套利|其他, 必填)",',
         '      "confidence": "低|中|高 (必填)",',
         '      "reason": "一句话理由 (引用具体数据)",',
         '      ' + Core.Premortem.PROMPT_SPEC.split('\n').join('\n      '),

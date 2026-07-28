@@ -82,6 +82,23 @@ function _loadRealPortfolio() {
   return _REAL_PORTFOLIO;
 }
 
+// H1 Commit 2: 同样真实加载 position-sizing.js 让 sandbox 有 Core.PositionSizing
+let _REAL_POSITION_SIZING = null;
+function _loadRealPositionSizing() {
+  if (_REAL_POSITION_SIZING !== null) return _REAL_POSITION_SIZING;
+  const src = readFileSafe(path.join(WWW, 'core', 'position-sizing.js'));
+  if (!src) { _REAL_POSITION_SIZING = null; return _REAL_POSITION_SIZING; }
+  const cctx = vm.createContext({ window: {}, console });
+  try {
+    vm.runInContext(src, cctx);
+    _REAL_POSITION_SIZING = cctx.window.Core && cctx.window.Core.PositionSizing
+      ? cctx.window.Core.PositionSizing : null;
+  } catch (e) {
+    _REAL_POSITION_SIZING = null;
+  }
+  return _REAL_POSITION_SIZING;
+}
+
 // ========== [1] JS 语法检查 ==========
 section('1] JS 语法检查');
 const syntaxFiles = [
@@ -6416,6 +6433,10 @@ section('[39] ShortTrader 盘前 AI 交易计划 (T2): 交易日判定 / prompt 
     const pmCtx = vm.createContext({ window: {}, console });
     vm.runInContext(readFileSafe(path.join(WWW, 'core/premortem.js')), pmCtx);
     const realPremortem = pmCtx.window.Core.Premortem;
+    // 真实 Core.PositionSizing (Commit 2 H1 凯利集成, _validatePlans 依赖 _kellyFraction + _clampKelly)
+    const psCtx = vm.createContext({ window: {}, console });
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/position-sizing.js')), psCtx);
+    const realPositionSizing = psCtx.window.Core.PositionSizing;
     // 真实 Core.AI.parseJsonOutput (Phase T 模式, 从 ai-service 提取; 加载只需 State/get mock)
     const aiCtx = { console, setTimeout, clearTimeout, Core: { State: { get: () => ({}) } }, fetch: async () => ({ ok: false }) };
     vm.createContext(aiCtx);
@@ -6446,6 +6467,7 @@ section('[39] ShortTrader 盘前 AI 交易计划 (T2): 交易日判定 / prompt 
         Data: { getIndexSpot: async () => storageData.indexSpot || [] },
         Util: { stockCodePrefix: (c) => /^(60|68)/.test(c) ? 'sh' : 'sz' },
         Premortem: realPremortem,
+        PositionSizing: _loadRealPositionSizing(),
         AI: {
           parseJsonOutput: realParseJsonOutput,
           callWithTimeout: async () => { throw new Error('测试不应走到真实 LLM'); }
@@ -6523,10 +6545,13 @@ section('[39] ShortTrader 盘前 AI 交易计划 (T2): 交易日判定 / prompt 
       recentSellCodes: new Set(), regimeState: 'range', positionScale: 1,
       roundLot: (s) => Math.floor(s / 100) * 100
     }, over || {});
-    // 合法通过 + shares 换算整手 (30000×0.2/10 = 600)
+    // 合法通过 + shares 换算整手 (30000×0.1/10 = 300) — H1 凯利生效后 positionPct 来自凯利
+    // mkPlan 默认 prob=60, R=(11-10)/(10-9)=1, raw=(0.6-0.4/1)/1=0.2, 半凯利=0.1, 整手 300 股
     let r = ST._validatePlans([mkPlan()], vctx());
-    if (r.passed.length === 1 && r.dropped.length === 0 && r.passed[0].shares === 600
-      && r.passed[0].probability === 60 && r.passed[0].confidence === '中') ok('validate: 合法 plan 通过, shares=现金×pct/价→整手 600');
+    if (r.passed.length === 1 && r.dropped.length === 0 && r.passed[0].shares === 300
+      && Math.abs(r.passed[0].positionPct - 0.1) < 0.005
+      && Math.abs(r.passed[0].kellyRaw - 0.2) < 0.005
+      && r.passed[0].probability === 60 && r.passed[0].confidence === '中') ok('validate: 合法 plan 通过, 凯利 f=0.1, shares=现金×pct/价→整手 300');
     else fail('validate 通过', JSON.stringify(r));
     // plans=[] 空仓合法
     r = ST._validatePlans([], vctx());
@@ -6586,13 +6611,15 @@ section('[39] ShortTrader 盘前 AI 交易计划 (T2): 交易日判定 / prompt 
     r = ST._validatePlans([mkPlan()], vctx({ cash: 500 }));
     if (r.passed.length === 0 && r.dropped[0] && r.dropped[0].stage === 'shares') ok('validate: 现金 500 换算不足一手 → shares 丢弃');
     else fail('validate shares', JSON.stringify(r.dropped));
-    // positionPct 超限收敛 (0.5 → 0.20, 不丢弃)
+    // H1 凯利后, LLM 报 positionPct=0.5 不再走 _scalePositionPct 上限收敛 — 凯利先算 (0.1),
+    // 然后 _scalePositionPct 用凯利结果作为 pct 入参, 无超上限 → positionPct=0.1
     r = ST._validatePlans([mkPlan({ positionPct: 0.5 })], vctx());
-    if (r.passed.length === 1 && r.passed[0].positionPct === 0.2) ok('validate: positionPct 0.5 超上限 → 收敛 0.20 不丢弃');
+    if (r.passed.length === 1 && Math.abs(r.passed[0].positionPct - 0.1) < 0.005
+      && Math.abs(r.passed[0].kellyCapped - 0.1) < 0.005) ok('validate: LLM 报 0.5 → 凯利覆盖, positionPct=0.1 (不再用 0.5 走 _scalePositionPct 上限)');
     else fail('validate pct 收敛', JSON.stringify(r));
-    // regime bear 仓位缩放 (0.2 × 0.5 = 0.1, shares 300)
+    // H1 + regime bear: 凯利 0.1 × bear 0.5 = 0.05, shares 30000*0.05/10=150→整手 100
     r = ST._validatePlans([mkPlan()], vctx({ regimeState: 'bear', positionScale: 0.5 }));
-    if (r.passed.length === 1 && r.passed[0].positionPct === 0.1 && r.passed[0].shares === 300) ok('validate: regime bear → positionPct ×0.5, shares 随缩放 300');
+    if (r.passed.length === 1 && Math.abs(r.passed[0].positionPct - 0.05) < 0.005 && r.passed[0].shares === 100) ok('validate: H1 凯利 + bear → positionPct=0.05, shares 100');
     else fail('validate regime 缩放', JSON.stringify(r));
     // _scalePositionPct 直测
     if (ST._scalePositionPct(undefined, 'range', 1) === 0.2
@@ -6600,6 +6627,50 @@ section('[39] ShortTrader 盘前 AI 交易计划 (T2): 交易日判定 / prompt 
       && ST._scalePositionPct(0.1, 'bear', 0.5) === 0.05
       && ST._scalePositionPct(0.1, 'bull', 0.5) === 0.1) ok('scalePct: 缺失默认/超限收敛/bear 缩放/非 bear 不缩放');
     else fail('scalePct', '');
+    // H1 maxPct 参数注入 (Commit 2): 传入 0.10 → 收敛到 0.10 (替代默认 0.20)
+    if (ST._scalePositionPct(0.5, 'range', 1, 0.10) === 0.10
+      && ST._scalePositionPct(0.05, 'range', 1, 0.10) === 0.05
+      && ST._scalePositionPct(undefined, 'range', 1, 0.10) === 0.10) ok('scalePct maxPct: 4 参签名, 默认走 maxPct 而非 MAX_POSITION_PCT');
+    else fail('scalePct maxPct', '');
+
+    // H1 凯利集成 (Commit 2): validatePlans 输出的 passed 含 kellyRaw/kellyCapped/payoffRatio
+    // 构造一个有完整 4 参的 plan: tp=10 sl=9 tg=13 → R=3, prob=80 → raw=(0.8-0.2/3)/3=0.244, kelly=0.1222
+    // _clampKelly(0.1222, 0.20) → 0.1222 (未超 maxPct)
+    const kellyPlan = {
+      code: '600519', name: '凯利测试', triggerDirection: 'below',
+      triggerPrice: 10, stopLoss: 9, targetPrice: 13, positionPct: 0.5,
+      probability: 80, confidence: '高', assumption: '技术突破', reason: 'test',
+      bullCase: 'x', bearCase: 'y', falsifyCondition: 'z', invalidation: 'w'
+    };
+    const kellyRes = ST._validatePlans([kellyPlan], vctx({ cash: 100000, quotaLeft: 3, regimeState: 'range', positionScale: 1 }));
+    if (kellyRes.passed.length === 1) {
+      const p = kellyRes.passed[0];
+      // positionPct 应是凯利 clamp 后 (0.1222), 而非 LLM 报的 0.5
+      if (Math.abs(p.positionPct - 0.1222) < 0.005
+        && Math.abs(p.kellyCapped - 0.1222) < 0.005
+        && Math.abs(p.kellyRaw - 0.244) < 0.01
+        && Math.abs(p.payoffRatio - 3) < 0.01) {
+        ok(`H1 凯利集成: p=80 R=3 → positionPct=${p.positionPct} (覆写 LLM 报的 0.5), 含 kellyRaw/Capped/R`);
+      } else fail('H1 凯利集成 positionPct 错', `positionPct=${p.positionPct} kellyRaw=${p.kellyRaw} R=${p.payoffRatio}`);
+    } else fail('H1 凯利集成 未通过', JSON.stringify(kellyRes.dropped));
+
+    // H1 凯利 + regime bear: 凯利 0.1222 × 0.5 (bear) = 0.0611
+    const kellyBearRes = ST._validatePlans([kellyPlan], vctx({ cash: 100000, quotaLeft: 3, regimeState: 'bear', positionScale: 0.5 }));
+    if (kellyBearRes.passed.length === 1 && Math.abs(kellyBearRes.passed[0].positionPct - 0.0611) < 0.005) {
+      ok(`H1 凯利 + bear regime: positionPct=${kellyBearRes.passed[0].positionPct} (凯利 0.122 × bear 0.5)`);
+    } else fail('H1 凯利 + bear', JSON.stringify(kellyBearRes));
+
+    // H1 凯利超 maxPct: prob=99 R=3 → raw=0.33 ×0.5=0.165; prob=99 R=10 → raw=0.099 ×0.5=0.0496;
+    // 构造 raw > maxPct (0.20) 的场景: prob 极高 + R 高 → 不容易超, 直接测 _clampKelly 上限
+    // 用 prob=99 tg-tp=20 sl-tp=1 R=20 → raw=(0.99-0.01/20)/20=0.0495 ×0.5=0.0247
+    // 直接验证 clamp 上限: 给一个 raw > 0.20 的值, _clampKelly 应收敛
+    const _PS = _loadRealPositionSizing();
+    if (_PS._clampKelly(0.50, 0.20) === 0.20
+      && _PS._clampKelly(0.001, 0.20) === 0.20  // 凯利<minPct 走上限
+      && _PS._clampKelly(0, 0.20) === 0.20  // 兜底
+      && _PS._clampKelly(0.10, 0.20) === 0.10) {  // 中间值原样
+      ok('H1 _clampKelly 上限/下限/兜底/中间值');
+    } else fail('H1 _clampKelly', '');
 
     // 39.4 _hasRecentShortSell 分支
     const NOW = new Date(2026, 6, 27, 8, 30).getTime();
@@ -6655,13 +6726,13 @@ section('[39] ShortTrader 盘前 AI 交易计划 (T2): 交易日判定 / prompt 
     if (llmCalls === 1 && plan7.date === '2026-07-27' && plan7.marketView.includes('震荡')) ok('gen: LLM 调用 1 次, plan.date/marketView 落盘');
     else fail('gen 基本', JSON.stringify({ llmCalls, date: plan7.date }));
     if (plan7.plans.length === 1 && plan7.plans[0].code === '600519'
-      && plan7.plans[0].condOrderId && plan7.plans[0].shares === 600) ok('gen: 通过 1 条, condOrderId 回填, shares 600');
+      && plan7.plans[0].condOrderId && plan7.plans[0].shares === 300) ok('gen: 通过 1 条, condOrderId 回填, shares 300 (H1 凯利生效)');
     else fail('gen plans', JSON.stringify(plan7.plans));
     if (plan7.dropped.length === 1 && plan7.dropped[0].stage === 'hallucination' && plan7.dropped[0].code === '600000') ok('gen: 池外 600000 → hallucination 丢弃');
     else fail('gen dropped', JSON.stringify(plan7.dropped));
     if (store7.addedOrders.length === 1 && store7.addedOrders[0].source === 'ai'
       && store7.addedOrders[0].sleeve === 'short' && store7.addedOrders[0].code === '600519'
-      && store7.addedOrders[0].shares === 600 && store7.addedOrders[0].probability === 60) ok('gen: addCondOrder 接线 (source=ai, sleeve=short, 整手/probability 透传)');
+      && store7.addedOrders[0].shares === 300 && store7.addedOrders[0].probability === 60) ok('gen: addCondOrder 接线 (source=ai, sleeve=short, 整手/probability 透传, H1 凯利 300)');
     else fail('gen addCondOrder', JSON.stringify(store7.addedOrders));
     if (store7.kv.paper_short_plan && store7.kv.paper_short_plan.date === '2026-07-27'
       && Array.isArray(store7.kv.paper_short_plan.plans)) ok('gen: kv paper_short_plan 落库');
@@ -6678,7 +6749,7 @@ section('[39] ShortTrader 盘前 AI 交易计划 (T2): 交易日判定 / prompt 
       now: new Date(2026, 6, 27, 8, 30),
       deps: { callLLM: async () => JSON.stringify({ marketView: 'm', plans: [mkPlan()] }) }
     });
-    if (plan8.plans.length === 1 && plan8.plans[0].positionPct === 0.1 && plan8.plans[0].shares === 300) ok('gen: regime bear → 仓位 ×0.5 (0.2→0.1, shares 300)');
+    if (plan8.plans.length === 1 && Math.abs(plan8.plans[0].positionPct - 0.05) < 0.005 && plan8.plans[0].shares === 100) ok('gen: regime bear + H1 凯利 → 仓位 0.05 (凯利 0.1 × bear 0.5), shares 100');
     else fail('gen bear', JSON.stringify(plan8.plans));
 
     // 39.9 当日已建 3 单 → quotaLeft=0 全丢弃不落地
@@ -6795,6 +6866,7 @@ section('[40] ShortTrader T4 学习环: _judgeClosedTrade 全分支 / verify 扫
         },
         Util: { stockCodePrefix: (c) => /^(60|68)/.test(c) ? 'sh' : 'sz' },
         Premortem: { checkPick: () => [], PROMPT_SPEC: 'spec' },
+        PositionSizing: _loadRealPositionSizing(),
         AI: {
           parseJsonOutput: realParseJsonOutput40,
           callWithTimeout: async () => { throw new Error('测试不应走到真实 LLM'); }
@@ -7691,6 +7763,7 @@ section('[46] Bug B 现价锚定: _buildCandidatePool / _validatePlans 方向对
         Data: { getIndexSpot: async () => [] },
         Util: { stockCodePrefix: () => 'sz' },
         Premortem: realPremortem,
+        PositionSizing: _loadRealPositionSizing(),
         AI: { parseJsonOutput: realParseJsonOutput, callWithTimeout: async () => { throw new Error('no LLM'); } },
         Regime: {
           get: async () => ({ state: 'range' }),
@@ -7847,6 +7920,7 @@ section('[47] Bug D verify 盘中跳过: 交易日 09:30~15:00 不写回 verifyO
           ]
         },
         Premortem: { checkPick: () => [] },
+        PositionSizing: _loadRealPositionSizing(),
         AI: { parseJsonOutput: () => ({ ok: true, obj: {} }), callWithTimeout: async () => '' },
         Regime: { get: async () => ({ state: 'range' }), gateMultipliers: () => ({ state: 'range', label: '震荡市', positionScale: 1 }) },
         Discipline: { DEFAULT_CONFIG: { short: { maxDailyTrades: 3, cooldownHours: 48 } } }
@@ -9282,6 +9356,30 @@ section('[60] IntradayTrader 集成: 整轮 runNow + 机械止盈/止损优先 +
     if (clearCount.n === 1) ok('53.11 stopPolling 清掉定时器 (1 次 clearInterval)');
     else fail('53.11', JSON.stringify(clearCount));
 
+    // 53.12 Bug #1 修复: 持仓 200, LLM trim 150 → 旧逻辑卖 150 (剩 50 < 1 手), 新逻辑卖 100 (留 1 手)
+    const ctx12 = buildCtx53({
+      positions: [{ id: 'h12', code: '000012', name: 'F', market: 'sz', costPrice: 10, shares: 200, stopLoss: 0, targetPrice: 0, createdAt: 'MOCK' }],
+      quote: { 最新价: 10.5, 涨跌幅: 5 },
+      llmRaw: '{"action":"trim","shares":150,"reason":"减仓","confidence":"mid"}'
+    });
+    ctx12.positions[0].createdAt = ctx12.sctx.MOCK_NOW_MS - 30 * 60 * 1000;
+    await ctx12.sctx.window.IntradayTrader.runNow();
+    if (ctx12._sold.length === 1 && ctx12._sold[0].shares === 100 && ctx12._sold[0].o.reason === 'intraday-trim') {
+      ok('53.12 Bug #1 修复: LLM trim 150 (持仓 200) → 卖 100 留 1 手 (不是全平)');
+    } else fail('53.12', 'sold=' + JSON.stringify(ctx12._sold));
+
+    // 53.13 Bug #1 边界: 持仓仅 1 手 (100), LLM trim 50 → 旧会卖 50 剩 50, 新改走 close (卖全部 100)
+    const ctx13 = buildCtx53({
+      positions: [{ id: 'h13', code: '000013', name: 'G', market: 'sz', costPrice: 10, shares: 100, stopLoss: 0, targetPrice: 0, createdAt: 'MOCK' }],
+      quote: { 最新价: 10.5, 涨跌幅: 5 },
+      llmRaw: '{"action":"trim","shares":50,"reason":"减仓","confidence":"low"}'
+    });
+    ctx13.positions[0].createdAt = ctx13.sctx.MOCK_NOW_MS - 30 * 60 * 1000;
+    await ctx13.sctx.window.IntradayTrader.runNow();
+    if (ctx13._sold.length === 1 && ctx13._sold[0].shares === 100 && ctx13._sold[0].o.reason === 'intraday-trim-to-close') {
+      ok('53.13 Bug #1 边界: 仅 1 手 + LLM trim 50 → 改走 close (全部 100, reason=intraday-trim-to-close)');
+    } else fail('53.13', 'sold=' + JSON.stringify(ctx13._sold));
+
   } catch (e) {
     fail('60 IntradayTrader 集成', e.message + ' / ' + (e.stack || ''));
   }
@@ -9487,6 +9585,8 @@ section('[54] LongTrader: _shouldRun 触发判定 + LLM 选股 + 整轮 runNow')
     if (ctx11._autoTrades.length === 1 && ctx11._autoTrades[0].code === '000001') {
       ok('54.11 LLM 返非法 code (abc) 被过滤, 只成交合法 code');
     } else fail('54.11', 'autoTrades=' + JSON.stringify(ctx11._autoTrades));
+
+    // 54.12 Bug #2 修复: bear + positionScale 0.3 < 0.5 → 跳过
 
     // 54.12 Bug #1: _planAutoTrade 返 null (现金买不起 1 手 30 元股) → 跳过, 不调 LLM
     const ctx12 = buildCtx({
