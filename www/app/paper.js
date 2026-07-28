@@ -54,6 +54,25 @@
   // _orderEligible 判定: createdAfterClose → bar.date > cd; 否则 bar.date >= cd
   const _isOutsideTradingHours = (mins) => mins < MARKET_OPEN_MINUTES || mins >= MARKET_CLOSE_MINUTES;
 
+  // Tier 1 Commit C: LLM 自由文本 assumption → Discipline 枚举映射
+  // Core.Discipline._checkInputs 强校验 ASSUMPTIONS.includes(assumption), 必须落到枚举
+  const ASSUMPTION_MAP = {
+    '业绩拐点': '业绩拐点', '拐点': '业绩拐点', 'earnings': '业绩拐点',
+    '估值修复': '估值修复', '低估值': '估值修复', '修复': '估值修复',
+    '题材催化': '题材催化', '题材': '题材催化', '概念': '题材催化', '催化': '题材催化',
+    '技术突破': '技术突破', '突破': '技术突破', '技术': '技术突破',
+    '分红套利': '分红套利', '分红': '分红套利', '高股息': '分红套利', '股息': '分红套利'
+  };
+  function _mapAssumptionLlm(llmText) {
+    if (!llmText) return '题材催化';     // 缺省 fallback, 保留旧行为
+    const norm = String(llmText).trim();
+    if (Core.Discipline && Core.Discipline.ASSUMPTIONS && Core.Discipline.ASSUMPTIONS.includes(norm)) return norm;
+    for (const k of Object.keys(ASSUMPTION_MAP)) {
+      if (norm.includes(k)) return ASSUMPTION_MAP[k];
+    }
+    return '其他';   // 匹配不上 → 显式标 '其他', 比写死 '题材催化' 诚实
+  }
+
   const Paper = {
 
     async init() {
@@ -484,9 +503,12 @@
         // Phase B 交易纪律: AI 自动成交走同一套 preBuyCheck (T1: 按 sleeve 分账户口径)
         // blocks 命中 → console.warn 跳过该笔 (不打扰用户); warns 无人确认不阻塞, 写入交易行 disciplineWarns
         if (Core.Discipline && Core.Discipline.preBuyCheck) {
-          // AI 场景无人工假设: 固定归到"题材催化"; 止损默认 成交价 × 0.92 (-8%)
-          const assumption = '题材催化';
-          const stopLoss = +(price * Core.Constants.STOP_LOSS_RATIO_AUTO).toFixed(2);
+          // Tier 1 Commit C: 优先用 LLM 透传 assumption/stopLoss; 缺省 fallback 旧值
+          // LLM stopLoss 异常 (<=0/非数字) 回 fallback; stopLoss >= price 由 discipline._checkInputs 拦截
+          const assumption = _mapAssumptionLlm(pick.assumption);
+          const llmStopLoss = (typeof pick.stopLoss === 'number' && pick.stopLoss > 0)
+            ? +pick.stopLoss.toFixed(2) : null;
+          const stopLoss = llmStopLoss ?? +(price * Core.Constants.STOP_LOSS_RATIO_AUTO).toFixed(2);
           const chk = await Core.Discipline.preBuyCheck({
             code: pick.code, name: pick.name || '', market: pick.market || '',
             price, shares, amount: shares * price,
@@ -1535,6 +1557,12 @@
       // T4: 学习曲线区块 (2 行钩子, 渲染逻辑全在 ShortTrader.renderLearningCurve)
       if (sleeve === 'short' && window.ShortTrader && ShortTrader.renderLearningCurve) {
         ShortTrader.renderLearningCurve().catch(e => console.warn('[Paper] ShortTrader 学习曲线渲染失败:', e));
+      }
+      // P2-1: 校准健康卡片 (短线 tab 显示, 校准漂移检测结果)
+      const calEl = document.getElementById('shortCalibrationCard');
+      if (calEl) calEl.style.display = sleeve === 'short' ? '' : 'none';
+      if (sleeve === 'short' && window.ShortTrader && ShortTrader.renderCalibrationCard) {
+        ShortTrader.renderCalibrationCard().catch(e => console.warn('[Paper] 校准卡渲染失败:', e));
       }
       // L1.6: 长线业绩归因卡片 (挂 #longTraderTrackSection, 仅 long tab 显示)
       const ltSection = document.getElementById('longTraderTrackSection');

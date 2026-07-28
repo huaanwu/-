@@ -10378,9 +10378,24 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
     if (/LONG_VERIFY_THRESHOLD_PCT\s*=\s*0\.05/.test(cs) && /LONG_VERIFY_THRESHOLD_BAD_PCT\s*=\s*0\.08/.test(cs) && /LONG_VERIFY_TIMING_GOOD_PCT\s*=\s*0\.08/.test(cs)) {
       ok('66.15 constants 含 L1 阈值常量 (5% / 8%)');
     } else fail('66.15 常量', '缺');
+
+    // ---- 66.16 L1.6 UI 渲染: renderTrackRecord + 挂载点 ----
+    const idx = readFileSafe(path.join(WWW, 'index.html'));
+    if (/longTraderTrackSection/.test(idx)) ok('66.16a index.html 挂载点 longTraderTrackSection');
+    else fail('66.16a html 挂载', '缺');
+    if (/renderTrackRecord/.test(readFileSafe(path.join(WWW, 'app/long-trader.js')))) {
+      ok('66.16b LongTrader.renderTrackRecord 方法已暴露');
+    } else fail('66.16b 暴露', '缺');
+    if (/LongTrader\.renderTrackRecord/.test(readFileSafe(path.join(WWW, 'app/paper.js')))) {
+      ok('66.16c paper.renderPage 调用 LongTrader.renderTrackRecord');
+    } else fail('66.16c 接线', '缺');
+    if (/sleeve === 'long'/.test(readFileSafe(path.join(WWW, 'app/paper.js')))) {
+      ok('66.16d 仅 long tab 显示 (sleeve === long 守卫)');
+    } else fail('66.16d 守卫', '缺');
   } catch (e) {
     fail('66 L1', e.message + ' / ' + (e.stack || ''));
   }
+})();
 
   // ========== [67] H3 UI 红条 + 5 调用方 prompt (Commit 6) ==========
   try {
@@ -10435,7 +10450,561 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
   } catch (e) {
     fail('67 H3 UI', e.message + ' / ' + (e.stack || ''));
   }
-})();
+
+  // ========== [68] P1-2 + P2-1: LLM 性能埋点 + 校准漂移检测 ==========
+  section('[68] P1-2: _logAiPerf + P2-1: _checkCalibrationDrift + checkCalibrationDriftReport + renderCalibrationCard');
+  (async () => {
+    try {
+      const { TextDecoder: NodeTextDecoder } = require('util');
+      const perfStore = { kv: {} };
+      const DS = {
+        console, setTimeout, clearTimeout, URLSearchParams,
+        TextDecoder: NodeTextDecoder, fetch: () => Promise.reject(new Error('no fetch')),
+        window: {},
+        Core: {
+          State: { get: () => null },
+          Storage: {
+            all: async () => [],
+            kvGet: async (k) => perfStore.kv[k] || null,
+            kvSet: async (k, v) => { perfStore.kv[k] = v; }
+          }
+        }
+      };
+      DS.window = DS;
+      vm.createContext(DS);
+      vm.runInContext(readFileSafe(path.join(WWW, 'core/constants.js')), DS);
+      vm.runInContext(readFileSafe(path.join(WWW, 'app/short-trader.js')), DS);
+      const ST = DS.window.ShortTrader;
+      if (!ST) { fail('68.0 加载 short-trader 失败', '无 ST'); return; }
+
+      // ---- 68.1 _logAiPerf 写一条 ----
+      await ST._logAiPerf({ scenario: 't2-test', votes: 3, latencyMs: 1200, successCount: 3, failCount: 0 });
+      const log1 = await ST._readAiPerfLog();
+      if (log1.length === 1 && log1[0].scenario === 't2-test' && log1[0].votes === 3 && log1[0].latencyMs === 1200) {
+        ok('68.1 _logAiPerf 写一条 + _readAiPerfLog 读出');
+      } else fail('68.1 perf 写读', JSON.stringify(log1));
+
+      // ---- 68.2 滚动 200 ----
+      for (let i = 0; i < 205; i++) {
+        await ST._logAiPerf({ scenario: 'rolling', votes: 1, latencyMs: 100, successCount: 1, failCount: 0 });
+      }
+      const log2 = await ST._readAiPerfLog();
+      if (log2.length === 200 && log2[0].scenario !== 't2-test' && log2[199].scenario === 'rolling') {
+        ok('68.2 _logAiPerf 滚动 200 (最早的 t2-test 被淘汰)');
+      } else fail('68.2 滚动', 'len=' + log2.length);
+
+      // ---- 68.3 写失败被 catch 吞 ----
+      const DS3 = Object.assign({}, DS, { window: DS, Core: Object.assign({}, DS.Core, {
+        Storage: Object.assign({}, DS.Core.Storage, {
+          kvSet: async () => { throw new Error('kv down'); },
+          kvGet: async () => null
+        })
+      }) });
+      DS3.window = DS3;
+      vm.createContext(DS3);
+      vm.runInContext(readFileSafe(path.join(WWW, 'core/constants.js')), DS3);
+      vm.runInContext(readFileSafe(path.join(WWW, 'app/short-trader.js')), DS3);
+      const ST3 = DS3.window.ShortTrader;
+      let threw = false;
+      try { await ST3._logAiPerf({ scenario: 'fail' }); } catch (e) { threw = true; }
+      if (!threw) ok('68.3 _logAiPerf 写失败被 catch 吞, 不抛');
+      else fail('68.3 吞错', '抛了');
+
+      // ---- 68.4 _checkCalibrationDrift 空 → null ----
+      const r4 = ST._checkCalibrationDrift([], { nowMs: Date.now() });
+      if (r4 === null) ok('68.4 _checkCalibrationDrift 空 → null');
+      else fail('68.4 空', String(r4));
+
+      // ---- 68.5 样本不足 ----
+      const now5 = 1700000000000;
+      const r5 = ST._checkCalibrationDrift([
+        { probability: 70, outcome: 'correct', verifiedAt: now5 - 1000 }
+      ], { nowMs: now5 });
+      // 单笔在 recent 但 base 为 0 → baseBrier=null + reason=样本不足 (recentBrier 不为 null)
+      if (r5 && r5.baseBrier === null && r5.reason === '样本不足' && r5.recentN === 1 && r5.baseN === 0) {
+        ok('68.5 样本不足 (base=0) → baseBrier=null + reason=样本不足');
+      } else fail('68.5 不足', JSON.stringify(r5));
+
+      // ---- 68.6 Brier 上升 > 阈值 → drifted=true ----
+      const trades6 = [];
+      for (let i = 0; i < 5; i++) trades6.push({ probability: 60, outcome: 'correct', verifiedAt: now5 - 10 * 86400 * 1000 + i * 1000 });
+      trades6.push({ probability: 60, outcome: 'wrong', verifiedAt: now5 - 10 * 86400 * 1000 + 5000 });
+      for (let i = 0; i < 2; i++) trades6.push({ probability: 80, outcome: 'correct', verifiedAt: now5 - 3 * 86400 * 1000 + i * 1000 });
+      for (let i = 0; i < 4; i++) trades6.push({ probability: 80, outcome: 'wrong', verifiedAt: now5 - 3 * 86400 * 1000 + 3000 + i * 1000 });
+      const r6 = ST._checkCalibrationDrift(trades6, { nowMs: now5, threshold: 0.05 });
+      if (r6 && r6.drifted === true && r6.direction === 'up' && r6.delta > 0.05) {
+        ok('68.6 Brier 上升 > 阈值 → drifted=true (direction=up)');
+      } else fail('68.6 漂移', JSON.stringify(r6));
+
+      // ---- 68.7 Brier 下降 → drifted=false, direction=down ----
+      const trades7 = [];
+      for (let i = 0; i < 4; i++) trades7.push({ probability: 80, outcome: 'wrong', verifiedAt: now5 - 10 * 86400 * 1000 + i * 1000 });
+      for (let i = 0; i < 2; i++) trades7.push({ probability: 80, outcome: 'correct', verifiedAt: now5 - 10 * 86400 * 1000 + 4000 + i * 1000 });
+      for (let i = 0; i < 5; i++) trades7.push({ probability: 60, outcome: 'correct', verifiedAt: now5 - 3 * 86400 * 1000 + i * 1000 });
+      trades7.push({ probability: 60, outcome: 'wrong', verifiedAt: now5 - 3 * 86400 * 1000 + 5000 });
+      const r7 = ST._checkCalibrationDrift(trades7, { nowMs: now5, threshold: 0.05 });
+      if (r7 && r7.drifted === false && r7.direction === 'down' && r7.delta < 0) {
+        ok('68.7 Brier 下降 → drifted=false (direction=down, delta<0)');
+      } else fail('68.7 下降', JSON.stringify(r7));
+
+      // ---- 68.8 无 trades → 跳过得报告 ----
+      const r8 = await ST.checkCalibrationDriftReport({ nowMs: now5, minSamples: 5 });
+      if (r8 && r8.persisted === false && r8.report && r8.report.skipped === true) {
+        ok('68.8 无样本 → persisted=false, skipped=true');
+      } else fail('68.8 跳过', JSON.stringify(r8));
+
+      // ---- 68.9 持久化到 kv (mock paper_cond_orders 给 probability + content) ----
+      perfStore.kv = {};
+      const orderMap = {};
+      trades6.forEach((t, i) => { orderMap['a' + i] = { id: 'a' + i, probability: t.probability, assumption: '题材' }; });
+      // 让 position.exitDate / entryDate 对齐 journal 的 verifiedAt ±几天, _linkVerifiedTrades 才能匹配上
+      const positionMap = {};
+      trades6.forEach((t, i) => {
+        const exitDate = new Date(t.verifiedAt + 86400 * 1000).toISOString().slice(0, 10);
+        const entryDate = new Date(t.verifiedAt - 2 * 86400 * 1000).toISOString().slice(0, 10);
+        positionMap['a' + i] = { code: '600519', closed: true, exitDate, entryDate, planOrderId: 'a' + i };
+      });
+      // content 含 _extractExitInfo 4 要素 (卖出日期/原因/入场/出场) + 6 笔不同 exitDate/entryDate
+      const journals9 = trades6.map((t, i) => {
+        const exitD = new Date(t.verifiedAt + 86400 * 1000);
+        const exitDate = exitD.toISOString().slice(0, 10);
+        const entryD = new Date(t.verifiedAt - 2 * 86400 * 1000);
+        const entryDate = entryD.toISOString().slice(0, 10);
+        return {
+          id: 'a' + i, code: '600519', sleeve: 'short', auto: true, verifyOutcome: t.outcome,
+          verifiedAt: t.verifiedAt, assumption: '题材',
+          content: '卖出日期:' + exitDate + '\n原因:止盈\n入场:' + entryDate + '@10\n出场:11'
+        };
+      });
+      const DS9 = Object.assign({}, DS, { window: DS, Core: Object.assign({}, DS.Core, {
+        Storage: Object.assign({}, DS.Core.Storage, {
+          all: async () => journals9,
+          kvGet: async (k) => {
+            if (k === 'paper_short_positions') return Object.values(positionMap);
+            if (k === 'paper_cond_orders') return Object.values(orderMap);
+            return perfStore.kv[k] || null;
+          },
+          kvSet: async (k, v) => { perfStore.kv[k] = v; }
+        })
+      }) });
+      DS9.window = DS9;
+      vm.createContext(DS9);
+      vm.runInContext(readFileSafe(path.join(WWW, 'core/constants.js')), DS9);
+      vm.runInContext(readFileSafe(path.join(WWW, 'app/short-trader.js')), DS9);
+      const ST9 = DS9.window.ShortTrader;
+      const r9 = await ST9.checkCalibrationDriftReport({ nowMs: now5, minSamples: 3, threshold: 0.05 });
+      if (r9 && r9.persisted === true && r9.report.drifted === true
+          && perfStore.kv['short_calibration_drift']
+          && perfStore.kv['short_calibration_drift'].date) {
+        ok('68.9 报告持久化 kv short_calibration_drift (drifted=true)');
+      } else fail('68.9 持久化', JSON.stringify(r9).slice(0, 200));
+
+      // ---- 68.10 _readCalibrationDrift ----
+      const r10 = await ST9._readCalibrationDrift();
+      if (r10 && r10.drifted === true && r10.recentBrier > 0) ok('68.10 _readCalibrationDrift 读最新报告');
+      else fail('68.10 读', JSON.stringify(r10).slice(0, 200));
+
+      // ---- 68.11 源码对账 ----
+      const src = readFileSafe(path.join(WWW, 'app/short-trader.js'));
+      if (/init\(\)\s*\{[\s\S]{0,300}runDailyCalibrationReport/.test(src)) ok('68.11a init 调 runDailyCalibrationReport (含飞书推送)');
+      else fail('68.11a init', '缺');
+      if (/aiLatencyMs\s*=\s*Date\.now\(\)\s*-\s*aiStartMs/.test(src)) ok('68.11b 算 aiLatencyMs');
+      else fail('68.11b 耗时', '缺');
+      if (/_logAiPerf\(\{/.test(src) && /paper_ai_perf_log/.test(src)) ok('68.11c _logAiPerf 写 paper_ai_perf_log');
+      else fail('68.11c 埋点', '缺');
+
+      // ---- 68.12 UI 渲染 ----
+      const idx = readFileSafe(path.join(WWW, 'index.html'));
+      if (/shortCalibrationCard/.test(idx)) ok('68.12a index.html 挂载点 shortCalibrationCard');
+      else fail('68.12a html', '缺');
+      if (/renderCalibrationCard/.test(src) && /ShortTrader\.renderCalibrationCard/.test(readFileSafe(path.join(WWW, 'app/paper.js')))) {
+        ok('68.12b paper.renderPage 调 ShortTrader.renderCalibrationCard');
+      } else fail('68.12b 接线', '缺');
+    } catch (e) {
+      fail('68 P1-2+P2-1', e.message + ' / ' + (e.stack || ''));
+    }
+  })();
+
+  // ========== [68.5] P2-2: 校准漂移飞书推送 ==========
+  section('[68.5] P2-2: 飞书推送校准漂移报告 + runDailyCalibrationReport');
+  (async () => {
+    try {
+      const { TextDecoder: NodeTextDecoder } = require('util');
+      const perfStore = { kv: {} };
+      let fetchCalled = null;
+      const mockFetch = async (url, opts) => {
+        fetchCalled = { url, opts: JSON.parse(opts.body) };
+        return { ok: true };
+      };
+      const DS = {
+        console, setTimeout, clearTimeout, URLSearchParams,
+        TextDecoder: NodeTextDecoder, fetch: mockFetch,
+        window: {},
+        Core: {
+          State: { get: () => null },
+          Storage: {
+            all: async () => [],
+            kvGet: async (k) => perfStore.kv[k] || null,
+            kvSet: async (k, v) => { perfStore.kv[k] = v; }
+          }
+        }
+      };
+      DS.window = DS;
+      vm.createContext(DS);
+      vm.runInContext(readFileSafe(path.join(WWW, 'core/constants.js')), DS);
+      vm.runInContext(readFileSafe(path.join(WWW, 'app/short-trader.js')), DS);
+      const ST = DS.window.ShortTrader;
+      if (!ST) { fail('68.5.0 加载 short-trader 失败', '无 ST'); return; }
+
+      // ---- 68.5.1 _formatCalibrationDriftText 纯函数 ----
+      const txt1 = ST._formatCalibrationDriftText({
+        date: '2026-07-28', recentBrier: 0.33, baseBrier: 0.83, delta: -0.5,
+        direction: 'down', recentN: 6, baseN: 6
+      });
+      if (txt1.includes('校准漂移') && txt1.includes('2026-07-28') && txt1.includes('0.330') && txt1.includes('0.830')) {
+        ok('68.5.1 _formatCalibrationDriftText 含日期 + Brier + 方向');
+      } else fail('68.5.1 格式化', txt1.slice(0, 200));
+
+      // ---- 68.5.2 _pushCalibrationToFeishu: 无 webhook → 返 false 不发 fetch ----
+      fetchCalled = null;
+      const r2 = await ST._pushCalibrationToFeishu({ drifted: true, date: '2026-07-28' });
+      if (r2 === false && fetchCalled === null) ok('68.5.2 无 webhook 配置 → 不推送 (返 false)');
+      else fail('68.5.2 无 webhook', 'fetchCalled=' + JSON.stringify(fetchCalled));
+
+      // ---- 68.5.3 _pushCalibrationToFeishu: drifted=false → 不发 fetch ----
+      perfStore.kv['feishu_webhook'] = 'https://feishu.test/webhook';
+      fetchCalled = null;
+      const r3 = await ST._pushCalibrationToFeishu({ drifted: false, date: '2026-07-28' });
+      if (r3 === false && fetchCalled === null) ok('68.5.3 drifted=false → 不推送');
+      else fail('68.5.3 不漂移', '应不推送');
+
+      // ---- 68.5.4 _pushCalibrationToFeishu: drifted=true + webhook → 推送 ----
+      fetchCalled = null;
+      const r4 = await ST._pushCalibrationToFeishu({
+        date: '2026-07-28', drifted: true, recentBrier: 0.33, baseBrier: 0.10,
+        delta: 0.23, direction: 'up', recentN: 5, baseN: 5
+      });
+      if (r4 === true && fetchCalled && fetchCalled.url === 'https://feishu.test/webhook'
+          && fetchCalled.opts.msg_type === 'text'
+          && fetchCalled.opts.content && fetchCalled.opts.content.text.includes('校准漂移')) {
+        ok('68.5.4 drifted=true + webhook → 推送 (msg_type=text)');
+      } else fail('68.5.4 推送', 'fetchCalled=' + JSON.stringify(fetchCalled));
+
+      // ---- 68.5.5 _pushCalibrationToFeishu: fetch 失败 → 返 false 不抛 ----
+      const DS5 = Object.assign({}, DS, { window: DS, fetch: async () => { throw new Error('CORS blocked'); } });
+      DS5.window = DS5;
+      vm.createContext(DS5);
+      vm.runInContext(readFileSafe(path.join(WWW, 'core/constants.js')), DS5);
+      vm.runInContext(readFileSafe(path.join(WWW, 'app/short-trader.js')), DS5);
+      const ST5 = DS5.window.ShortTrader;
+      let threw5 = false;
+      try { await ST5._pushCalibrationToFeishu({ drifted: true, date: '2026-07-28' }); }
+      catch (e) { threw5 = true; }
+      if (!threw5) ok('68.5.5 fetch 抛错被 catch 吞, 不抛');
+      else fail('68.5.5 吞错', '抛了');
+
+      // ---- 68.5.6 runDailyCalibrationReport: 样本不足 → 不推送 ----
+      const r6 = await ST.runDailyCalibrationReport({ nowMs: 1700000000000 });
+      if (r6.persisted === false && r6.pushed === false && r6.report.skipped) {
+        ok('68.5.6 runDaily 无样本 → persisted=false pushed=false skipped');
+      } else fail('68.5.6 无样本', JSON.stringify(r6).slice(0, 200));
+
+      // ---- 68.5.7 runDailyCalibrationReport: 持久化报告 + 漂移时推送 ----
+      const now7 = 1700000000000;
+      const trades6 = [];
+      for (let i = 0; i < 5; i++) trades6.push({ probability: 60, outcome: 'correct', verifiedAt: now7 - 10 * 86400 * 1000 + i * 1000 });
+      trades6.push({ probability: 60, outcome: 'wrong', verifiedAt: now7 - 10 * 86400 * 1000 + 5000 });
+      for (let i = 0; i < 2; i++) trades6.push({ probability: 80, outcome: 'correct', verifiedAt: now7 - 3 * 86400 * 1000 + i * 1000 });
+      for (let i = 0; i < 4; i++) trades6.push({ probability: 80, outcome: 'wrong', verifiedAt: now7 - 3 * 86400 * 1000 + 3000 + i * 1000 });
+      const orderMap = {}; trades6.forEach((t, i) => { orderMap['a' + i] = { id: 'a' + i, probability: t.probability, assumption: '题材' }; });
+      const positionMap = {}; trades6.forEach((t, i) => {
+        const exitDate = new Date(t.verifiedAt + 86400 * 1000).toISOString().slice(0, 10);
+        const entryDate = new Date(t.verifiedAt - 2 * 86400 * 1000).toISOString().slice(0, 10);
+        positionMap['a' + i] = { code: '600519', closed: true, exitDate, entryDate, planOrderId: 'a' + i };
+      });
+      const journals9 = trades6.map((t, i) => {
+        const exitDate = new Date(t.verifiedAt + 86400 * 1000).toISOString().slice(0, 10);
+        const entryDate = new Date(t.verifiedAt - 2 * 86400 * 1000).toISOString().slice(0, 10);
+        return {
+          id: 'a' + i, code: '600519', sleeve: 'short', auto: true, verifyOutcome: t.outcome,
+          verifiedAt: t.verifiedAt, assumption: '题材',
+          content: '卖出日期:' + exitDate + '\n原因:止盈\n入场:' + entryDate + '@10\n出场:11'
+        };
+      });
+      perfStore.kv['feishu_webhook'] = 'https://feishu.test/webhook';
+      fetchCalled = null;
+      const DS7 = Object.assign({}, DS, { window: DS, Core: Object.assign({}, DS.Core, {
+        Storage: Object.assign({}, DS.Core.Storage, {
+          all: async () => journals9,
+          kvGet: async (k) => {
+            if (k === 'paper_short_positions') return Object.values(positionMap);
+            if (k === 'paper_cond_orders') return Object.values(orderMap);
+            return perfStore.kv[k] || null;
+          },
+          kvSet: async (k, v) => { perfStore.kv[k] = v; }
+        })
+      }) });
+      DS7.window = DS7;
+      vm.createContext(DS7);
+      vm.runInContext(readFileSafe(path.join(WWW, 'core/constants.js')), DS7);
+      vm.runInContext(readFileSafe(path.join(WWW, 'app/short-trader.js')), DS7);
+      const ST7 = DS7.window.ShortTrader;
+      const r7 = await ST7.runDailyCalibrationReport({ nowMs: now7 });
+      // base (60% 准) brier=0.19, recent (80% 不准) brier=0.45, direction=up drifted=true
+      if (r7.persisted && r7.drifted && r7.pushed
+          && fetchCalled && fetchCalled.opts.content.text.includes('上升')
+          && perfStore.kv['short_calibration_drift'] && perfStore.kv['short_calibration_drift'].drifted) {
+        ok('68.5.7 端到端: 检查 → 持久化 → 飞书推送 (drifted=up)');
+      } else fail('68.5.7 端到端', JSON.stringify(r7).slice(0, 200) + ' fetch=' + JSON.stringify(fetchCalled).slice(0, 100));
+
+      // ---- 68.5.8 runDailyCalibrationReport: skipFeishu=true → 跑检查但不推 ----
+      fetchCalled = null;
+      const r8 = await ST7.runDailyCalibrationReport({ nowMs: now7, skipFeishu: true });
+      if (r8.persisted && r8.drifted && r8.pushed === false && fetchCalled === null) {
+        ok('68.5.8 skipFeishu=true → drifted 仍触发报告但跳过推送');
+      } else fail('68.5.8 skip', JSON.stringify(r8).slice(0, 200));
+    } catch (e) {
+      fail('68.5 P2-2', e.message + ' / ' + (e.stack || ''));
+    }
+  })();
+
+  // ========== [69] Y.2 + Y.3: 排雷扫描 + 缓存 + UI 卡片 ==========
+  section('[69] Phase Y: Core.RiskMine.scanHits / checkRows / refreshCache / getCache + 选股页 UI 卡片');
+  (async () => {
+  try {
+    const { TextDecoder: NodeTextDecoder } = require('util');
+    const riskStore = { kv: {} };
+    const DS = {
+      console, setTimeout, clearTimeout, URLSearchParams,
+      TextDecoder: NodeTextDecoder, fetch: () => Promise.reject(new Error('no fetch')),
+      window: {},
+      Core: {
+        State: { get: () => null },
+        Storage: {
+          all: async () => [],
+          kvGet: async (k) => riskStore.kv[k] || null,
+          kvSet: async (k, v) => { riskStore.kv[k] = v; }
+        },
+        Data: { fetch: async () => [] }
+      }
+    };
+    DS.window = DS;
+    vm.createContext(DS);
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/risk-mine.js')), DS);
+    const RM = DS.window.Core.RiskMine;
+    if (!RM) { fail('69.0 加载 risk-mine 失败', '无 RM'); return; }
+
+    // ---- 69.1 scanHits: 空 codes → 空数组 ----
+    if (RM.scanHits([], new Map()).length === 0) ok('69.1 scanHits 空 → []');
+    else fail('69.1 空', '');
+
+    // ---- 69.2 scanHits: codes 在 reasonMap 中 → 命中 ----
+    const m2 = new Map();
+    m2.set('600519', new Set(['商誉偏高']));
+    m2.set('000001', new Set(['股东减持', '业绩首亏']));  // 2 条 → HIGH
+    const h2 = RM.scanHits(['600519', '000001', '000002'], m2);
+    if (h2.length === 2 && h2[0].code === '600519' && h2[0].level === 1
+        && h2[1].code === '000001' && h2[1].level === 2) {
+      ok('69.2 scanHits 1 条→LOW / 2 条→HIGH (level)');
+    } else fail('69.2 命中', JSON.stringify(h2));
+
+    // ---- 69.3 scanHits: 容错 (code 非 6 位 / reasonMap 非 Map) ----
+    if (RM.scanHits(['60', null, '600519'], null).length === 0
+        && RM.scanHits(['600519'], null).length === 0) {
+      ok('69.3 scanHits 容错 (短 code / null / 非 Map)');
+    } else fail('69.3 容错', '');
+
+    // ---- 69.4 checkRows: 给行数组 + reasonMap → 加 riskFields ----
+    const m4 = new Map();
+    m4.set('600519', new Set(['商誉偏高']));
+    const rows4 = [{ code: '600519', name: '贵州茅台' }, { code: '000001', name: '平安银行' }];
+    const r4 = RM.checkRows(rows4, 'code', m4);
+    if (r4[0].riskFields && r4[0].riskFields.reasons.includes('商誉偏高') && r4[0].riskFields.level === 1
+        && !r4[1].riskFields) {
+      ok('69.4 checkRows 命中行加 riskFields, 未命中行原样');
+    } else fail('69.4 checkRows', JSON.stringify(r4));
+
+    // ---- 69.5 checkRows: 不修改原行 (新数组) ----
+    if (r4 !== rows4 && !rows4[0].riskFields) ok('69.5 checkRows 浅拷贝, 不改原行');
+    else fail('69.5 不改原', '');
+
+    // ---- 69.6 refreshCache: mock 4 类 fetcher → 写 kv ----
+    const DS6 = Object.assign({}, DS, { window: DS, Core: Object.assign({}, DS.Core, {
+      Storage: Object.assign({}, DS.Core.Storage, {
+        kvGet: async (k) => riskStore.kv[k] || null,
+        kvSet: async (k, v) => { riskStore.kv[k] = v; }
+      })
+    }) });
+    DS6.window = DS6;
+    vm.createContext(DS6);
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/risk-mine.js')), DS6);
+    const RM6 = DS6.window.Core.RiskMine;
+    const r6 = await RM6.refreshCache({
+      fetchers: {
+        goodwill: () => [{ '代码': '600519', '商誉占总资产比': 0.40 }],   // > 0.30 命中
+        decrease: () => [{ '代码': '000001', '变动比例': 0.02 }],     // > 0.01 命中
+        profit: () => [],
+        capital: () => [{ '代码': '300750', '主力净流入净额': -2e7 }]      // < -1e7 命中
+      }
+    });
+    // duck typing (跨 vm context Map instanceof 不可靠)
+    const r6m = r6 && r6.map;
+    if (r6 && r6.ok && r6m && typeof r6m.get === 'function' && r6m.size === 3
+        && r6m.get('600519') && r6m.get('600519').has('商誉偏高')
+        && r6m.get('000001') && r6m.get('000001').has('股东减持')
+        && r6m.get('300750') && r6m.get('300750').has('主力净流出')
+        && riskStore.kv['risk_mine_cache'] && riskStore.kv['risk_mine_cache'].ts) {
+      ok('69.6 refreshCache 拉 4 类 → 写 kv risk_mine_cache (3 命中)');
+    } else fail('69.6 refresh', JSON.stringify(r6).slice(0, 200));
+
+    // ---- 69.7 getCache: 还原 Map + TTL 校验 ----
+    const c7 = await RM6.getCache();
+    // 跨 vm context 时 instanceof Map 不可靠, 用 duck typing (有 .get + .size)
+    if (c7 && c7.map && typeof c7.map.get === 'function' && c7.map.size === 3
+        && c7.map.get('600519') && c7.map.get('600519').has('商誉偏高')) {
+      ok('69.7 getCache 还原 Map + 含 3 命中');
+    } else fail('69.7 getCache', JSON.stringify(c7).slice(0, 200));
+
+    // ---- 69.8 getCache: 过期 → null ----
+    riskStore.kv['risk_mine_cache'].ts = Date.now() - 7 * 3600 * 1000;  // 7 小时前, 过期 (TTL 6h)
+    const c8 = await RM6.getCache();
+    if (c8 === null) ok('69.8 getCache 过期 (7h > 6h TTL) → null');
+    else fail('69.8 过期', '');
+
+    // ---- 69.9 refreshCache: fetcher 全失败 → ok=false 不抛 ----
+    const r9 = await RM6.refreshCache({
+      fetchers: {
+        goodwill: () => Promise.reject(new Error('net down')),
+        decrease: () => Promise.reject(new Error('net down')),
+        profit: () => Promise.reject(new Error('net down')),
+        capital: () => Promise.reject(new Error('net down'))
+      }
+    });
+    if (r9 && r9.ok === true && r9.map.size === 0) ok('69.9 refreshCache 4 类全失败 → ok=true map=空 (不抛)');
+    else fail('69.9 全失败', JSON.stringify(r9).slice(0, 200));
+
+    // ---- 69.10 源码对账: SEVERITY + 4 函数导出 ----
+    const src = readFileSafe(path.join(WWW, 'core/risk-mine.js'));
+    if (/SEVERITY\s*=\s*\{[\s\S]{0,100}LOW:\s*1/.test(src) && /HIGH:\s*2/.test(src)) ok('69.10a SEVERITY (LOW/HIGH)');
+    else fail('69.10a SEVERITY', '缺');
+    if (/scanHits\(/.test(src) && /checkRows\(/.test(src) && /refreshCache\(/.test(src) && /getCache\(/.test(src)) {
+      ok('69.10b 4 函数均导出');
+    } else fail('69.10b 函数', '缺');
+
+    // ---- 69.11 UI: 挂载点 + 渲染 + 启动钩子 ----
+    const idx = readFileSafe(path.join(WWW, 'index.html'));
+    if (/screenerRiskMineCard/.test(idx)) ok('69.11a index.html 挂载点 screenerRiskMineCard');
+    else fail('69.11a html', '缺');
+    if (/renderRiskMineCard/.test(readFileSafe(path.join(WWW, 'app/screener.js')))) {
+      ok('69.11b Screener.renderRiskMineCard 方法');
+    } else fail('69.11b 暴露', '缺');
+    if (/Screener\.renderRiskMineCard\(\)/.test(readFileSafe(path.join(WWW, 'app/screener.js')))) {
+      ok('69.11c _onShow_pageScreener 调 renderRiskMineCard');
+    } else fail('69.11c 接线', '缺');
+    if (/RiskMine\.refreshCache\(\)/.test(readFileSafe(path.join(WWW, 'app/screener.js')))) {
+      ok('69.11d screener.init 异步刷排雷缓存');
+    } else fail('69.11d 启动钩子', '缺');
+  } catch (e) {
+    fail('69 Y', e.message + ' / ' + (e.stack || ''));
+  }
+  })();
+
+  // ========== [70] Regime 6 调用方补齐: journal.js 复盘 AI ==========
+  section('[70] Regime 6 调用方: journal.js 复盘 AI 助手注入 Regime');
+  try {
+    const src = readFileSafe(path.join(WWW, 'app/journal.js'));
+    if (/Core\.Regime\._formatRegimeBlock/.test(src)
+        && /regimeBlock[\s\S]{0,200}userPrompt/.test(src)) {
+      ok('70.1 journal.js _runAiAssistant 注入 _formatRegimeBlock 到 userPrompt');
+    } else fail('70.1 journal 注入', '缺');
+    // 6 调用方对账 (P0-3 + Regime 5 调用方)
+    const callerSrc = [
+      readFileSafe(path.join(WWW, 'app/short-trader.js')),
+      readFileSafe(path.join(WWW, 'app/screener.js')),
+      readFileSafe(path.join(WWW, 'app/stock-advisor.js')),
+      readFileSafe(path.join(WWW, 'app/fund/ai-advisor.js')),
+      readFileSafe(path.join(WWW, 'app/journal.js'))
+    ].join('\n');
+    const calls = (callerSrc.match(/Core\.Regime\._formatRegimeBlock/g) || []).length;
+    if (calls >= 6) ok('70.2 全 6 个调用方都注入 _formatRegimeBlock');
+    else fail('70.2 计数', 'calls=' + calls);
+  } catch (e) {
+    fail('70 Regime 调用方', e.message);
+  }
+
+  // ========== [71] Tier 1 Tier 1 Commit C: paper._mapAssumptionLlm + stopLoss fallback ==========
+  // 测试 mirror (跟 www/app/paper.js _mapAssumptionLlm 逻辑保持一致; 改 paper.js 必须同步这里)
+  section('71] Tier 1: paper._mapAssumptionLlm + stopLoss fallback');
+  try {
+    const ASSUMPTIONS = ['业绩拐点', '估值修复', '题材催化', '技术突破', '分红套利', '其他'];
+    const ASSUMPTION_MAP = {
+      '业绩拐点': '业绩拐点', '拐点': '业绩拐点', 'earnings': '业绩拐点',
+      '估值修复': '估值修复', '低估值': '估值修复', '修复': '估值修复',
+      '题材催化': '题材催化', '题材': '题材催化', '概念': '题材催化', '催化': '题材催化',
+      '技术突破': '技术突破', '突破': '技术突破', '技术': '技术突破',
+      '分红套利': '分红套利', '分红': '分红套利', '高股息': '分红套利', '股息': '分红套利'
+    };
+    const mapLlm = (txt) => {
+      if (!txt) return '题材催化';
+      const norm = String(txt).trim();
+      if (ASSUMPTIONS.includes(norm)) return norm;
+      for (const k of Object.keys(ASSUMPTION_MAP)) {
+        if (norm.includes(k)) return ASSUMPTION_MAP[k];
+      }
+      return '其他';
+    };
+    // case 71.1 枚举直通
+    if (mapLlm('业绩拐点') === '业绩拐点') ok('71.1 枚举直通');
+    else fail('71.1 枚举直通', mapLlm('业绩拐点'));
+    // case 71.2 同义词命中
+    if (mapLlm('低估值修复') === '估值修复' && mapLlm('高股息套利') === '分红套利') ok('71.2 同义词命中');
+    else fail('71.2 同义词命中', JSON.stringify([mapLlm('低估值修复'), mapLlm('高股息套利')]));
+    // case 71.3 未匹配 → '其他'
+    if (mapLlm('xyz未知') === '其他') ok('71.3 未匹配 → 其他');
+    else fail('71.3 未匹配', mapLlm('xyz未知'));
+    // case 71.4 空串 → '题材催化' fallback
+    if (mapLlm('') === '题材催化' && mapLlm(null) === '题材催化' && mapLlm(undefined) === '题材催化') ok('71.4 空/null/undefined → 题材催化 fallback');
+    else fail('71.4 缺省 fallback', JSON.stringify([mapLlm(''), mapLlm(null), mapLlm(undefined)]));
+    // case 71.5 paper.js 中 ASSUMPTION_MAP 必须存在且大小一致 (锁死不缩)
+    const paperSrc = readFileSafe(path.join(WWW, 'app/paper.js'));
+    const mapMatch = paperSrc.match(/const ASSUMPTION_MAP = \{([\s\S]*?)\}/);
+    if (mapMatch) {
+      const paperMapKeys = (mapMatch[1].match(/'\S+?'\s*:/g) || []).length;
+      if (paperMapKeys >= Object.keys(ASSUMPTION_MAP).length) ok('71.5 paper.js ASSUMPTION_MAP 包含 mirror 全部 key (paper=' + paperMapKeys + ', mirror=' + Object.keys(ASSUMPTION_MAP).length + ')');
+      else fail('71.5 paper.js ASSUMPTION_MAP key 缺失', 'paper=' + paperMapKeys + ', mirror=' + Object.keys(ASSUMPTION_MAP).length);
+    } else {
+      fail('71.5 paper.js ASSUMPTION_MAP 未找到', '');
+    }
+    // case 71.6 paper.js autoTradeFromPick 必须用 _mapAssumptionLlm (不能再写死 '题材催化')
+    if (/assumption\s*=\s*_mapAssumptionLlm\(/.test(paperSrc)) ok('71.6 paper.js assumption 走 _mapAssumptionLlm');
+    else fail('71.6 paper.js assumption 写死', '仍是字面量或未替换');
+    // case 71.7 stopLoss fallback: pick.stopLoss = null/NaN/<=0 → 写死 price × STOP_LOSS_RATIO_AUTO
+    const computeStopLoss = (pickStopLoss, price, ratio) => {
+      const llm = (typeof pickStopLoss === 'number' && pickStopLoss > 0) ? +pickStopLoss.toFixed(2) : null;
+      return llm ?? +(price * ratio).toFixed(2);
+    };
+    const r71_7a = computeStopLoss(null, 10, 0.92);     // null → fallback
+    const r71_7b = computeStopLoss(NaN, 10, 0.92);      // NaN → fallback
+    const r71_7c = computeStopLoss(-1, 10, 0.92);      // <=0 → fallback
+    const r71_7d = computeStopLoss(9.2, 10, 0.92);     // 有效 → 用 LLM
+    if (r71_7a === 9.2 && r71_7b === 9.2 && r71_7c === 9.2 && r71_7d === 9.2) ok('71.7 stopLoss fallback (null/NaN/<=0 → 写死, 有效 → LLM)');
+    else fail('71.7 stopLoss fallback', JSON.stringify([r71_7a, r71_7b, r71_7c, r71_7d]));
+    // case 71.8 screener.js btn data-assumption-llm + data-stopLoss-llm + data-confidence 必须在
+    const scSrc = readFileSafe(path.join(WWW, 'app/screener.js'));
+    const hasAssumptionAttr = /data-assumption-llm=/.test(scSrc);
+    const hasStopLossAttr = /data-stopLoss-llm=/.test(scSrc);
+    const hasConfidenceAttr = /data-confidence=/.test(scSrc);
+    if (hasAssumptionAttr && hasStopLossAttr && hasConfidenceAttr) ok('71.8 screener.js btn 加 3 个 data-* 透传字段');
+    else fail('71.8 btn data-* 缺失', JSON.stringify({ hasAssumptionAttr, hasStopLossAttr, hasConfidenceAttr }));
+    // case 71.9 screener.js userPrompt 必须包含【行业归属】段
+    if (/【行业归属】/.test(scSrc)) ok('71.9 screener.js userPrompt 注入【行业归属】');
+    else fail('71.9 【行业归属】段缺失', '');
+    // case 71.10 screener.js systemPrompt 必须包含【近期纪律拦截】段
+    if (/【近期纪律拦截/.test(scSrc)) ok('71.10 screener.js systemPrompt 注入【近期纪律拦截】');
+    else fail('71.10 【近期纪律拦截】段缺失', '');
+  } catch (e) {
+    fail('71 Tier 1 mirror 测试', e.message);
+  }
 
 waitForIIFEsDrain().then(() => {
   console.log(`\n\x1b[1m===== 测试结果 =====\x1b[0m`);

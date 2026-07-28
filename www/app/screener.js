@@ -17,6 +17,10 @@
         const ta = document.getElementById('scBlacklist');
         if (ta && v && typeof v === 'string') ta.value = v;
       } catch (e) { console.warn('[screener] blacklist 恢复失败:', e); }
+      // Y.3: 异步刷排雷缓存 (不阻塞, 失败吞)
+      if (window.Core && Core.RiskMine && Core.RiskMine.refreshCache) {
+        Core.RiskMine.refreshCache().catch(e => console.warn('[screener] 排雷缓存失败:', e));
+      }
     },
 
     _renderForm() {
@@ -288,10 +292,21 @@
         const pb = parseFloat(s.市净率);
         const turn = parseFloat(s.换手率);
         const mcap = parseFloat(s.总市值);
+        const lvr = parseFloat(s.量比);
         // Y.3 P-C: PE<=0 (亏损股) 标 '亏损' 防误读
         const peStr = isNaN(pe) ? '-' : (pe <= 0 ? '亏损' : pe.toFixed(1));
-        return `[${i}] ${s.代码} ${s.名称} | PE=${peStr} | PB=${isNaN(pb) ? '-' : pb.toFixed(2)} | 换手=${isNaN(turn) ? '-' : turn.toFixed(2) + '%'} | 市值=${isNaN(mcap) ? '-' : (mcap / 1e8).toFixed(1) + '亿'} | 涨跌幅=${parseFloat(s.涨跌幅).toFixed(2)}%`;
+        return `[${i}] ${s.代码} ${s.名称} | PE=${peStr} | PB=${isNaN(pb) ? '-' : pb.toFixed(2)} | 换手=${isNaN(turn) ? '-' : turn.toFixed(2) + '%'} | 量比=${isNaN(lvr) ? '-' : lvr.toFixed(2)} | 市值=${isNaN(mcap) ? '-' : (mcap / 1e8).toFixed(1) + '亿'} | 涨跌幅=${parseFloat(s.涨跌幅).toFixed(2)}%`;
       }).join('\n');
+
+      // Tier 1 Commit B: 行业归属 (24h 缓存, 30 只几乎免费)
+      let industryLine = '(行业数据不可用)';
+      try {
+        const slice = top.slice(0, 30);
+        const codes = slice.map(s => s.代码);
+        const indArr = await Promise.all(codes.map(c => Core.Data.getStockIndustryByCode(c).catch(() => null)));
+        const lines = slice.map((s, i) => `[${i}] ${s.代码} ${s.名称}${indArr[i] ? ' | 行业=' + indArr[i] : ' | 行业=[降级]'}`);
+        industryLine = lines.join('\n');
+      } catch (e) { console.warn('[screener] 行业拉取失败:', e); }
 
       // 并行加载宏观 + 新闻 + Phase O: 13 维上下文 + KB + Y.3 P-A 持仓
       const macroP = Core.Macro.get().catch(e => null);
@@ -363,6 +378,16 @@
         const pt = await Core.LearningPool.format();
         if (pt) poolBlock = '\n\n【全系统学习池】' + pt;
       } catch (e) { /* 学习池可选 */ }
+      // Tier 1 Commit A: 近期纪律拦截 (避免 LLM 重复推被纪律拦过的代码)
+      let discBlock = '';
+      try {
+        const discLog = await Core.Storage.kvGet('paper_discipline_log') || [];
+        const recent = discLog.slice(-5);
+        if (recent.length > 0) {
+          const txt = recent.map(d => `- ${d.date} ${d.code}: ${(d.reasons || []).join('；')}`).join('\n');
+          discBlock = '\n\n【近期纪律拦截 (避免重复推)】\n' + txt;
+        }
+      } catch (e) { /* 纪律日志缺失静默 */ }
       const systemPrompt = `你是 Phase O 高手版 A 股个股投资顾问, 风格稳健, 严守数据边界。
 
 【投资框架】价值 + 趋势 + 风险平价 混合:
@@ -403,7 +428,7 @@ ${Core.AI.formatUserProfile() || '长期稳健型 (年化 3-5%), 不追短期暴
 7. **pre-mortem 必填**: 每只 pick 必须给 bullCase/bearCase/falsifyCondition/invalidation 四字段; bearCase 禁止"无明显风险/暂无风险"空话, falsifyCondition 必须具体可观测 (价格/指标/财报数字)
 8. **已有持仓友好**: 用户持仓超过 10 万的代码视为"重复持仓", 应在 marketView / risks 中提示, 不强制进 picks
 9. **排雷标签 ✓ 必须尊重**: 候选池中如已被前端标 [排雷] 的代码 (商誉偏高/股东减持/业绩亏损/主力出逃), 一律不进 picks, 除非 KB 经典模式能给出反转理由 (例如"高商誉但 ROE 持续 > 20% 的特例")
-10. 严禁绝对化表述 ("一定涨" 等)${poolBlock}`;
+10. 严禁绝对化表述 ("一定涨" 等)${poolBlock}${discBlock}`;
 
       const userPrompt = `【我的现有持仓 (前 10, Y.3 P-A)】
 ${portfolioLine}
@@ -429,7 +454,10 @@ ${intlText}
 
 ${kbText}
 
-【候选池 (按涨跌幅降序, 最多 30 只, 字段: 代码 名称 PE PB 换手率 市值 涨跌幅)】
+【行业归属】(24h 缓存, 单只失败标 [降级])
+${industryLine}
+
+【候选池 (按涨跌幅降序, 最多 30 只, 字段: 代码 名称 PE PB 换手率 量比 市值 涨跌幅)】
 ${candidates}
 
 请从候选池中挑出 5-10 只最适合用户偏好的股票, 严格使用候选项, JSON 输出 (按 systemPrompt 格式)。每条 reason 引用具体数据, 信心等级和 KB 引用必填。`;
@@ -486,11 +514,15 @@ ${candidates}
             // Phase D2: 回测前置的"假设"文本 = 理由 + bullCase, 供策略映射 (技术突破→突破策略等)
             const bullTxt = Array.isArray(p.bullCase) ? p.bullCase.join(' ') : (p.bullCase || '');
             const assumptionTxt = escapeHtml((p.reasons || []).join(' ') + ' ' + bullTxt);
+            // Tier 1 Commit C: 透传 LLM 输出到 paper (assumption/confidence/stopLoss)
+            const assumptionLlm = (p.assumption || '').trim();
+            const stopLossLlm = (typeof p.stopLoss === 'number') ? p.stopLoss.toFixed(2) : '';
+            const confidenceLlm = p.confidence || '';
             // Bug H 修复: outOfTop 标 [未在候选池] 红字; 禁"加自选"按钮
             const outTag = p.outOfTop ? `<span style="color:var(--down);font-size:11px;margin-left:6px;">[未在候选池]</span>` : '';
             const addBtnHtml = p.outOfTop
               ? `<button class="btn btn-sm" data-code="${escapeHtml(p.code)}" data-action="add" disabled style="opacity:0.5;cursor:not-allowed;" title="不在 top30 候选池, 拒绝加入">⛔ ${escapeHtml(p.code)} 未在候选池</button>`
-              : `<button class="btn btn-sm btn-primary" data-code="${escapeHtml(p.code)}" data-name="${escapeHtml(p.name || '')}" data-riskscore="${p.riskScore || ''}" data-reasons="${reasonsJson}" data-falsify="${escapeHtml(p.falsifyCondition || '')}" data-invalidation="${escapeHtml(p.invalidation || '')}" data-action="add">📌 加入自选</button>`;
+              : `<button class="btn btn-sm btn-primary" data-code="${escapeHtml(p.code)}" data-name="${escapeHtml(p.name || '')}" data-riskscore="${p.riskScore || ''}" data-reasons="${reasonsJson}" data-falsify="${escapeHtml(p.falsifyCondition || '')}" data-invalidation="${escapeHtml(p.invalidation || '')}" data-confidence="${escapeHtml(confidenceLlm)}" data-assumption-llm="${escapeHtml(assumptionLlm)}" data-stopLoss-llm="${escapeHtml(stopLossLlm)}" data-action="add">📌 加入自选</button>`;
             return `
               <div class="ai-pick">
                 <div class="ai-pick-head">
@@ -762,7 +794,14 @@ ${candidates}
         // 3) 模拟盘自动成交 (Phase A: AI 建议按真实行情在模拟盘成交; Paper 不存在则跳过, 不硬依赖)
         // Phase D1: 证伪/失效条件随 pick 传给模拟盘, 写入 transactions 行
         if (window.Paper && typeof window.Paper.autoTradeFromPick === 'function') {
-          window.Paper.autoTradeFromPick({ code, name, falsifyCondition, invalidation });
+          // Tier 1 Commit C: 透传 LLM assumption/confidence/stopLoss 给 paper (fallback 内部 helper)
+          const stopLossRaw = +(btn.dataset.stopLossLlm || '');
+          window.Paper.autoTradeFromPick({
+            code, name, falsifyCondition, invalidation,
+            assumption: btn.dataset.assumptionLlm || '',
+            stopLoss: Number.isFinite(stopLossRaw) && stopLossRaw > 0 ? stopLossRaw : null,
+            confidence: btn.dataset.confidence || ''
+          });
         }
 
         // 4) Phase E: 生成实盘"待确认交易"卡片 (人确认才成交; 失败只 warn, 不影响加自选主流程)
@@ -814,12 +853,70 @@ ${candidates}
         console.error('[Screener] _addWatchlistFromPick 失败:', e);
         toastError('加自选失败: ' + e.message);
       }
+    },
+
+  /**
+   * Phase Y.5: 渲染"排雷命中"卡片 (挂 #screenerRiskMineCard)
+   * - 读 Core.RiskMine.getCache() → 拿 reasonMap
+   * - 拿自选股 + 持仓的 code 列表 → scanHits
+   * - 命中按 level (HIGH 红 / LOW 黄) 分组显示
+   * - 缓存无/失败 → 隐藏
+   */
+  async renderRiskMineCard() {
+    const el = document.getElementById('screenerRiskMineCard');
+    if (!el) return;
+    try {
+      const RM = window.Core && Core.RiskMine;
+      if (!RM) { el.style.display = 'none'; return; }
+      const cache = await RM.getCache();
+      if (!cache) {
+        el.style.display = 'none';
+        return;
+      }
+      // 拉自选 + 持仓 code
+      const codes = [];
+      try {
+        const wl = (await Core.Storage.all('watchlist')) || [];
+        wl.forEach(w => { if (w && w.code) codes.push(w.code); });
+        const hl = (await Core.Storage.all('holdings')) || [];
+        hl.forEach(h => { if (h && h.code) codes.push(h.code); });
+      } catch (e) { /* 单块失败不阻塞 */ }
+      const hits = RM.scanHits(Array.from(new Set(codes)), cache.map);
+      if (!hits.length) {
+        el.style.display = 'none';
+        return;
+      }
+      const esc = (s) => Core.Util.escapeHtml(String(s));
+      const high = hits.filter(h => h.level === 2);
+      const low = hits.filter(h => h.level === 1);
+      const rows = (arr, color) => arr.map(h =>
+        '<div style="padding:4px 0;font-size:12px;">' +
+          '<span style="color:' + color + ';">⚠</span> ' +
+          '<b>' + esc(h.code) + '</b> ' +
+          esc(h.reasons.join(' / ')) +
+        '</div>'
+      ).join('');
+      el.style.display = '';
+      el.innerHTML =
+        '<div style="font-weight:600;margin-bottom:6px;">⚠️ 排雷命中 (自选+持仓)</div>' +
+        '<div style="font-size:12px;color:var(--text-muted);margin-bottom:6px;">' +
+          '共 ' + hits.length + ' 只命中 (' + high.length + ' 高风险 / ' + low.length + ' 提醒), ' +
+          '缓存 ' + new Date(cache.ts).toISOString().slice(0, 16).replace('T', ' ') +
+        '</div>' +
+        (high.length ? '<div style="margin-bottom:4px;color:var(--down);">🔴 高风险 (≥2 维度共振)</div>' + rows(high, 'var(--down)') : '') +
+        (low.length ? '<div style="margin-top:6px;margin-bottom:4px;color:var(--text-muted);">🟡 提醒 (单维度)</div>' + rows(low, 'var(--text-muted)') : '');
+    } catch (e) {
+      console.warn('[screener] renderRiskMineCard 失败:', e);
+      el.style.display = 'none';
     }
+  }
   };
 
   window.Screener = Screener;
   window._onShow_pageScreener = function() {
     if (!document.getElementById('screenerForm').innerHTML) Screener._renderForm();
     if (window.MarketBar) MarketBar.mount('pageScreener', 'industry');
+    // Y.5: 切到选股页时渲染排雷卡
+    if (Screener.renderRiskMineCard) Screener.renderRiskMineCard().catch(e => console.warn('[screener] 排雷卡渲染失败:', e));
   };
 })();
