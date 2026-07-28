@@ -142,7 +142,10 @@
         });
       } else if (decision.action === 'trim' || decision.action === 'add') {
         const llmShares = Math.floor(parseFloat(decision.shares) || 0);
-        if (llmShares < Core.Constants.LOT_SIZE) return;  // 不足一手不调
+        // add 不足一手直接跳过 (buy 内部也卡); trim 不足一手交给 _executeAction
+        // 内部判断 (1 手时改 close, > 1 手时按规则 trim)
+        if (decision.action === 'add' && llmShares < Core.Constants.LOT_SIZE) return;
+        if (llmShares <= 0) return;  // 0 或负数直接跳过
         const actShares = decision.action === 'trim' ? -llmShares : llmShares;
         await this._executeAction(p, decision.action === 'trim' ? 'trim' : 'add', {
           price, shares: actShares,  // 正=加仓, 负=减仓
@@ -279,9 +282,18 @@ ${trackText || '(样本不足, 不显示)'}
         if (action === 'close') {
           result = await Paper.sell(p.id, Math.abs(p.shares), { price, reason: 'intraday-' + (source || 'close') });
         } else if (action === 'trim') {
-          const trimShares = Math.min(Math.abs(shares), p.shares);
-          if (trimShares >= Core.Constants.LOT_SIZE) {
-            result = await Paper.sell(p.id, trimShares, { price, reason: 'intraday-trim' });
+          // Bug #1 修复: LLM trim 超限 (如想 trim 150 但持仓 100) → 旧逻辑会全平 100 (违反 LLM 意图)
+          // 新逻辑: trimShares = min(LLM shares, p.shares - LOT_SIZE) 保证至少留 1 手
+          //   边界: p.shares = 1 手 (100) 且要 trim → 留 0 < 1 手 → 改走 close
+          const maxKeepOneLot = p.shares - Core.Constants.LOT_SIZE;
+          if (maxKeepOneLot < Core.Constants.LOT_SIZE) {
+            // 持仓仅 1 手, 不能 trim (减完会剩 0) → 改 close
+            result = await Paper.sell(p.id, p.shares, { price, reason: 'intraday-trim-to-close' });
+          } else {
+            const trimShares = Math.min(Math.abs(shares), maxKeepOneLot);
+            if (trimShares >= Core.Constants.LOT_SIZE) {
+              result = await Paper.sell(p.id, trimShares, { price, reason: 'intraday-trim' });
+            }
           }
         } else if (action === 'add') {
           const addShares = Math.abs(shares);
