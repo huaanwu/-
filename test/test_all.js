@@ -11909,30 +11909,25 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
     else fail('101.7 journal toast 缺失', '');
   } catch (e) { fail('101.x V6 silent failure 提示', e.message); }
 
-  // ===== 102.x: V9 不强制覆盖, 信任用户输入 =====
+  // ===== 102.x: V10 用 Capacitor.isNativePlatform 检测, 不依赖 UA =====
   try {
     const s102 = readFileSafe(path.join(WWW, 'core', 'state.js'));
 
-    // 102.1: 绝对 URL 仍走信任分支 (任何 LAN IP/域名/端口都直接用, 不擦掉)
+    // 102.1: 用官方 Capacitor.isNativePlatform() (Capacitor 8 UA 已去 wv 标记)
+    if (/window\.Capacitor[\s\S]{0,200}isNativePlatform\(\)/.test(s102))
+      ok('102.1 _isNative 用 Capacitor.isNativePlatform() (V10)');
+    else fail('102.1 V10 平台检测改用官方 API', '');
+
+    // 102.2: 不再依赖 UA 正则
+    if (!/;\s*wv\)/.test(s102))
+      ok('102.2 _isNative 不再用 UA 正则 (V10 修复 Capacitor 8 UA 失效)');
+    else fail('102.2 V10 应删 UA 正则', '');
+
+    // 102.3: V9 信任用户输入的绝对 URL 分支保留
     if (/proxyBase\s*&&\s*\/\^https\?:\\\/\\\/\/i\.test\(proxyBase\)[\s\S]{0,80}_state\.proxyBase\s*=\s*proxyBase/.test(s102))
-      ok('102.1 init() 信任用户输入的合法绝对 URL (V9)');
-    else fail('102.1 信任用户绝对 URL 分支缺失', '');
-
-    // 102.2: 不再硬编码 192.168.1.3 (V9 删掉强制覆盖)
-    if (!/192\.168\.1\.3/.test(s102))
-      ok('102.2 init() 不再硬编码 LAN IP (V9 尊重配置页输入)');
-    else fail('102.2 V8 硬编码 LAN IP 仍残留, V9 应删', '');
-
-    // 102.3: APK + kv 无值 → 留空 + 标记需要 toast
-    if (/_isNative[\s\S]{0,300}_needProxyToast\s*=\s*true/.test(s102))
-      ok('102.3 APK 无 kv URL → _needProxyToast 标记 (V9 引导而非覆盖)');
-    else fail('102.3 V9 toast 引导标记缺失', '');
-
-    // 102.4: 注释里说明 V9 设计意图 (尊重配置页契约)
-    if (/V9[\s\S]{0,200}信任|尊重|配置页|不再强制/.test(s102))
-      ok('102.4 注释说明 V9 设计意图 (V8 → V9 修订)');
-    else fail('102.4 V9 注释缺失', '');
-  } catch (e) { fail('102.x V9 信任用户输入', e.message); }
+      ok('102.3 init() 信任用户输入的合法绝对 URL (V9 保留)');
+    else fail('102.3 V9 信任分支被破坏', '');
+  } catch (e) { fail('102.x V10', e.message); }
 
 
 

@@ -5,10 +5,16 @@
 (function() {
   'use strict';
 
-  // 平台检测: Capacitor webview 的 UA 含 'wv' (Android WebView) 或者 '; wv)' 标记
-  // 浏览器 dev (Chrome/Edge) UA 没这个标记
-  // 参考: https://developer.chrome.com/docs/multidevice/user-agent/#webview_user_agent
-  const _isNative = (typeof navigator !== 'undefined' && /; wv\)|\bwv\b/.test(navigator.userAgent || ''));
+  // 平台检测:
+//   - 优先用官方 Capacitor.isNativePlatform() (检查 window.androidBridge / webkit.messageHandlers)
+//     Capacitor 8 默认 UA 已不再含 'wv' 标记 (Chromium 110+ + Capacitor 注入器改写 UA),
+//     UA 正则失效, 必须用桥接对象检测
+//   - 浏览器 dev (vite) UA 也可能 'wv' (老 Edge/某些 ChromeOS), 所以 Capacitor 优先
+// 参考: node_modules/@capacitor/core/dist/index.cjs.js:52
+const _isNative = (typeof window !== 'undefined'
+  && !!window.Capacitor
+  && typeof window.Capacitor.isNativePlatform === 'function'
+  && window.Capacitor.isNativePlatform());
 
   // V9: 标记 init() 完成后是否需要打"未配 LAN IP"的引导 toast
   //   供 app.js 在 Core.State.on('initComplete') 时读

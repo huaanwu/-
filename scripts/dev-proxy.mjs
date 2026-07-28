@@ -223,10 +223,27 @@ function _probeEndpoint(host, port, timeoutMs = 3000) {
 
 const app = express();
 
-// ===== CORS 放行 (APK 局域网自动发现 dev-proxy 用) =====
-// 浏览器 fetch http://192.168.x.x:8089/health 时, dev-proxy 必须回 ACAO: *
-// 否则 OPTIONS 预检失败, fetch 直接 reject. 仅放行 GET /health 这一个明确路径,
-// 不全局放行 (避免被恶意页面当开放代理)
+// ===== CORS 放行 (APK 局域网访问用) =====
+// V10: APK WebView origin 是 http://localhost (Capacitor androidScheme: 'http'),
+//      fetch http://192.168.x.x:8089/api/akshare/... 是 cross-origin, 浏览器会先发 OPTIONS 预检.
+//      之前只放行 /health, 导致 /api/* 的 OPTIONS 预检 404, fetch 直接 reject (浏览器能通因为 Android Chrome 对 user-typed URL 宽容, WebView 标准 fetch 严).
+//      这里通用放行 /api/* OPTIONS (ACAO: * + ACAM: GET/POST + ACCH: Content-Type),
+//      不全局放行 (只针对 /api/* + /health, 避免被恶意页面当开放代理).
+// 注意: http-proxy-middleware 在 proxy 路由里会接管 res, 用 res.setHeader 设的 ACAO 会被上游响应覆盖.
+//       必须在 proxy.onProxyRes 钩子里再注入一次. 下面 createProxyMiddleware 调用统一传入 onProxyRes.
+function _addCorsHeaders(proxyRes, req, res) {
+  proxyRes.headers['access-control-allow-origin'] = '*';
+  proxyRes.headers['access-control-allow-methods'] = 'GET, POST, OPTIONS';
+  proxyRes.headers['access-control-allow-headers'] = 'Content-Type';
+}
+const _proxyOpts = { onProxyRes: _addCorsHeaders };
+
+app.options('/api/*', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.status(204).end();
+});
 app.options('/health', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -342,6 +359,7 @@ app.use('/api/akshare', createProxyMiddleware({
   target: AKSHARE_TARGET,
   changeOrigin: true,
   pathRewrite: (path) => `/api/public${path}`,
+  onProxyRes: _proxyOpts.onProxyRes,
   onError: (err, req, res) => {
     console.error(`[proxy] ${req.method} ${req.url} → ${err.message}`);
     res.status(502).json({
@@ -378,6 +396,7 @@ app.use('/api/tencent', createProxyMiddleware({
   target: 'https://qt.gtimg.cn',
   changeOrigin: true,
   pathRewrite: (path) => path,
+  onProxyRes: _proxyOpts.onProxyRes,
   onProxyReq: (proxyReq, req) => {
     proxyReq.setHeader('Referer', 'https://gu.qq.com/');
     proxyReq.setHeader('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
@@ -400,6 +419,7 @@ app.use('/api/sina', createProxyMiddleware({
   target: 'http://money.finance.sina.com.cn',
   changeOrigin: true,
   pathRewrite: (path) => path,  // 不改 path
+  onProxyRes: _proxyOpts.onProxyRes,
   onError: (err, req, res) => {
     console.error(`[sina] ${req.method} ${req.url} → ${err.message}`);
     res.status(502).json({
@@ -427,6 +447,7 @@ app.use('/api/fund', createProxyMiddleware({
   },
   changeOrigin: true,
   pathRewrite: (path) => path.replace(/^\/(eastmoney|tt)/, ''),
+  onProxyRes: _proxyOpts.onProxyRes,
   onProxyReq: (proxyReq, req) => {
     const m = req.url.match(/^\/(eastmoney|tt)/);
     const tag = m ? m[1] : 'eastmoney';
@@ -463,6 +484,7 @@ app.use('/api/llm', (req, res, next) => {
     target,
     changeOrigin: true,
     pathRewrite: () => rest,
+    onProxyRes: _proxyOpts.onProxyRes,
     onError: (err, _req, _res) => console.error(`[llm] ${err.message}`)
   })(req, res, next);
 });
@@ -475,6 +497,7 @@ app.use('/api/local', createProxyMiddleware({
   target: LOCAL_LLM_TARGET,
   changeOrigin: true,
   pathRewrite: (path) => path.replace(/^\/api\/local/, ''),
+  onProxyRes: _proxyOpts.onProxyRes,
   onError: (err, req, res) => {
     console.error(`[local-llm] ${req.method} ${req.url} → ${err.message}`);
     res.status(502).json({

@@ -169,7 +169,7 @@ function hideRegimeAlertBanner() {
         }
       });
       // 本轮 init 已完成, 同步触发一次 (上面 onEvent 是为下次启动)
-      if (Core.State.get('proxyBase') === '' && /; wv\)|\bwv\b/.test(navigator.userAgent || '')) {
+      if (Core.State.get('proxyBase') === '' && window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform()) {
         setTimeout(() => {
           if (Core.Toast) Core.Toast.show('📡 APK 启动: 还没配 AKShare 代理地址 — 打开设置页点「🔍 找 PC 上的 dev-proxy」', 6000);
         }, 1000);
