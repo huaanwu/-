@@ -513,12 +513,18 @@
     if (!path || typeof path !== 'string') return path;
     // 绝对 URL 直接返
     if (/^https?:\/\//i.test(path)) return path;
-    const base = (window.Core && Core.State && Core.State.get('proxyBase')) || DEFAULT_PROXY;
-    // proxyBase 是相对路径 (浏览器 dev) → 直接返原 path (走 vite proxy)
-    if (!/^https?:\/\//i.test(base)) return path;
-    // proxyBase 是绝对 URL (APK) → 抽 origin 拼 path
+    // V11: 显式检查 proxyBase === '' (而非 '|| DEFAULT_PROXY'), 空字符串 ≠ 缺失
+    //   APK 首次启动若 proxyBase 是 '' (V10 设计), 不要 fallback 到相对路径 (会解析成 localhost/* 失败)
+    const pb = (window.Core && Core.State && Core.State.get('proxyBase'));
+    if (pb == null) return path;  // 没配置 → 浏览器 dev 期望相对路径
+    if (pb === '') {
+      // 显式空 → 返空字符串, 调用方自己处理 (避免静默走相对路径)
+      return '';
+    }
+    if (!/^https?:\/\//i.test(pb)) return path;  // 相对路径 → 浏览器 dev 走 vite proxy
+    // proxyBase 是绝对 URL (APK 已配 LAN) → 抽 origin 拼 path
     try {
-      const u = new URL(base);
+      const u = new URL(pb);
       return `${u.origin}${path.startsWith('/') ? path : '/' + path}`;
     } catch (e) {
       console.warn('[Data] proxyBase 解析失败, 退到相对路径:', e.message);

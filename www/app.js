@@ -169,10 +169,19 @@ function hideRegimeAlertBanner() {
         }
       });
       // 本轮 init 已完成, 同步触发一次 (上面 onEvent 是为下次启动)
-      if (Core.State.get('proxyBase') === '' && window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform()) {
-        setTimeout(() => {
-          if (Core.Toast) Core.Toast.show('📡 APK 启动: 还没配 AKShare 代理地址 — 打开设置页点「🔍 找 PC 上的 dev-proxy」', 6000);
-        }, 1000);
+      const _isNativeNow = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+      const _pbNow = Core.State.get('proxyBase');
+      if (_isNativeNow && (!_pbNow || _pbNow === '')) {
+        // V11: APK 首次启动 proxyBase 空 → 后台自动跑 LAN 扫描, 命中自动写回
+        setTimeout(() => { _autoDiscoverDevProxy(); }, 1500);
+      } else if (_isNativeNow && _pbNow && /^https?:\/\//.test(_pbNow)) {
+        // 已有合法 URL → 不动, 但如果不通打提示
+        setTimeout(async () => {
+          try {
+            const r = await fetch(_pbNow.replace(/\/api\/.*$/, '') + '/health', { cache: 'no-store' });
+            if (!r.ok && Core.Toast) Core.Toast.show('⚠️ 配置的 dev-proxy 不通 (' + r.status + '), 设置页检查', 5000);
+          } catch (e) { /* 网络异常静默 */ }
+        }, 2000);
       }
     }
 
@@ -300,6 +309,54 @@ function hideRegimeAlertBanner() {
     toastError('应用启动失败: ' + e.message);
   }
 })();
+
+/**
+ * V11: APK 首次启动自动跑 LAN 扫描, 找 dev-proxy (端口 8089)
+ *   直接打 LAN IP, 不走 _apiUrl (proxyBase 还没配置, 走不通)
+ *   命中 → 自动写回 state, 弹 toast 提示
+ *   失败 → toast 引导去设置页手动填
+ *
+ * 候选 IP 来自常见家用子网 (.1-.10 含网关 + 常用设备) — 假设 PC 大概率在网关附近
+ *   如果用户 PC IP 在 .20+.50+.100 等不常见位置, 此函数扫不到, 需要手动填
+ */
+async function _autoDiscoverDevProxy() {
+  const port = 8089;
+  // 常见家用子网 + 部分商用 (OpenWrt / 软路由常见)
+  const subnets = ['192.168.1', '192.168.0', '192.168.31', '10.0.0', '172.20', '172.24'];
+  const candidates = [];
+  for (const sn of subnets) {
+    // 扫 .1 (网关/Possible PC) + .2-.10 (常见 PC 地址)
+    for (let i = 1; i <= 10; i++) candidates.push(`${sn}.${i}`);
+  }
+  // 并发扫: 单个 2.5s 超时 (WebView fetch 没 abort, 用 AbortController), 整批 8s 总预算
+  const tasks = candidates.map(async (ip) => {
+    const c = new AbortController();
+    const timer = setTimeout(() => c.abort(), 2500);
+    try {
+      const r = await fetch(`http://${ip}:${port}/health`, { cache: 'no-store', signal: c.signal });
+      clearTimeout(timer);
+      if (!r.ok) return null;
+      const j = await r.json().catch(() => null);
+      if (j && j.status === 'ok') return { ip, j };
+      return null;
+    } catch (e) {
+      clearTimeout(timer);
+      return null;
+    }
+  });
+  const settled = await Promise.allSettled(tasks);
+  const hits = settled.map(s => s.value).filter(Boolean);
+  if (hits.length === 0) {
+    if (window.Core && Core.Toast) Core.Toast.show('📡 APK 自动发现失败 — 打开设置页手动填代理地址', 6000);
+    return;
+  }
+  // 取第一个命中 (理论上都很快, 任意一个都行)
+  const picked = hits[0];
+  const url = `http://${picked.ip}:${port}/api/akshare`;
+  window.Core.State.set('proxyBase', url);
+  if (window.Core && Core.Toast) Core.Toast.show(`📡 自动发现 dev-proxy @ ${picked.ip}:${port} (设置页可改)`, 5000);
+  console.log('[App] V11 auto-discover 命中:', url, '其他候选:', hits.slice(1).map(h => h.ip).join(','));
+}
 
 // ========== 设置页渲染 ==========
 window._renderSettings = function() {
