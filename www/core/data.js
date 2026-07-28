@@ -1650,20 +1650,43 @@
   }
 
   /**
-   * Tier 2: 全市场个股上榜统计 (近 5 个交易日) — 24h 缓存
-   * aktools: stock_lhb_stock_statistic_em (无参, 全市场)
-   *   实际字段: 代码/名称/最近上榜日/收盘价/涨跌幅/上榜次数/龙虎榜净买额/买入额/卖出额/总成交额
-   *   + 上榜后1日/3日/6日/1月 涨跌幅 (历史均值, 给 AI 看"上榜后表现")
-   * 端点 stock_lhb_ggtj_em 在 aktools 实际不存在 (HTTP 404),改用 stock_statistic
-   * 数据 T+1 (今日收盘后公布), 5 日滚动
-   * @returns {Promise<Map<string, LhbEntry> | null>} code → {name, lastDate, count, net, postN}
+   * Tier 3A: 龙虎榜 reason 文本 → 6 类结构化标签 (LLM 用得上的离散信号)
+   *   'surge' 涨幅异动 (日涨幅偏离 7% / 涨幅 15% / 连续累计涨幅 20% 30%)
+   *   'plunge' 跌幅异动 (日跌幅偏离 7% / ST 连续累计跌幅 12%)
+   *   'turnover' 换手异动 (日换手率 20% 30%)
+   *   'amplitude' 振幅异动 (日振幅 15%)
+   *   'st_risk' ST 类风险
+   *   'normal' 其它/普通上榜
+   * @param {string} reason 上榜原因原文
+   * @returns {string} 6 类标签之一
+   */
+  function _classifyLhbReason(reason) {
+    const r = String(reason || '');
+    if (/ST|\*ST|股改/.test(r)) return 'st_risk';
+    if (/涨幅|上涨/.test(r)) return 'surge';
+    if (/跌幅|下跌|偏离/.test(r) && !/涨幅/.test(r)) return 'plunge';
+    if (/换手率/.test(r)) return 'turnover';
+    if (/振幅/.test(r)) return 'amplitude';
+    return 'normal';
+  }
+
+  /**
+   * Tier 3A: 全市场龙虎榜个股 Map (近 5 日, 含机构席位 + 上榜原因分类)
+   * aktools: stock_lhb_jgmmtj_em (无参, 全市场)
+   *   字段: 代码/名称/收盘价/涨跌幅/买方机构数/卖方机构数/机构买入净额/机构净买额占总成交额比
+   *         /换手率/流通市值/上榜原因/上榜日期
+   * 数据 T+1 (今日收盘后公布); 24h 缓存
+   * 端点选型说明:
+   *   原 stock_lhb_stock_statistic_em 返 994 条但 reason 字段全空, 无机构数据
+   *   stock_lhb_jgmmtj_em 返 382 条但有 reason + 机构净额 (Tier 3A 升级)
+   * @returns {Promise<Map<string, LhbEntry> | null>} code → {name, lastDate, count, net, reasonTag, institutionNet, institutionRatio}
    */
   async function getLhbSnapshotMap() {
-    const cacheKey = 'lhb_stock_statistic_v1';
+    const cacheKey = 'lhb_jgmmtj_v1';
     try {
       const raw = await fetchWithCache(
         cacheKey,
-        'stock_lhb_stock_statistic_em',
+        'stock_lhb_jgmmtj_em',
         {},
         24 * 60 * 60 * 1000
       );
@@ -1672,16 +1695,23 @@
       for (const r of raw) {
         const code = String(r['代码'] || r.code || '').padStart(6, '0');
         if (!/^\d{6}$/.test(code)) continue;
-        const netYuan = parseFloat(r['龙虎榜净买额'] || r.net_amount || 0);
-        if (isNaN(netYuan)) continue;
+        const instNetYuan = parseFloat(r['机构买入净额'] || r['机构买入总额'] || r.net_amount || 0);
+        if (isNaN(instNetYuan)) continue;
+        const ratioPct = parseFloat(r['机构净买额占总成交额比'] || r['机构净买额占总成交额比'] || 0);
+        const instBuy = parseInt(r['买方机构数'] || 0, 10) || 0;
+        const instSell = parseInt(r['卖方机构数'] || 0, 10) || 0;
+        const reasonRaw = r['上榜原因'] || r.reason || '';
         m.set(code, {
           name: r['名称'] || r.name || '',
-          lastDate: (r['最近上榜日'] || r.last_date || '').slice(0, 10),
-          count: parseInt(r['上榜次数'] || r.count || 0, 10) || 0,
-          net: +(netYuan / 1e8).toFixed(2),                // 亿
-          post1d: parseFloat(r['上榜后1日涨跌幅'] || r.post1d || 0),
-          post3d: parseFloat(r['上榜后3日涨跌幅'] || r.post3d || 0),
-          post6d: parseFloat(r['上榜后6日涨跌幅'] || r.post6d || 0)
+          lastDate: (r['上榜日期'] || r.last_date || '').slice(0, 10),
+          count: 1,                                  // jgmmtj 端点每次只返一条 (单日上榜), count 语义不同
+          net: +(instNetYuan / 1e8).toFixed(2),      // 亿 (机构净额, 不是全市场净买)
+          reasonTag: _classifyLhbReason(reasonRaw),  // 6 类标签
+          reasonText: reasonRaw.slice(0, 20),        // 原文截断 (调试/UI 可读)
+          institutionNet: +(instNetYuan / 1e8).toFixed(2),
+          institutionRatio: isNaN(ratioPct) ? 0 : +ratioPct.toFixed(2),  // %
+          institutionBuy: instBuy,
+          institutionSell: instSell
         });
       }
       return m.size > 0 ? m : null;
@@ -1712,25 +1742,35 @@
   }
 
   /**
-   * Tier 2: 格式化龙虎榜 Map → 短文本(注入 LLM prompt)
-   * @param {Map<string, {name, lastDate, count, net, post1d, post3d, post6d}>} lhbMap
+   * Tier 3A: 格式化龙虎榜 Map → 短文本(注入 LLM prompt)
+   * 排序: 机构净额绝对值降序 (机构主导 > 游资主导, 反映"知情资金"强度)
+   * 输出: reason 标签 + 机构净额 + 占比
+   * @param {Map<string, {name, lastDate, count, net, reasonTag, reasonText, institutionNet, institutionRatio}>} lhbMap
    * @param {number} topN 默认 10
    */
   function formatLhbForPrompt(lhbMap, topN = 10) {
     if (!(lhbMap instanceof Map) || lhbMap.size === 0) return '';
+    // 6 类 reason 标签 → 短中文标签 (LLM 看得懂)
+    const TAG_LABEL = {
+      surge: '涨幅异动',
+      plunge: '跌幅异动',
+      turnover: '换手异动',
+      amplitude: '振幅异动',
+      st_risk: 'ST风险',
+      normal: '其它上榜'
+    };
     const rows = [...lhbMap.entries()]
-      .sort((a, b) => Math.abs(b[1].net) - Math.abs(a[1].net))
+      .filter(([, v]) => v && (v.institutionNet !== 0 || v.institutionRatio !== 0))
+      .sort((a, b) => Math.abs(b[1].institutionNet) - Math.abs(a[1].institutionNet))
       .slice(0, topN);
     if (!rows.length) return '';
     const lines = rows.map(([code, v]) => {
-      const sign = v.net >= 0 ? '+' : '';
-      // 上榜后 1/3/6 日 平均涨跌幅 → 上榜效应参考
-      const post = (v.post1d != null && !isNaN(v.post1d))
-        ? ` | 上榜后1日${v.post1d >= 0 ? '+' : ''}${v.post1d.toFixed(1)}%`
-        : '';
-      return `- ${code} ${v.name} ${sign}${v.net}亿 (近5日${v.count}次${post})`;
+      const sign = v.institutionNet >= 0 ? '+' : '';
+      const tag = TAG_LABEL[v.reasonTag] || '其它上榜';
+      const ratio = v.institutionRatio ? ` | 机构占成交${v.institutionRatio.toFixed(1)}%` : '';
+      return `- ${code} ${v.name} [${tag}] 机构${sign}${v.institutionNet}亿${ratio}`;
     });
-    return '【龙虎榜 (近 5 日, T+1, 上榜个股)】\n' + lines.join('\n');
+    return '【龙虎榜 (近 5 日, T+1, 机构主导)】\n' + lines.join('\n');
   }
 
   /**
