@@ -129,13 +129,39 @@
           if (fe.grossProfitMargin != null && fe.grossProfitMargin < 10) continue;
           finFiltered.push(s);
         }
-        const pool = finFiltered.length >= 3 ? finFiltered : sorted;
+        // Bug #4 修复: finFiltered < 3 只时, 不要再全部用 sorted 回退
+        // 至少剔除已确认不达标的 (有数据但 ROE<5%/毛利率<10%)
+        let pool;
+        if (finFiltered.length >= 3) {
+          pool = finFiltered;
+        } else {
+          const knownBadCodes = new Set();
+          for (const s of sorted) {
+            const raw = finMap.get(s.代码);
+            if (!raw) continue;
+            const fe = _extractFundamentals(raw);
+            if (fe && ((fe.roe != null && fe.roe < 5) || (fe.grossProfitMargin != null && fe.grossProfitMargin < 10)))
+              knownBadCodes.add(s.代码);
+          }
+          const filtered = sorted.filter(s => !knownBadCodes.has(s.代码));
+          console.warn(`[LongTrader] 基本面硬筛仅通过 ${finFiltered.length} 只, 回退到 ${filtered.length} 只 (剔除已知不达标 ${knownBadCodes.size} 只)`);
+          pool = filtered;
+        }
         if (pool.length === 0) return;
         // Phase 5 Commit D: 行业集中度检测
         let heldList = [];
         try {
           heldList = (await Paper._getPaperHoldings('long')) || [];
         } catch (e) { /* 无需处理 */ }
+        // Bug #1 修复: industryMap 必须覆盖 sorted + heldList 去重并集
+        // (否则已持仓但不在今日 top30 的股票, 行业市值会被漏算)
+        const allCodes = [...new Set([
+          ...sorted.map(s => s.代码),
+          ...heldList.map(h => h.code).filter(Boolean)
+        ])];
+        try {
+          industryMap = await Core.Data.getStockIndustryBatch(allCodes);
+        } catch (e) { console.warn('[LongTrader] 行业补拉失败:', e); }
         const heldByInd = {};
         for (const h of heldList) {
           const ind = industryMap.get(h.code);
@@ -149,17 +175,21 @@
         // 6. 自动成交到 long sleeve (纪律引擎自动卡)
         const cashBefore = acc.cash;
         const results = [];
+        // Bug #2 修复: 维护 cashRemaining, 每成交一只后扣减, 行业 cap 用递减后的现金重算
+        let cashRemaining = acc.cash;
         for (const p of picks) {
           // Phase 5 Commit D: 行业集中度 cap 检测
           const pInd = industryMap.get(p.code);
           if (pInd) {
             const currentIndValue = heldByInd[pInd] || 0;
-            const pMkt = acc.positionPct * acc.cash;         // 估算单票买入市值
+            const pMkt = acc.positionPct * cashRemaining;       // 估算单票买入市值 (用递减后的现金)
             if ((currentIndValue + pMkt) / totalAssets > indCap) {
               console.log('[LongTrader] ' + p.code + ' 行业 ' + pInd + ' 集中度超标,跳过');
               results.push({ code: p.code, name: p.name, ok: false, reason: p.reason, error: '行业集中度超标' });
               continue;
             }
+            // 占位: 即便通过 cap, 也要在 heldByInd 里先记账, 下一只同行业的能正确感知
+            heldByInd[pInd] = currentIndValue + pMkt;
           }
           try {
             const h = await Paper.autoTradeFromPick({ code: p.code, name: p.name, sleeve: 'long' });
@@ -331,7 +361,7 @@
         '无风险则 warnings: []。只输出 JSON。';
       const raw = await Core.AI.callWithTimeout({
         prompt,
-        temperature: 0.5,
+        temperature: 0.3,
         maxTokens: 800,
         timeoutMs: 60000,
         page: 'long-trader',

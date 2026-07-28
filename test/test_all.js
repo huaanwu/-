@@ -11296,6 +11296,32 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
     else fail('86.2 reviewHoldings 缺失', '');
   } catch (e) { fail('86.x 行业+持股再评估', e.message); }
 
+  // ===== 87.x: Bug 修复 (Tier 5 audit) =====
+  try {
+    const lt87 = readFileSafe(path.join(WWW, 'app', 'long-trader.js'));
+    // 87.1: Bug 1 — industryMap 覆盖 sorted + heldList 并集
+    if (/allCodes = \[\.\.\.new Set/.test(lt87) && /getStockIndustryBatch\(allCodes\)/.test(lt87))
+      ok('87.1 industryMap 合并 sorted + heldList');
+    else fail('87.1 行业并集缺失', '');
+    // 87.2: Bug 2 — cashRemaining 维护递减
+    if (/cashRemaining/.test(lt87) && /positionPct \* cashRemaining/.test(lt87))
+      ok('87.2 行业 cap 用 cashRemaining 递减');
+    else fail('87.2 cashRemaining 缺失', '');
+    // 87.3: Bug 3 — bear agent temperature 降低 (与 bull temperature=0.5 区分)
+    if (/purpose: 'long-trader-bear'/.test(lt87)) {
+      // 取 _bearReview 块 (purpose: 'long-trader-bear' 出现位置)
+      const bearBlock = lt87.slice(lt87.indexOf("purpose: 'long-trader-bear'") - 400,
+                                   lt87.indexOf("purpose: 'long-trader-bear'") + 400);
+      if (/temperature: 0\.3/.test(bearBlock)) ok('87.3 bear agent temperature=0.3');
+      else fail('87.3 bear temperature 修复缺失', '');
+    } else fail('87.3 bear purpose 缺失', '');
+    // 87.4: Bug 4 — finFiltered 回退剔除已知不达标
+    if (/knownBadCodes/.test(lt87) && /回退到/.test(lt87))
+      ok('87.4 finFiltered 回退剔除已知不达标');
+    else fail('87.4 knownBadCodes 修复缺失', '');
+  } catch (e) { fail('87.x bug 修复', e.message); }
+
+
 
 
 
