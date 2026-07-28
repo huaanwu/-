@@ -69,7 +69,7 @@ node scripts/daily_summary.mjs --verify-dry-run ./journals.json   # 事后验证
 node scripts/daily_summary.mjs --premarket   # Phase C 盘前简报 (隔夜外盘+日历+财新要闻 → LLM → 飞书; 建议 Windows 计划任务 交易日 08:30)
 ```
 
-`test/test_all.js` 36 节:JS 语法、域脚本接口完备性 (`DOMAINS` 字典)、Core 命名空间导出、index.html script 引用对账、Worker 结构、关键文件存在、Data 层方法签名、回测引擎 vm 沙箱实测、Vite external 对账、journal/market/fund/alerts 纯函数实测、daily_summary 单测 (含 --premarket 盘前简报)、5.1/5.2/5.3 互通闭环实测、数据源限流、Paper 模拟盘纯函数实测 (含 Phase C EOD 日终小结 + 23b T1 sleeve 分账户: 双账户独立现金/过滤/重置/快照 shortTotal/纪律锚点分 sleeve/向后兼容)、Discipline 纪律引擎实测、Phase D1 pre-mortem + 个股公告实测、Phase D2 回测前置 + 双模型实测、Phase E 待确认交易实测 (Pending 去重/上限/过期/状态机/建议仓位 + 接线)、Phase W 中长线盯盘实测 (horizon 打标/短线定时器起停注入断言/交易时段守卫/通知冷却/事件驱动接线/业绩预告 filter+lastNotifiedKeys 去重/regime 三态迁移/估值判定+进出阈值区去重/nextCheck 门控)、ShortTrader T2 盘前计划实测 (39 节: 交易日边界/prompt 要素/校验管线全分支/丢弃留痕/空仓合法/整手换算/regime 缩放/当日防重复/addCondOrder 接线)、ShortTrader T4 学习环实测 (40 节: _judgeClosedTrade 全分支/verify 扫描跳过未到期+已验证+K线失败/_linkVerifiedTrades 关联/_buildTrackRecord 分组+Top3+门槛/distill 触发条件+JSON 失败保护+items 上限/Brier+校准分桶/prompt 注入)。**改完域脚本或新增域方法必须先 `npm test`,并同步更新该文件的 `DOMAINS` 字典。**
+`test/test_all.js` 36 节:JS 语法、域脚本接口完备性 (`DOMAINS` 字典)、Core 命名空间导出、index.html script 引用对账、Worker 结构、关键文件存在、Data 层方法签名、回测引擎 vm 沙箱实测、Vite external 对账、journal/market/fund/alerts 纯函数实测、daily_summary 单测 (含 --premarket 盘前简报)、5.1/5.2/5.3 互通闭环实测、数据源限流、Paper 模拟盘纯函数实测 (含 Phase C EOD 日终小结 + 23b T1 sleeve 分账户: 双账户独立现金/过滤/重置/快照 shortTotal/纪律锚点分 sleeve/向后兼容)、Discipline 纪律引擎实测、Phase D1 pre-mortem + 个股公告实测、Phase D2 回测前置 + 双模型实测、Phase E 待确认交易实测 (Pending 去重/上限/过期/状态机/建议仓位 + 接线)、Phase W 中长线盯盘实测 (horizon 打标/短线定时器起停注入断言/交易时段守卫/通知冷却/事件驱动接线/业绩预告 filter+lastNotifiedKeys 去重/regime 三态迁移/估值判定+进出阈值区去重/nextCheck 门控)、ShortTrader T2 盘前计划实测 (39 节: 交易日边界/prompt 要素/校验管线全分支/丢弃留痕/空仓合法/整手换算/regime 缩放/当日防重复/addCondOrder 接线)、ShortTrader T4 学习环实测 (40 节: _judgeClosedTrade 全分支/verify 扫描跳过未到期+已验证+K线失败/_linkVerifiedTrades 关联/_buildTrackRecord 分组+Top3+门槛/distill 触发条件+JSON 失败保护+items 上限/Brier+校准分桶/prompt 注入)、**IntradayTrader 盘中操盘手实测 (52+53 节: 交易时段守卫 11 用例/冷却/日限/机械止盈止损/最短持有/_parseDecision 7 用例/整轮 runNow 11 场景含 mock Date 交易时段 + 机械止盈止损优先 + LLM add/trim/close + 日志 + 冷却/日限/最小持有跳过 + 周日守卫 + init 定时器)、LongTrader 长线操盘手实测 (54 节: _shouldRun 10 个用例含周一/工作日/周末/7 天冷却/整轮 runNow 11 场景含周一触发/非周一跳过/现金下限/7 天去重/LLM 非法 JSON 降级/硬筛过滤负股/非 6 位 code 过滤/init 30 分钟轮询/stopPolling)**。**改完域脚本或新增域方法必须先 `npm test`,并同步更新该文件的 `DOMAINS` 字典。**
 
 `scripts/e2e.mjs` 注意:Chrome 路径硬编码 `C:\Program Files\Google\Chrome\Application\chrome.exe`,需要 Vite 已在 3003 端口跑着。
 
@@ -283,6 +283,25 @@ vite.config.js              # root=www,域脚本 external 列表,dev proxy
 | T4-ST.3 周末教训提炼 | `www/app/short-trader.js` + `www/app.js` | `maybeDistillLessons(now, deps)`: 距 lastDistill ≥7 天 且 新增已验证 ≥5 条 → LLM 喂最近 20 条已验证摘要 (code/assumption/盈亏/归因/note) 提炼 2-3 条第一人称可执行错误模式, 严格 JSON `{lessons:[...]}` 走 parseJsonOutput, 失败只 console.warn 不动旧 lessons; app init 异步调用 |
 | T4-ST.4 UI 学习曲线 | `www/index.html` + `www/app/short-trader.js` | 短线 tab `#shortTraderLearning` "📊 学习曲线" (`renderLearningCurve`, paper.js renderPage 2 行挂载): Brier score (`_brierScore`, correct=1/partial=0.5/wrong=0, 样本 <BRIER_MIN_SAMPLES 显示积累中) + 校准分桶表 (`_calibrationBuckets`, CALIBRATION_BUCKET_EDGES <40/40-60/60-80/≥80) + 最近 10 条已验证对照表 + 【我的教训】列表, 全 escapeHtml |
 
+### Phase T5 (IntradayTrader) 盘中盯盘层 (AI 短线操盘手: 1 分钟轮询 + 本地 LLM 实时调仓)
+
+> 跟 T2-T4 盘前计划 + 日 K 条件单**并存**, 不替换; 保守版只盯已持仓, 不主动开新仓 (新仓仍走 T2-T3 条件单)。
+> 显式 `local:true` 调本地 LLM (盯盘场景, 本地优先降低延迟 + 成本 + 隐私)。
+> 不接实盘: 只操作 `isPaper=true && sleeve==='short'` 持仓, 调 `Paper.buy/sell` 自动过滤。
+
+| 子项 | 实现位置 | 关键方法 |
+|---|---|---|
+| T5-ST.0 常量 | `www/core/constants.js` | `INTRADAY_TICK_MS`(1 分钟) / `INTRADAY_KLINE_BARS`(30 根) / `INTRADAY_MIN_HOLD_MINUTES`(15, 防开仓秒平) / `INTRADAY_COOLDOWN_MS`(10 分钟, 同代码防 LLM 反复横跳) / `INTRADAY_LLM_TIMEOUT_MS`(20s) / `INTRADAY_LOG_LIMIT`(200, 滚动截断) / `INTRADAY_MAX_DAILY_ACTIONS`(4, 单只单日上限) |
+| T5-ST.1 主控 + 1 分钟轮询 | `www/app/intraday-trader.js` | `init()` 启动时立刻跑一轮 + 起 1 分钟定时器 (可注入 `_setInterval`/`_clearInterval` 测试) / `runNow()` 公开给 paper.js 页面展示时也调, 内部 `_running` 守卫防重叠 |
+| T5-ST.2 交易时段守卫 | `www/app/intraday-trader.js` | `_isTradingTime(now)` 纯函数: 周一~周五 09:30-11:30/13:00-15:00 边界含端点 (复用 `Core.Constants.TRADING_WINDOWS`); 非交易时段 runNow 直接 return |
+| T5-ST.3 单只处理流水线 | `www/app/intraday-trader.js` `_processPosition` | 拉价 (`Core.Data.getStockQuote`) → 最小持有守卫 → **机械止盈止损** (优先级最高, 不调 LLM) → 冷却/日限检查 → 调 LLM 决策 |
+| T5-ST.4 LLM 决策 (本地优先) | `www/app/intraday-trader.js` `_decideWithLlm` | 拼 prompt: 持仓 (代码/成本/现价/浮盈/止盈止损) + 近 5 日 K + Regime 状态 + 历史成绩单 (复用 ShortTrader._formatTrackRecord); `Core.AI.callWithTimeout({local:true, temperature:0.3, maxTokens:400, timeoutMs:20s})`; 解析 `parseJsonOutput` 走 `{ok, obj}` 协议; action 范围 `hold/trim/add/close` |
+| T5-ST.5 调仓落地 | `www/app/intraday-trader.js` `_executeAction` | 写决策日志 (kv `paper_intraday_log`, 滚动截断 INTRADAY_LOG_LIMIT) + 调 `Paper.buy` (add) / `Paper.sell` (trim/close) 走纪律引擎; close 用 `Math.abs(p.shares)` 全平; add 用 `addShares = abs(shares)` 写 `assumption`/`stopLoss`/`targetPrice` 透传 |
+| T5-ST.6 冷却 + 日动作上限 | `www/app/intraday-trader.js` `_isCooldownOver`/`_isUnderDailyLimit` + kv `paper_intraday_cooldown` | 纯函数可测; `{date, lastAt, todayCount}` map 按 code 索引; 跨日自动重置 `todayCount`; 成功调仓才更新 lastAt+todayCount (失败重试下次还有机会) |
+| T5-ST.7 启动钩子 | `www/app.js` | init 后 `IntradayTrader.init()` 同步调 (内部起定时器, 跑首轮 runNow 异步不阻塞) |
+| T5-ST.8 短路 (机械胜于 LLM) | `www/app/intraday-trader.js` `_mechanicalExit` | 现价 ≤ 止损 → 'stop' 标记; 现价 ≥ 目标 → 'target'; 任一命中 → 走 `_executeAction('close', source='mechanical-stop'/'mechanical-target')` 不调 LLM |
+| T5-ST.9 UI 入口 | (后续) | 短线 tab 加"⚡ 盘中盯盘"状态卡片: 今日动作数 / 上次调仓时间 / 最近 5 条决策日志; renderPage 末尾加挂载点 |
+
 ### Phase D AI 建议"高手化" (D1)
 
 | 子项 | 实现位置 | 关键方法 |
@@ -317,7 +336,24 @@ vite.config.js              # root=www,域脚本 external 列表,dev proxy
 | E.2 screener 生成入口 | `www/app/screener.js` | `_addWatchlistFromPick` 追加第 4 步: 现价 + `Core.Portfolio.getAssets({paper:false})` 实盘口径 → `_suggestPosition` → `Core.Pending.add` (assumption 固定'题材催化', stopLoss=现价×0.92, 与模拟盘口径一致), 失败只 warn 不影响加自选 |
 | E.3 持仓页确认 UI | `www/app/holdings.js` + `index.html` `#pendingTrades` | `_renderPending` (持仓列表上方, 无 pending 不渲染, 理由/pre-mortem 折叠, 全转义) / `confirmPending` (已有同 code 持仓→addTxDialog 加仓, 否则 _formDialog 新建, 预填 code/shares/现价/assumption/stopLoss) / `ignorePending`; **成交落库后**才 `_markPendingConfirmed`, 预填后放弃保存保持 pending |
 
-### Phase W 中长线盯盘改造 (双模式分层轮询)
+### Phase L 长线操盘手 (Long Trader) - AI 自动选股 + 自动成交
+
+> 跟 T2-T5 短线操盘手形成一快一慢双层: 短线 sleeve 走条件单 + 盘中盯盘, 长线 sleeve 走 AI 选股自动成交。
+> 跟 Screener 选股逻辑对接: 长线不需要人去选股页点加自选, 每周一自动跑。
+
+| 子项 | 实现位置 | 关键方法 |
+|---|---|---|
+| L.0 常量 | `www/core/constants.js` | `LONG_TRADER_CHECK_MS`(30 分钟) / `LONG_TRADER_TOP_N`(3 只) / `LONG_TRADER_HARD_SCREEN_TOP`(30 喂 LLM) / `LONG_TRADER_RERUN_DAYS`(7 天内不重跑) / `LONG_TRADER_MIN_CASH`(5000, 长线 sleeve 现金下限) / `LONG_TRADER_LOG_LIMIT`(100, 决策日志滚动截断) |
+| L.1 主控 + 30 分钟轮询 | `www/app/long-trader.js` | `init()` 启动时立刻跑一轮 (失败吞) + 起 30 分钟定时器 (可注入 `_setInterval`/`_clearInterval` 测试) / `runNow(opts)` 公开给手动触发; `_running` 守卫防重叠 |
+| L.2 触发判定 | `www/app/long-trader.js` `_shouldRun` | 纯函数: 周一 (getDay()===1) + 距上次 ≥ 7 天 (`LONG_TRADER_RERUN_DAYS`); 交易日/节假日简化不判 (用户不在乎) |
+| L.3 硬筛 | `www/app/long-trader.js` `runNow` | 调 `Core.Data.getStockSpot()` 拿全市场 → 过滤涨跌幅 > 0 → 排序取前 30 只; 不复用 `Screener.run()` (强依赖 DOM) |
+| L.4 LLM 解读 | `www/app/long-trader.js` `_llmPickTop` | systemPrompt 注入"长线选股助手"人设 + 优先级规则 (市值≥50亿/涨幅 3-9% 区间/排 ST); 喂 30 只让 LLM 挑 3 只; 严格 JSON `{picks: [{code, name, reason}]}` → `Core.AI.callWithTimeout` + `parseJsonOutput` 走 `{ok, obj}` 协议; 非 6 位 code 被过滤 |
+| L.5 自动成交 | `www/app/long-trader.js` `runNow` | 遍历 picks → 调 `Paper.autoTradeFromPick({ code, name, sleeve: 'long' })` → 纪律引擎 (单票上限/重复错误/月度回撤) 自动卡; 失败 console.warn 不 throw; cashBefore/After 记日志 |
+| L.6 决策日志 + lastRun | `www/app/long-trader.js` `_appendLog` | kv `paper_long_trader_log` (上限 100, 滚动截断): {ts, date, trigger, picks: [{code, name, ok, reason}], cashBefore, cashAfter, cashUsed}; kv `paper_long_trader_last` {date, ts} 防重复 |
+| L.7 启动钩子 | `www/app.js` | init 后 `LongTrader.init()` 同步调 (内部起 30 分钟定时器, 跑首轮 runNow 异步不阻塞) |
+| L.8 UI 入口 | (后续) | 模拟盘页长线 tab 加"🤖 本周自动选股"区块: 显示 lastRun 日期 + 本次 picks 卡片 + 累计自动成交金额/笔数; 调 `LongTrader.listLog(10)` 渲染 |
+
+
 
 | 子项 | 实现位置 | 关键方法 |
 |------|----------|----------|
