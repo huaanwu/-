@@ -9968,6 +9968,451 @@ section('[63] H3 regime 多指数 + ATR + 失灵熔断 (Commit 5)');
   }
 })();
 
+// ========== [64] P1-3: 短线成绩单风险/收益形状 (夏普/最大回撤/盈亏比) ==========
+section('[64] P1-3: short-trader._computeSharpe / _computeMaxDrawdown / _computePayoffRatio + 注入成绩单');
+(async () => {
+  try {
+    const { TextDecoder: NodeTextDecoder } = require('util');
+    const DS = {
+      console, setTimeout, clearTimeout, URLSearchParams,
+      TextDecoder: NodeTextDecoder, fetch: () => Promise.reject(new Error('no fetch')),
+      window: {}, Core: { State: { get: () => null }, Storage: { all: async () => [], kvGet: async () => null, kvSet: async () => {} } }
+    };
+    DS.window = DS;
+    vm.createContext(DS);
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/constants.js')), DS);
+    vm.runInContext(readFileSafe(path.join(WWW, 'app/short-trader.js')), DS);
+    const ST = DS.window.ShortTrader;
+    if (!ST || typeof ST._computeSharpe !== 'function') {
+      fail('64.0 加载 short-trader 失败', '缺 _computeSharpe');
+      return;
+    }
+
+    // ---- 64.1 _computeSharpe: 样本 <2 → null ----
+    if (ST._computeSharpe([]) === null && ST._computeSharpe([{pnl: 0.05}]) === null) {
+      ok('64.1 _computeSharpe 样本 <2 → null');
+    } else fail('64.1 sharpe 少样本', '');
+
+    // ---- 64.2 _computeSharpe: 全部相同 → null (sd=0) ----
+    if (ST._computeSharpe([{pnl: 0.05}, {pnl: 0.05}, {pnl: 0.05}]) === null) {
+      ok('64.2 _computeSharpe sd=0 → null (无意义)');
+    } else fail('64.2 sharpe sd=0', '');
+
+    // ---- 64.3 _computeSharpe: 正收益序列 → 正数 ----
+    // 假设 5 笔 pnl = [0.02, 0.03, 0.01, 0.04, 0.02], periodsPerYear=48
+    // mean=0.024, sd≈0.01166, sharpe = (0.024/0.01166) * sqrt(48) ≈ 2.058 * 6.928 ≈ 14.26
+    const win = [{pnl:0.02},{pnl:0.03},{pnl:0.01},{pnl:0.04},{pnl:0.02}];
+    const sharpeWin = ST._computeSharpe(win, 48);
+    if (sharpeWin > 0 && Math.abs(sharpeWin - 14.26) < 0.5) {
+      ok('64.3 _computeSharpe 正收益序列 → 约 +14.26 (年化): ' + sharpeWin);
+    } else fail('64.3 sharpe 正', String(sharpeWin));
+
+    // ---- 64.4 _computeSharpe: 负收益 → 负数 ----
+    const lose = [{pnl:-0.02},{pnl:-0.03},{pnl:-0.01},{pnl:-0.04},{pnl:-0.02}];
+    const sharpeLose = ST._computeSharpe(lose, 48);
+    if (sharpeLose < 0) ok('64.4 _computeSharpe 负收益 → 负数: ' + sharpeLose);
+    else fail('64.4 sharpe 负', String(sharpeLose));
+
+    // ---- 64.5 _computeMaxDrawdown: 空数组 → null ----
+    if (ST._computeMaxDrawdown([]) === null) ok('64.5 _computeMaxDrawdown 空 → null');
+    else fail('64.5 DD 空', '');
+
+    // ---- 64.6 _computeMaxDrawdown: 单调上升 → 0 (无回撤) ----
+    if (ST._computeMaxDrawdown([{pnl:0.01},{pnl:0.02},{pnl:0.03}]) === 0) {
+      ok('64.6 _computeMaxDrawdown 单调上升 → 0');
+    } else fail('64.6 DD 0', '');
+
+    // ---- 64.7 _computeMaxDrawdown: peak 3, valley 1 → DD = -2/3 ≈ -0.6667 ----
+    // pnl: 0.05, 0.10, -0.20, 0.05 → cum: 0.05, 0.15, -0.05, 0 → peak=0.15, valley cum=-0.05 → dd=(-0.05-0.15)/0.15=-1.333
+    const dd1 = ST._computeMaxDrawdown([{pnl:0.05},{pnl:0.10},{pnl:-0.20},{pnl:0.05}]);
+    if (Math.abs(dd1 - (-1.3333)) < 0.01) ok('64.7 _computeMaxDrawdown 复杂路径: ' + dd1);
+    else fail('64.7 DD 复杂', String(dd1));
+
+    // ---- 64.8 _computePayoffRatio: 无盈利 → null ----
+    if (ST._computePayoffRatio([{pnl:-0.01},{pnl:-0.02}]) === null) ok('64.8 payoff 无盈利 → null');
+    else fail('64.8 payoff 无赢', '');
+
+    // ---- 64.9 _computePayoffRatio: 平均盈利 0.045 / 平均亏损 0.015 → 3.0 ----
+    const ratio = ST._computePayoffRatio([{pnl:0.05},{pnl:0.04},{pnl:-0.02},{pnl:-0.01}]);
+    if (Math.abs(ratio - 3.0) < 0.01) ok('64.9 _computePayoffRatio: ' + ratio);
+    else fail('64.9 payoff', String(ratio));
+
+    // ---- 64.10 _buildTrackRecord 集成 3 个字段 (P1-3 升级) ----
+    // 5 笔样本: 4 正确 + 1 错 (足够 SCORECARD_MIN=3)
+    const trades = [
+      { outcome: 'correct', pnl: 0.05, assumption: '题材催化', reason: null },
+      { outcome: 'correct', pnl: 0.03, assumption: '题材催化', reason: null },
+      { outcome: 'correct', pnl: 0.04, assumption: '突破', reason: null },
+      { outcome: 'partial', pnl: 0.01, assumption: '题材催化', reason: null },
+      { outcome: 'wrong',   pnl: -0.08, assumption: '突破',     reason: '假设错误' }
+    ];
+    const rec = ST._buildTrackRecord(trades);
+    if (rec && rec.total === 5 && rec.sharpe != null && rec.maxDrawdown != null && rec.payoffRatio != null) {
+      ok('64.10 track record 含 sharpe/maxDrawdown/payoffRatio');
+    } else fail('64.10 track 字段', JSON.stringify(rec));
+
+    // ---- 64.11 _formatTrackRecord 渲染 3 个风险指标 ----
+    const text = ST._formatTrackRecord(rec);
+    if (text.includes('夏普') && text.includes('最大回撤') && text.includes('盈亏比')) {
+      ok('64.11 成绩单 prompt 文本含 3 风险指标');
+    } else fail('64.11 渲染', text.slice(0, 200));
+
+    // ---- 64.12 源码对账: 3 纯函数 + track record 集成 ----
+    const src = readFileSafe(path.join(WWW, 'app/short-trader.js'));
+    if (/_computeSharpe/.test(src) && /_computeMaxDrawdown/.test(src) && /_computePayoffRatio/.test(src)) {
+      ok('64.12a 源码含 3 纯函数');
+    } else fail('64.12a 3 函数', '缺');
+    if (/periodsPerYear\s*=\s*48/.test(src)) ok('64.12b 默认 48 笔/年 (周频)');
+    else fail('64.12b 频率', '缺默认 48');
+    if (/riskParts/.test(src) && /sharpe.*toFixed/.test(src)) ok('64.12c 渲染含 sharpe');
+    else fail('64.12c 渲染', '缺 riskParts');
+  } catch (e) {
+    fail('64 P1-3', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [65] P1-4: Core.SimilarMarket 历史相似行情 RAG ==========
+section('[65] P1-4: Core.SimilarMarket 纯函数 + T2 集成');
+(async () => {
+  try {
+    const { TextDecoder: NodeTextDecoder } = require('util');
+    const DS = {
+      console, setTimeout, clearTimeout, URLSearchParams,
+      TextDecoder: NodeTextDecoder, fetch: () => Promise.reject(new Error('no fetch')),
+      window: {}, Core: {}
+    };
+    DS.window = DS;
+    vm.createContext(DS);
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/similar-market.js')), DS);
+    const SM = DS.window.Core.SimilarMarket;
+    if (!SM || typeof SM.find !== 'function') {
+      fail('65.0 加载 similar-market 失败', '缺 find');
+      return;
+    }
+
+    // ---- 65.1 _pearson: 完全相同向量 → 1.0 ----
+    const v1 = [1, 2, 3, 4];
+    const p1 = SM._pearson(v1, [2, 4, 6, 8]);  // 完美正相关
+    if (p1 != null && Math.abs(p1 - 1) < 1e-9) ok('65.1 _pearson 完美正相关 → 1.0');
+    else fail('65.1 pearson 1', String(p1));
+
+    // ---- 65.2 _pearson: 完美负相关 → -1.0 ----
+    const p2 = SM._pearson([1, 2, 3, 4], [4, 3, 2, 1]);
+    if (p2 != null && Math.abs(p2 - (-1)) < 1e-9) ok('65.2 _pearson 完美负相关 → -1.0');
+    else fail('65.2 pearson -1', String(p2));
+
+    // ---- 65.3 _pearson: 跳过 NaN ----
+    const p3 = SM._pearson([1, NaN, 3, 4], [2, 0, 6, 8]);  // NaN 跳过, 剩 3 维完美正相关
+    if (p3 != null && Math.abs(p3 - 1) < 1e-9) ok('65.3 _pearson 跳过 NaN 维度');
+    else fail('65.3 pearson NaN', String(p3));
+
+    // ---- 65.4 _pearson: 维度全 NaN → null ----
+    const p4 = SM._pearson([NaN, NaN], [1, 2]);
+    if (p4 === null) ok('65.4 _pearson 全 NaN → null');
+    else fail('65.4 pearson 全空', String(p4));
+
+    // ---- 65.5 _rsi14: 数据不足 → null ----
+    if (SM._rsi14([100, 101, 99]) === null) ok('65.5 _rsi14 数据不足 → null');
+    else fail('65.5 RSI 短', '');
+
+    // ---- 65.6 _rsi14: 全部上涨 → 100 (avgLoss=0) ----
+    const up = Array.from({ length: 20 }, (_, i) => 100 + i);
+    if (SM._rsi14(up) === 100) ok('65.6 _rsi14 全涨 → 100');
+    else fail('65.6 RSI 全涨', '');
+
+    // ---- 65.7 _featuresOf: 20 根 K 线返 4 维 ----
+    const bars = Array.from({ length: 30 }, (_, i) => ({
+      close: 100 + (i % 5),
+      volume: 1000 + i * 10,
+      open: 100 + (i % 5)
+    }));
+    const f = SM._featuresOf(bars);
+    if (typeof f.ret5 === 'number' && typeof f.volRatio === 'number'
+        && typeof f.rsi14 === 'number' && typeof f.vol20 === 'number') {
+      ok('65.7 _featuresOf 返 4 维 (ret5/volRatio/rsi14/vol20)');
+    } else fail('65.7 features', JSON.stringify(f));
+
+    // ---- 65.8 _forwardReturn: 5 日后收益 ----
+    const bar2 = Array.from({ length: 30 }, (_, i) => ({ close: 100 + i }));
+    const fwd = SM._forwardReturn(bar2, 24, 5);
+    if (fwd != null && Math.abs(fwd - 5/124) < 0.001) ok('65.8 _forwardReturn 后续 5 日: ' + fwd.toFixed(4));
+    else fail('65.8 forward', String(fwd));
+
+    // ---- 65.9 find: K线 < 30 → null ----
+    const shortKline = Array.from({ length: 20 }, (_, i) => ({ 日期: '20260' + (i+1), 收盘: 100 + i }));
+    const r9 = await SM.find('600519', { fetcher: async () => shortKline });
+    if (r9 === null) ok('65.9 find K线<30 → null');
+    else fail('65.9 find 少', JSON.stringify(r9));
+
+    // ---- 65.10 find: 模拟 250 根稳定 K 线, query vs 自己 → corr=1, summary 全填 ----
+    const kline250 = Array.from({ length: 250 }, (_, i) => {
+      const close = 100 + Math.sin(i * 0.3) * 2 + (i % 7);
+      return { 日期: `2026-${String(Math.floor(i/30)+1).padStart(2,'0')}-${String(i%30+1).padStart(2,'0')}`, 开盘: close - 0.5, 收盘: close, 成交量: 1000000 + i * 1000 };
+    });
+    const r10 = await SM.find('600519', { days: 20, lookahead: 5, topK: 3, histWindow: 200, fetcher: async () => kline250 });
+    if (r10 && r10.code === '600519' && r10.topSegments && r10.topSegments.length === 3
+        && r10.summary && r10.summary.sampleSize > 0 && r10.summary.maxCorr != null) {
+      ok('65.10 find 250 根 → top3 + summary (sampleSize=' + r10.summary.sampleSize + ', maxCorr=' + r10.summary.maxCorr + ')');
+    } else fail('65.10 find 250', JSON.stringify(r10).slice(0, 200));
+
+    // ---- 65.11 formatForPrompt: 含 "历史相似" + 后续收益 ----
+    const t11 = SM.formatForPrompt(r10);
+    if (t11.includes('历史相似') && t11.includes('600519') && (t11.includes('平均') || t11.includes('样本不足'))) {
+      ok('65.11 formatForPrompt 含 "历史相似" + 收益摘要');
+    } else fail('65.11 渲染', t11.slice(0, 200));
+
+    // ---- 65.12 formatForPrompt: null → 空串 ----
+    if (SM.formatForPrompt(null) === '' && SM.formatForPrompt(undefined) === '') {
+      ok('65.12 formatForPrompt null → ""');
+    } else fail('65.12 空', '');
+
+    // ---- 65.13 源码对账: 4 个纯函数 + 主入口 ----
+    const src = readFileSafe(path.join(WWW, 'core/similar-market.js'));
+    if (/_pearson\(/.test(src) && /_featuresOf\(/.test(src) && /_rsi14\(/.test(src) && /_forwardReturn\(/.test(src)) {
+      ok('65.13a 源码含 4 纯函数');
+    } else fail('65.13a 4 函数', '缺');
+    if (/DEFAULT_HIST_WINDOW\s*=\s*240/.test(src)) ok('65.13b 默认 240 窗口');
+    else fail('65.13b 窗口', '缺');
+    if (/topK/.test(src) && /avgForwardReturn/.test(src)) ok('65.13c topK + 后续收益');
+    else fail('65.13c 收益', '缺');
+
+    // ---- 65.14 index.html + vite.config 注册 ----
+    const idx = readFileSafe(path.join(WWW, 'index.html'));
+    const vite = readFileSafe(path.join(WWW, '..', 'vite.config.js'));
+    if (idx && /core\/similar-market\.js/.test(idx)) ok('65.14a index.html 引用 similar-market.js');
+    else fail('65.14a html 引用', '');
+    if (vite && /core\/similar-market\.js/.test(vite)) ok('65.14b vite.config external 收口');
+    else fail('65.14b vite ext', '');
+
+    // ---- 65.15 T2 _buildPlanContext 集成 similarByCode ----
+    const stSrc = readFileSafe(path.join(WWW, 'app/short-trader.js'));
+    if (/similarByCode/.test(stSrc) && /Core\.SimilarMarket\.find/.test(stSrc)) {
+      ok('65.15 T2 _buildPlanContext 注入 Core.SimilarMarket.find');
+    } else fail('65.15 集成', '缺');
+    if (/formatForPrompt\(/.test(stSrc)) ok('65.16 _buildUserPrompt 渲染 formatForPrompt');
+    else fail('65.16 渲染', '缺');
+  } catch (e) {
+    fail('65 P1-4', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [66] L1: LongTrader 业绩归因 (journal + 机械 verify + 8 类归因 + 成绩单) ==========
+section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyLongTrades');
+(async () => {
+  try {
+    const { TextDecoder: NodeTextDecoder } = require('util');
+    const DS = {
+      console, setTimeout, clearTimeout, URLSearchParams,
+      TextDecoder: NodeTextDecoder, fetch: () => Promise.reject(new Error('no fetch')),
+      window: {}, Core: {
+        State: { get: () => null },
+        Storage: { all: async () => [], kvGet: async () => null, kvSet: async () => {},
+                   add: async () => 1, update: async () => true }
+      }
+    };
+    DS.window = DS;
+    vm.createContext(DS);
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/constants.js')), DS);
+    vm.runInContext(readFileSafe(path.join(WWW, 'app/long-trader.js')), DS);
+    const LT = DS.window.LongTrader;
+    if (!LT) { fail('66.0 加载 long-trader 失败', '无 LT'); return; }
+
+    // ---- 66.1 _judgeLongOutcome: 浮盈 ≥ 8% → correct + timingGood ----
+    const c1 = LT._judgeLongOutcome(0.10);
+    if (c1.outcome === 'correct' && c1.reason === 'timingGood') ok('66.1 浮盈 10% → correct/timingGood');
+    else fail('66.1 浮盈 10', JSON.stringify(c1));
+
+    // ---- 66.2 _judgeLongOutcome: 浮盈 5-8% → correct/选股对 ----
+    const c2 = LT._judgeLongOutcome(0.06);
+    if (c2.outcome === 'correct' && c2.reason === '选股对') ok('66.2 浮盈 6% → correct/选股对');
+    else fail('66.2 浮盈 6', JSON.stringify(c2));
+
+    // ---- 66.3 _judgeLongOutcome: 浮亏 ≥ 8% → wrong/假设错误 ----
+    const c3 = LT._judgeLongOutcome(-0.10);
+    if (c3.outcome === 'wrong' && c3.reason === '假设错误') ok('66.3 浮亏 10% → wrong/假设错误');
+    else fail('66.3 浮亏 10', JSON.stringify(c3));
+
+    // ---- 66.4 _judgeLongOutcome: 浮亏 5-8% → wrong/选股错 ----
+    const c4 = LT._judgeLongOutcome(-0.06);
+    if (c4.outcome === 'wrong' && c4.reason === '选股错') ok('66.4 浮亏 6% → wrong/选股错');
+    else fail('66.4 浮亏 6', JSON.stringify(c4));
+
+    // ---- 66.5 _judgeLongOutcome: ±5% 内 → partial/时机过早 ----
+    const c5 = LT._judgeLongOutcome(0.02);
+    if (c5.outcome === 'partial' && c5.reason === '时机过早') ok('66.5 浮盈 2% → partial/时机过早');
+    else fail('66.5 浮盈 2', JSON.stringify(c5));
+
+    // ---- 66.6 _judgeLongOutcome: NaN → partial/数据不足 ----
+    const c6 = LT._judgeLongOutcome(NaN);
+    if (c6.outcome === 'partial' && c6.reason === '数据不足') ok('66.6 NaN → partial/数据不足');
+    else fail('66.6 NaN', JSON.stringify(c6));
+
+    // ---- 66.7 _buildLongTrackRecord: 样本 < 3 → null ----
+    if (LT._buildLongTrackRecord([]) === null
+        && LT._buildLongTrackRecord([{ outcome: 'correct', reason: '题材' }]) === null) {
+      ok('66.7 样本 < 3 → null');
+    } else fail('66.7 样本少', '');
+
+    // ---- 66.8 _buildLongTrackRecord: 6 笔样本, 按 reason 关键词分类 (题材/业绩/资金/技术) ----
+    const trades8 = [
+      { outcome: 'correct', reason: '题材催化: AI 概念', pnlPct: 0.06, code: '000001' },
+      { outcome: 'correct', reason: '题材: 芯片', pnlPct: 0.05, code: '000002' },
+      { outcome: 'partial', reason: '题材: 医药', pnlPct: 0.02, code: '000003' },
+      { outcome: 'wrong',   reason: '业绩: 净利润增 50%', pnlPct: -0.07, code: '000004' },
+      { outcome: 'wrong',   reason: '技术: 突破 MA60', pnlPct: -0.05, code: '000005' },
+      { outcome: 'correct', reason: '资金: 北向流入', pnlPct: 0.04, code: '000006' }
+    ];
+    const rec8 = LT._buildLongTrackRecord(trades8);
+    if (rec8 && rec8.total === 6
+        && rec8.byReason.length === 4
+        && rec8.byReason[0].category === '题材' && rec8.byReason[0].total === 3) {
+      ok('66.8 6 笔 → 4 类 (题材 3 / 业绩 1 / 资金 1 / 技术 1)');
+    } else fail('66.8 分组', JSON.stringify(rec8));
+
+    // ---- 66.9 _buildLongTrackRecord: 胜率正确 (3 correct + 1 partial + 2 wrong = 3.5/6 = 0.58) ----
+    if (Math.abs(rec8.correctRate - 0.58) < 0.01) ok('66.9 correctRate=0.58: ' + rec8.correctRate);
+    else fail('66.9 胜率', String(rec8.correctRate));
+
+    // ---- 66.10 verifyLongTrades: 无 journal → 0 ----
+    // 沙箱 Storage.all → []
+    const r10 = await LT.verifyLongTrades({ now: new Date(2026, 6, 30, 10, 0) });
+    if (r10.scanned === 0 && r10.verified === 0) ok('66.10 无 journal → 0');
+    else fail('66.10 空', JSON.stringify(r10));
+
+    // ---- 66.11 verifyLongTrades: 3 笔 journal (1 entryDate 90 天内, 1 已 verify, 1 拉 K 失败) → 1 verified ----
+    const fakeJournals = [
+      { id: 'a', code: '600519', sleeve: 'long', auto: true, entryDate: '2026-06-01', costPrice: 100, verifyOutcome: null },
+      { id: 'b', code: '000001', sleeve: 'long', auto: true, entryDate: '2026-07-01', costPrice: 50, verifyOutcome: 'correct' },  // 已 verify 跳过
+      { id: 'c', code: '300750', sleeve: 'short', auto: true, entryDate: '2026-05-01', costPrice: 200, verifyOutcome: null }  // sleeve 不对跳过
+    ];
+    const fakeKline = (code) => {
+      if (code === '600519') {
+        // 5 根 K: 100, 105, 110, 108, 115 (最后 115 → 浮盈 15%)
+        return [
+          { 日期: '2026-06-01', 收盘: 100 }, { 日期: '2026-06-15', 收盘: 105 },
+          { 日期: '2026-07-01', 收盘: 110 }, { 日期: '2026-07-15', 收盘: 108 },
+          { 日期: '2026-07-30', 收盘: 115 }
+        ];
+      }
+      return [];
+    };
+    const DS2 = Object.assign({}, DS, { window: DS, Core: Object.assign({}, DS.Core, {
+      Storage: Object.assign({}, DS.Core.Storage, {
+        all: async () => fakeJournals,
+        update: async (table, id, patch) => ({ table, id, patch })
+      })
+    }) });
+    DS2.window = DS2;
+    vm.createContext(DS2);
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/constants.js')), DS2);
+    vm.runInContext(readFileSafe(path.join(WWW, 'app/long-trader.js')), DS2);
+    const LT2 = DS2.window.LongTrader;
+    const r11 = await LT2.verifyLongTrades({
+      now: new Date(2026, 6, 30, 10, 0),
+      fetcher: async (code) => fakeKline(code)
+    });
+    if (r11.scanned === 1 && r11.verified === 1) ok('66.11 1 笔 long+无 verify → verified=1');
+    else fail('66.11 verify', JSON.stringify(r11));
+
+    // ---- 66.12 _writeLongJournal: 写 journal 行 (mock Storage.add) ----
+    let addedRow = null;
+    const DS3 = Object.assign({}, DS, { window: DS, Core: Object.assign({}, DS.Core, {
+      Storage: Object.assign({}, DS.Core.Storage, {
+        add: async (table, row) => { addedRow = { table, row }; return 1; }
+      })
+    }) });
+    DS3.window = DS3;
+    vm.createContext(DS3);
+    vm.runInContext(readFileSafe(path.join(WWW, 'core/constants.js')), DS3);
+    vm.runInContext(readFileSafe(path.join(WWW, 'app/long-trader.js')), DS3);
+    const LT3 = DS3.window.LongTrader;
+    const j = await LT3._writeLongJournal({
+      code: '600519', name: '贵州茅台', reason: '题材: 提价预期', costPrice: 1800, shares: 100
+    });
+    if (j && j.sleeve === 'long' && j.auto === true && j.code === '600519'
+        && j.costPrice === 1800 && j.shares === 100 && j.entryDate
+        && j.content.includes('题材: 提价预期') && j.id && j.id.startsWith('lt-')) {
+      ok('66.12 _writeLongJournal 写 sleeve=long/auto=true/costPrice/shares');
+    } else fail('66.12 journal', JSON.stringify(j).slice(0, 200));
+
+    // ---- 66.13 _writeLongJournal: 缺 code → null ----
+    const j13 = await LT3._writeLongJournal({ name: 'X', reason: 'r' });
+    if (j13 === null) ok('66.13 缺 code → null');
+    else fail('66.13 缺 code', JSON.stringify(j13));
+
+    // ---- 66.14 源码对账: init 调 verify + runNow 调 _writeLongJournal ----
+    const src = readFileSafe(path.join(WWW, 'app/long-trader.js'));
+    if (/verifyLongTrades\(\)/.test(src) && /init\(\)[\s\S]{0,500}verifyLongTrades/.test(src)) {
+      ok('66.14a init 调 verifyLongTrades');
+    } else fail('66.14a init', '缺');
+    if (/_writeLongJournal\(/.test(src) && /autoTradeFromPick[\s\S]{0,400}_writeLongJournal/.test(src)) {
+      ok('66.14b runNow 调 _writeLongJournal');
+    } else fail('66.14b runNow', '缺');
+
+    // ---- 66.15 constants.js L1 常量 ----
+    const cs = readFileSafe(path.join(WWW, 'core/constants.js'));
+    if (/LONG_VERIFY_THRESHOLD_PCT\s*=\s*0\.05/.test(cs) && /LONG_VERIFY_THRESHOLD_BAD_PCT\s*=\s*0\.08/.test(cs) && /LONG_VERIFY_TIMING_GOOD_PCT\s*=\s*0\.08/.test(cs)) {
+      ok('66.15 constants 含 L1 阈值常量 (5% / 8%)');
+    } else fail('66.15 常量', '缺');
+  } catch (e) {
+    fail('66 L1', e.message + ' / ' + (e.stack || ''));
+  }
+
+  // ========== [67] H3 UI 红条 + 5 调用方 prompt (Commit 6) ==========
+  try {
+    // 67.1 app.js: 含 _renderRegimeBadge / showRegimeAlertBanner / hideRegimeAlertBanner / subscribe
+    const app = readFileSafe(path.join(WWW, 'app.js'));
+    if (/_renderRegimeBadge/.test(app) && /showRegimeAlertBanner/.test(app) && /hideRegimeAlertBanner/.test(app)) {
+      ok('67.1 app.js 含 _renderRegimeBadge / showRegimeAlertBanner / hideRegimeAlertBanner');
+    } else fail('67.1 app.js UI 函数', '缺');
+    if (/Core\.Regime\.subscribe/.test(app) && /setInterval[\s\S]{0,300}refresh\(\)[\s\S]{0,200}_renderRegimeBadge/.test(app)) {
+      ok('67.2 app.js 订阅 regime + 5min 周期 refresh loopback');
+    } else fail('67.2 app.js subscribe/interval', '缺');
+
+    // 67.3 styles.src.css: .regime-badge (3 variants) + .regime-alert + @keyframes
+    const css = readFileSafe(path.join(WWW, 'styles.src.css'));
+    if (/\.regime-badge\s*\{[\s\S]*?\.regime-bull/.test(css) && /\.regime-range/.test(css) && /\.regime-bear/.test(css)) {
+      ok('67.3 styles 含 .regime-badge (3 variants: bull/range/bear)');
+    } else fail('67.3 styles variants', '缺');
+    if (/\.regime-alert\s*\{[\s\S]*?(gradient|linear-gradient)/.test(css)) {
+      ok('67.4 styles 含 .regime-alert 红条 gradient');
+    } else fail('67.4 .regime-alert', '缺');
+    if (/@keyframes\s+regime-alert-pulse/.test(css)) {
+      ok('67.5 styles 含 @keyframes regime-alert-pulse');
+    } else fail('67.5 keyframes', '缺');
+
+    // 67.6 core/regime.js: _formatRegimeBlock 导出 + 渲染 stale line + per-index
+    const regime = readFileSafe(path.join(WWW, 'core/regime.js'));
+    if (/_formatRegimeBlock[\s\S]{0,1000}?指数共识[\s\S]{0,200}sh000300[\s\S]{0,200}sh000852[\s\S]{0,200}sz399303/.test(regime)) {
+      ok('67.6 regime.js _formatRegimeBlock 渲染 3 指数 + 中文标签');
+    } else fail('67.6 _formatRegimeBlock', '缺');
+    if (/stale\s*\?\s*`[\s\S]{0,40}指数数据源失灵/.test(regime) || /指数数据源失灵/.test(regime)) {
+      ok('67.7 regime.js stale 段含"指数数据源失灵"');
+    } else fail('67.7 stale line', '缺');
+
+    // 67.8-67.12 5 调用方 prompt 注入
+    const callers = [
+      ['short-trader.js', /Core\.Regime\._formatRegimeBlock/],
+      ['intraday-trader.js', /Core\.Regime[\s\S]{0,40}_formatRegimeBlock/],
+      ['long-trader.js', /Core\.Regime[\s\S]{0,40}gateMultipliers/],
+      ['screener.js', /Core\.Regime[\s\S]{0,40}_formatRegimeBlock/],
+      ['fund/ai-advisor.js', /Core\.Regime[\s\S]{0,40}_formatRegimeBlock/]
+    ];
+    callers.forEach(([name, re], i) => {
+      const src = readFileSafe(path.join(WWW, 'app', name));
+      if (re.test(src)) ok(`67.${8 + i} ${name} prompt 含 regime 块`);
+      else fail(`67.${8 + i} ${name} regime 注入`, '缺');
+    });
+
+    // 67.13 stale UI 条件: 失败时 banner 类 + retry button (仅 staleFailures >= STALE_FAIL_THRESHOLD)
+    if (/g\.stale\s*\?\s*['"]?[`'"][\s\S]{0,40}失灵/.test(app) || /staleFailures\s*>=\s*STALE_FAIL_THRESHOLD/.test(app)) {
+      ok('67.13 app.js 含 staleFailures >= STALE_FAIL_THRESHOLD 触发 banner');
+    } else fail('67.13 stale 触发', '缺');
+  } catch (e) {
+    fail('67 H3 UI', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
 waitForIIFEsDrain().then(() => {
   console.log(`\n\x1b[1m===== 测试结果 =====\x1b[0m`);
   console.log(`\x1b[32m通过: ${passed}\x1b[0m  |  \x1b[${failed > 0 ? '31' : '32'}]m失败: ${failed}\x1b[0m`);

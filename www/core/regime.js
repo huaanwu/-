@@ -347,6 +347,24 @@
     };
   }
 
+  /**
+   * 渲染大盘状态机 prompt 段 (H3: 5 caller + journal 消费)
+   * 失败→range 兜底 (与 gateMultipliers 行为一致)
+   * @returns {string} 适合直接拼到 systemPrompt / userPrompt 的多行文本
+   */
+  function _formatRegimeBlock() {
+    const g = gateMultipliers();
+    const idx = g.indices || {};
+    const ind = (code) => {
+      const x = idx[code];
+      if (!x || x.state == null) return `${code}: 数据缺失`;
+      const sl = (x.close != null && x.ma60 != null) ? `, 价/MA60=${(x.close / x.ma60).toFixed(3)}` : '';
+      return `${code}=${x.state}${sl}`;
+    };
+    const staleLine = g.stale ? `\n**⚠ 指数数据源失灵 (连续 ${g.staleFailures} 次失败)** — 已强制按"震荡市"处理。本判断保守化, 减仓信号优先于加仓, 不要新增激进仓位。` : '';
+    return `## 大盘状态机 (Regime)\n当前: ${g.label} (${g.state}), 仓位系数 ×${g.positionScale}, 回测 Sharpe 门槛 ${g.sharpeThreshold}${staleLine}\n指数共识: ${ind('sh000300')} | ${ind('sh000852')} | ${ind('sz399303')}\n原则: 下跌市(bear)仅当胜率显著时才加仓, 仓位上限 ×0.5; 趋势市(bull)允许正常加仓; 震荡市(range)严控新仓。`;
+  }
+
   /** 测试专用: 重置内部状态 (供 vm sandbox 在多组测试间清理) */
   function _resetForTest() {
     _mem = null;
@@ -364,6 +382,7 @@
     _consensus,
     _processIndex,
     gateMultipliers,
+    _formatRegimeBlock,
     subscribe,
     _resetForTest
   };

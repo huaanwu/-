@@ -85,6 +85,64 @@ function updateMarketStatus() {
   Core.State.set('marketOpen', open);
 }
 
+// ========== 大盘状态机 UI (H3: 多指数徽章 + 失灵红条) ==========
+// 顶部 Header 注入一个 <span class="regime-badge"> 在 marketStatus 左侧;
+// 失灵时在 <header> 下方注入一个 sticky 红条提醒"指数数据源异常"。
+// 5 caller prompt 段 (short-trader / intraday / screener / fund-ai-advisor / journal) 直接调
+// Core.Regime.gateMultipliers() 拿数据, 不依赖这里。
+
+function _ensureRegimeBadge() {
+  let badge = document.getElementById('regimeBadge');
+  if (!badge) {
+    badge = document.createElement('span');
+    badge.id = 'regimeBadge';
+    badge.className = 'regime-badge';
+    badge.title = '大盘状态机 (HS300 + CSI1000 + CSI2000 共识)';
+    const ms = document.getElementById('marketStatus');
+    if (ms && ms.parentNode) ms.parentNode.insertBefore(badge, ms);
+    else document.querySelector('.header-right')?.appendChild(badge);
+  }
+  return badge;
+}
+
+function _renderRegimeBadge() {
+  if (!window.Core || !Core.Regime || !Core.Regime.gateMultipliers) return;
+  const badge = _ensureRegimeBadge();
+  const g = Core.Regime.gateMultipliers();
+  const staleTag = g.stale ? ' ⚠失灵' : '';
+  badge.className = 'regime-badge ' + g.badgeClass + (g.stale ? ' stale' : '');
+  badge.textContent = `${g.icon} ${g.label}${staleTag}`;
+  if (g.stale) showRegimeAlertBanner(g);
+  else hideRegimeAlertBanner();
+}
+
+function showRegimeAlertBanner(g) {
+  let banner = document.getElementById('regimeAlertBanner');
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'regimeAlertBanner';
+    banner.className = 'regime-alert';
+    const header = document.querySelector('.app-header');
+    if (header && header.parentNode) header.parentNode.insertBefore(banner, header.nextSibling);
+    else document.body.prepend(banner);
+  }
+  const failCount = (g && typeof g.staleFailures === 'number') ? g.staleFailures : '';
+  const codes = (g && g.indices) ? Object.keys(g.indices) : [];
+  const failedList = codes.filter(c => g.indices[c] && g.indices[c].state == null).join(', ') || '未知指数';
+  const retryBtn = (failCount !== '' && failCount >= Core.Constants.STALE_FAIL_THRESHOLD)
+    ? '<button class="btn btn-sm" onclick="Core.Regime.refresh().then(_renderRegimeBadge)">🔄 重试</button>' : '';
+  banner.innerHTML = `
+    <span class="regime-alert-icon">⚠</span>
+    <span class="regime-alert-text">大盘状态机失灵 (连续失败 ${failCount} 次, 受影响指数: ${Core.Util.escapeHtml(failedList)}) — 已强制按"震荡市"保守处理, AI 建议自动降仓位 ×${Core.Regime.GATES.range.positionScale}, 建议门槛 0.5。${retryBtn}</span>
+    <span class="regime-alert-close" onclick="this.parentElement.remove()">×</span>
+  `;
+}
+
+function hideRegimeAlertBanner() {
+  const banner = document.getElementById('regimeAlertBanner');
+  if (banner) banner.remove();
+}
+
 // ========== 启动 ==========
 (async function init() {
   try {
@@ -109,12 +167,27 @@ function updateMarketStatus() {
       }
     });
 
-    // 4b. 大盘状态机每日重算 (Z1 Phase A, 接管 Kimi 活)
+    // 4b. 大盘状态机每日重算 (Z1 Phase A, 接管 Kimi 活; H3 多指数 + 失灵熔断)
     // 异步, 失败不阻塞 UI; 每日 1 次 by kv lastDate 去重
     if (window.Core && Core.Regime && Core.Regime.refresh) {
       Core.Regime.refresh().then(rec => {
         console.log('[App] 大盘状态:', rec.state, rec.snapshot ? `HS300 ${rec.snapshot.close} vs MA60 ${rec.snapshot.ma60}` : '(无 snapshot)');
+        // H3: 刷新顶部徽章 + 失灵红条
+        _renderRegimeBadge();
       }).catch(e => console.warn('[App] Regime refresh 失败:', e && e.message || e));
+      // H3: 订阅 state 切换 → 弹红条
+      if (Core.Regime.subscribe) {
+        Core.Regime.subscribe(({ oldState, newState, rec }) => {
+          console.log(`[App] Regime ${oldState} → ${newState}`);
+          _renderRegimeBadge();
+        });
+      }
+      // H3: 启动后即渲染徽章 (走内存缓存, 不触发新一次 refresh)
+      _renderRegimeBadge();
+      // H3: 5 分钟轮询一次, 兜底处理"setInterval 失灵"导致 stale 累计
+      setInterval(() => {
+        Core.Regime.refresh().then(_renderRegimeBadge).catch(e => console.warn('[App] Regime 周期 refresh 失败:', e && e.message || e));
+      }, 5 * 60 * 1000);
     }
 
     // 5. 初始化各域

@@ -418,6 +418,14 @@
       } else {
         lines.push('(候选池为空 → 必须输出 plans: [])');
       }
+      // P1-4: 历史相似行情 (top5 候选, 各取 5 日后平均收益)
+      if (ctx.similarByCode && ctx.similarByCode.size) {
+        lines.push('');
+        lines.push('## 历史相似 (近 20 日形态匹配)');
+        for (const [code, rec] of ctx.similarByCode.entries()) {
+          lines.push('- ' + Core.SimilarMarket.formatForPrompt(rec));
+        }
+      }
       return lines.join('\n');
     },
 
@@ -599,6 +607,24 @@
             .map(t => t.code)
         );
       } catch (e) { console.warn('[ShortTrader] ctx 读交易流水失败:', e); }
+      // P1-4: 历史相似行情 (Core.SimilarMarket) - 取候选池前 5 只各算一次
+      //   - 失败容错 (单只拉 K 失败 → 该只跳过, 不影响其他)
+      //   - 5 只足够, LLM 看经验先验 (5 日后平均涨 X%)
+      ctx.similarByCode = new Map();
+      try {
+        if (Core.SimilarMarket && Array.isArray(ctx.pool) && ctx.pool.length) {
+          const top5 = ctx.pool.slice(0, 5);
+          const simResults = await Promise.allSettled(
+            top5.map(c => Core.SimilarMarket.find(c.code, { days: 20, lookahead: 5, topK: 3 }).catch(() => null))
+          );
+          for (let i = 0; i < top5.length; i++) {
+            const r = simResults[i];
+            if (r && r.status === 'fulfilled' && r.value) {
+              ctx.similarByCode.set(top5[i].code, r.value);
+            }
+          }
+        }
+      } catch (e) { console.warn('[ShortTrader] ctx similar-market 失败:', e); }
       return ctx;
     },
 
@@ -860,9 +886,14 @@
         .map(([reason, count]) => ({ reason, count }));
       const lastWrongT = [...list].reverse().find(t => t.outcome === 'wrong') || null;
       const totalScore = list.reduce((s, t) => s + score(t.outcome), 0);
+      // P1-3: 风险/收益形状 (按 exitDate 已升序, pnl 用 return 比, 跨账户可比)
+      const sharpe = this._computeSharpe(list);
+      const maxDD = this._computeMaxDrawdown(list);
+      const payoff = this._computePayoffRatio(list);
       return {
         total: list.length,
         correctRate: +(totalScore / list.length).toFixed(2),
+        sharpe, maxDrawdown: maxDD, payoffRatio: payoff,
         byAssumption,
         topReasons,
         lastWrong: lastWrongT ? { code: lastWrongT.code, assumption: lastWrongT.assumption || '',
@@ -875,6 +906,12 @@
       if (!rec) return '';
       const L = [];
       L.push(`【你的历史成绩单】短线已验证 ${rec.total} 笔, 综合胜率 ${(rec.correctRate * 100).toFixed(0)}% (partial 计 0.5)`);
+      // P1-3: 风险/收益形状注入
+      const riskParts = [];
+      if (rec.sharpe != null) riskParts.push(`夏普 ${rec.sharpe.toFixed(2)}`);
+      if (rec.maxDrawdown != null) riskParts.push(`最大回撤 ${(rec.maxDrawdown * 100).toFixed(1)}%`);
+      if (rec.payoffRatio != null) riskParts.push(`盈亏比 ${rec.payoffRatio.toFixed(2)}`);
+      if (riskParts.length) L.push('风险/收益: ' + riskParts.join(' / '));
       if (rec.byAssumption.length) {
         L.push('分假设: ' + rec.byAssumption.map(g =>
           `${g.assumption} ${g.total}笔 胜率${(g.correctRate * 100).toFixed(0)}%` +
@@ -908,8 +945,10 @@
       const mean = list.reduce((s, t) => s + t.pnl, 0) / list.length;
       const variance = list.reduce((s, t) => s + Math.pow(t.pnl - mean, 2), 0) / (list.length - 1);
       const sd = Math.sqrt(variance);
-      if (sd === 0) return null;  // 全部相同 → 无风险收益, 比率无意义
+      // 浮点误差: 全部相同时 sd 极小 (1e-18), ratio 爆炸 → 用 EPS 兜底
+      if (!isFinite(sd) || sd < 1e-12) return null;
       const sharpe = (mean / sd) * Math.sqrt(periodsPerYear);
+      if (!isFinite(sharpe)) return null;
       return +sharpe.toFixed(3);
     },
 
@@ -1117,6 +1156,13 @@
             console.warn('[ShortTrader] 校准块渲染失败:', e);
           }
         }
+        // H3 大盘状态机 (每次盘前重算, 不在 trade 闭环内; 但跟历史胜率强相关)
+        try {
+          if (Core.Regime && Core.Regime._formatRegimeBlock) {
+            const regimeBlock = Core.Regime._formatRegimeBlock();
+            if (regimeBlock) parts.push('', regimeBlock);
+          }
+        } catch (e) { console.warn('[ShortTrader] regime 块渲染失败:', e); }
         let lessons = null;
         try { lessons = await Core.Storage.kvGet(SHORT_LESSONS_KEY); }
         catch (e) { console.warn('[ShortTrader] 读 lessons 失败:', e); }

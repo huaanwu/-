@@ -42,6 +42,8 @@
           CHECK_MS
         );
       }
+      // Phase L1: 启动时跑一轮 verify (不阻塞, 失败吞)
+      this.verifyLongTrades().catch(e => console.warn('[LongTrader] 启动 verify 失败:', e));
     },
 
     stopPolling() {
@@ -115,7 +117,9 @@
         for (const p of picks) {
           try {
             const h = await Paper.autoTradeFromPick({ code: p.code, name: p.name, sleeve: 'long' });
-            results.push({ code: p.code, name: p.name, ok: !!h, reason: p.reason });
+            results.push({ code: p.code, name: p.name, ok: !!h, reason: p.reason, costPrice: h && h.costPrice, shares: h && h.shares });
+            // Phase L1: 写 journal 行 (verify 后续归因用)
+            if (h) await this._writeLongJournal({ ...p, costPrice: h.costPrice, shares: h.shares });
           } catch (e) {
             console.warn(`[LongTrader] autoTradeFromPick 失败 ${p.code}:`, e);
             results.push({ code: p.code, name: p.name, ok: false, reason: p.reason, error: String(e.message || e) });
@@ -185,11 +189,23 @@
         // 等以后机械 verify 落实后, 在这里拼 _calibrationBuckets →
         // Core.Calibration._formatCalibrationPrompt 段, 短期先用 entries.cap
         // 限制 _formatCalibrationPrompt 不渲染 (samples < 5 走 null 路径)。
+
+        // H3 大盘状态机 (commit 6): 仅一行提示, 不影响 schema (只返 {code, name, reason})
+        // 长线 sleeve 也没自动仓位系数 (acc.positionPct 是固定的), 只供 LLM 在趋势/下跌市收紧
+        let regimeLine = '【大盘状态】默认震荡市';
+        try {
+          if (window.Core && Core.Regime && Core.Regime.gateMultipliers) {
+            const g = Core.Regime.gateMultipliers();
+            regimeLine = `【大盘状态】${g.label} (${g.state})${g.stale ? ' ⚠ 数据源失灵' : ''}, 仓位系数 ×${g.positionScale}, ${g.state === 'bear' ? '仅胜率显著才加仓' : (g.state === 'bull' ? '趋势市正常加仓' : '震荡市严控新仓')}`;
+          }
+        } catch (e) { console.warn('[LongTrader] regime 取值失败:', e); }
+
         const systemPrompt = `你是 A 股长线选股助手, 帮用户从硬筛池里挑 ${topN} 只作为本周模拟盘长线 sleeve 的买入标的。
 - 选有真实上涨逻辑的 (题材/业绩/资金/技术突破)
 - 优先选市值 ≥ 50 亿的 (流动性好)
 - 优先选当日涨幅在 3-9% 区间的 (避免追高/避冷门)
 - 排除 ST/退市风险股
+${regimeLine}
 - 输出严格 JSON, 不要其他文字`;
 
         const userPrompt = `硬筛池 (今日涨幅前 ${stocks.length}):
@@ -243,6 +259,177 @@ ${list}
       const list = (await Core.Storage.kvGet(LOG_KEY)) || [];
       const sorted = list.slice().sort((a, b) => (b.ts || 0) - (a.ts || 0));
       return limit ? sorted.slice(0, limit) : sorted;
+    },
+
+    // ========== Phase L1: 长线业绩归因 (journal + 机械 verify + 8 类归因) ==========
+
+    /**
+     * 写长线建仓 journal (sleeve='long', auto=true), 跟 T3 _writeCondJournal 模式一致
+     * @param {{code, name, reason, costPrice, shares, entryDate}} pick - autoTradeFromPick 返的持仓行
+     */
+    async _writeLongJournal(pick) {
+      if (!pick || !pick.code) return null;
+      try {
+        const today = new Date().toISOString().slice(0, 10);
+        const cost = parseFloat(pick.costPrice || pick.price || 0);
+        const shares = parseInt(pick.shares || 0, 10);
+        const reason = String(pick.reason || 'AI 长线选股').slice(0, 200);
+        const content = `# AI 长线自动建仓
+
+- 代码: ${pick.code}
+- 名称: ${pick.name || ''}
+- 成本价: ¥${cost.toFixed(2)}
+- 股数: ${shares} (${shares / 100}手)
+- 选股理由: ${reason}
+- 成交日期: ${today}
+
+> 本条由 LongTrader 自动写入, 后续 verify 用于归因`;
+        const row = {
+          id: 'lt-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
+          date: today,
+          title: `📈 长线建仓: ${pick.code} ${pick.name || ''}`,
+          content,
+          code: pick.code,
+          assumption: reason,
+          emotion: 'neutral',
+          verify: 'pending',
+          verifyOutcome: null,
+          sleeve: 'long',
+          auto: true,
+          costPrice: cost,
+          shares,
+          entryDate: today,
+          createdAt: Date.now()
+        };
+        await Core.Storage.add('journals', row);
+        return row;
+      } catch (e) {
+        console.warn('[LongTrader] 写 journal 失败:', e);
+        return null;
+      }
+    },
+
+    /**
+     * 长线归因纯函数 (复用 VERIFY_FAILURE_REASONS 8 类, 长线简化为 3 类)
+     * @param {number} pnlPct 浮盈浮亏 (小数, 0.05=5%)
+     * @returns {{outcome: 'correct'|'wrong'|'partial', reason: string}}
+     */
+    _judgeLongOutcome(pnlPct) {
+      const thr = Core.Constants.LONG_VERIFY_THRESHOLD_PCT;
+      const badThr = Core.Constants.LONG_VERIFY_THRESHOLD_BAD_PCT;
+      const goodThr = Core.Constants.LONG_VERIFY_TIMING_GOOD_PCT;
+      if (!isFinite(pnlPct)) return { outcome: 'partial', reason: '数据不足' };
+      if (pnlPct >= goodThr) return { outcome: 'correct', reason: 'timingGood' };  // 浮盈 ≥ 8% → 时机好
+      if (pnlPct >= thr) return { outcome: 'correct', reason: '选股对' };          // 浮盈 5-8% → 选股对
+      if (pnlPct <= -badThr) return { outcome: 'wrong', reason: '假设错误' };        // 浮亏 ≥ 8% → 假设错
+      if (pnlPct <= -thr) return { outcome: 'wrong', reason: '选股错' };             // 浮亏 5-8% → 选股错
+      return { outcome: 'partial', reason: '时机过早' };                            // ±5% 内 → 时机过早
+    },
+
+    /**
+     * 长线 verify 主流程: 拉 journal 表, long+auto+无 verify 的, 拉后续 K 线判定 outcome
+     * @param {{daysBack?: number, fetcher?: function, now?: Date}} [opts]
+     * @returns {Promise<{scanned: number, verified: number, skipped: number}>}
+     */
+    async verifyLongTrades(opts = {}) {
+      const daysBack = parseInt(opts.daysBack) || 90;  // 默认回看 90 天
+      const now = opts.now || new Date();
+      const fetcher = opts.fetcher || (Core.Data && Core.Data.getStockKLine);
+      if (typeof fetcher !== 'function') {
+        console.warn('[LongTrader] verifyLongTrades 缺 fetcher, 跳过');
+        return { scanned: 0, verified: 0, skipped: 0 };
+      }
+      const todayStr = (d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`)(now);
+      let scanned = 0, verified = 0, skipped = 0;
+      try {
+        const all = (await Core.Storage.all('journals')) || [];
+        const cutoff = (d => {
+          const dt = new Date(d.getTime() - daysBack * 24 * 3600 * 1000);
+          return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
+        })(now);
+        const targets = all.filter(j =>
+          j && (j.sleeve || '') === 'long' && j.auto === true
+          && j.code && j.entryDate && j.entryDate >= cutoff && j.entryDate < todayStr
+          && (!j.verifyOutcome || j.verifyOutcome === null)
+        );
+        for (const j of targets) {
+          scanned++;
+          try {
+            // 拉近 100 根日 K, 算 entryDate 后的最新收益
+            const kline = await fetcher(j.code, 'daily', undefined, undefined, '').catch(() => null);
+            if (!Array.isArray(kline) || kline.length < 5) { skipped++; continue; }
+            const closes = kline.map(b => parseFloat(b.收盘 || b.close)).filter(c => c > 0);
+            if (closes.length < 5) { skipped++; continue; }
+            // entryDate 当日及之后: 找 >= entryDate 的第一根
+            const dates = kline.map(b => String(b.日期 || b.date || '').slice(0, 10));
+            const entryIdx = dates.findIndex(d => d >= j.entryDate);
+            if (entryIdx < 0 || entryIdx >= closes.length) { skipped++; continue; }
+            const entryPrice = j.costPrice || closes[entryIdx];
+            const lastPrice = closes[closes.length - 1];
+            if (!(entryPrice > 0) || !(lastPrice > 0)) { skipped++; continue; }
+            const pnlPct = (lastPrice - entryPrice) / entryPrice;
+            const { outcome, reason } = this._judgeLongOutcome(pnlPct);
+            await Core.Storage.update('journals', j.id, {
+              verifyOutcome: outcome,
+              verifyFailureReason: reason,
+              verifiedAt: Date.now(),
+              pnlPct: +pnlPct.toFixed(4),
+              lastPrice: +lastPrice.toFixed(2)
+            });
+            verified++;
+          } catch (e) {
+            console.warn(`[LongTrader] verify ${j.code} 失败:`, e.message || e);
+            skipped++;
+          }
+        }
+        return { scanned, verified, skipped };
+      } catch (e) {
+        console.warn('[LongTrader] verifyLongTrades 总流程失败:', e);
+        return { scanned, verified, skipped };
+      }
+    },
+
+    /**
+     * 长线成绩单 (按 reason 关键词分组胜率, 跟 T4 _buildTrackRecord 同构)
+     * @param {Array<{outcome: string, reason: string, pnlPct: number, code: string}>} trades
+     * @returns {null|{total: number, correctRate: number, byReason: Array, topReasons: Array}}
+     */
+    _buildLongTrackRecord(trades) {
+      const list = (Array.isArray(trades) ? trades : []).filter(t => t && t.outcome);
+      const minSamples = Core.Constants.LONG_VERIFY_MIN_SAMPLES;
+      if (list.length < minSamples) return null;
+      // 归一化 reason 关键词: 题材/业绩/资金/技术 → 4 大类
+      const catOf = (r) => {
+        const s = String(r || '');
+        if (/题材|概念|事件/.test(s)) return '题材';
+        if (/业绩|财报|利润|营收/.test(s)) return '业绩';
+        if (/资金|流入|主力|北向/.test(s)) return '资金';
+        if (/技术|突破|均线|金叉/.test(s)) return '技术';
+        return '其他';
+      };
+      const score = (o) => o === 'correct' ? 1 : (o === 'partial' ? 0.5 : 0);
+      const groups = {};
+      for (const t of list) {
+        const cat = catOf(t.reason);
+        const g = groups[cat] || (groups[cat] = { total: 0, scoreSum: 0, pnlSum: 0, reasons: {} });
+        g.total++;
+        g.scoreSum += score(t.outcome);
+        g.pnlSum += (t.pnlPct || 0);
+        if (t.reason) g.reasons[t.reason] = (g.reasons[t.reason] || 0) + 1;
+      }
+      const byReason = Object.entries(groups).map(([cat, g]) => ({
+        category: cat,
+        total: g.total,
+        correctRate: +(g.scoreSum / g.total).toFixed(2),
+        avgPnl: +(g.pnlSum / g.total * 100).toFixed(2),
+        topReason: Object.entries(g.reasons).sort((a, b) => b[1] - a[1])[0]?.[0] || null
+      })).sort((a, b) => b.total - a.total);
+      const totalScore = list.reduce((s, t) => s + score(t.outcome), 0);
+      return {
+        total: list.length,
+        correctRate: +(totalScore / list.length).toFixed(2),
+        byReason
+      };
     }
   };
 

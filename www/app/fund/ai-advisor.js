@@ -189,12 +189,19 @@
       kbText = Core.KB.formatForPrompt(kbEntries);
     } catch (e) { console.warn('[ai-advisor] KB 取条失败:', e); }
 
+    // H3 大盘状态机段 (commit 6): 多指数共识 + 失灵提示
+    // 基金相对股票更看股债跷跷板, 但仓位/久期决策仍受 Regime 影响
+    const regimeBlock = (Core.Regime && Core.Regime._formatRegimeBlock)
+      ? Core.Regime._formatRegimeBlock() : '';
+
     const systemPrompt = `你是 Phase O 高手版中国 A 股基金投资顾问, 风格稳健, 严守数据边界。
 
 【投资框架】价值 + 趋势 + 风险平价 混合:
 - 价值: 票息 / 资本利得 / 估值分位
 - 趋势: 利率方向 / 板块轮动 / 北向流向
 - 风险平价: 跨资产相关性 / 组合最大回撤 / 夏普
+
+${regimeBlock}
 
 【用户画像】(Core.UserProfile 单次动态注入)
 ${Core.AI.formatUserProfile() || '长期稳健型 (年化 3-5% 跑赢通胀), 不追求暴利。'}

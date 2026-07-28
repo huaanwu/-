@@ -354,12 +354,17 @@
       // 验证数据 (不像 short-trader T4 学习环有完整闭环), 校准注入会误导 LLM。
       // 等以后周度机械 verify 落实后, 在这里拼 _calibrationBuckets →
       // Core.Calibration._formatCalibrationPrompt 段, samples < 5 自动不渲染。
+      // H3 大盘状态机段: 多指数共识 + 失灵提示, 让 LLM 在 bear/range 时更保守
+      const regimeBlock = (Core.Regime && Core.Regime._formatRegimeBlock)
+        ? Core.Regime._formatRegimeBlock() : '';
       const systemPrompt = `你是 Phase O 高手版 A 股个股投资顾问, 风格稳健, 严守数据边界。
 
 【投资框架】价值 + 趋势 + 风险平价 混合:
 - 价值: PE/PB/ROE + 历史分位
 - 趋势: 板块轮动、北向方向、行业资金流
 - 风险: 个股波动、行业暴露、相关性
+
+${regimeBlock}
 
 【用户画像】(Core.UserProfile 单次动态注入 - 选股/选基共用同一来源)
 ${Core.AI.formatUserProfile() || '长期稳健型 (年化 3-5%), 不追短期暴利。'}

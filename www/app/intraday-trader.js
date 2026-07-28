@@ -177,13 +177,20 @@
           }
         } catch (e) { /* 拉不到不致命 */ }
 
-        // Regime 状态 (失败保持 range 档 = 不缩放)
-        let regimeText = 'Regime: 震荡市 (默认)';
+        // H3 Regime 状态块 (失败保持 range 档 = 不缩放)
+        let regimeText = '';
         try {
-          const rec = await Core.Regime.get();
-          const gate = Core.Regime.gateMultipliers();
-          regimeText = `Regime: ${rec.state} (${gate.label}, 仓位系数 ${gate.positionScale})`;
-        } catch (e) { /* */ }
+          if (Core.Regime && Core.Regime._formatRegimeBlock) {
+            regimeText = await Core.Regime._formatRegimeBlock();
+          }
+        } catch (e) { regimeText = ''; /* 兜底走老的纯标签 */ }
+        if (!regimeText) {
+          try {
+            const rec = await Core.Regime.get();
+            const gate = Core.Regime.gateMultipliers();
+            regimeText = `Regime: ${rec.state} (${gate.label}, 仓位系数 ${gate.positionScale})`;
+          } catch (e) { regimeText = 'Regime: 震荡市 (默认)'; }
+        }
 
         // 成绩单 (样本不足返空)
         let trackText = '';

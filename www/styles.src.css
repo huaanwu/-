@@ -1247,3 +1247,73 @@ body {
     grid-template-columns: repeat(2, 1fr) !important;
   }
 }
+
+/* ============ H3 大盘状态机 UI (Commit 6) ============ */
+.regime-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  cursor: default;
+  user-select: none;
+}
+.regime-badge.regime-bull {
+  background: var(--up-soft);
+  color: var(--up);
+  border-color: var(--up);
+}
+.regime-badge.regime-range {
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  border-color: var(--border);
+}
+.regime-badge.regime-bear {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.regime-badge.stale {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--accent);
+  animation: regime-alert-pulse 2s ease-in-out infinite;
+}
+
+.regime-alert {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  background: linear-gradient(90deg, #f59e0b 0%, #ef4444 100%);
+  color: #0d1117;
+  font-size: 13px;
+  font-weight: 500;
+  border-bottom: 2px solid #ea580c;
+  animation: regime-alert-pulse 2s ease-in-out infinite;
+}
+.regime-alert-icon {
+  font-size: 18px;
+  flex-shrink: 0;
+}
+.regime-alert-text {
+  flex: 1;
+}
+.regime-alert-close {
+  cursor: pointer;
+  font-size: 22px;
+  line-height: 1;
+  padding: 0 6px;
+  opacity: 0.7;
+}
+.regime-alert-close:hover { opacity: 1; }
+
+@keyframes regime-alert-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
