@@ -8726,6 +8726,147 @@ section('[57] screener.js scPreference 优先级链: scPreference > userProfile.
   }
 })();
 
+// ========== [58] Core.PositionSizing: 半凯利仓位公式 (H1 核心) ==========
+section('[58] core/position-sizing.js: 半凯利公式 _kellyFraction + _clampKelly');
+(async () => {
+  try {
+    const psSrc = readFileSafe(path.join(WWW, 'core', 'position-sizing.js'));
+    if (!psSrc) throw new Error('position-sizing.js 不存在');
+    const cctx = vm.createContext({ window: {}, console });
+    vm.runInContext(psSrc, cctx);
+    const PS = cctx.window.Core.PositionSizing;
+    if (!PS) throw new Error('Core.PositionSizing 未挂载');
+    if (!PS._kellyFraction || !PS._clampKelly) throw new Error('_kellyFraction/_clampKelly 缺失');
+    if (PS.KELLY_FRACTION !== 0.5) throw new Error('KELLY_FRACTION != 0.5');
+    if (PS.KELLY_MIN_PCT !== 0.02) throw new Error('KELLY_MIN_PCT != 0.02');
+    ok('58.0 PositionSizing 导出 + 常量正确');
+
+    // 58.a 正常路径: p=0.6, R=2 → raw=(0.6-0.4/2)/2=0.2, f=0.1
+    const r1 = PS._kellyFraction({ probability: 60, triggerPrice: 10, stopLoss: 9, targetPrice: 12 });
+    if (r1.payoffRatio === 2 && Math.abs(r1.f - 0.1) < 0.001) ok(`58.a 正常路径 p=60% R=2 → f=${r1.f} R=${r1.payoffRatio}`);
+    else fail('58.a', `payoffRatio=${r1.payoffRatio} f=${r1.f} (期望 R=2, f≈0.1)`);
+
+    // 58.b 高信心 + 大盈亏比: tp=10 sl=9 tg=13 → R=3 → raw=(0.8-0.2/3)/3=0.244, f=0.122
+    const r2 = PS._kellyFraction({ probability: 80, triggerPrice: 10, stopLoss: 9, targetPrice: 13 });
+    if (r2.payoffRatio === 3 && Math.abs(r2.f - 0.1222) < 0.002) ok(`58.b 高信心 p=80% R=3 → f=${r2.f}`);
+    else fail('58.b', `f=${r2.f} (期望 ≈0.122)`);
+
+    // 58.c p<50% → 期望负 → f=0
+    const r3 = PS._kellyFraction({ probability: 30, triggerPrice: 10, stopLoss: 9, targetPrice: 12 });
+    if (r3.f === 0) ok('58.c p=30% 期望负 → f=0 (不押注)');
+    else fail('58.c', `f=${r3.f} (期望 0)`);
+
+    // 58.d R≤0 (止损 ≥ 触发价) → 兜底 f=0
+    const r4 = PS._kellyFraction({ probability: 80, triggerPrice: 10, stopLoss: 11, targetPrice: 9 });
+    if (r4.f === 0) ok('58.d 价格关系非法 (sl≥tp) → f=0');
+    else fail('58.d', `f=${r4.f} (期望 0)`);
+
+    // 58.e 缺参 (空对象/null) → f=0 不抛
+    const r5 = PS._kellyFraction(null);
+    if (r5.f === 0 && r5.payoffRatio === 0) ok('58.e 缺参 → f=0 不抛');
+    else fail('58.e', JSON.stringify(r5));
+
+    // 58.f probability 越界 → f=0
+    const r6 = PS._kellyFraction({ probability: 150, triggerPrice: 10, stopLoss: 9, targetPrice: 12 });
+    if (r6.f === 0) ok('58.f probability 越界 150 → f=0');
+    else fail('58.f', `f=${r6.f}`);
+
+    // 58.g _clampKelly: 凯利 0 → 兜底 maxPct
+    const c1 = PS._clampKelly(0, 0.20);
+    if (c1 === 0.20) ok('58.g _clampKelly(0) → maxPct 兜底');
+    else fail('58.g', `c1=${c1}`);
+
+    // 58.h _clampKelly: 凯利 0.5 > maxPct=0.2 → 收敛到 0.2
+    const c2 = PS._clampKelly(0.5, 0.20);
+    if (c2 === 0.20) ok('58.h _clampKelly(0.5) → 收敛到 maxPct');
+    else fail('58.h', `c2=${c2}`);
+
+    // 58.i _clampKelly: 凯利 0.05 (在 MIN_PCT 之上) → 透传
+    const c3 = PS._clampKelly(0.05, 0.20);
+    if (c3 === 0.05) ok('58.i _clampKelly(0.05) → 透传 (在 MIN 之上)');
+    else fail('58.i', `c3=${c3}`);
+
+    // 58.j _clampKelly: 凯利 0.01 (在 MIN_PCT 之下) → 走 maxPct
+    const c4 = PS._clampKelly(0.01, 0.20);
+    if (c4 === 0.20) ok('58.j _clampKelly(0.01 < MIN) → maxPct');
+    else fail('58.j', `c4=${c4}`);
+  } catch (e) {
+    fail('58 PositionSizing', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [59] Core.Calibration: 概率校准反向 prompt (H2 核心) ==========
+section('[59] core/calibration.js: _formatCalibrationPrompt');
+(async () => {
+  try {
+    const calSrc = readFileSafe(path.join(WWW, 'core', 'calibration.js'));
+    if (!calSrc) throw new Error('calibration.js 不存在');
+    const cctx = vm.createContext({ window: {}, console });
+    vm.runInContext(calSrc, cctx);
+    const CAL = cctx.window.Core.Calibration;
+    if (!CAL) throw new Error('Core.Calibration 未挂载');
+    if (!CAL._formatCalibrationPrompt) throw new Error('_formatCalibrationPrompt 缺失');
+    if (CAL.BIAS_THRESHOLD_PP !== 10) throw new Error('BIAS_THRESHOLD_PP != 10');
+    ok('59.0 Calibration 导出 + 常量正确');
+
+    // 59.a 样本不足 (< 5) → 返 null
+    const r1 = CAL._formatCalibrationPrompt([
+      { label: '60-80%', n: 3, predMean: 70, hitRate: 0.5 }
+    ]);
+    if (r1 === null) ok('59.a 样本 <5 → 返 null (不渲染)');
+    else fail('59.a', `应为 null, 实得 ${typeof r1}`);
+
+    // 59.b 样本 ≥5 + 系统性高估 → 含"高估"
+    // 桶构造: 80-100% (predMean=90, hit=0.40, bias=-50pp → over); 60-80% (predMean=70, hit=0.45, bias=-25pp → over);
+    //         40-60% (predMean=50, hit=0.50, bias=0 → cal);  → overCount=2 calCount=1 → 高估
+    const r2 = CAL._formatCalibrationPrompt([
+      { label: '80-100%', n: 6, predMean: 90, hitRate: 0.40 },
+      { label: '60-80%', n: 8, predMean: 70, hitRate: 0.45 },
+      { label: '40-60%', n: 5, predMean: 50, hitRate: 0.50 }
+    ]);
+    if (typeof r2 === 'string' && r2.includes('高估') && r2.includes('80-100%')) {
+      ok('59.b 样本≥5 + 高估桶居多 → 含"高估" + 区间名');
+    } else fail('59.b', r2 ? r2.slice(0, 200) : 'null');
+
+    // 59.c 样本 ≥5 + 系统性低估 → 含"低估"
+    const r3 = CAL._formatCalibrationPrompt([
+      { label: '40-60%', n: 10, predMean: 50, hitRate: 0.75 }
+    ]);
+    if (typeof r3 === 'string' && r3.includes('低估')) ok('59.c 系统性低估 → 含"低估"');
+    else fail('59.c', r3 ? r3.slice(0, 100) : 'null');
+
+    // 59.d 偏差都在 ±10pp 内 → 含"基本校准"
+    const r4 = CAL._formatCalibrationPrompt([
+      { label: '40-60%', n: 6, predMean: 50, hitRate: 0.52 }
+    ]);
+    if (typeof r4 === 'string' && r4.includes('基本校准')) ok('59.d 偏差小 → 含"基本校准"');
+    else fail('59.d', r4 ? r4.slice(0, 100) : 'null');
+
+    // 59.e 空 buckets → null
+    const r5 = CAL._formatCalibrationPrompt([]);
+    if (r5 === null) ok('59.e 空 buckets → null');
+    else fail('59.e', '应为 null');
+
+    // 59.f null / 非数组 → null 不抛
+    const r6 = CAL._formatCalibrationPrompt(null);
+    if (r6 === null) ok('59.f null 入参 → null 不抛');
+    else fail('59.f', '应为 null');
+
+    // 59.g 多桶渲染: 应包含所有桶 label
+    const r7 = CAL._formatCalibrationPrompt([
+      { label: '0-40%', n: 2, predMean: 30, hitRate: 0.5 },
+      { label: '40-60%', n: 5, predMean: 50, hitRate: 0.5 },
+      { label: '60-80%', n: 7, predMean: 70, hitRate: 0.5 },
+      { label: '80-100%', n: 4, predMean: 90, hitRate: 0.5 }
+    ]);
+    if (typeof r7 === 'string' && r7.includes('0-40%') && r7.includes('80-100%')) {
+      ok('59.g 多桶渲染含 4 个桶');
+    } else fail('59.g', r7 ? r7.slice(0, 150) : 'null');
+  } catch (e) {
+    fail('59 Calibration', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
 // ========== [59] IntradayTrader 盘中操盘手 (T5: 1 分钟轮询 + 本地 LLM 实时调仓) ==========
 section('[59] IntradayTrader: 纯函数 (交易时段/冷却/日限/机械止盈止损/最短持有/解析)');
 (async () => {
@@ -9191,6 +9332,11 @@ section('[54] LongTrader: _shouldRun 触发判定 + LLM 选股 + 整轮 runNow')
         },
         Data: {
           getStockSpot: async () => opts.stocks || []
+        },
+        // Bug #2 mock: Regime (默认 range + positionScale 1, opts.regime 注入)
+        Regime: {
+          get: async () => opts.regime || { state: 'range' },
+          gateMultipliers: () => opts.gate || { state: 'range', label: '震荡市', positionScale: 1 }
         }
       };
       sctx.Core = sctx.window.Core;
@@ -9199,6 +9345,10 @@ section('[54] LongTrader: _shouldRun 触发判定 + LLM 选股 + 整轮 runNow')
           long: { cash: opts.cash ?? 100000, initialCash: 100000, positionPct: 0.10 },
           short: { cash: 30000, initialCash: 30000, positionPct: 0.20 }
         })[sleeve || 'long'] || { cash: 0, initialCash: 0, positionPct: 0 },
+        // Bug #1 mock: _planAutoTrade 探测 (默认返 100 = 1 手 30 元股, opts.planAutoTrade=null 模拟跑空)
+        _planAutoTrade: opts.planAutoTrade === null ? () => null : (opts.planAutoTrade || (() => 100)),
+        // Bug #3 mock: 已持仓 code 列表 (默认空, opts.heldCodes 注入)
+        _getPaperHoldings: async (sleeve) => (opts.heldCodes || []).map(code => ({ code, sleeve: sleeve || 'long' })),
         autoTradeFromPick: async (pick) => { _autoTrades.push(pick); return { id: 'h-new', ...pick }; }
       };
       sctx.Paper = sctx.window.Paper;
@@ -9337,6 +9487,53 @@ section('[54] LongTrader: _shouldRun 触发判定 + LLM 选股 + 整轮 runNow')
     if (ctx11._autoTrades.length === 1 && ctx11._autoTrades[0].code === '000001') {
       ok('54.11 LLM 返非法 code (abc) 被过滤, 只成交合法 code');
     } else fail('54.11', 'autoTrades=' + JSON.stringify(ctx11._autoTrades));
+
+    // 54.12 Bug #1: _planAutoTrade 返 null (现金买不起 1 手 30 元股) → 跳过, 不调 LLM
+    const ctx12 = buildCtx({
+      cash: 3000,  // < 5000
+      planAutoTrade: null,  // 模拟探测失败
+      stocks: [{ 代码: '000001', 名称: 'A', 涨跌幅: 5, 换手率: 1, 总市值: 1e10 }],
+      llmRaw: '{"picks":[{"code":"000001","name":"A","reason":"x"}]}'
+    });
+    await ctx12.sctx.window.LongTrader.runNow({ now: new Date(2026, 6, 27, 10, 0) });
+    if (ctx12._autoTrades.length === 0) ok('54.12 Bug #1 修复: _planAutoTrade 探测失败 → 跳过, 避免跑空');
+    else fail('54.12', 'autoTrades=' + JSON.stringify(ctx12._autoTrades));
+
+    // 54.13 Bug #2: Regime bear + positionScale < 0.5 → 跳过
+    const ctx13 = buildCtx({
+      regime: { state: 'bear' },
+      gate: { state: 'bear', label: '熊市', positionScale: 0.3 },
+      stocks: [{ 代码: '000001', 名称: 'A', 涨跌幅: 5, 换手率: 1, 总市值: 1e10 }],
+      llmRaw: '{"picks":[{"code":"000001","name":"A","reason":"x"}]}'
+    });
+    await ctx13.sctx.window.LongTrader.runNow({ now: new Date(2026, 6, 27, 10, 0) });
+    if (ctx13._autoTrades.length === 0) ok('54.13 Bug #2 修复: bear + positionScale 0.3 < 0.5 → 跳过');
+    else fail('54.13', 'autoTrades=' + JSON.stringify(ctx13._autoTrades));
+
+    // 54.14 Bug #2 边界: bear + positionScale 0.6 → 不跳过 (≥ 0.5)
+    const ctx14 = buildCtx({
+      regime: { state: 'bear' },
+      gate: { state: 'bear', label: '熊市', positionScale: 0.6 },
+      stocks: [{ 代码: '000001', 名称: 'A', 涨跌幅: 5, 换手率: 1, 总市值: 1e10 }],
+      llmRaw: '{"picks":[{"code":"000001","name":"A","reason":"x"}]}'
+    });
+    await ctx14.sctx.window.LongTrader.runNow({ now: new Date(2026, 6, 27, 10, 0) });
+    if (ctx14._autoTrades.length === 1) ok('54.14 Bug #2 边界: bear + positionScale 0.6 ≥ 0.5 → 仍可跑');
+    else fail('54.14', 'autoTrades=' + JSON.stringify(ctx14._autoTrades));
+
+    // 54.15 Bug #3: 已持仓 code 000001 被硬筛过滤
+    const ctx15 = buildCtx({
+      heldCodes: ['000001'],  // 平安银行已持仓
+      stocks: [
+        { 代码: '000001', 名称: '平安银行', 涨跌幅: 5, 换手率: 1, 总市值: 1e10 },  // 涨 5%
+        { 代码: '000002', 名称: '万科A', 涨跌幅: 4, 换手率: 1, 总市值: 1e10 }     // 涨 4%
+      ],
+      llmRaw: '{"picks":[{"code":"000002","name":"万科A","reason":"x"}]}'
+    });
+    await ctx15.sctx.window.LongTrader.runNow({ now: new Date(2026, 6, 27, 10, 0) });
+    if (ctx15._autoTrades.length === 1 && ctx15._autoTrades[0].code === '000002') {
+      ok('54.15 Bug #3 修复: 已持仓 code 000001 被硬筛过滤, 只推未持仓 000002');
+    } else fail('54.15', 'autoTrades=' + JSON.stringify(ctx15._autoTrades));
 
   } catch (e) {
     fail('54 LongTrader', e.message + ' / ' + (e.stack || ''));
