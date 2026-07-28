@@ -26,12 +26,13 @@
 
   // 静态默认权重 (LLM 调不通时 fallback)
   const DEFAULT_WEIGHTS = {
-    roe: 0.20,           // ROE/ROIC 质量
-    ep: 0.18,            // EP (盈利收益率)
-    hot: 0.16,           // 板块动量 (热点因子, Tier 6+)
-    turnover: 0.14,      // 换手率反转
-    north: 0.14,         // 20 日北向净流入
-    industryPenalty: 0.18 // 行业集中度惩罚
+    roe: 0.18,           // ROE/ROIC 质量
+    ep: 0.16,            // EP (盈利收益率)
+    hot: 0.14,           // 板块动量 (热点因子, Tier 6+)
+    turnover: 0.13,      // 换手率反转
+    north: 0.13,         // 20 日北向净流入
+    industryPenalty: 0.16, // 行业集中度惩罚
+    forecast: 0.10       // V2 P2: 业绩预告 (利润断层/拐点信号)
   };
 
   // 板块涨幅 → 热度分 (反向打分 — A 股热点大多是接盘陷阱)
@@ -91,7 +92,7 @@
    * @param {Object} weights - 权重表 (来自 WeightAdvisor 或 fallback)
    * @returns {Array} sorted by _score desc
    */
-  function rank(stocks, finMap, industryMap, northMap, heldByInd, weights, conceptMap, conceptPerf, sectorPerf) {
+  function rank(stocks, finMap, industryMap, northMap, heldByInd, weights, conceptMap, conceptPerf, sectorPerf, forecastMap) {
     if (!Array.isArray(stocks) || stocks.length === 0) return [];
     const w = Object.assign({}, DEFAULT_WEIGHTS, weights || {});
 
@@ -113,6 +114,25 @@
     const epRanks = rankNormalize(epVals);
     const turnoverRanks = rankNormalize(turnoverVals, true);
     const northRanks = rankNormalize(northVals);
+
+    // V2 P2: 业绩预告百分位 (高预增 = 高分, 预亏 = 0)
+    const forecastVals = enriched.map(e => {
+      const f = forecastMap ? forecastMap.get(e.s.代码) : null;
+      if (!f || f.pct == null) return null;
+      // 预亏/续亏/首亏 = 0 (不参与排名, 实际靠硬过滤剔除)
+      if (/亏|不确定|减亏|续亏/.test(f.type || '')) return null;
+      return f.pct;
+    }).filter(v => v != null);
+    const forecastRanks = rankNormalize(forecastVals);
+    // 还原回 enriched 顺序
+    const forecastFullRanks = enriched.map(e => {
+      const f = forecastMap ? forecastMap.get(e.s.代码) : null;
+      if (!f || f.pct == null) return 0;  // 无数据 → 中性 0
+      if (/亏|不确定|减亏|续亏/.test(f.type || '')) return 0;
+      // 找该 pct 在 forecastVals 中的 rank
+      const idx = forecastVals.indexOf(f.pct);
+      return idx >= 0 ? (forecastRanks[idx] || 0) : 0;
+    });
 
     // 行业板块涨幅 → Map (industryName → pctChange)
     const sectorMap = new Map();
@@ -145,7 +165,7 @@
       return Math.min(1, cur / (totalHeld * 0.25));
     };
 
-    // 打分 (6 因子)
+    // 打分 (7 因子)
     return enriched
       .map((e, i) => {
         const factors = {
@@ -154,7 +174,8 @@
           hot: hotRanks[i] || 0,
           turnover: turnoverRanks[i] || 0,
           north: northRanks[i] || 0,
-          industryPenalty: indPenalty(e.industry)
+          industryPenalty: indPenalty(e.industry),
+          forecast: forecastFullRanks[i] || 0
         };
         const score =
           w.roe * factors.roe +
@@ -162,7 +183,8 @@
           w.hot * factors.hot +
           w.turnover * factors.turnover +
           w.north * factors.north -
-          w.industryPenalty * factors.industryPenalty;
+          w.industryPenalty * factors.industryPenalty +
+          w.forecast * factors.forecast;
         return Object.assign({}, e.s, { _score: score, _factors: factors });
       })
       .sort((a, b) => b._score - a._score);
@@ -249,17 +271,26 @@
       } catch (e) { console.warn('[Scoring] WeightAdvisor 失败, 用默认:', e); }
     }
 
+    // V2 P2: 拉业绩预告 (季度 batch, 7d TTL, 失败降级)
+    let forecastMap = new Map();
+    if (Core.Data.getStockEarningForecastBatch) {
+      try {
+        forecastMap = await Core.Data.getStockEarningForecastBatch(codes);
+      } catch (e) { console.warn('[Scoring] 业绩预告拉取失败:', e); }
+    }
+
     // 5. 硬过滤 + 打分
-    const filtered = applyHardFilters(all, opts);
-    const ranked = rank(filtered, finMap, industryMap, northMap, heldByInd, weights, conceptMap, conceptPerf, sectorPerf);
+    const filtered = applyHardFilters(all, opts, forecastMap);
+    const ranked = rank(filtered, finMap, industryMap, northMap, heldByInd, weights, conceptMap, conceptPerf, sectorPerf, forecastMap);
 
     return includeFiltered ? ranked : ranked.slice(0, topN);
   }
 
   /**
    * 硬过滤: 新股/ST/一字板
+   * V2 P2: + 业绩预告"首亏/续亏"硬剔除
    */
-  function applyHardFilters(stocks, opts = {}) {
+  function applyHardFilters(stocks, opts = {}, forecastMap) {
     const filters = Object.assign({}, HARD_FILTERS, opts.filters || {});
     const today = Date.now();
     return stocks.filter(s => {
@@ -278,6 +309,11 @@
         const pct = parseFloat(s.涨跌幅 || 0);
         const amount = parseFloat(s.成交额 || 0);
         if (pct >= ONE_WORD_LIMITUP_THRESHOLD.pctChange && amount < ONE_WORD_LIMITUP_THRESHOLD.amountFloor) return false;
+      }
+      // V2 P2: 业绩预告首亏/续亏 → 硬剔除
+      if (forecastMap && forecastMap instanceof Map) {
+        const f = forecastMap.get(s.代码);
+        if (f && /首亏|续亏/.test(f.type || '')) return false;
       }
       return true;
     });

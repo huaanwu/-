@@ -11416,12 +11416,12 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
     else fail('91.2 导出缺失', '');
 
     // 91.3: scoring.js 加 hot 因子 + _hotScore
-    if (/hot: 0\.16/.test(sc91) && /_hotScore/.test(sc91))
+    if (/hot: 0\.14/.test(sc91) && /_hotScore/.test(sc91))
       ok('91.3 scoring 含 hot 因子 + _hotScore');
     else fail('91.3 hot 因子缺失', '');
 
     // 91.4: scoring.rank 调用传 sectorPerf
-    if (/sectorPerf/.test(sc91) && /rank\(.*sectorPerf\)/.test(sc91))
+    if (/sectorPerf/.test(sc91) && /rank\([^)]*sectorPerf[^)]*\)/.test(sc91))
       ok('91.4 rank() 接收 sectorPerf');
     else fail('91.4 sectorPerf 传参缺失', '');
 
@@ -11533,6 +11533,61 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
       ok('94.7 long-trader systemPrompt 拼接 kbBlock');
     else fail('94.7 kbBlock 未进 systemPrompt', '');
   } catch (e) { fail('94.x SKL 注入', e.message); }
+
+  // ===== 95.x: V2 P2 业绩预告因子注入 scoring =====
+  try {
+    const dataJs95 = fs.readFileSync(path.join(__dirname, '..', 'www', 'core', 'data.js'), 'utf8');
+    // 95.1: data.js 含 getStockEarningForecast
+    if (dataJs95.indexOf('async function getStockEarningForecast(quarter)') !== -1 &&
+        dataJs95.indexOf('stock_yjyg_em') !== -1)
+      ok('95.1 data.js 含 getStockEarningForecast(quarter) + stock_yjyg_em');
+    else fail('95.1 getStockEarningForecast 缺失', '');
+
+    // 95.2: data.js 含 getStockEarningForecastBatch + 净利润指标
+    if (dataJs95.indexOf('async function getStockEarningForecastBatch') !== -1 &&
+        dataJs95.indexOf('归属于上市公司股东的净利润') !== -1 &&
+        dataJs95.indexOf('扣除非经常性损益后的净利润') !== -1)
+      ok('95.2 data.js 含 Batch + 净利润指标过滤');
+    else fail('95.2 batch / 指标过滤缺失', '');
+
+    // 95.3: data.js 已暴露 getStockEarningForecastBatch
+    if (dataJs95.indexOf('getStockEarningForecast, getStockEarningForecastBatch') !== -1)
+      ok('95.3 data.js 暴露 Core.Data.getStockEarningForecastBatch');
+    else fail('95.3 未暴露 batch fetcher', '');
+
+    // 95.4: scoring.js rankCandidates 拉 forecast
+    const sc95 = fs.readFileSync(path.join(__dirname, '..', 'www', 'core', 'scoring.js'), 'utf8');
+    if (sc95.indexOf('getStockEarningForecastBatch') !== -1 &&
+        sc95.indexOf('forecastMap = new Map()') !== -1)
+      ok('95.4 scoring rankCandidates 拉 forecastMap');
+    else fail('95.4 scoring 未拉 forecast', '');
+
+    // 95.5: scoring.js rank 加 forecast 因子
+    if (sc95.indexOf('forecastFullRanks') !== -1 &&
+        sc95.indexOf('forecast: forecastFullRanks') !== -1 &&
+        sc95.indexOf('w.forecast * factors.forecast') !== -1)
+      ok('95.5 scoring rank 加 forecast 7 因子打分');
+    else fail('95.5 forecast 因子未入打分', '');
+
+    // 95.6: scoring.js applyHardFilters 加首亏/续亏剔除 (用 indexOf)
+    if (sc95.indexOf('首亏') !== -1 && sc95.indexOf('续亏') !== -1 &&
+        sc95.indexOf('applyHardFilters(all, opts, forecastMap)') !== -1)
+      ok('95.6 applyHardFilters 硬剔首亏/续亏');
+    else fail('95.6 硬过滤未加首亏剔除', '');
+
+    // 95.7: DEFAULT_WEIGHTS 含 forecast = 0.10
+    if (sc95.indexOf('forecast: 0.10') !== -1)
+      ok('95.7 DEFAULT_WEIGHTS 含 forecast = 0.10');
+    else fail('95.7 DEFAULT_WEIGHTS 缺 forecast', '');
+
+    // 95.8: weight-advisor.js FACTOR_KEYS 加 forecast
+    const wa95 = fs.readFileSync(path.join(__dirname, '..', 'www', 'core', 'weight-advisor.js'), 'utf8');
+    if (wa95.indexOf("FACTOR_KEYS = ['roe', 'ep', 'turnover', 'north', 'industryPenalty', 'forecast']") !== -1)
+      ok('95.8 weight-advisor FACTOR_KEYS 6 因子');
+    else fail('95.8 FACTOR_KEYS 未含 forecast', '');
+  } catch (e) { fail('95.x 业绩预告因子', e.message); }
+
+
 
 
 

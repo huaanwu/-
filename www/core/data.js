@@ -794,6 +794,69 @@
   }
 
   /**
+   * 业绩预告 (V2 P2: long-trader earnings forecast factor)
+   * 数据源: stock_yjyg_em (东方财富, 季度预告)
+   *   - date 必填 YYYYMMDD, 必须季度末 (0331/0630/0930/1231), 季度内不变 → TTL 7d
+   *   - 不支持 stock_code 单股, 必须按季度整期拉一次, 客户端按"股票代码"过滤
+   *   - 字段: 股票代码 / 股票简称 / 预测指标 / 业绩变动幅度 / 预告类型
+   *   - ⚠️ "业绩变动幅度" 仅 "归属于上市公司股东的净利润" 或 "扣非净利润" 行有值, 其他行可能 null
+   *     → 前端 filter 预测指标∈{归属上市公司股东净利润, 扣非净利润} 再读幅度
+   */
+  async function getStockEarningForecast(quarter) {
+    if (!/^\d{8}$/.test(quarter)) throw new Error('quarter 必须是 YYYYMMDD 格式');
+    return await fetchWithCache(
+      `yjyg_${quarter}`,
+      'stock_yjyg_em',
+      { date: quarter },
+      7 * 24 * 60 * 60 * 1000  // 7 天 (季度内不变)
+    );
+  }
+
+  /**
+   * 批量: 给定 code 列表 + 当前季度 → Map<code, { 业绩变动幅度, 预告类型, 预测指标 }>
+   * @param {string[]} codes - 股票代码数组
+   * @param {string} [quarter] - YYYYMMDD, 缺省用最近一个季度末日
+   * @returns {Promise<Map<string, {pct:number, type:string, indicator:string}>>}
+   */
+  async function getStockEarningForecastBatch(codes, quarter) {
+    const results = new Map();
+    const q = quarter || _latestQuarterEnd();
+    let raw;
+    try {
+      raw = await getStockEarningForecast(q);
+    } catch (e) { console.warn('[Data] yjyg 拉取失败:', e.message); return results; }
+    if (!Array.isArray(raw) || raw.length === 0) return results;
+
+    const codeSet = new Set(codes);
+    // 只保留 "归属于上市公司股东的净利润" / "扣非净利润" 行 (peer 实测: 其他指标幅度可能 null)
+    const PROFIT_INDICATORS = ['归属于上市公司股东的净利润', '扣除非经常性损益后的净利润'];
+    for (const row of raw) {
+      const c = row['股票代码'] || row.股票代码;
+      if (!c || !codeSet.has(c)) continue;
+      const indicator = row['预测指标'] || row.预测指标;
+      if (!PROFIT_INDICATORS.includes(indicator)) continue;
+      const pct = row['业绩变动幅度'] != null ? parseFloat(row['业绩变动幅度']) : null;
+      const type = row['预告类型'] || row.预告类型 || '';
+      // 取同一 code 多个指标中幅度最大的 (扣非更直接, 但归母覆盖更广, 用 max)
+      const prev = results.get(c);
+      if (!prev || (pct != null && (prev.pct == null || pct > prev.pct))) {
+        results.set(c, { pct, type, indicator });
+      }
+    }
+    return results;
+  }
+
+  function _latestQuarterEnd() {
+    const d = new Date();
+    const m = d.getMonth() + 1;  // 1-12
+    const y = d.getFullYear();
+    if (m >= 1 && m <= 4) return `${y}0331`;
+    if (m >= 5 && m <= 8) return `${y}0630`;
+    if (m >= 9 && m <= 10) return `${y}0930`;
+    return `${y}1231`;
+  }
+
+  /**
    * 个股近 N 期财务指标对比 (Phase R)
    * 数据源: stock_financial_analysis_indicator_em (东方财富, AKShare 1.13+ 替换 stock_zh_a_financial_indicator)
    *   - symbol 必须带市场后缀: '600519.SH' / '301389.SZ'
@@ -2223,6 +2286,7 @@
     getStockIndustryBatch,
     getSectorPerformance,
     getConceptBoardPerformance, getConceptMembership,  // Tier 6+: 概念板块涨幅 + 反查
+    getStockEarningForecast, getStockEarningForecastBatch,  // V2 P2: 业绩预告
     getStockVolumeAnomaly,
     // 基金
     getFundSpot, getFundHistory, getFundPortfolio,
