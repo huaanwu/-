@@ -11160,6 +11160,22 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
     fail('77 B-fix', e.message);
   }
 
+  // ========== [78] Tier 3B-2: KB reasonTag 注入 screener context ==========
+  section('78] Tier 3B-2: reasonTag 注入');
+  try {
+    const scSrc = readFileSafe(path.join(WWW, 'app/screener.js'));
+    // 78.1 从 lhbMap 提取去重 reasonTag (reasonTags 变量定义)
+    if (/const reasonTags =/.test(scSrc) && /\.reasonTag/.test(scSrc))
+      ok('78.1 screener 从 lhbMap 提取去重 reasonTags');
+    else fail('78.1 reasonTags 提取缺失', '');
+    // 78.2 注入 pickRelevant context.reasonTags (reasonTags ? { reasonTags } : {})
+    if (/reasonTags \? \{ reasonTags \} : \{\}/.test(scSrc))
+      ok('78.2 pickRelevant 注入 context.reasonTags');
+    else fail('78.2 context.reasonTags 注入缺失', '');
+  } catch (e) {
+    fail('78 3B-2', e.message);
+  }
+
 waitForIIFEsDrain().then(() => {
   console.log(`\n\x1b[1m===== 测试结果 =====\x1b[0m`);
   console.log(`\x1b[32m通过: ${passed}\x1b[0m  |  \x1b[${failed > 0 ? '31' : '32'}]m失败: ${failed}\x1b[0m`);

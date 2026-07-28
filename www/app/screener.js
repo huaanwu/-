@@ -329,6 +329,12 @@
       const northText = Core.Data.formatNorthboundForPrompt(northByCode, 10);
       const lhbText = Core.Data.formatLhbForPrompt(lhbMap, 10);
 
+      // Tier 3B-2: 从 lhbMap 提取去重 reasonTag 集合 → 注入 KB pickRelevant context
+      // 让 pickRelevant 命中 NORTH/LHB 系列条目, 避免只靠 lhb:true 宽匹配
+      const reasonTags = lhbMap instanceof Map
+        ? [...new Set([...lhbMap.values()].map(v => v.reasonTag).filter(Boolean))]
+        : undefined;
+
       // 并行加载宏观 + 新闻 + Phase O: 13 维上下文 + KB + Y.3 P-A 持仓
       const macroP = Core.Macro.get().catch(e => null);
       const newsP = Core.News.get().catch(e => null);
@@ -347,7 +353,7 @@
         const topNames = top.slice(0, 8).map(s => ({ name: s.名称 }));
         const kbEntries = await Core.KB.pickRelevant({
           holdings: topNames,
-          context: ctx || {},
+          context: Object.assign({}, ctx, reasonTags ? { reasonTags } : {}),
           maxN: 4
         });
         kbText = Core.KB.formatForPrompt(kbEntries) || '[降级] KB 知识库为空';
