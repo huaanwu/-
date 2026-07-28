@@ -410,7 +410,7 @@
         const ind = industryMap.get(h.code);
         if (ind) byInd[ind] = (byInd[ind] || 0) + (h.mkt || 0);
       }
-    } catch (e) { /* */ }
+    } catch (e) { console.warn('[Scoring] 拉已持仓行业失败, 跳过行业集中度:', e); }
     return byInd;
   }
 
@@ -437,10 +437,13 @@
   function _extractFundamentals(raw) {
     if (!raw || typeof raw !== 'object') return null;
     const out = {};
+    // V5 修复: 补 毛利率 字段 (applyHardFilters + reviewHoldings 都靠 fe.grossProfitMargin 判断)
+    // 之前 _extractFundamentals 只读 pe/pb/roe, 导致毛利率门槛静默不生效 (s._fe 存在但 grossProfitMargin=undefined)
     const keys = {
       pe: ['市盈率', 'PE', 'pe', 'pe_ttm'],
       pb: ['市净率', 'PB', 'pb'],
-      roe: ['净资产收益率', 'ROE', 'roe', '加权平均净资产收益率']
+      roe: ['净资产收益率', 'ROE', 'roe', '加权平均净资产收益率'],
+      grossProfitMargin: ['毛利率', '销售毛利率', 'grossProfitMargin', 'gp_margin']
     };
     for (const [k, names] of Object.entries(keys)) {
       for (const n of names) {

@@ -102,7 +102,7 @@
         try {
           const held = (await Paper._getPaperHoldings('long')) || [];
           heldCodes = new Set(held.map(h => h.code).filter(Boolean));
-        } catch (e) { /* */ }
+        } catch (e) { console.warn('[LongTrader] 拉已持仓失败, 跳过排除:', e); }
         // 4. Tier 6: 多因子打分排序 (替代涨跌幅单维, 候选质量决定 LLM pick 天花板)
         //    硬过滤 (新股 < 5 日 / ST / 一字板) 已内置在 Scoring.applyHardFilters
         //    换手率 ≥ 1% 也通过 Scoring 的 turn-over 因子隐式表达
@@ -244,6 +244,7 @@
             finPart = ` | ROE=${fe.roe ?? '?'}% PE=${fe.pe ?? '?'} PB=${fe.pb ?? '?'} 毛利=${fe.grossProfitMargin ?? '?'}%`;
           }
           // V2 P3: chokepoint 标签 (主营构成: max(收入比例) > 40% = 单一产品依赖)
+          // topProductPct 已是 0~1 小数 (data.js _summarizeZygc 归一化), 直接 toFixed
           let ckPart = '';
           if (s._chokepoint === true) {
             const pct = (s._topProductPct * 100).toFixed(1);

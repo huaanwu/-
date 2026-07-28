@@ -868,10 +868,12 @@
       return d === maxDate && cat === '按产品分类' && name && name !== '其他(补充)';
     });
     if (filtered.length === 0) return null;
-    // 3. max(收入比例)
+    // 3. max(收入比例) — stock_zygc_em 收入比例字段是百分数 (0~100), 归一化到 0~1 小数
+    //    否则 long-trader 的 (s._topProductPct * 100).toFixed(1) 会变 8677.0%
     let top = null;
     for (const r of filtered) {
-      const pct = parseFloat(r['收入比例'] || 0);
+      const pctRaw = parseFloat(r['收入比例'] || 0);
+      const pct = pctRaw > 1 ? pctRaw / 100 : pctRaw;  // 兼容百分数 (86.77) 与小数 (0.867) 两种形态
       if (!top || pct > top.pct) top = { name: r['主营构成'] || r.主营构成, pct };
     }
     if (!top) return null;

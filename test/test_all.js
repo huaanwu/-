@@ -11659,9 +11659,9 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
           { 报告日期: '2025-06-30', 分类类型: '按地区分类', 主营构成: '国内', 收入比例: 95.0 }
         ];
         const sum = sandbox._summarizeZygc(sample);
-        // 收入比例 字段是百分数 (如 86.7695), _summarizeZygc 直接保留 (>40 阈值仍命中)
-        if (sum && sum.chokepoint === true && sum.topProduct === '茅台酒' && Math.abs(sum.topProductPct - 86.7695) < 0.001)
-          ok('96.7 茅台 2025 → chokepoint=true 茅台酒 86.77% (inline 样本)');
+        // V5: _summarizeZygc 把收入比例 百分数 归一化到 0~1 小数, chokepoint 阈值 = 0.40
+        if (sum && sum.chokepoint === true && sum.topProduct === '茅台酒' && Math.abs(sum.topProductPct - 0.867695) < 0.001)
+          ok('96.7 茅台 2025 → chokepoint=true 茅台酒 86.77% (0.8677 小数)');
         else fail('96.7 判定不符', JSON.stringify(sum));
       }
     }
@@ -11718,8 +11718,8 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
     if (wa98.indexOf("'hot'") !== -1 &&
         wa98.indexOf("'forecast'") !== -1 &&
         wa98.indexOf("'rps'") !== -1 &&
-        wa98.indexOf('SUM_TOLERANCE = 0.01') !== -1)
-      ok('98.1 weight-advisor 8 因子 FACTOR_KEYS + 1% 容差');
+        wa98.indexOf('SUM_TOLERANCE = 0.05') !== -1)
+      ok('98.1 weight-advisor 8 因子 FACTOR_KEYS + V5 放宽到 ±5% 容差 (LLM 通过率回升)');
     else fail('98.1 FACTOR_KEYS / SUM_TOLERANCE 缺失', '');
 
     // 98.2: weight-advisor 默认 8 因子 fallback (Fix A fallback)
@@ -11824,6 +11824,44 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
       ok('99.9 scoring.js 暴露 FACTOR_KEYS 给 weight-advisor 引用');
     else fail('99.9 scoring.js 未暴露 FACTOR_KEYS', '');
   } catch (e) { fail('99.x V4 bug 修复', e.message); }
+
+  // ===== 100.x: V5 审计潜在 bug 修复 =====
+  try {
+    const d100 = readFileSafe(path.join(WWW, 'core', 'data.js'));
+    const sc100 = readFileSafe(path.join(WWW, 'core', 'scoring.js'));
+    const wa100 = readFileSafe(path.join(WWW, 'core', 'weight-advisor.js'));
+    const lt100 = readFileSafe(path.join(WWW, 'app', 'long-trader.js'));
+
+    // 100.1: _summarizeZygc 收入比例归一化 0~1 小数 (long-trader 直接 *100 不再变 8677%)
+    if (/function _summarizeZygc[\s\S]{0,1500}pctRaw\s*>\s*1\s*\?\s*pctRaw\s*\/\s*100/.test(d100))
+      ok('100.1 _summarizeZygc 收入比例 百分数→小数 归一化');
+    else fail('100.1 _summarizeZygc 未归一化 pct', '');
+
+    // 100.2: chokepoint 阈值仍是 0.40 (小数比较)
+    if (/function _summarizeZygc[\s\S]{0,1500}chokepoint:\s*top\.pct\s*>\s*0\.40/.test(d100))
+      ok('100.2 chokepoint 阈值 > 0.40 (小数 40%)');
+    else fail('100.2 chokepoint 阈值漂移', '');
+
+    // 100.3: _extractFundamentals 加 grossProfitMargin (高 severity bug 修复)
+    if (/grossProfitMargin:\s*\[['"]毛利率/.test(sc100))
+      ok('100.3 _extractFundamentals 加 毛利率 字段 (applyHardFilters/reviewHoldings 不再静默失效)');
+    else fail('100.3 _extractFundamentals 仍缺 毛利率', '');
+
+    // 100.4: SUM_TOLERANCE 放宽到 0.05 (LLM 通过率回升)
+    if (/SUM_TOLERANCE\s*=\s*0\.05/.test(wa100))
+      ok('100.4 weight-advisor SUM_TOLERANCE = 0.05 (V5 放宽 ±5%)');
+    else fail('100.4 SUM_TOLERANCE 未放宽', '');
+
+    // 100.5: long-trader 关键 catch 不再空块 (CLAUDE.md 规则)
+    if (!/Paper\._getPaperHoldings[\s\S]{0,150}\/\*\s*\*\//.test(lt100))
+      ok('100.5 long-trader 拉已持仓 catch 不再空块 (含 console.warn)');
+    else fail('100.5 long-trader 仍有空 catch', '');
+
+    // 100.6: scoring _loadHeldByInd catch 不再空块
+    if (!/_loadHeldByInd[\s\S]{0,200}\/\*\s*\*\//.test(sc100))
+      ok('100.6 scoring _loadHeldByInd catch 不再空块');
+    else fail('100.6 scoring 仍有空 catch', '');
+  } catch (e) { fail('100.x V5 审计修复', e.message); }
 
 
 

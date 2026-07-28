@@ -29,7 +29,9 @@
   const WEIGHT_MIN = 0.02;
   const WEIGHT_MAX = 0.35;
   const CHANGE_RATIO = 0.5;  // 单因子相对 DEFAULT 最大变化 ±50%
-  const SUM_TOLERANCE = 0.01;  // 权重和容差 ±1% (LLM 输出 0.95+0.05=1.0 太宽松)
+  // V5: ±5% 容差 (8 因子 × ±1% 太严, LLM 经常输出 0.985/1.015 被静默拒绝退回默认权重)
+  // V4 收紧到 ±1% 后实测 LLM 通过率 < 50%, 改为 ±5% 但保留归一化
+  const SUM_TOLERANCE = 0.05;
 
   function getDefaultWeights() {
     // 优先从 Core.Scoring.DEFAULT_WEIGHTS 取 (8 因子, 加新因子时单点维护)
