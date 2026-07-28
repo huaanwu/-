@@ -267,11 +267,12 @@
       try {
         const list = stocks.map((s, i) => {
           const code = s.代码;
-          const name = s.名称;
-          const chg = parseFloat(s.涨跌幅).toFixed(2);
-          const turn = parseFloat(s.换手率 || 0).toFixed(2);
-          const mcap = parseFloat(s.总市值 || 0);
-          const mcapStr = isNaN(mcap) || mcap === 0 ? '?' : (mcap / 1e8).toFixed(1) + '亿';
+          const name = s.名称 || '';
+          // NaN 防护: spot_em 偶尔缺字段 (新上市/停牌), 默认 0 不让 LLM 看到 NaN
+          const chg = (parseFloat(s.涨跌幅) || 0).toFixed(2);
+          const turn = (parseFloat(s.换手率) || 0).toFixed(2);
+          const mcap = parseFloat(s.总市值) || 0;
+          const mcapStr = mcap === 0 ? '?' : (mcap / 1e8).toFixed(1) + '亿';
           // Phase 5: 基本面
           let finPart = '';
           if (finMap && finMap instanceof Map) {

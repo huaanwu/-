@@ -48,15 +48,22 @@
   // Tier 6+: 同时看 行业(industryPct) + 概念(conceptPcts[]), 取较低者
   //   (取较低者 = 只要任一维度进入接盘区就给负分, 更保守)
   function _hotScore(industryPct, conceptPcts) {
-    const indP = parseFloat(industryPct || 0);
-    let ind = _hotOne(indP);
-    let cptMin = 0;  // 初始化 = 0 (表示无概念数据时不影响)
+    // 缺数据 → 中性 0 (修复: 之前 parseFloat(undefined || 0) = 0 → _hotOne(0) = +0.10 偏向稀疏数据)
+    let ind = 0;
+    if (industryPct != null && !isNaN(parseFloat(industryPct))) {
+      ind = _hotOne(parseFloat(industryPct));
+    }
+    let cptMin = 0;  // 初始化 = 0 (无概念数据时不影响)
     if (Array.isArray(conceptPcts) && conceptPcts.length > 0) {
       cptMin = Infinity;
+      let anyValid = false;
       for (const cp of conceptPcts) {
-        const s = _hotOne(parseFloat(cp || 0));
+        if (cp == null || isNaN(parseFloat(cp))) continue;
+        const s = _hotOne(parseFloat(cp));
+        anyValid = true;
         if (s < cptMin) cptMin = s;
       }
+      if (!anyValid) cptMin = 0;  // 数组但全无效 → 中性
     }
     return Math.min(ind, cptMin);
   }
@@ -106,8 +113,9 @@
     });
 
     // 归一化 (rank): 把每维 raw 值映射到 [0, 1] 百分位
-    const roeVals = enriched.map(e => e.fe ? (e.fe.roe ?? 0) : null).filter(v => v != null);
-    const epVals = enriched.map(e => e.fe ? (e.fe.ep ?? (e.fe.pe ? 1 / e.fe.pe : null)) : null).filter(v => v != null);
+    // 关键: 无数据股票保留为 null (避免 ?? 0 污染排名), rankNormalize 会跳过 null
+    const roeVals = enriched.map(e => e.fe ? (e.fe.roe ?? null) : null);
+    const epVals = enriched.map(e => e.fe ? (e.fe.ep ?? (e.fe.pe ? 1 / e.fe.pe : null)) : null);
     const turnoverVals = enriched.map(e => parseFloat(e.s.换手率 || 0));
     const northVals = enriched.map(e => e.north20d);
 
@@ -117,21 +125,18 @@
     const northRanks = rankNormalize(northVals);
 
     // V2 P2: 业绩预告百分位 (高预增 = 高分, 预亏 = 0)
-    const forecastVals = enriched.map(e => {
+    // 关键: 单次循环同时计算 forecastVal (用作 null 排除) + forecastRanks (并行), 不再用 indexOf 反查
+    const forecastPerStock = enriched.map(e => {
       const f = forecastMap ? forecastMap.get(e.s.代码) : null;
       if (!f || f.pct == null) return null;
-      // 预亏/续亏/首亏 = 0 (不参与排名, 实际靠硬过滤剔除)
       if (/亏|不确定|减亏|续亏/.test(f.type || '')) return null;
       return f.pct;
-    }).filter(v => v != null);
-    const forecastRanks = rankNormalize(forecastVals);
-    // 还原回 enriched 顺序
-    const forecastFullRanks = enriched.map(e => {
-      const f = forecastMap ? forecastMap.get(e.s.代码) : null;
-      if (!f || f.pct == null) return 0;  // 无数据 → 中性 0
-      if (/亏|不确定|减亏|续亏/.test(f.type || '')) return 0;
-      // 找该 pct 在 forecastVals 中的 rank
-      const idx = forecastVals.indexOf(f.pct);
+    });
+    const forecastForRank = forecastPerStock.filter(v => v != null);
+    const forecastRanks = rankNormalize(forecastForRank);
+    const forecastFullRanks = forecastPerStock.map(v => {
+      if (v == null) return 0;
+      const idx = forecastForRank.indexOf(v);
       return idx >= 0 ? (forecastRanks[idx] || 0) : 0;
     });
 
@@ -251,26 +256,7 @@
     if (Core.Data.getConceptBoardPerformance && Core.Data.getConceptMembership) {
       try {
         conceptPerf = await Core.Data.getConceptBoardPerformance();
-        // 给当前批次所有 code 反查其所属概念 (复用 getConceptMembership 内部缓存)
-        const conceptBoardMap = new Map();
-        for (const c of conceptPerf) {
-          if (c && c.name) conceptBoardMap.set(c.name, parseFloat(c.pctChange || 0));
-        }
-        // 并发反查所有 code (限并发 10 避免雪崩)
-        const allCodes = all.map(s => s.代码).filter(Boolean);
-        const chunkSize = 10;
-        for (let i = 0; i < allCodes.length; i += chunkSize) {
-          const chunk = allCodes.slice(i, i + chunkSize);
-          const results = await Promise.all(
-            chunk.map(c => Core.Data.getConceptMembership(c).catch(() => []))
-          );
-          chunk.forEach((c, idx) => {
-            const names = results[idx] || [];
-            if (names.length > 0) conceptMap.set(c, names);
-          });
-        }
-        void conceptBoardMap;  // 留作未来 hotScore 内部使用, 当前 hotScore 已在 rank 里重建
-      } catch (e) { console.warn('[Scoring] 概念板块拉取失败:', e); }
+      } catch (e) { console.warn('[Scoring] 概念板块涨幅拉取失败:', e); }
     }
 
     // 4. 拉动态权重 (LLM 周度) — 失败 fallback 默认
@@ -282,6 +268,7 @@
     }
 
     // V2 P2: 拉业绩预告 (季度 batch, 7d TTL, 失败降级)
+    // 注意: stock_yjyg_em 不支持单股, 必须按季度 batch 拉整期 (5500 行), 没法限定候选集
     let forecastMap = new Map();
     if (Core.Data.getStockEarningForecastBatch) {
       try {
@@ -289,15 +276,8 @@
       } catch (e) { console.warn('[Scoring] 业绩预告拉取失败:', e); }
     }
 
-    // V2 P3: 主营构成 chokepoint (30d TTL, 失败降级)
-    let zygcMap = new Map();
-    if (Core.Data.getStockBusinessCompositionBatch) {
-      try {
-        zygcMap = await Core.Data.getStockBusinessCompositionBatch(codes);
-      } catch (e) { console.warn('[Scoring] 主营构成拉取失败:', e); }
-    }
-
     // V2 P4: RPS 快照 (60 日涨幅 vs 中位数, 24h TTL, 失败降级)
+    // RPS 是全市场单端点, 没法限定候选集; 走 24h 缓存
     let rpsMap = new Map();
     if (Core.Data.getRpsSnapshot) {
       try {
@@ -309,9 +289,41 @@
     const filtered = applyHardFilters(all, opts, forecastMap);
     const ranked = rank(filtered, finMap, industryMap, northMap, heldByInd, weights, conceptMap, conceptPerf, sectorPerf, forecastMap, rpsMap);
 
-    // V2 P3: 把 chokepoint 标签附加到 ranked 候选上 (供 long-trader LLM 决策)
+    // V2 P3 / V2+concept: chokepoint + 概念板块只对 top 候选调, 避免全市场 IO
+    // 性能修复: zygc 单股接口 5 并发, 全市场 5500 只 ≈ 220s (阻塞); concept 10 并发全市场 ≈ 5500 个 leaderStock refetch
+    // 改为: rank 后取 topN*2 候选, 再调这两个 fetcher
+    const candidateTopN = ranked.slice(0, Math.min(ranked.length, topN * 2));
+    const candidateCodes = candidateTopN.map(s => s.代码).filter(Boolean);
+
+    let zygcMap = new Map();
+    if (Core.Data.getStockBusinessCompositionBatch && candidateCodes.length > 0) {
+      try {
+        zygcMap = await Core.Data.getStockBusinessCompositionBatch(candidateCodes);
+      } catch (e) { console.warn('[Scoring] 主营构成拉取失败:', e); }
+    }
+
+    if (Core.Data.getConceptMembership && candidateCodes.length > 0) {
+      try {
+        const chunkSize = 10;
+        for (let i = 0; i < candidateCodes.length; i += chunkSize) {
+          const chunk = candidateCodes.slice(i, i + chunkSize);
+          const results = await Promise.all(
+            chunk.map(c => Core.Data.getConceptMembership(c).catch(() => []))
+          );
+          chunk.forEach((c, idx) => {
+            const names = results[idx] || [];
+            if (names.length > 0) conceptMap.set(c, names);
+          });
+        }
+      } catch (e) { console.warn('[Scoring] 概念 membership 拉取失败:', e); }
+    }
+
+    // 用 topN 候选的 chokepoint / concept 信息重新打分 (前次 hot 用了空 conceptMap 是中性)
+    const finalRanked = rank(candidateTopN, finMap, industryMap, northMap, heldByInd, weights, conceptMap, conceptPerf, sectorPerf, forecastMap, rpsMap);
+
+    // V2 P3: 把 chokepoint 标签附加到最终 ranked 候选上 (供 long-trader LLM 决策)
     if (zygcMap && zygcMap.size > 0) {
-      for (const r of ranked) {
+      for (const r of finalRanked) {
         const z = zygcMap.get(r.代码);
         if (z) {
           r._chokepoint = z.chokepoint;
@@ -321,15 +333,15 @@
       }
     }
 
-    // V2 P4: 把 RPS 信息附加到 ranked 候选上
+    // V2 P4: 把 RPS 信息附加到最终 ranked 候选上
     if (rpsMap && rpsMap.size > 0) {
-      for (const r of ranked) {
+      for (const r of finalRanked) {
         const rs = rpsMap.get(r.代码);
         if (rs) r._rps = rs;
       }
     }
 
-    return includeFiltered ? ranked : ranked.slice(0, topN);
+    return includeFiltered ? finalRanked : finalRanked.slice(0, topN);
   }
 
   /**

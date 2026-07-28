@@ -20,14 +20,18 @@
   'use strict';
 
   const KV_KEY = 'weight_advisor_this_week';
-  const FACTOR_KEYS = ['roe', 'ep', 'turnover', 'north', 'industryPenalty', 'forecast', 'rps'];
+  const FACTOR_KEYS = ['roe', 'ep', 'hot', 'turnover', 'north', 'industryPenalty', 'forecast', 'rps'];
   const WEIGHT_MIN = 0.02;
   const WEIGHT_MAX = 0.35;
   const CHANGE_RATIO = 0.5;  // 单因子相对 DEFAULT 最大变化 ±50%
+  const SUM_TOLERANCE = 0.01;  // 权重和容差 ±1% (LLM 输出 0.95+0.05=1.0 太宽松)
 
   function getDefaultWeights() {
+    // 优先从 Core.Scoring.DEFAULT_WEIGHTS 取 (8 因子, 加新因子时单点维护)
+    // Fallback 仅在 Core.Scoring 未加载时使用, 必须含 8 因子键
     return (window.Core && Core.Scoring && Core.Scoring.DEFAULT_WEIGHTS) || {
-      roe: 0.22, ep: 0.20, turnover: 0.16, north: 0.16, industryPenalty: 0.26
+      roe: 0.16, ep: 0.14, hot: 0.12, turnover: 0.12, north: 0.12,
+      industryPenalty: 0.14, forecast: 0.10, rps: 0.10
     };
   }
 
@@ -44,6 +48,7 @@
 
   /**
    * 三层兜底 parse: 抓 { → JSON.parse → schema 校验
+   * 关键约束: 8 因子键必须全部存在 (否则视为 schema 不匹配, fallback)
    */
   function parseAndValidate(raw) {
     if (typeof raw !== 'string') return null;
@@ -53,17 +58,17 @@
     try { obj = JSON.parse(raw.slice(i, j + 1)); } catch (e) { return null; }
     if (!obj || typeof obj !== 'object') return null;
 
-    // schema 校验: 5 因子 + 权重和
+    // schema 校验: 8 因子必须全部存在, 数值合法
     const weights = {};
     let sum = 0;
     for (const k of FACTOR_KEYS) {
       const v = parseFloat(obj[k]);
-      if (isNaN(v)) return null;
+      if (isNaN(v)) return null;  // 缺键 / 非数字 → 整批拒绝 (不再用默认值顶替)
       weights[k] = v;
       sum += v;
     }
-    // 权重和容许 ±5% 误差
-    if (Math.abs(sum - 1.0) > 0.05) return null;
+    // 权重和容差 ±1% (收紧自原 ±5%, 避免 0.95+0.05=1.0 蒙混过关)
+    if (Math.abs(sum - 1.0) > SUM_TOLERANCE) return null;
     // 归一化
     for (const k of FACTOR_KEYS) weights[k] = +(weights[k] / sum).toFixed(4);
     return weights;
@@ -71,13 +76,14 @@
 
   /**
    * 上下限 clamp + 变化上限 + 归一化 (防 LLM 一次推太狠)
+   * 关键修复: 缺失 key 默认值必须从 baseWeights 取, 不能写死 0.2 (避免与真实 DEFAULT 漂移)
    */
   function clamp(llmWeights, baseWeights) {
     const out = {};
     let sum = 0;
     for (const k of FACTOR_KEYS) {
       const v = llmWeights[k];
-      const base = baseWeights[k] || 0.2;
+      const base = (baseWeights && baseWeights[k] != null) ? baseWeights[k] : (1 / FACTOR_KEYS.length);
       const minV = Math.max(WEIGHT_MIN, base * (1 - CHANGE_RATIO));
       const maxV = Math.min(WEIGHT_MAX, base * (1 + CHANGE_RATIO));
       out[k] = Math.max(minV, Math.min(maxV, v));
@@ -129,19 +135,20 @@
       '本周宏观新闻: ' + (ctx.macro || '(无)').slice(0, 500) + '\n' +
       '本周政策事件: ' + (ctx.policy || '(无)').slice(0, 500) + '\n' +
       '本周板块表现 (top10): ' + (ctx.sectors || '(无)') + '\n\n' +
-      '当前 7 因子基础权重: ' + JSON.stringify(defaults) + '\n\n' +
-      '7 个因子说明:\n' +
+      '当前 8 因子基础权重: ' + JSON.stringify(defaults) + '\n\n' +
+      '8 个因子说明:\n' +
       '- roe: ROE 质量 (基本面优先)\n' +
       '- ep: EP 低估值 (价值)\n' +
+      '- hot: 板块动量 (反向, 热点回避, 接盘陷阱)\n' +
       '- turnover: 换手率反转 (低换手加分)\n' +
       '- north: 北向资金流入 (外资偏好)\n' +
       '- industryPenalty: 行业集中度惩罚 (防单行业暴露)\n' +
       '- forecast: 业绩预告预增 (利润断层/拐点信号, 季度性强)\n' +
       '- rps: 60 日涨幅 vs 中位数 (强势股偏好, 趋势确认)\n\n' +
       '任务: 根据本周市场状态, 输出下周权重 (JSON):\n' +
-      '{ "roe": 0.16, "ep": 0.14, "turnover": 0.12, "north": 0.12, "industryPenalty": 0.14, "forecast": 0.10, "rps": 0.10 }\n' +
-      '要求和 = 1.0 (±5% 容差), 每个因子 [0.02, 0.35]。\n' +
-      '熊市加重 industryPenalty/roe, 减 north; 政策利好期可加 north; AI/科技主题期可加 roe; 业绩预告披露期 (1/4/7/10 月) 可加 forecast; 趋势确认期 (突破/主升) 可加 rps。\n' +
+      '{ "roe": 0.16, "ep": 0.14, "hot": 0.12, "turnover": 0.12, "north": 0.12, "industryPenalty": 0.14, "forecast": 0.10, "rps": 0.10 }\n' +
+      '要求和 = 1.0 (±1% 容差), 每个因子 [0.02, 0.35]。\n' +
+      '熊市加重 industryPenalty/roe, 减 north; 政策利好期可加 north; AI/科技主题期可加 roe; 业绩预告披露期 (1/4/7/10 月) 可加 forecast; 趋势确认期 (突破/主升) 可加 rps; 热点主升期 (主升浪) 减 hot。\n' +
       '只输出 JSON, 不要其他文字。';
 
     const raw = await Core.AI.callWithTimeout({

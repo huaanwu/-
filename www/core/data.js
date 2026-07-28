@@ -893,6 +893,11 @@
    */
   async function getRpsSnapshot(opts = {}) {
     const days = opts.days || 60;  // 默认 60 日 (RPS-2 近似)
+    // 只支持 60 日 (spot_em 字段限制), 其他值显式拒绝 (避免静默返回空 Map)
+    if (days !== 60) {
+      console.warn('[Data] getRpsSnapshot 仅支持 days=60 (RPS-2 近似, 因 stock_zh_a_spot_em 字段限制); days=' + days + ' 升级需新增 fetcher');
+      return new Map();
+    }
     const cacheKey = `rps_snapshot_${days}d`;
     // 1) 内存缓存 (24h)
     const cached = await Core.Storage.cacheGet(cacheKey);

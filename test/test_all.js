@@ -11582,8 +11582,8 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
 
     // 95.8: weight-advisor.js FACTOR_KEYS 加 forecast + rps
     const wa95 = fs.readFileSync(path.join(__dirname, '..', 'www', 'core', 'weight-advisor.js'), 'utf8');
-    if (wa95.indexOf("FACTOR_KEYS = ['roe', 'ep', 'turnover', 'north', 'industryPenalty', 'forecast', 'rps']") !== -1)
-      ok('95.8 weight-advisor FACTOR_KEYS 7 因子');
+    if (wa95.indexOf("FACTOR_KEYS = ['roe', 'ep', 'hot', 'turnover', 'north', 'industryPenalty', 'forecast', 'rps']") !== -1)
+      ok('95.8 weight-advisor FACTOR_KEYS 8 因子');
     else fail('95.8 FACTOR_KEYS 未含 forecast', '');
   } catch (e) { fail('95.x 业绩预告因子', e.message); }
 
@@ -11695,10 +11695,72 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
     else fail('97.6 long-trader RPS 注入缺失', '');
 
     const wa97 = fs.readFileSync(path.join(__dirname, '..', 'www', 'core', 'weight-advisor.js'), 'utf8');
-    if (wa97.indexOf("FACTOR_KEYS = ['roe', 'ep', 'turnover', 'north', 'industryPenalty', 'forecast', 'rps']") !== -1)
-      ok('97.7 weight-advisor FACTOR_KEYS 7 因子');
+    if (wa97.indexOf("FACTOR_KEYS = ['roe', 'ep', 'hot', 'turnover', 'north', 'industryPenalty', 'forecast', 'rps']") !== -1)
+      ok('97.7 weight-advisor FACTOR_KEYS 8 因子');
     else fail('97.7 FACTOR_KEYS 未含 rps', '');
   } catch (e) { fail('97.x RPS', e.message); }
+
+  // ===== 98.x: V3 P2 bug 修复回归测试 =====
+  try {
+    // 98.1: weight-advisor FACTOR_KEYS 8 因子含 hot (Critical Fix A)
+    const wa98 = fs.readFileSync(path.join(__dirname, '..', 'www', 'core', 'weight-advisor.js'), 'utf8');
+    if (wa98.indexOf("'hot'") !== -1 &&
+        wa98.indexOf("'forecast'") !== -1 &&
+        wa98.indexOf("'rps'") !== -1 &&
+        wa98.indexOf('SUM_TOLERANCE = 0.01') !== -1)
+      ok('98.1 weight-advisor 8 因子 FACTOR_KEYS + 1% 容差');
+    else fail('98.1 FACTOR_KEYS / SUM_TOLERANCE 缺失', '');
+
+    // 98.2: weight-advisor 默认 8 因子 fallback (Fix A fallback)
+    if (wa98.indexOf('hot: 0.12') !== -1 && wa98.indexOf('forecast: 0.10') !== -1 && wa98.indexOf('rps: 0.10') !== -1)
+      ok('98.2 weight-advisor fallback 含 hot + forecast + rps');
+    else fail('98.2 fallback 不全', '');
+
+    // 98.3: weight-advisor clamp 默认值用 1/N 不是 0.2 (Fix I)
+    if (wa98.indexOf('1 / FACTOR_KEYS.length') !== -1)
+      ok('98.3 clamp 默认值用 1/N 而非硬编码 0.2');
+    else fail('98.3 clamp 默认值仍是硬编码', '');
+
+    // 98.4: long-trader NaN 防护 (Fix B)
+    const lt98 = fs.readFileSync(path.join(__dirname, '..', 'www', 'app', 'long-trader.js'), 'utf8');
+    if (lt98.indexOf('parseFloat(s.涨跌幅) || 0') !== -1 &&
+        lt98.indexOf('parseFloat(s.换手率) || 0') !== -1 &&
+        lt98.indexOf('parseFloat(s.总市值) || 0') !== -1)
+      ok('98.4 long-trader parseFloat NaN 防护');
+    else fail('98.4 long-trader NaN 防护缺失', '');
+
+    // 98.5: _hotScore 缺数据中性化 (Fix C)
+    const sc98 = fs.readFileSync(path.join(__dirname, '..', 'www', 'core', 'scoring.js'), 'utf8');
+    if (sc98.indexOf('industryPct != null') !== -1 && sc98.indexOf('anyValid') !== -1)
+      ok('98.5 _hotScore 缺数据中性 (不再默认 +0.10)');
+    else fail('98.5 _hotScore 缺数据未中性化', '');
+
+    // 98.6: forecastFullRanks 单次循环不再用 indexOf 反查 (Fix D)
+    if (sc98.indexOf('forecastForRank') !== -1 &&
+        sc98.indexOf('forecastPerStock') !== -1)
+      ok('98.6 forecastFullRanks 单次循环 (无 indexOf)');
+    else fail('98.6 forecastFullRanks 仍用 indexOf', '');
+
+    // 98.7: roeVals 用 null 排除无数据股票 (Fix G)
+    if (sc98.indexOf('e.fe ? (e.fe.roe ?? null)') !== -1 &&
+        sc98.indexOf('e.fe ? (e.fe.ep ??') !== -1)
+      ok('98.7 roe/ep 无数据 → null (不再 ?? 0 污染)');
+    else fail('98.7 roe/ep 仍 ?? 0', '');
+
+    // 98.8: scoring 收紧 chokepoint/concept 调用范围 (Fix E+F)
+    if (sc98.indexOf('candidateCodes') !== -1 &&
+        sc98.indexOf('slice(0, Math.min(ranked.length, topN * 2))') !== -1)
+      ok('98.8 chokepoint/concept 只对 topN*2 候选调用');
+    else fail('98.8 zygc/concept 仍全市场调用', '');
+
+    // 98.9: getRpsSnapshot days 校验 (Fix H)
+    const d98 = fs.readFileSync(path.join(__dirname, '..', 'www', 'core', 'data.js'), 'utf8');
+    if (d98.indexOf('仅支持 days=60') !== -1 && d98.indexOf('if (days !== 60)') !== -1)
+      ok('98.9 getRpsSnapshot days != 60 显式拒绝');
+    else fail('98.9 getRpsSnapshot 未校验 days', '');
+  } catch (e) { fail('98.x V3 bug 修复', e.message); }
+
+
 
 
 
