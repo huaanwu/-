@@ -85,6 +85,18 @@
   /** 调仓动作上限: 单只持仓 1 天内最多调仓 N 次 (额外冷却, 跟 cooldown 互补) */
   const INTRADAY_MAX_DAILY_ACTIONS = 4;
 
+  /** 盘中决策验证: 平仓后至少 N 根后续日 K 才判定 (默认 1 天) */
+  const INTRADAY_VERIFY_DELAY_BARS = 1;
+
+  /** 盘中决策验证: 决策日后观察窗口 (收盘后最多看 N 根 K) */
+  const INTRADAY_VERIFY_LOOKAHEAD_BARS = 5;
+
+  /** 盘中决策验证: 拉近 N 根日 K (含决策日) */
+  const INTRADAY_VERIFY_KLINE_BARS = 15;
+
+  /** 盘中决策验证: 成绩单注入最少样本数 */
+  const INTRADAY_VERIFY_MIN_SAMPLES = 5;
+
   // ==================== 长线操盘手 (Long Trader) ====================
   // AI 长线 sleeve 自动选股 (对接 Screener 选股逻辑): 周一开盘前自动跑 AI 选股
   // → top N picks 自动成交到 long sleeve → 纪律引擎自动卡
@@ -106,6 +118,26 @@
 
   /** kv paper_long_trader_log: 选股决策日志上限 (滚动截断) */
   const LONG_TRADER_LOG_LIMIT = 100;
+
+  // ==================== Phase L1 长线业绩归因 ====================
+
+  /** 长线 verify 检查周期: 周一/三/五 跑 (长线不需日级) */
+  const LONG_VERIFY_CHECK_DAYS = 3;
+
+  /** 长线浮盈 5% 算 correct, 浮亏 5% 算 wrong, 中间 partial */
+  const LONG_VERIFY_THRESHOLD_PCT = 0.05;
+
+  /** 长线归因: 浮盈超 8% 算时机好 (timingGood) */
+  const LONG_VERIFY_TIMING_GOOD_PCT = 0.08;
+
+  /** 长线归因: 浮亏超 8% 算假设错 */
+  const LONG_VERIFY_THRESHOLD_BAD_PCT = 0.08;
+
+  /** 长线 journal 上限: 滚动 200 (T3 _writeCondJournal 模式) */
+  const LONG_JOURNAL_LIMIT = 200;
+
+  /** 长线 verify 样本下限: < 3 不渲染成绩单 (跟 T4 SCORECARD_MIN 一致) */
+  const LONG_VERIFY_MIN_SAMPLES = 3;
 
   // ==================== 基金再平衡 ====================
 
@@ -348,6 +380,29 @@
     ATR_MIN_BAND,
     ATR_MAX_BAND,
     REGIME_FALLBACK_BAND,
+    LONG_TRADER_CHECK_MS,
+    LONG_TRADER_TOP_N,
+    LONG_TRADER_HARD_SCREEN_TOP,
+    LONG_TRADER_RERUN_DAYS,
+    LONG_TRADER_MIN_CASH,
+    LONG_TRADER_LOG_LIMIT,
+    LONG_VERIFY_CHECK_DAYS,
+    LONG_VERIFY_THRESHOLD_PCT,
+    LONG_VERIFY_TIMING_GOOD_PCT,
+    LONG_VERIFY_THRESHOLD_BAD_PCT,
+    LONG_JOURNAL_LIMIT,
+    LONG_VERIFY_MIN_SAMPLES,
+    INTRADAY_TICK_MS,
+    INTRADAY_KLINE_BARS,
+    INTRADAY_MIN_HOLD_MINUTES,
+    INTRADAY_COOLDOWN_MS,
+    INTRADAY_LLM_TIMEOUT_MS,
+    INTRADAY_LOG_LIMIT,
+    INTRADAY_MAX_DAILY_ACTIONS,
+    INTRADAY_VERIFY_DELAY_BARS,
+    INTRADAY_VERIFY_LOOKAHEAD_BARS,
+    INTRADAY_VERIFY_KLINE_BARS,
+    INTRADAY_VERIFY_MIN_SAMPLES,
     MODULE_TAG
   };
 })();

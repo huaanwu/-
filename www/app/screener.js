@@ -357,6 +357,12 @@
       // H3 大盘状态机段: 多指数共识 + 失灵提示, 让 LLM 在 bear/range 时更保守
       const regimeBlock = (Core.Regime && Core.Regime._formatRegimeBlock)
         ? Core.Regime._formatRegimeBlock() : '';
+      // P3 全系统学习池
+      let poolBlock = '';
+      try {
+        const pt = await Core.LearningPool.format();
+        if (pt) poolBlock = '\n\n【全系统学习池】' + pt;
+      } catch (e) { /* 学习池可选 */ }
       const systemPrompt = `你是 Phase O 高手版 A 股个股投资顾问, 风格稳健, 严守数据边界。
 
 【投资框架】价值 + 趋势 + 风险平价 混合:
@@ -397,7 +403,7 @@ ${Core.AI.formatUserProfile() || '长期稳健型 (年化 3-5%), 不追短期暴
 7. **pre-mortem 必填**: 每只 pick 必须给 bullCase/bearCase/falsifyCondition/invalidation 四字段; bearCase 禁止"无明显风险/暂无风险"空话, falsifyCondition 必须具体可观测 (价格/指标/财报数字)
 8. **已有持仓友好**: 用户持仓超过 10 万的代码视为"重复持仓", 应在 marketView / risks 中提示, 不强制进 picks
 9. **排雷标签 ✓ 必须尊重**: 候选池中如已被前端标 [排雷] 的代码 (商誉偏高/股东减持/业绩亏损/主力出逃), 一律不进 picks, 除非 KB 经典模式能给出反转理由 (例如"高商誉但 ROE 持续 > 20% 的特例")
-10. 严禁绝对化表述 ("一定涨" 等)`;
+10. 严禁绝对化表述 ("一定涨" 等)${poolBlock}`;
 
       const userPrompt = `【我的现有持仓 (前 10, Y.3 P-A)】
 ${portfolioLine}

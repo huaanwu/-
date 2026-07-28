@@ -193,6 +193,12 @@
     // 基金相对股票更看股债跷跷板, 但仓位/久期决策仍受 Regime 影响
     const regimeBlock = (Core.Regime && Core.Regime._formatRegimeBlock)
       ? Core.Regime._formatRegimeBlock() : '';
+    // P3 全系统学习池
+    let poolBlock = '';
+    try {
+      const pt = await Core.LearningPool.format();
+      if (pt) poolBlock = '\n\n【全系统学习池】' + pt;
+    } catch (e) { /* 学习池可选 */ }
 
     const systemPrompt = `你是 Phase O 高手版中国 A 股基金投资顾问, 风格稳健, 严守数据边界。
 
@@ -243,7 +249,7 @@ ${Core.AI.formatUserProfile() || '长期稳健型 (年化 3-5% 跑赢通胀), �
 7. **KB 引用**: 如有相关条目 (data.kb 字段), 在 reasons 里引用条目号, kbRefs 数组填条目号
 8. **置信度**: confidence = 高 (多维数据一致+符合 KB 经典模式) / 中 (数据冲突或 KB 不明确) / 低 (新策略/极端市场)
 9. **pre-mortem 必填**: 每只 pick 必须给 bullCase/bearCase/falsifyCondition/invalidation 四字段; bearCase 禁止"无明显风险/暂无风险"空话 (利率/信用/流动性/政策风险至少写一条具体的), falsifyCondition 必须具体可观测 (如"10 年期国债收益率上行超 X bp"/"单月回撤 >X%")
-10. 禁止用"建议投资""一定赚钱"等绝对化表述`;
+10. 禁止用"建议投资""一定赚钱"等绝对化表述${poolBlock}`;
 
     const userPrompt = `【用户画像】(本单口径, 可覆盖 Core.UserProfile 的全局设置)
 - 总金额: ${amount} 元

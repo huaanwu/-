@@ -179,7 +179,8 @@ const CORE_MODULES = {
   'core/premortem.js': 'Core.Premortem',
   'core/prebacktest.js': 'Core.PreBacktest',
   'core/crosscheck.js': 'Core.CrossCheck',
-  'core/user-profile.js': 'Core.UserProfile'
+  'core/user-profile.js': 'Core.UserProfile',
+  'core/learning-pool.js': 'Core.LearningPool'
 };
 for (const [file, ns] of Object.entries(CORE_MODULES)) {
   const content = readFileSafe(path.join(WWW, file));
@@ -217,9 +218,9 @@ for (const m of NEWS_METHODS) {
   else fail(`News.${m}`, '缺失');
 }
 
-// 检查 Core.Premortem (Phase D1) 的方法清单
+// 检查 Core.Premortem (Phase D1 + P1) 的方法清单
 const pmContent = readFileSafe(path.join(WWW, 'core/premortem.js'));
-const PM_METHODS = ['checkPick', 'checkPicks', 'renderBlock'];
+const PM_METHODS = ['checkPick', 'checkPicks', 'renderBlock', 'verifyFalsifyCondition', 'verifyInvalidation', 'verifyPick', 'verifyPendingJournals'];
 for (const m of PM_METHODS) {
   if (pmContent && new RegExp(`\\b${m}\\s*\\(`).test(pmContent)) ok(`Premortem.${m}`);
   else fail(`Premortem.${m}`, '缺失');
@@ -249,6 +250,24 @@ const CC_METHODS = ['pickSecondProvider', 'resolveSecondOpinion', 'buildCompareP
 for (const m of CC_METHODS) {
   if (ccContent && new RegExp(`\\b${m}\\s*\\(`).test(ccContent)) ok(`CrossCheck.${m}`);
   else fail(`CrossCheck.${m}`, '缺失');
+}
+
+// 检查 Core.LearningPool (P3 跨调用方学习池) 的方法清单
+const lpContent = readFileSafe(path.join(WWW, 'core/learning-pool.js'));
+const LP_METHODS = ['collect', 'format'];
+for (const m of LP_METHODS) {
+  if (lpContent && new RegExp(`\\b${m}\\s*\\(`).test(lpContent)) ok(`LearningPool.${m}`);
+  else fail(`LearningPool.${m}`, '缺失');
+}
+// 检查 5 调用方注入 Core.LearningPool.format()
+const callerFiles = [
+  'short-trader.js', 'long-trader.js', 'screener.js',
+  'intraday-trader.js', 'fund/ai-advisor.js'
+];
+for (const cf of callerFiles) {
+  const src = readFileSafe(path.join(WWW, 'app', cf));
+  if (src && src.includes('Core.LearningPool.format')) ok(`学习池注入 app/${cf}`);
+  else fail(`学习池注入 app/${cf}`, src ? '缺 Core.LearningPool.format' : '读不到');
 }
 
 // ========== [4] index.html script 引用对得上 ==========
@@ -6724,10 +6743,10 @@ section('[39] ShortTrader 盘前 AI 交易计划 (T2): 交易日判定 / prompt 
     let llmCalls = 0;
     const plan7 = await ST7.generatePlan({
       now: new Date(2026, 6, 27, 8, 30),
-      deps: { callLLM: async ({ systemPrompt, prompt }) => { llmCalls++; return llmJson; } },
-      votes: 1   // 测试期望单票 (默认 3 票投票是 P0-1 升级)
+      deps: { callLLM: async ({ systemPrompt, prompt }) => { llmCalls++; return llmJson; } }
+      // P0-1: generatePlan 现在做 3 路并行 self-consistency 投票, llmCalls 应 = 3
     });
-    if (llmCalls === 1 && plan7.date === '2026-07-27' && plan7.marketView.includes('震荡')) ok('gen: LLM 调用 1 次, plan.date/marketView 落盘');
+    if (llmCalls === 3 && plan7.date === '2026-07-27' && plan7.marketView.includes('震荡')) ok('gen: self-consistency 3 路 LLM 调用, plan.date/marketView 落盘 (P0-1)');
     else fail('gen 基本', JSON.stringify({ llmCalls, date: plan7.date }));
     if (plan7.plans.length === 1 && plan7.plans[0].code === '600519'
       && plan7.plans[0].condOrderId && plan7.plans[0].shares === 300) ok('gen: 通过 1 条, condOrderId 回填, shares 300 (H1 凯利生效)');
@@ -6801,15 +6820,15 @@ section('[39] ShortTrader 盘前 AI 交易计划 (T2): 交易日判定 / prompt 
       && store11.kv.paper_short_plan.error && store11.kv.paper_short_plan.plans.length === 0) ok('maybe: 失败不打扰 → kv 写 error 记录 (UI 显示可重试)');
     else fail('maybe 失败记录', JSON.stringify({ r: r11, kv: store11.kv.paper_short_plan }));
 
-    // 39.12 LLM 输出非 JSON → parseJsonOutput schema 拦截
+    // 39.12 LLM 输出非 JSON → 3 路 parseJsonOutput 全失败 → throw
     const store12 = { kv: {}, tables: { watchlist: [] } };
     const ctx12 = buildCtx(store12);
     let threw12 = false;
     try {
       await ctx12.window.ShortTrader.generatePlan({ now: new Date(2026, 6, 27, 8, 30), deps: { callLLM: async () => '我无法给出建议' } });
-    } catch (e) { threw12 = e.message.includes('schema'); }
-    if (threw12) ok('gen: 非 JSON 输出 → parseJsonOutput schema 拦截 throw');
-    else fail('gen 非 JSON', '');
+    } catch (e) { threw12 = e.message.includes('全失败'); }
+    if (threw12) ok('gen: 非 JSON 输出 → 3 路全 parseJsonOutput 失败 throw (P0-1 self-consistency)');
+    else fail('gen 非-JSON', '');
 
   } catch (e) {
     fail('39 ShortTrader T2', e.message + ' / ' + (e.stack || ''));
@@ -6914,9 +6933,12 @@ section('[40] ShortTrader T4 学习环: _judgeClosedTrade 全分支 / verify 扫
     j = J({ exitReason: '手动卖出', pnl: -0.5, entryPrice: 10, exitPrice: 9.5, exitDate: '2026-07-20', bars: [] });
     if (j.outcome === 'wrong' && j.reason === '假设错误') ok('judge: 未知退出+亏损 → wrong/假设错误');
     else fail('judge 兜底亏损', JSON.stringify(j));
-    // 止损: 第 2 根收复入场价 → wrong + 时机过早
+    // 止损: 持有 ≥ 3 日, 第 2 根收复入场价 → wrong + 时机过早
+    // (P0-2 归因细化: 持有 <3 日走"择时错"分支, 此用例确保 barsHeld ≥ 3 测到时机过早)
     const barsRecover = [
-      bar('2026-07-20', 10, 10.1, 9.4, 9.5),   // 出场日 (不计入观察窗)
+      bar('2026-07-17', 10.2, 10.3, 10, 10.1),
+      bar('2026-07-18', 10.1, 10.2, 9.9, 10),
+      bar('2026-07-20', 10, 10.1, 9.4, 9.5),   // 出场日 (barsHeld=3)
       bar('2026-07-21', 9.5, 9.7, 9.4, 9.6),
       bar('2026-07-22', 9.8, 10.2, 9.7, 10.1), // close 10.1 ≥ 入场价 10 → 收复
       bar('2026-07-23', 10.1, 10.3, 10, 10.2)
@@ -6924,9 +6946,11 @@ section('[40] ShortTrader T4 学习环: _judgeClosedTrade 全分支 / verify 扫
     j = J({ exitReason: '止损', pnl: -0.5, entryPrice: 10, exitPrice: 9.5, exitDate: '2026-07-20', bars: barsRecover });
     if (j.outcome === 'wrong' && j.reason === '时机过早' && j.note.includes('2 日收复')) ok('judge: 止损后 2 日收复入场价 → wrong/时机过早');
     else fail('judge 止损收复', JSON.stringify(j));
-    // 止损(跳空) 同口径; 3 日未收复 → wrong + 假设错误
+    // 止损(跳空) 同口径; barsHeld ≥ 3, 3 日未收复 → wrong + 假设错误
     const barsNoRecover = [
-      bar('2026-07-20', 10, 10.1, 9.4, 9.5),
+      bar('2026-07-17', 10.2, 10.3, 10, 10.1),
+      bar('2026-07-18', 10.1, 10.2, 9.9, 10),
+      bar('2026-07-20', 10, 10.1, 9.4, 9.5),  // 出场日 (barsHeld=3)
       bar('2026-07-21', 9.5, 9.7, 9.4, 9.6),
       bar('2026-07-22', 9.6, 9.8, 9.5, 9.7),
       bar('2026-07-23', 9.7, 9.9, 9.6, 9.8)
@@ -6957,7 +6981,7 @@ section('[40] ShortTrader T4 学习环: _judgeClosedTrade 全分支 / verify 扫
     if (j.outcome === 'correct') ok('judge: 强平盈利 → correct');
     else fail('judge 强平盈利', JSON.stringify(j));
     j = J({ exitReason: '到期强平', pnl: -0.3, entryPrice: 10, exitPrice: 9.7, exitDate: '2026-07-20', bars: [] });
-    if (j.outcome === 'partial' && j.reason === '时机过早') ok('judge: 强平亏损 → partial/时机过早');
+    if (j.outcome === 'partial' && j.reason === '择时错') ok('judge: 强平亏损 → partial/择时错 (P0-2 归因细化)');
     else fail('judge 强平亏损', JSON.stringify(j));
 
     // ---- 40.2 _extractExitInfo 解析 ----
@@ -7022,9 +7046,9 @@ section('[40] ShortTrader T4 学习环: _judgeClosedTrade 全分支 / verify 扫
     else fail('verify 汇总', JSON.stringify(sumV));
     if (storeV.puts.length === 1 && storeV.puts[0].t === 'journals') {
       const wr = storeV.puts[0].row;
-      if (wr.id === 'j1' && wr.verifyOutcome === 'wrong' && wr.verifyFailureReason === '时机过早'
-        && wr.verifiedAt > 0 && typeof wr.postExitNote === 'string' && wr.postExitNote.includes('收复')) {
-        ok('verify: 写回 verifyOutcome/verifyFailureReason/verifiedAt/postExitNote (止损后 2 日收复 → wrong/时机过早)');
+      if (wr.id === 'j1' && wr.verifyOutcome === 'wrong' && wr.verifyFailureReason === '择时错'
+        && wr.verifiedAt > 0 && typeof wr.postExitNote === 'string' && wr.postExitNote.includes('入场')) {
+        ok('verify: 写回 verifyOutcome/verifyFailureReason/verifiedAt/postExitNote (持有 <2 日止损 → wrong/择时错, P0-2 归因细化)');
       } else fail('verify 写回字段', JSON.stringify(wr));
     } else fail('verify put 次数', 'puts=' + storeV.puts.length);
     if (!storeV.tables.journals.find(r => r.id === 'j4').verifyOutcome) ok('verify: K线失败行不写失败态 (下轮再试)');

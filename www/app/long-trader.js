@@ -77,11 +77,11 @@
           console.log(`[LongTrader] 现金 ${acc.cash} × ${acc.positionPct || 0.10} 买不起 1 手 30 元股, 跳过`);
           return;
         }
-        // Bug #2 修复 (Regime gate): 熊市 + 仓位系数 < 0.5 → 跳过, 防买在反弹半山腰
+        // Bug #2 修复 (Regime gate): 熊市 → 跳过, 防买在反弹半山腰
         try {
           const rec = await Core.Regime.get();
           const gate = Core.Regime.gateMultipliers();
-          if (rec && rec.state === 'bear' && gate && gate.positionScale < 0.5) {
+          if (rec && rec.state === 'bear' && gate && gate.positionScale <= 0.5) {
             console.log(`[LongTrader] Regime bear + positionScale ${gate.positionScale} < 0.5, 跳过`);
             return;
           }
@@ -177,19 +177,6 @@
           return `[${i}] ${code} ${name} | 涨跌幅=${chg}% | 换手=${turn}% | 市值=${mcapStr}`;
         }).join('\n');
 
-        // TODO H1 凯利 接入: 当前 LLM schema 只返 {code, name, reason}, 没有
-        // numeric probability / triggerPrice / stopLoss / targetPrice, 凯利公式
-        // (Core.PositionSizing._kellyFraction) 需要 4 个数值字段。
-        // 等以后 schema 扩展 (LLM 报 probability 0-100 + 3 件套价格),
-        // 在这里拼 schema 描述, 在 pick 落地前用 _kellyFraction 算仓位,
-        // 替换现行 acc.positionPct 固定上限的 fallback。
-        //
-        // TODO H2 校准 接入: 当前 long-trader 没有 (predict → actual) 机械
-        // 验证数据 (不像 short-trader T4 学习环有完整闭环), 校准注入会误导 LLM。
-        // 等以后机械 verify 落实后, 在这里拼 _calibrationBuckets →
-        // Core.Calibration._formatCalibrationPrompt 段, 短期先用 entries.cap
-        // 限制 _formatCalibrationPrompt 不渲染 (samples < 5 走 null 路径)。
-
         // H3 大盘状态机 (commit 6): 仅一行提示, 不影响 schema (只返 {code, name, reason})
         // 长线 sleeve 也没自动仓位系数 (acc.positionPct 是固定的), 只供 LLM 在趋势/下跌市收紧
         let regimeLine = '【大盘状态】默认震荡市';
@@ -200,25 +187,32 @@
           }
         } catch (e) { console.warn('[LongTrader] regime 取值失败:', e); }
 
-        const systemPrompt = `你是 A 股长线选股助手, 帮用户从硬筛池里挑 ${topN} 只作为本周模拟盘长线 sleeve 的买入标的。
-- 选有真实上涨逻辑的 (题材/业绩/资金/技术突破)
-- 优先选市值 ≥ 50 亿的 (流动性好)
-- 优先选当日涨幅在 3-9% 区间的 (避免追高/避冷门)
-- 排除 ST/退市风险股
-${regimeLine}
-- 输出严格 JSON, 不要其他文字`;
+        // P3 全系统学习池
+        let poolText = '';
+        try {
+          poolText = (await Core.LearningPool.format()) || '';
+        } catch (e) { console.warn('[LongTrader] 学习池渲染失败:', e); }
+
+        const systemPrompt = '你是 A 股长线选股助手, 帮用户从硬筛池里挑 ' + topN + ' 只作为本周模拟盘长线 sleeve 的买入标的。' +
+          '\n- 选有真实上涨逻辑的 (题材/业绩/资金/技术突破)' +
+          '\n- 优先选市值 ≥ 50 亿的 (流动性好)' +
+          '\n- 优先选当日涨幅在 3-9% 区间的 (避免追高/避冷门)' +
+          '\n- 排除 ST/退市风险股' +
+          '\n' + regimeLine +
+          (poolText ? '\n- 【全系统学习池】' + poolText.replace(/\n/g, ' ').slice(0, 200) : '') +
+          '\n- 输出严格 JSON, 不要其他文字';
 
         const userPrompt = `硬筛池 (今日涨幅前 ${stocks.length}):
 
-${list}
+	${list}
 
-输出 JSON:
-{
-  "picks": [
-    { "code": "000001", "name": "平安银行", "reason": "一句话理由" }
-  ]
-}
-只输出 picks 数组 (${topN} 只以内), 不要其他字段。`;
+	输出 JSON:
+	{
+	  "picks": [
+	    { "code": "000001", "name": "平安银行", "reason": "一句话理由" }
+	  ]
+	}
+	只输出 picks 数组 (${topN} 只以内), 不要其他字段。`;
 
         const raw = await Core.AI.callWithTimeout({
           systemPrompt,
@@ -274,20 +268,18 @@ ${list}
         const cost = parseFloat(pick.costPrice || pick.price || 0);
         const shares = parseInt(pick.shares || 0, 10);
         const reason = String(pick.reason || 'AI 长线选股').slice(0, 200);
-        const content = `# AI 长线自动建仓
-
-- 代码: ${pick.code}
-- 名称: ${pick.name || ''}
-- 成本价: ¥${cost.toFixed(2)}
-- 股数: ${shares} (${shares / 100}手)
-- 选股理由: ${reason}
-- 成交日期: ${today}
-
-> 本条由 LongTrader 自动写入, 后续 verify 用于归因`;
+        const content = '# AI 长线自动建仓\n\n' +
+          '- 代码: ' + pick.code + '\n' +
+          '- 名称: ' + (pick.name || '') + '\n' +
+          '- 成本价: ¥' + cost.toFixed(2) + '\n' +
+          '- 股数: ' + shares + ' (' + (shares / 100) + '手)\n' +
+          '- 选股理由: ' + reason + '\n' +
+          '- 成交日期: ' + today + '\n\n' +
+          '> 本条由 LongTrader 自动写入, 后续 verify 用于归因';
         const row = {
           id: 'lt-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
           date: today,
-          title: `📈 长线建仓: ${pick.code} ${pick.name || ''}`,
+          title: '📈 长线建仓: ' + pick.code + ' ' + (pick.name || ''),
           content,
           code: pick.code,
           assumption: reason,
@@ -319,66 +311,64 @@ ${list}
       const badThr = Core.Constants.LONG_VERIFY_THRESHOLD_BAD_PCT;
       const goodThr = Core.Constants.LONG_VERIFY_TIMING_GOOD_PCT;
       if (!isFinite(pnlPct)) return { outcome: 'partial', reason: '数据不足' };
-      if (pnlPct >= goodThr) return { outcome: 'correct', reason: 'timingGood' };  // 浮盈 ≥ 8% → 时机好
-      if (pnlPct >= thr) return { outcome: 'correct', reason: '选股对' };          // 浮盈 5-8% → 选股对
-      if (pnlPct <= -badThr) return { outcome: 'wrong', reason: '假设错误' };        // 浮亏 ≥ 8% → 假设错
-      if (pnlPct <= -thr) return { outcome: 'wrong', reason: '选股错' };             // 浮亏 5-8% → 选股错
-      return { outcome: 'partial', reason: '时机过早' };                            // ±5% 内 → 时机过早
+      if (pnlPct >= goodThr) return { outcome: 'correct', reason: 'timingGood' };
+      if (pnlPct >= thr) return { outcome: 'correct', reason: '选股对' };
+      if (pnlPct <= -badThr) return { outcome: 'wrong', reason: '假设错误' };
+      if (pnlPct <= -thr) return { outcome: 'wrong', reason: '选股错' };
+      return { outcome: 'partial', reason: '时机过早' };
     },
 
     /**
      * 长线 verify 主流程: 拉 journal 表, long+auto+无 verify 的, 拉后续 K 线判定 outcome
-     * @param {{daysBack?: number, fetcher?: function, now?: Date}} [opts]
-     * @returns {Promise<{scanned: number, verified: number, skipped: number}>}
      */
     async verifyLongTrades(opts = {}) {
-      const daysBack = parseInt(opts.daysBack) || 90;  // 默认回看 90 天
+      const daysBack = parseInt(opts.daysBack) || 90;
       const now = opts.now || new Date();
       const fetcher = opts.fetcher || (Core.Data && Core.Data.getStockKLine);
       if (typeof fetcher !== 'function') {
         console.warn('[LongTrader] verifyLongTrades 缺 fetcher, 跳过');
         return { scanned: 0, verified: 0, skipped: 0 };
       }
-      const todayStr = (d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`)(now);
+      const todayStr = (function(d) {
+        return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+      })(now);
       let scanned = 0, verified = 0, skipped = 0;
       try {
         const all = (await Core.Storage.all('journals')) || [];
-        const cutoff = (d => {
+        const cutoff = (function(d) {
           const dt = new Date(d.getTime() - daysBack * 24 * 3600 * 1000);
-          return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
+          return dt.getFullYear() + '-' + String(dt.getMonth()+1).padStart(2,'0') + '-' + String(dt.getDate()).padStart(2,'0');
         })(now);
-        const targets = all.filter(j =>
-          j && (j.sleeve || '') === 'long' && j.auto === true
-          && j.code && j.entryDate && j.entryDate >= cutoff && j.entryDate < todayStr
-          && (!j.verifyOutcome || j.verifyOutcome === null)
-        );
+        const targets = all.filter(function(j) {
+          return j && (j.sleeve || '') === 'long' && j.auto === true
+            && j.code && j.entryDate && j.entryDate >= cutoff && j.entryDate < todayStr
+            && (!j.verifyOutcome || j.verifyOutcome === null);
+        });
         for (const j of targets) {
           scanned++;
           try {
-            // 拉近 100 根日 K, 算 entryDate 后的最新收益
-            const kline = await fetcher(j.code, 'daily', undefined, undefined, '').catch(() => null);
+            const kline = await fetcher(j.code, 'daily', undefined, undefined, '').catch(function() { return null; });
             if (!Array.isArray(kline) || kline.length < 5) { skipped++; continue; }
-            const closes = kline.map(b => parseFloat(b.收盘 || b.close)).filter(c => c > 0);
+            const closes = kline.map(function(b) { return parseFloat(b.收盘 || b.close); }).filter(function(c) { return c > 0; });
             if (closes.length < 5) { skipped++; continue; }
-            // entryDate 当日及之后: 找 >= entryDate 的第一根
-            const dates = kline.map(b => String(b.日期 || b.date || '').slice(0, 10));
-            const entryIdx = dates.findIndex(d => d >= j.entryDate);
+            const dates = kline.map(function(b) { return String(b.日期 || b.date || '').slice(0, 10); });
+            const entryIdx = dates.findIndex(function(d) { return d >= j.entryDate; });
             if (entryIdx < 0 || entryIdx >= closes.length) { skipped++; continue; }
             const entryPrice = j.costPrice || closes[entryIdx];
             const lastPrice = closes[closes.length - 1];
             if (!(entryPrice > 0) || !(lastPrice > 0)) { skipped++; continue; }
             const pnlPct = (lastPrice - entryPrice) / entryPrice;
-            const { outcome, reason } = this._judgeLongOutcome(pnlPct);
+            const outcome = this._judgeLongOutcome(pnlPct);
             await Core.Storage.update('journals', j.id, {
-              verifyOutcome: outcome,
-              verifyFailureReason: reason,
+              verifyOutcome: outcome.outcome,
+              verifyFailureReason: outcome.reason,
               verifiedAt: Date.now(),
               pnlPct: +pnlPct.toFixed(4),
               lastPrice: +lastPrice.toFixed(2)
             });
             verified++;
           } catch (e) {
-            console.warn(`[LongTrader] verify ${j.code} 失败:`, e.message || e);
+            console.warn('[LongTrader] verify ' + j.code + ' 失败:', e.message || e);
             skipped++;
           }
         }
@@ -390,45 +380,46 @@ ${list}
     },
 
     /**
-     * 长线成绩单 (按 reason 关键词分组胜率, 跟 T4 _buildTrackRecord 同构)
-     * @param {Array<{outcome: string, reason: string, pnlPct: number, code: string}>} trades
-     * @returns {null|{total: number, correctRate: number, byReason: Array, topReasons: Array}}
+     * 长线成绩单 (按 reason 关键词分组胜率)
      */
     _buildLongTrackRecord(trades) {
-      const list = (Array.isArray(trades) ? trades : []).filter(t => t && t.outcome);
+      const list = (Array.isArray(trades) ? trades : []).filter(function(t) { return t && t.outcome; });
       const minSamples = Core.Constants.LONG_VERIFY_MIN_SAMPLES;
       if (list.length < minSamples) return null;
-      // 归一化 reason 关键词: 题材/业绩/资金/技术 → 4 大类
-      const catOf = (r) => {
-        const s = String(r || '');
+      var catOf = function(r) {
+        var s = String(r || '');
         if (/题材|概念|事件/.test(s)) return '题材';
         if (/业绩|财报|利润|营收/.test(s)) return '业绩';
         if (/资金|流入|主力|北向/.test(s)) return '资金';
         if (/技术|突破|均线|金叉/.test(s)) return '技术';
         return '其他';
       };
-      const score = (o) => o === 'correct' ? 1 : (o === 'partial' ? 0.5 : 0);
-      const groups = {};
-      for (const t of list) {
-        const cat = catOf(t.reason);
-        const g = groups[cat] || (groups[cat] = { total: 0, scoreSum: 0, pnlSum: 0, reasons: {} });
+      var score = function(o) { return o === 'correct' ? 1 : (o === 'partial' ? 0.5 : 0); };
+      var groups = {};
+      for (var t = 0; t < list.length; t++) {
+        var tr = list[t];
+        var cat = catOf(tr.reason);
+        var g = groups[cat] || (groups[cat] = { total: 0, scoreSum: 0, pnlSum: 0, reasons: {} });
         g.total++;
-        g.scoreSum += score(t.outcome);
-        g.pnlSum += (t.pnlPct || 0);
-        if (t.reason) g.reasons[t.reason] = (g.reasons[t.reason] || 0) + 1;
+        g.scoreSum += score(tr.outcome);
+        g.pnlSum += (tr.pnlPct || 0);
+        if (tr.reason) g.reasons[tr.reason] = (g.reasons[tr.reason] || 0) + 1;
       }
-      const byReason = Object.entries(groups).map(([cat, g]) => ({
-        category: cat,
-        total: g.total,
-        correctRate: +(g.scoreSum / g.total).toFixed(2),
-        avgPnl: +(g.pnlSum / g.total * 100).toFixed(2),
-        topReason: Object.entries(g.reasons).sort((a, b) => b[1] - a[1])[0]?.[0] || null
-      })).sort((a, b) => b.total - a.total);
-      const totalScore = list.reduce((s, t) => s + score(t.outcome), 0);
+      var byReason = Object.entries(groups).map(function(entry) {
+        var cat = entry[0], g = entry[1];
+        return {
+          category: cat,
+          total: g.total,
+          correctRate: +(g.scoreSum / g.total).toFixed(2),
+          avgPnl: +(g.pnlSum / g.total * 100).toFixed(2),
+          topReason: Object.entries(g.reasons).sort(function(a, b) { return b[1] - a[1]; })[0]?.[0] || null
+        };
+      }).sort(function(a, b) { return b.total - a.total; });
+      var totalScore = list.reduce(function(s, t) { return s + score(t.outcome); }, 0);
       return {
         total: list.length,
         correctRate: +(totalScore / list.length).toFixed(2),
-        byReason
+        byReason: byReason
       };
     }
   };

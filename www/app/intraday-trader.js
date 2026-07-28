@@ -47,6 +47,10 @@
           TICK_MS
         );
       }
+      // P0: 启动时跑一轮机械验证 (异步, 不阻塞)
+      this.verifyIntradayDecisions().then(r => {
+        if (r && r.verified > 0) console.log(`[IntradayTrader] 启动 verify: 扫描${r.scanned} 验证${r.verified} 跳过${r.skipped}`);
+      }).catch(e => console.warn('[IntradayTrader] 启动 verify 失败:', e));
     },
 
     stopPolling() {
@@ -138,6 +142,7 @@
           reason: `LLM 平仓: ${decision.reason || '(无原因)'}`,
           source: 'llm-close',
           confidence: decision.confidence,
+          probability: decision.probability,
           cooldownMap, today
         });
       } else if (decision.action === 'trim' || decision.action === 'add') {
@@ -152,6 +157,7 @@
           reason: `LLM ${decision.action === 'trim' ? '减仓' : '加仓'}: ${decision.reason || '(无原因)'}`,
           source: 'llm',
           confidence: decision.confidence,
+          probability: decision.probability,
           cooldownMap, today
         });
       }
@@ -181,7 +187,7 @@
         let regimeText = '';
         try {
           if (Core.Regime && Core.Regime._formatRegimeBlock) {
-            regimeText = await Core.Regime._formatRegimeBlock();
+            regimeText = Core.Regime._formatRegimeBlock();
           }
         } catch (e) { regimeText = ''; /* 兜底走老的纯标签 */ }
         if (!regimeText) {
@@ -192,22 +198,50 @@
           } catch (e) { regimeText = 'Regime: 震荡市 (默认)'; }
         }
 
-        // 成绩单 (样本不足返空)
-        let trackText = '';
+        // 盘中验证闭环学习文本 (校准偏差 + 成绩单)
+        let learningText = '';
         try {
-          if (window.ShortTrader && ShortTrader._formatTrackRecord) {
-            const rec = await ShortTrader._buildTrackRecord();
-            if (rec) trackText = await ShortTrader._formatTrackRecord(rec);
-          }
+          learningText = await this._buildIntradayLearningPrompt();
+        } catch (e) { /* */ }
+        // P3 全系统学习池
+        let poolText = '';
+        try {
+          const pt = await Core.LearningPool.format();
+          if (pt) poolText = '\n\n【全系统学习池】' + pt;
+        } catch (e) { /* 学习池可选 */ }
+        // 短线教训借镜
+        let shortLessons = '';
+        try {
+          shortLessons = await this._borrowShortTraderLessons();
         } catch (e) { /* */ }
 
-        const systemPrompt = this._buildSystemPrompt();
+        // P0-3: 显式市场状态前缀
+        const regimePrefix = regimeText ? '【当前市场状态】' + regimeText.replace('Regime:', '').trim() + '\n\n' : '';
+        // P0-4: 市场宽度信号
+        let widthText = '';
+        try {
+          if (Core.MarketWidth && Core.MarketWidth.get) {
+            const mw = await Core.MarketWidth.get();
+            if (mw && mw.status !== 'unknown') {
+              widthText = '【市场宽度】上涨: ' + mw.advance + ' 下跌: ' + mw.decline + ' | 涨跌比 ' + (mw.advancePct != null ? (mw.advancePct * 100).toFixed(0) + '%' : 'N/A') + '\n';
+              // 极端宽度 → 强制 hold
+              if (mw.advancePct != null) {
+                if (mw.advancePct < 0.15) widthText += '⚠ 上涨不足 15%, 极端弱势, 不做任何买入动作\n';
+                if (mw.advancePct > 0.85) widthText += '⚠ 上涨超过 85%, 极端强势, 不追高\n';
+              }
+            }
+          }
+        } catch (e) { /* 市场宽度可选 */ }
+
+        const systemPrompt = this._buildSystemPrompt(learningText + poolText);
+        const finalSystemPrompt = regimePrefix + systemPrompt;
         const userPrompt = `【持仓: ${p.code} ${p.name || ''}】
 成本价: ${cost} | 现价: ${currentPrice} | 浮盈: ${(plPct * 100).toFixed(2)}%
 止损价: ${stop} | 目标价: ${target}
 股数: ${p.shares}
 今天涨跌: ${quote['涨跌幅'] ?? quote.changePct ?? '?'}%
 换手率: ${quote['换手率'] ?? '?'}%
+${shortLessons ? `\n【短线操盘手最近教训】\n${shortLessons}` : ''}
 
 【近 5 日 K】
 ${klineText}
@@ -215,12 +249,11 @@ ${klineText}
 【市场状态】
 ${regimeText}
 
-【你的历史成绩单 (短线)】
-${trackText || '(样本不足, 不显示)'}
+${widthText || '【市场宽度】数据不可用\n'}
 
 【请决策】`;
         const raw = await Core.AI.callWithTimeout({
-          systemPrompt,
+          systemPrompt: finalSystemPrompt,
           prompt: userPrompt,
           local: true,                  // 显式本地优先
           temperature: 0.3,             // 决策类用低温
@@ -233,11 +266,13 @@ ${trackText || '(样本不足, 不显示)'}
         // 解析 JSON: Core.AI.parseJsonOutput 返 { ok, obj, errors, raw }
         const parsed = await Core.AI.parseJsonOutput(raw, 'intraday');
         if (!parsed || !parsed.ok || !parsed.obj) return null;
+        const probability = parseFloat(parsed.obj.probability);
         return {
           action: String(parsed.obj.action || 'hold').toLowerCase(),
           shares: parseFloat(parsed.obj.shares) || 0,
           reason: String(parsed.obj.reason || '').slice(0, 200),
-          confidence: String(parsed.obj.confidence || 'low')
+          confidence: String(parsed.obj.confidence || 'low'),
+          probability: (probability >= 0 && probability <= 100) ? probability : null
         };
       } catch (e) {
         console.warn('[IntradayTrader] LLM 决策失败:', e);
@@ -245,20 +280,8 @@ ${trackText || '(样本不足, 不显示)'}
       }
     },
 
-    _buildSystemPrompt() {
-      // TODO H1 凯利 接入: 当前 LLM schema 只返 confidence (low/mid/high 类别),
-      // 没有 numeric probability 也没有 triggerPrice/stopLoss/targetPrice —
-      // 凯利公式 (Core.PositionSizing._kellyFraction) 需要 4 个数值字段。
-      // 等以后 schema 扩展 (LLM 报 probability 0-100 + 3 件套价格), 在这里
-      // 拼一段 schema 描述, 在 _aiDecide 出口前调 _kellyFraction 重算
-      // 决策仓位 (shares 或 trim% 而非 shares 数)。
-      //
-      // TODO H2 校准 接入: 当前 intraday-trader 没有出 (predict → actual) 机械
-      // 验证数据 (不像 short-trader T4 学习环有完整闭环), 校准注入会误导 LLM。
-      // 等以后 settleIntraday(hold-trader 走 paper_cond_orders 验证) 落实后,
-      // 在这里拼 _calibrationBuckets → Core.Calibration._formatCalibrationPrompt
-      // 段, 复用 short-trader 的 _buildLearningPromptText 模式。
-      return `你是短线操盘手, 正在做"盘中实时盯盘"决策。
+    _buildSystemPrompt(learningText = '') {
+      let prompt = `你是短线操盘手, 正在做"盘中实时盯盘"决策。
 
 【职责】
 - 对**已持仓**的股票, 决定该不该: 加仓(add) / 减仓(trim) / 平仓(close) / 持有观望(hold)
@@ -270,13 +293,15 @@ ${trackText || '(样本不足, 不显示)'}
 - 近 5 日 K 线
 - 市场状态 (Regime)
 - 你的历史成绩单 (基于机械 verify)
+- 概率校准偏差 (system 自动注入, 帮助你把自评 probability 对准实际命中率)
 
 【输出】严格 JSON, 字段:
 {
   "action": "hold" | "trim" | "add" | "close",
   "shares": 100,           // trim/add 时填具体股数, hold/close 时可省
   "reason": "一句话理由",   // ≤ 50 字
-  "confidence": "low"|"mid"|"high"
+  "confidence": "low"|"mid"|"high",
+  "probability": 65        // 你的胜率自评 (0-100), 必填; 系统用此校准反馈, close/add 必须填
 }
 
 【约束】
@@ -284,18 +309,23 @@ ${trackText || '(样本不足, 不显示)'}
 - 加仓/减仓股数必须是 100 的倍数
 - 同一只持仓 10 分钟内只能决策 1 次, 1 天最多 4 次
 - trim/add 占比建议: 单次不超过当前持仓 ±30%
+- probability 必填, 不自评视为无效输出
 
 【不要】
 - 不要预测大盘走势 (那是 Regime 的事)
 - 不要给目标价/止损价建议 (那是开仓时定的)
 - 不要在浮亏 < 2% 时主动 close (给交易一点空间)`;
+      if (learningText) {
+        prompt += '\n\n' + learningText;
+      }
+      return prompt;
     },
 
     /**
      * 调仓落地: 写日志 + 更新冷却 + 调 Paper.buy/sell (纪律引擎自动卡)
      * shares 正数=加仓, 负数=减仓, close=全平
      */
-    async _executeAction(p, action, { price, shares, reason, source, confidence, cooldownMap, today }) {
+    async _executeAction(p, action, { price, shares, reason, source, confidence, probability, cooldownMap, today }) {
       let result = null;
       try {
         if (action === 'close') {
@@ -339,6 +369,7 @@ ${trackText || '(样本不足, 不显示)'}
         reason: String(reason || '').slice(0, 200),
         source: source || 'unknown',
         confidence: confidence || null,
+        probability: probability != null ? probability : null,
         ok: !!(result && result.id)
       };
       await this._appendLog(logEntry);
@@ -444,8 +475,217 @@ ${trackText || '(样本不足, 不显示)'}
           action,
           shares: parseFloat(obj.shares) || 0,
           reason: String(obj.reason || '').slice(0, 200),
-          confidence: String(obj.confidence || 'low')
+          confidence: String(obj.confidence || 'low'),
+          probability: (() => { const p = parseFloat(obj.probability); return (p >= 0 && p <= 100) ? p : null; })()
         };
+      } catch (e) { return null; }
+    },
+
+    // ============== 机械验证闭环 (P0) ==============
+    // 复用 ShortTrader T4 模式: 平仓后拉 K 线 → 纯函数判定 → 校准分桶 → 注入下次 prompt
+
+    /**
+     * 验证已平仓决策 (close / trim), 拉后续 K 线机械判定
+     * 在 startup / 手工触发时跑, 异步不阻塞
+     * @returns {Promise<{scanned: number, verified: number, skipped: number}>}
+     */
+    async verifyIntradayDecisions(opts = {}) {
+      const fetcher = opts.fetcher || (Core.Data && Core.Data.getStockKLine);
+      if (typeof fetcher !== 'function') {
+        console.warn('[IntradayTrader] verifyIntradayDecisions 缺 fetcher, 跳过');
+        return { scanned: 0, verified: 0, skipped: 0 };
+      }
+      const now = opts.now || new Date();
+      const todayStr = (d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`)(now);
+      const lookbackDays = opts.lookbackDays || 30;
+      const cutoffTs = now.getTime() - lookbackDays * 24 * 3600 * 1000;
+      const delayBars = Core.Constants.INTRADAY_VERIFY_DELAY_BARS;
+      const lookaheadBars = Core.Constants.INTRADAY_VERIFY_LOOKAHEAD_BARS;
+      let scanned = 0, verified = 0, skipped = 0;
+      try {
+        const log = (await Core.Storage.kvGet(LOG_KEY)) || [];
+        // 筛选: 距今天 ≥ delayBars 日 + 未验证 + 有 probability 的 close/trim
+        const targets = log.filter(e => {
+          if (!e || !e.code) return false;
+          if (e.date >= todayStr) return false;
+          if (e.ts < cutoffTs) return false;
+          if (!e.probability || e.probability == null) return false;
+          if (e.verified) return false;
+          return e.action === 'close' || e.action === 'trim';
+        });
+
+        for (const e of targets) {
+          scanned++;
+          try {
+            const kline = await fetcher(e.code, 'daily', undefined, undefined, '');
+            if (!Array.isArray(kline) || kline.length < delayBars + 1) { skipped++; continue; }
+            const dates = kline.map(b => String(b.日期 || b.date || '').slice(0, 10));
+            const closePrices = kline.map(b => parseFloat(b.收盘 || b.close)).filter(c => c > 0);
+            if (closePrices.length < delayBars + 1) { skipped++; continue; }
+            const decIdx = dates.findIndex(d => d > e.date);
+            if (decIdx < 0 || decIdx >= closePrices.length - delayBars) { skipped++; continue; }
+            const startIdx = decIdx + delayBars;
+            const windowCloses = closePrices.slice(startIdx, startIdx + lookaheadBars);
+            if (windowCloses.length < 1) { skipped++; continue; }
+            const windowHighs = kline.slice(startIdx, startIdx + lookaheadBars)
+              .map(b => parseFloat(b.最高 || b.high)).filter(h => h > 0);
+            const windowLows = kline.slice(startIdx, startIdx + lookaheadBars)
+              .map(b => parseFloat(b.最低 || b.low)).filter(l => l > 0);
+
+            const decisionPrice = parseFloat(e.price) || 0;
+            if (!(decisionPrice > 0)) { skipped++; continue; }
+            const exitPrice = decisionPrice;
+
+            const outcome = this._judgeIntradayDecision({
+              action: e.action,
+              exitPrice,
+              windowCloses,
+              windowHighs,
+              windowLows
+            });
+            if (!outcome) { skipped++; continue; }
+
+            await this._patchLogOutcome(e.ts, e.code, {
+              verified: true,
+              verifyOutcome: outcome.outcome,
+              verifyReason: outcome.reason
+            });
+            verified++;
+          } catch (err) {
+            console.warn(`[IntradayTrader] verify ${e.code} ${e.date} 失败:`, err.message || err);
+            skipped++;
+          }
+        }
+        return { scanned, verified, skipped };
+      } catch (err) {
+        console.warn('[IntradayTrader] verifyIntradayDecisions 总流程失败:', err);
+        return { scanned, verified, skipped };
+      }
+    },
+
+    /**
+     * 判定单条盘中决策是否正确 (纯函数, 决策表)
+     * close/trim = 出场动作, 判断"是否卖对了"
+     * @returns {{outcome: 'correct'|'wrong'|'partial', reason: string}|null}
+     */
+    _judgeIntradayDecision({ action, exitPrice, windowCloses, windowHighs, windowLows }) {
+      if (!exitPrice || exitPrice <= 0 || !Array.isArray(windowCloses) || windowCloses.length < 1) return null;
+      if (!['close', 'trim'].includes(action)) return null;
+      const lastClose = windowCloses[windowCloses.length - 1];
+      const maxHigh = windowHighs.length ? Math.max(...windowHighs) : lastClose;
+      const minLow = windowLows.length ? Math.min(...windowLows) : lastClose;
+      const finalChg = (lastClose - exitPrice) / exitPrice;
+      const maxDown = (minLow - exitPrice) / exitPrice;
+      const maxUp = (maxHigh - exitPrice) / exitPrice;
+
+      // 出场 = 卖出, correct=卖后继续跌, wrong=卖后大幅反弹
+      if (finalChg <= -0.05) return { outcome: 'correct', reason: '卖得对: 出场后继续跌超 5%' };
+      if (maxDown <= -0.08) return { outcome: 'correct', reason: '卖得对: 出场后最低跌超 8%' };
+      if (maxUp >= 0.08)   return { outcome: 'wrong', reason: '卖早了: 出场后反弹超 8%' };
+      if (finalChg >= 0.05) return { outcome: 'wrong', reason: '卖错了: 出场后续涨超 5%' };
+      if (finalChg >= 0.02) return { outcome: 'partial', reason: '部分错: 出场后小幅涨 2-5%' };
+      if (finalChg >= -0.02)return { outcome: 'partial', reason: '基本平: 出场后横盘 ±2%' };
+      return { outcome: 'correct', reason: '卖得对: 出场后下跌' };
+    },
+
+    /** 写回验证结果到日志条目 */
+    async _patchLogOutcome(ts, code, patch) {
+      try {
+        const list = (await Core.Storage.kvGet(LOG_KEY)) || [];
+        let changed = false;
+        for (const e of list) {
+          if (e.ts === ts && e.code === code && !e.verified) {
+            Object.assign(e, patch);
+            changed = true;
+            break;
+          }
+        }
+        if (changed) await Core.Storage.kvSet(LOG_KEY, list);
+      } catch (err) {
+        console.warn('[IntradayTrader] patchLogOutcome 失败:', err);
+      }
+    },
+
+    /**
+     * 概率校准分桶 (复用 ShortTrader T4 算法)
+     */
+    _calibrationBuckets(log) {
+      const edges = Core.Constants.CALIBRATION_BUCKET_EDGES;
+      const rows = (Array.isArray(log) ? log : []).filter(e => e && e.verified && e.probability != null && e.verifyOutcome);
+      const buckets = [];
+      for (let i = 0; i < edges.length - 1; i++) {
+        const lo = edges[i];
+        const hi = edges[i + 1];
+        const bucket = rows.filter(e => e.probability >= lo && e.probability < hi);
+        const n = bucket.length;
+        const correct = bucket.filter(e => e.verifyOutcome === 'correct').length;
+        const partial = bucket.filter(e => e.verifyOutcome === 'partial').length;
+        const predMean = n ? bucket.reduce((s, e) => s + e.probability, 0) / n : 0;
+        const hitRate = n ? (correct + partial * 0.5) / n : 0;
+        buckets.push({ range: `${lo}-${hi-1}%`, lo, hi, n, correct, partial, predMean: +predMean.toFixed(1), hitRate: +hitRate.toFixed(2) });
+      }
+      const total = rows.length;
+      const totalCorrect = rows.filter(e => e.verifyOutcome === 'correct').length;
+      const totalPartial = rows.filter(e => e.verifyOutcome === 'partial').length;
+      const hitRate = total ? (totalCorrect + totalPartial * 0.5) / total : 0;
+      return { hitRate: +hitRate.toFixed(2), total, buckets };
+    },
+
+    /**
+     * Brier score (概率校准质量)
+     */
+    _brierScore(log) {
+      const rows = (Array.isArray(log) ? log : []).filter(e => e && e.verified && e.probability != null && e.verifyOutcome);
+      if (!rows.length) return null;
+      const scoreOf = (o) => o === 'correct' ? 1 : (o === 'partial' ? 0.5 : 0);
+      const sum = rows.reduce((s, e) => {
+        const diff = e.probability / 100 - scoreOf(e.verifyOutcome);
+        return s + diff * diff;
+      }, 0);
+      return +(sum / rows.length).toFixed(4);
+    },
+
+    /**
+     * 构建学习 prompt 注入文本 (校准偏差 + 成绩单)
+     */
+    async _buildIntradayLearningPrompt() {
+      try {
+        const log = (await Core.Storage.kvGet(LOG_KEY)) || [];
+        const minSamples = Core.Constants.INTRADAY_VERIFY_MIN_SAMPLES;
+        const verified = log.filter(e => e && e.verified && e.verifyOutcome);
+        if (verified.length < minSamples) return null;
+        const cb = this._calibrationBuckets(log);
+        const brier = this._brierScore(log);
+        let text = '';
+        if (Core.Calibration && Core.Calibration._formatCalibrationPrompt) {
+          const calBlock = Core.Calibration._formatCalibrationPrompt(cb.buckets, minSamples);
+          if (calBlock) text += '\n【你的概率校准偏差 (盘中决策)】\n' + calBlock;
+        }
+        text += `\n【你的盘中决策成绩单】\n`
+          + `总验证: ${cb.total} 笔 | 综合命中率: ${(cb.hitRate * 100).toFixed(0)}%`
+          + (brier != null ? ` | Brier: ${brier}` : '');
+        for (const b of cb.buckets) {
+          if (b.n === 0) continue;
+          const bias = b.predMean - b.hitRate * 100;
+          const tag = Math.abs(bias) >= 10 ? (bias > 0 ? ' ⚠ 系统性高估' : ' ⚠ 系统性低估') : '';
+          text += `\n  ${b.range}: ${b.n}笔 命中${b.hitRate} 均自评${b.predMean}%${tag}`;
+        }
+        return text;
+      } catch (e) {
+        console.warn('[IntradayTrader] buildIntradayLearningPrompt 失败:', e);
+        return null;
+      }
+    },
+
+    /**
+     * 从 ShortTrader 学习环借教训 (跨模块)
+     */
+    async _borrowShortTraderLessons() {
+      try {
+        if (!window.ShortTrader || typeof ShortTrader._distillLessons !== 'function') return null;
+        const lessons = await Core.Storage.kvGet('short_trader_lessons');
+        if (!lessons || !Array.isArray(lessons.items) || lessons.items.length === 0) return null;
+        return lessons.items.slice(0, 3).map(l => l.text || '').filter(Boolean).join('；');
       } catch (e) { return null; }
     }
   };

@@ -215,6 +215,17 @@ function hideRegimeAlertBanner() {
     if (window.Paper && Paper.settleCondOrders) {
       Paper.settleCondOrders().catch(e => console.warn('[App] 条件单结算失败:', e));
     }
+    // P1: Pre-mortem 事后验证 (异步, 扫描 journal 表有 falsifyCondition 且未验证的行)
+    if (window.Core && Core.Premortem && Core.Premortem.verifyPendingJournals) {
+      (async () => {
+        try {
+          const rows = (await Core.Storage.all('journals')) || [];
+          const getKline = async (code) => Core.Data.getStockKLine(code, 'daily', undefined, undefined, '');
+          const r = await Core.Premortem.verifyPendingJournals(rows, getKline, new Date());
+          if (r.verified > 0) console.log(`[App] P1 pre-mortem verify: 扫描${r.scanned} 验证${r.verified} 跳过${r.skipped}`);
+        } catch (e) { console.warn('[App] P1 pre-mortem verify 失败:', e); }
+      })();
+    }
     // Phase T2 (ShortTrader): 盘前 AI 短线交易计划 (异步, 不阻塞启动; 交易日 + 无今日记录才生成)
     if (window.ShortTrader && ShortTrader.init) ShortTrader.init();
     if (window.ShortTrader && ShortTrader.maybeGeneratePlan) {

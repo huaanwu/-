@@ -789,7 +789,22 @@
         .slice(0, VERIFY_LOOKAHEAD);
       const reason = String(exitReason || '');
       const gain = (parseFloat(pnl) || 0) > 0;
+      // P0-2: 归因细化 — 区分选股错/择时错/仓位过重
+      // 选股错: 同行业/系统性杀跌, 出场后 5 日内继续跌 >5%
+      // 择时错: 入场过早, 持有 < 2 个交易日就被止损 (说明入场时机不对)
+      // 仓位过重: pnl 绝对值大但跌幅不大 (单一持仓拖累整体 > 5%)
+      // 其余归因沿袭旧逻辑: 追高/假设错误/时机过早/过度分析/其他
       if (reason.includes('止损')) {
+        // 持有期短 (<2 交易日) → 择时错
+        const barsHeld = exitDate && bars ? bars.filter(b => b.date && b.date <= exitDate).length : 0;
+        if (barsHeld < 3) {
+          return { outcome: 'wrong', reason: '择时错', note: '入场不到 2 个交易日即止损, 择时过早' };
+        }
+        // 止损后继续跌 >5% → 选股错 (系统性杀跌)
+        const maxDown = after.reduce((m, b) => Math.min(m, b.close), Infinity);
+        if (maxDown < exitPrice * 0.95) {
+          return { outcome: 'correct', reason: null, note: '止损后继续跌超 5%, 止损正确, 归因选股错' };
+        }
         const idx = after.findIndex(b => b.close >= entryPrice);
         if (idx >= 0) {
           return { outcome: 'wrong', reason: '时机过早', note: `止损后 ${idx + 1} 日收复入场价, 属时机过早` };
@@ -806,9 +821,16 @@
       }
       if (reason.includes('强平')) {
         if (gain) return { outcome: 'correct', reason: null, note: '到期强平仍盈利, 方向正确' };
-        return { outcome: 'partial', reason: '时机过早', note: '到期强平亏损, 入场时机偏早' };
+        return { outcome: 'partial', reason: '择时错', note: '到期强平亏损, 入场时机偏早' };
       }
       if (gain) return { outcome: 'correct', reason: null, note: '平仓盈利' };
+      // 亏损: bars 非空 + 持有 < 3 天 → 择时错; bars 空(无数据)→ 假设错误兜底
+      // 用 Array.isArray + .length > 0 避免 && 链里 0 被误判 truthy 的歧义
+      const hasBars = Array.isArray(bars) && bars.length > 0;
+      const barsHeld = (hasBars && exitDate) ? bars.filter(b => b.date && b.date <= exitDate).length : 0;
+      if (hasBars && barsHeld < 3) {
+        return { outcome: 'wrong', reason: '择时错', note: '持有不足 2 个交易日即亏损出场, 择时过早' };
+      }
       return { outcome: 'wrong', reason: '假设错误', note: '平仓亏损, 假设不成立' };
     },
 
@@ -1163,6 +1185,11 @@
             if (regimeBlock) parts.push('', regimeBlock);
           }
         } catch (e) { console.warn('[ShortTrader] regime 块渲染失败:', e); }
+        // P3 全系统学习池
+        try {
+          const poolText = await Core.LearningPool.format();
+          if (poolText) parts.push('', poolText);
+        } catch (e) { console.warn('[ShortTrader] 学习池渲染失败:', e); }
         let lessons = null;
         try { lessons = await Core.Storage.kvGet(SHORT_LESSONS_KEY); }
         catch (e) { console.warn('[ShortTrader] 读 lessons 失败:', e); }
@@ -1214,23 +1241,69 @@
       const today = this._todayStr(now);
       const ctx = await this._buildPlanContext(now);
       const systemPrompt = this._buildSystemPrompt();
-      // T4: 既有上下文后追加成绩单 + 我的教训 (样本不足/读取失败自动为空串, 不影响主流程)
+      // P0-3: 显式市场状态前缀
+      const regimeLine = '【当前市场状态】' + ctx.regime.label + ' (' + ctx.regime.state + ') — 仓位系数 ×' + ctx.regime.positionScale + '\n\n';
+      const finalSystemPrompt = regimeLine + systemPrompt;
+      // T4: 既有上下文后追加成绩单 + 我的教训
       const learningText = await this._buildLearningPromptText();
       const prompt = this._buildUserPrompt({ ...ctx, today }) + learningText;
       const callLLM = (opts.deps && opts.deps.callLLM)
         || (async ({ systemPrompt: sp, prompt: pr }) => Core.AI.callWithTimeout({ systemPrompt: sp, prompt: pr, timeout: LLM_TIMEOUT_MS }));
-      const text = await callLLM({ systemPrompt, prompt });
 
-      // (a) JSON schema 校验 (Phase T 模式: parseJsonOutput + required/types/arrayItemTypes)
-      const parsed = Core.AI.parseJsonOutput(text, {
-        required: ['marketView', 'plans'],
-        types: { marketView: 'string', plans: 'array' },
-        arrayItemTypes: { plans: 'object' }
-      });
-      if (!parsed.ok) throw new Error('AI 输出未通过 JSON schema 校验: ' + parsed.errors.join('; '));
+      // P0-1: self-consistency — 3 路并行, plan 级众数聚合
+      const CONSENSUS_N = 3;
+      const CONSENSUS_THRESHOLD = 0.6;  // ≥2/3
+      const tasks = [];
+      for (let i = 0; i < CONSENSUS_N; i++) {
+        tasks.push(callLLM({ systemPrompt: finalSystemPrompt, prompt }).then(raw => {
+          const p = Core.AI.parseJsonOutput(raw, {
+            required: ['marketView', 'plans'],
+            types: { marketView: 'string', plans: 'array' },
+            arrayItemTypes: { plans: 'object' }
+          });
+          return p.ok ? p.obj : null;
+        }).catch(() => null));
+      }
+      const results = (await Promise.allSettled(tasks)).map(s => s.status === 'fulfilled' ? s.value : null);
+      const valid = results.filter(r => r && Array.isArray(r.plans));
+      if (valid.length === 0) throw new Error('AI 输出 3 路全失败');
 
-      // (b)-(e) 校验管线 (纯函数)
-      const { passed, dropped } = this._validatePlans(parsed.obj.plans, {
+      // 取 marketView (取最长最完整的那路)
+      const marketView = valid.map(r => r.marketView || '').sort((a, b) => b.length - a.length)[0] || '';
+
+      // plan 级众数: 同代码+同方向投一票
+      const voteKey = p => p.code + '|' + (p.triggerDirection || '') + '|' + (Math.round(p.triggerPrice || 0));
+      const votes = {};
+      for (const r of valid) {
+        const seen = new Set();
+        for (const p of r.plans) {
+          const k = voteKey(p);
+          if (seen.has(k)) continue;  // 同一路内的重复不重复计票
+          seen.add(k);
+          if (!votes[k]) votes[k] = { count: 0, plan: p, from: [] };
+          votes[k].count++;
+          votes[k].from.push(r);
+        }
+      }
+      const maxCount = Math.max(...Object.values(votes).map(v => v.count), 0);
+      const consensusRate = valid.length > 0 ? maxCount / valid.length : 0;
+      const lowConsensus = consensusRate < CONSENSUS_THRESHOLD;
+
+      // 取≥2 票 + consensus 标记
+      const consensusPlans = Object.values(votes)
+        .filter(v => v.count >= 2)
+        .map(v => ({ ...v.plan, consensus: v.count + '/' + valid.length }));
+
+      // 0 票众数=> 取票数最高的做 fallback (但标 lowConsensus)
+      let passedPlans = consensusPlans;
+      if (passedPlans.length === 0) {
+        // fallback: 票数最高的那路全部 plans
+        const best = valid.sort((a, b) => b.plans.length - a.plans.length)[0];
+        passedPlans = (best.plans || []).map(p => ({ ...p, consensus: '1/' + valid.length, lowConsensus: true }));
+      }
+
+      // (b)-(e) 校验管线
+      const { passed, dropped } = this._validatePlans(passedPlans, {
         pool: new Set(ctx.pool.map(x => x.code)),
         cash: ctx.cash,
         quotaLeft: Math.max(0, SHORT_RULES.maxDailyTrades - ctx.todayCondCount),
@@ -1240,7 +1313,7 @@
         roundLot: (s) => Paper._roundLot(s)
       });
 
-      // 落地: 通过的 plans 逐条自动转条件单 (addCondOrder 内部二次校验价格/现金)
+      // 落地: 通过的 plans 逐条自动转条件单
       const plans = [];
       for (const p of passed) {
         const r = await Paper.addCondOrder({
@@ -1268,13 +1341,25 @@
 
       const plan = {
         date: today,
-        marketView: String(parsed.obj.marketView || ''),
+        marketView,
         plans,
         dropped,
-        generatedAt: Date.now()
+        generatedAt: Date.now(),
+        // P0-1: 元数据
+        selfConsistency: {
+          nRuns: CONSENSUS_N,
+          validRuns: valid.length,
+          consensusRate: +consensusRate.toFixed(2),
+          lowConsensus,
+          candidateCount: Object.keys(votes).length,
+          consensusCount: consensusPlans.length
+        }
       };
+      if (lowConsensus) {
+        console.log('[ShortTrader] ⚠ self-consistency 低共识率:', consensusRate, '仅', consensusPlans.length, '条一致');
+      }
       await Core.Storage.kvSet(PLAN_KEY, plan);
-      // 每条丢弃写 paper_plan_log (上限 SHORT_PLAN_LOG_LIMIT)
+      // 每条丢弃写 paper_plan_log
       if (dropped.length) {
         let log = [];
         try { log = (await Core.Storage.kvGet(PLAN_LOG_KEY)) || []; }

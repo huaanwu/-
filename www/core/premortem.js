@@ -117,6 +117,197 @@
       `</div>`;
   }
 
+  // ============== P1: Pre-mortem 事后验证 ==============
+
+  /**
+   * 用 K 线数据机械验证 falsifyCondition (纯函数)
+   * 支持模式:
+   *   "跌破 X 元" → 观察窗内最低价 ≤ X
+   *   "跌超 X%"  → 从入场到观察窗结束浮亏 ≥ X%
+   *   其他文本 → 用实际 PnL 兜底 (正→correct, 负→wrong)
+   *
+   * @param {string} falsifyCondition LLM 填的证伪条件文本
+   * @param {number} entryPrice 入场价
+   * @param {Array<{low:number,high:number,close:number}>} windowKlines 观察窗 K 线 (至少含入场后 1 根)
+   * @returns {{ triggered: boolean, confidence: 'high'|'low', detail: string }}
+   *   triggered=true → 证伪条件触发 (判断错误); false → 条件未触发 (判断正确或待观察)
+   *   confidence=high → 精确匹配; low → PnL 兜底
+   */
+  function verifyFalsifyCondition(falsifyCondition, entryPrice, windowKlines) {
+    if (!falsifyCondition || !entryPrice || !Array.isArray(windowKlines) || windowKlines.length < 1) {
+      return { triggered: false, confidence: 'low', detail: '数据不足, 跳过验证' };
+    }
+    const text = String(falsifyCondition).trim();
+    // 1) 精确模式: "跌破 X 元" (含 X 的数值)
+    const priceMatch = text.match(/(?:跌破|低于|下破|击穿)\s*(\d+\.?\d*)/);
+    if (priceMatch) {
+      const threshold = parseFloat(priceMatch[1]);
+      const lows = windowKlines.map(k => k.low).filter(l => l > 0);
+      if (lows.length && threshold > 0) {
+        const minLow = Math.min(...lows);
+        if (minLow <= threshold) {
+          return { triggered: true, confidence: 'high', detail: `精准: 最低 ${minLow} ≤ 阈值 ${threshold} (${priceMatch[1]})` };
+        }
+        return { triggered: false, confidence: 'high', detail: `精准: 最低 ${minLow} > 阈值 ${threshold}, 条件未触发` };
+      }
+    }
+    // 2) 百分比模式: "跌超 X%"
+    const pctMatch = text.match(/(?:跌|回撤|下跌)[超幅约]?\s*(\d+\.?\d*)\s*%/);
+    if (pctMatch) {
+      const thrPct = parseFloat(pctMatch[1]) / 100;
+      const closes = windowKlines.map(k => k.close).filter(c => c > 0);
+      if (closes.length) {
+        const maxDrawdown = Math.min(...closes);
+        const ddPct = (maxDrawdown - entryPrice) / entryPrice;
+        if (ddPct <= -thrPct) {
+          return { triggered: true, confidence: 'high', detail: `精准: 最大回撤 ${(ddPct*100).toFixed(1)}% ≤ -${(thrPct*100).toFixed(0)}%, 条件触发` };
+        }
+        return { triggered: false, confidence: 'high', detail: `精准: 最大回撤 ${(ddPct*100).toFixed(1)}% > -${(thrPct*100).toFixed(0)}%, 条件未触发` };
+      }
+    }
+    // 3) 含"放量"关键词 → 验证成交量 (需有 volume 数据)
+    //    暂朴素: 有量增就算触发 (P1 不做复杂量比, 后续可细化)
+    if (text.includes('放量') || text.includes('量增')) {
+      const vols = windowKlines.map(k => k.volume).filter(v => v > 0);
+      if (vols.length >= 2) {
+        const halfIdx = Math.floor(vols.length / 2);
+        const avgFirst = vols.slice(0, halfIdx).reduce((s, v) => s + v, 0) / halfIdx;
+        const avgLast = vols.slice(halfIdx).reduce((s, v) => s + v, 0) / (vols.length - halfIdx);
+        if (avgLast > avgFirst * 1.3) {
+          return { triggered: true, confidence: 'high', detail: `量增: 后半段均量 ${avgLast.toFixed(0)} vs 前半 ${avgFirst.toFixed(0)}, 放量 30%+` };
+        }
+        return { triggered: false, confidence: 'high', detail: `量未增: 后半段均量 ${avgLast.toFixed(0)} ≤ 前半 ${avgFirst.toFixed(0)}, 量未放大` };
+      }
+    }
+    // 4) 兜底: 用实际 PnL 做朴素判断
+    const lastClose = windowKlines[windowKlines.length - 1].close;
+    const pnlPct = (lastClose - entryPrice) / entryPrice;
+    if (pnlPct <= -0.05) {
+      return { triggered: true, confidence: 'low', detail: `PnL 兜底: 浮亏 ${(pnlPct*100).toFixed(1)}%, 证伪可能成立` };
+    }
+    return { triggered: false, confidence: 'low', detail: `PnL 兜底: 浮盈 ${(pnlPct*100).toFixed(1)}%, 证伪未触发` };
+  }
+
+  /**
+   * 解析 invalidation 失效条件的剩余天数 (纯函数)
+   * 支持: "N 天","N 周","N 个交易日"
+   * @param {string} invalidation
+   * @param {number} elapsedDays 从建仓起已过自然日
+   * @returns {{ expired: boolean, detail: string }}
+   */
+  function verifyInvalidation(invalidation, elapsedDays) {
+    if (!invalidation) return { expired: false, detail: '无失效条件' };
+    const text = String(invalidation).trim();
+    const dayMatch = text.match(/(\d+)\s*[天日个]/);
+    const weekMatch = text.match(/(\d+)\s*[周个]/);
+    const tradeDayMatch = text.match(/(\d+)\s*个?交易/);
+    let limitDays = null;
+    let unit = '';
+    if (tradeDayMatch) { limitDays = parseInt(tradeDayMatch[1]); unit = '交易日'; }
+    else if (weekMatch) { limitDays = parseInt(weekMatch[1]) * 7; unit = '周'; }
+    else if (dayMatch) { limitDays = parseInt(dayMatch[1]); unit = '天'; }
+    if (limitDays !== null) {
+      return {
+        expired: elapsedDays >= limitDays,
+        detail: `${limitDays}${unit}限制 ${elapsedDays}${unit}已过, ${elapsedDays >= limitDays ? '已过期' : '未过期'}`
+      };
+    }
+    return { expired: false, detail: `不可解析: "${text.slice(0, 30)}", 跳过` };
+  }
+
+  /**
+   * 事后验证单个 pick (纯函数)
+   * 综合 falsifyCondition + invalidation, 对 K 线数据做机械判断
+   *
+   * @param {object} pick - { code, falsifyCondition, invalidation }
+   * @param {object} ctx - { entryPrice, windowKlines, elapsedDays }
+   *   windowKlines: [{ date, open, close, high, low, volume }] (含入场后 K 线)
+   * @returns {{ premortemOutcome: 'correct'|'wrong'|'partial'|null,
+   *             premortemReason: string,
+   *             falsifyResult: object|null,
+   *             invalidationResult: object|null }}
+   */
+  function verifyPick(pick, ctx) {
+    if (!pick || !ctx || !ctx.entryPrice || !Array.isArray(ctx.windowKlines) || ctx.windowKlines.length < 1) {
+      return { premortemOutcome: null, premortemReason: '数据不足', falsifyResult: null, invalidationResult: null };
+    }
+    const falsifyResult = verifyFalsifyCondition(pick.falsifyCondition, ctx.entryPrice, ctx.windowKlines);
+    const invResult = verifyInvalidation(pick.invalidation, ctx.elapsedDays || 0);
+
+    // 综合判定:
+    //   falsify triggered + (expired 或 high confidence) → wrong (预测被证伪)
+    //   expired + falsify NOT triggered → partial (超期未兑现)
+    //   NOT triggered + NOT expired → correct (条件未触发, 判断有效)
+    const falsifyTriggered = falsifyResult.triggered;
+    const expired = invResult.expired;
+    const falsifyHighConf = falsifyResult.confidence === 'high';
+
+    if (falsifyTriggered && (expired || falsifyHighConf)) {
+      return { premortemOutcome: 'wrong', premortemReason: `证伪触发: ${falsifyResult.detail}`, falsifyResult, invalidationResult: invResult };
+    }
+    if (expired) {
+      return { premortemOutcome: 'partial', premortemReason: `超期未兑现: ${invResult.detail}`, falsifyResult, invalidationResult: invResult };
+    }
+    if (falsifyTriggered) {
+      return { premortemOutcome: 'partial', premortemReason: `证伪可能触发(低置信): ${falsifyResult.detail}`, falsifyResult, invalidationResult: invResult };
+    }
+    return { premortemOutcome: 'correct', premortemReason: `证伪未触发: ${falsifyResult.detail}`, falsifyResult, invalidationResult: invResult };
+  }
+
+  /**
+   * 批量验证 journal 表里的 pre-mortem 行 (有 falsifyCondition 且无 premortemOutcome)
+   * @param {Array} journals - journals 表行 (已含 falsifyCondition/invalidation 字段)
+   * @param {function} getKline - async (code) => [{date, open, close, high, low, volume}]
+   * @param {Date} now
+   * @returns {Promise<{scanned:number, verified:number, skipped:number}>}
+   */
+  async function verifyPendingJournals(journals, getKline, now) {
+    if (typeof getKline !== 'function') return { scanned: 0, verified: 0, skipped: 0 };
+    const today = (d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`)(now || new Date());
+    let scanned = 0, verified = 0, skipped = 0;
+    const targets = (Array.isArray(journals) ? journals : []).filter(j =>
+      j && j.falsifyCondition && !j.premortemOutcome && j.code && j.entryDate && j.entryDate < today
+    );
+    for (const j of targets) {
+      scanned++;
+      try {
+        const bars = await getKline(j.code);
+        if (!Array.isArray(bars) || bars.length < 2) { skipped++; continue; }
+        const kline = bars.map(b => ({
+          date: String(b.日期 || b.date || '').slice(0, 10),
+          open: parseFloat(b.开盘 || b.open),
+          close: parseFloat(b.收盘 || b.close),
+          high: parseFloat(b.最高 || b.high),
+          low: parseFloat(b.最低 || b.low),
+          volume: parseFloat(b.成交量 || b.volume) || 0
+        })).filter(b => b.close > 0);
+        if (kline.length < 2) { skipped++; continue; }
+        // 找到 entryDate 后的 K 线
+        const entryIdx = kline.findIndex(k => k.date >= j.entryDate);
+        if (entryIdx < 0) { skipped++; continue; }
+        const windowKlines = kline.slice(entryIdx);
+        if (windowKlines.length < 1) { skipped++; continue; }
+        const elapsedDays = Math.round((new Date(today).getTime() - new Date(j.entryDate).getTime()) / 86400000);
+        const ctx = {
+          entryPrice: parseFloat(j.costPrice) || windowKlines[0].open,
+          windowKlines,
+          elapsedDays: Math.max(elapsedDays, 0)
+        };
+        const result = verifyPick(j, ctx);
+        if (!result.premortemOutcome) { skipped++; continue; }
+        j.premortemOutcome = result.premortemOutcome;
+        j.premortemReason = result.premortemReason;
+        j.premortemVerifiedAt = Date.now();
+        await Core.Storage.put('journals', j);
+        verified++;
+      } catch (e) {
+        console.warn(`[Premortem] verify ${j.code} ${j.entryDate} 失败:`, e.message || e);
+        skipped++;
+      }
+    }
+    return { scanned, verified, skipped };
+  }
+
   window.Core = window.Core || {};
   window.Core.Premortem = {
     FIELDS,
@@ -124,6 +315,11 @@
     PROMPT_SPEC,
     checkPick,
     checkPicks,
-    renderBlock
+    renderBlock,
+    // P1 事后验证
+    verifyFalsifyCondition,
+    verifyInvalidation,
+    verifyPick,
+    verifyPendingJournals
   };
 })();

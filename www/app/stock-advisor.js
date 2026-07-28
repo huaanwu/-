@@ -232,6 +232,20 @@
       data.context = ctx ? Core.Data.formatAiContextForPrompt(ctx) : '(市场上下文不可用)';
       data.kb = Core.KB.formatForPrompt(kbEntries);
       data.intl = await Core.Data.getIntlSnapshot().then(s => Core.Data.formatIntlForPrompt(s)).catch(e => '(国际形势不可用)');
+      // P2: Regime 状态块
+      let regimeText = '';
+      try {
+        if (Core.Regime && Core.Regime._formatRegimeBlock) {
+          regimeText = Core.Regime._formatRegimeBlock();
+        }
+      } catch (e) { /* */ }
+      if (!regimeText) {
+        try {
+          const rec = await Core.Regime.get();
+          const gate = Core.Regime.gateMultipliers();
+          regimeText = `Regime: ${rec.state} (${gate.label}, 仓位系数 ${gate.positionScale})`;
+        } catch (e) { regimeText = 'Regime: 震荡市 (默认)'; }
+      }
       // Phase D1: 近期公告上下文 (最近 5 条标题+日期; null=拉取失败 → "公告数据不可用")
       if (window.Core.News && typeof Core.News.getStockNotices === 'function') {
         const notices = await Core.News.getStockNotices(code, 5)
@@ -240,6 +254,7 @@
       } else {
         data.notices = '(公告数据不可用)';
       }
+      data.regime = regimeText;
     } catch (e) {
       console.warn('[sa] 数据拉取失败:', e);
       if (ld) ld.textContent = '❌ 数据拉取失败: ' + e.message;
@@ -285,7 +300,10 @@
       '  证伪条件: 出现什么情况说明以上判断错了 (具体可观测, 如"跌破 20 日线且放量"/"季报净利润增速 <10%")',
       '  失效条件: 建议多久没兑现就该放弃 (如"2 周内未突破 X 元")',
       '',
-      '【近期公告】数据里有 notices 字段 ("近期无公告"/"公告数据不可用" 也有可能), 风险点和证伪条件须结合公告 (如减持/增发/诉讼)'
+      '【近期公告】数据里有 notices 字段 ("近期无公告"/"公告数据不可用" 也有可能), 风险点和证伪条件须结合公告 (如减持/增发/诉讼)',
+      '',
+      '【大盘状态 (Regime)】',
+      regimeText || '震荡市 (默认)'
     ].join('\n');
 
     const prompt = `单股简评请求:\n${JSON.stringify(data, null, 2)}\n\n请按上面 4 段结构输出。`;
@@ -400,6 +418,21 @@
       data.latest = _extractFundamentals(fin);
       data.context = ctx ? Core.Data.formatAiContextForPrompt(ctx) : '(市场上下文不可用)';
       data.kb = Core.KB.formatForPrompt(kbEntries);
+      // P2: Regime 注入
+      let regimeText = '';
+      try {
+        if (Core.Regime && Core.Regime._formatRegimeBlock) {
+          regimeText = Core.Regime._formatRegimeBlock();
+        }
+      } catch (e) { /* */ }
+      if (!regimeText) {
+        try {
+          const rec = await Core.Regime.get();
+          const gate = Core.Regime.gateMultipliers();
+          regimeText = `Regime: ${rec.state} (${gate.label}, 仓位系数 ${gate.positionScale})`;
+        } catch (e) { regimeText = '震荡市 (默认)'; }
+      }
+      data.regime = regimeText;
     } catch (e) {
       console.warn('[sa] 财报数据拉取失败:', e);
       if (ld) ld.textContent = '❌ 财报数据拉取失败: ' + e.message;
@@ -445,7 +478,10 @@
       '【Phase P 多视角辩论】在 📌 财报结论 之前, 增加:',
       '  📈 多方观点 (100 字): 财报看多的依据',
       '  📉 空方观点 (100 字): 财报看空的依据',
-      '  ⚖️ 综合判断 (60 字): 权衡后倾向'
+      '  ⚖️ 综合判断 (60 字): 权衡后倾向',
+      '',
+      '【大盘状态 (Regime)】',
+      data.regime || '震荡市 (默认)'
     ].join('\n');
 
     const prompt = `财报深度读请求:\n${JSON.stringify(data, null, 2)}\n\n请按上面 5 段结构输出。`;
