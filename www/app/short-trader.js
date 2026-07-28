@@ -76,7 +76,10 @@
   const ShortTrader = {
 
     /** 无启动副作用: 生成走 maybeGeneratePlan (app.js init 异步调用, 不阻塞启动) */
-    init() {},
+    init() {
+      // P2-1+P2-2: 启动时跑一次校准漂移日报 (检查 + 漂移时推飞书, 失败吞不阻塞)
+      this.runDailyCalibrationReport().catch(e => console.warn('[ShortTrader] 启动校准日报失败:', e));
+    },
 
     // ========== 纯函数 (不依赖 DOM/IndexedDB, Node 沙箱可测) ==========
 
@@ -1034,6 +1037,126 @@
       return buckets;
     },
 
+    // ========== P1-2: LLM 性能埋点 (ai_perf_log) ==========
+
+    /** AI 性能埋点: 异步写 kv paper_ai_perf_log, 滚动 200, 失败吞 (不阻塞主流程) */
+    async _logAiPerf(entry) {
+      try {
+        if (!entry || typeof entry !== 'object') return;
+        const list = (await Core.Storage.kvGet('paper_ai_perf_log')) || [];
+        list.push({
+          ts: Date.now(),
+          scenario: String(entry.scenario || 'unknown').slice(0, 50),
+          votes: parseInt(entry.votes) || 0,
+          latencyMs: parseInt(entry.latencyMs) || 0,
+          successCount: parseInt(entry.successCount) || 0,
+          failCount: parseInt(entry.failCount) || 0
+        });
+        await Core.Storage.kvSet('paper_ai_perf_log', list.slice(-200));
+      } catch (e) {
+        console.warn('[ShortTrader] 写 ai_perf_log 失败:', e);
+      }
+    },
+
+    /** 读 ai_perf_log (测试用, 默认 200 条滚动) */
+    async _readAiPerfLog(limit) {
+      try {
+        const list = (await Core.Storage.kvGet('paper_ai_perf_log')) || [];
+        return limit ? list.slice(-limit) : list;
+      } catch (e) { return []; }
+    },
+
+    // ========== P2-1: 校准漂移检测 (Brier 7/30 日对比) ==========
+
+    /**
+     * 校准漂移检测纯函数: 对比最近 N1 天 vs 之前 N2 天的 Brier score
+     * @param {Array<{verifiedAt: number, probability: number, outcome: string}>} trades
+     * @param {{recentDays?: number, baseDays?: number, threshold?: number,
+     *          nowMs?: number}} [opts]
+     *   threshold Brier 上升超过此值视为漂移 (默认 0.05, Brier 范围 0-1)
+     * @returns {null|{drifted: boolean, recentBrier: number|null, baseBrier: number|null,
+     *                  delta: number|null, recentN: number, baseN: number,
+     *                  direction: 'up'|'down'|'flat'}}
+     */
+    _checkCalibrationDrift(trades, opts = {}) {
+      const recentDays = parseInt(opts.recentDays) || 7;
+      const baseDays = parseInt(opts.baseDays) || 7;
+      const threshold = parseFloat(opts.threshold) || 0.05;
+      const nowMs = Number.isFinite(opts.nowMs) ? opts.nowMs : Date.now();
+      const recentStart = nowMs - recentDays * 24 * 3600 * 1000;
+      const baseStart = nowMs - (recentDays + baseDays) * 24 * 3600 * 1000;
+      const list = (Array.isArray(trades) ? trades : []).filter(t =>
+        t && t.verifiedAt > 0 && isFinite(t.probability) && t.outcome);
+      if (!list.length) return null;
+      const recent = list.filter(t => t.verifiedAt >= recentStart);
+      const base = list.filter(t => t.verifiedAt >= baseStart && t.verifiedAt < recentStart);
+      const recentBrier = this._brierScore(recent);
+      const baseBrier = this._brierScore(base);
+      if (recentBrier == null || baseBrier == null) {
+        return {
+          drifted: false, recentBrier, baseBrier,
+          delta: null, recentN: recent.length, baseN: base.length,
+          direction: 'flat', reason: '样本不足'
+        };
+      }
+      const delta = +(recentBrier - baseBrier).toFixed(4);
+      const direction = Math.abs(delta) < 0.005 ? 'flat' : (delta > 0 ? 'up' : 'down');
+      return {
+        drifted: delta > threshold,
+        recentBrier, baseBrier, delta,
+        recentN: recent.length, baseN: base.length,
+        direction
+      };
+    },
+
+    /**
+     * 校准漂移报告 (业务入口): 拉已验证 trades → 调 _checkCalibrationDrift → 写 kv
+     * @param {{ nowMs?: number, minSamples?: number, threshold?: number }} [opts]
+     * @returns {Promise<{ drift: object, persisted: boolean, report: object }>}
+     */
+    async checkCalibrationDriftReport(opts = {}) {
+      const nowMs = Number.isFinite(opts.nowMs) ? opts.nowMs : Date.now();
+      const minSamples = parseInt(opts.minSamples) || 5;
+      const threshold = parseFloat(opts.threshold) || 0.05;
+      try {
+        const trades = await this._collectVerifiedTrades();
+        const pairs = trades
+          .filter(t => isFinite(t.probability) && t.outcome)
+          .map(t => ({ probability: t.probability, outcome: t.outcome, verifiedAt: t.verifiedAt || 0 }));
+        const drift = this._checkCalibrationDrift(pairs, { nowMs, threshold });
+        // 样本不足: 不持久化 (避免误导)
+        if (!drift || (drift.recentN < minSamples && drift.baseN < minSamples)) {
+          return { drift, persisted: false, report: { skipped: true, reason: '样本不足' } };
+        }
+        const report = {
+          ts: nowMs,
+          date: new Date(nowMs).toISOString().slice(0, 10),
+          recentDays: 7, baseDays: 7, threshold,
+          recentBrier: drift.recentBrier,
+          baseBrier: drift.baseBrier,
+          delta: drift.delta,
+          direction: drift.direction,
+          drifted: drift.drifted,
+          recentN: drift.recentN,
+          baseN: drift.baseN
+        };
+        await Core.Storage.kvSet('short_calibration_drift', report);
+        return { drift, persisted: true, report };
+      } catch (e) {
+        console.warn('[ShortTrader] checkCalibrationDriftReport 失败:', e);
+        return { drift: null, persisted: false, report: { error: String(e.message || e) } };
+      }
+    },
+
+    /**
+     * 读最近一次校准漂移报告 (UI 用)
+     */
+    async _readCalibrationDrift() {
+      try {
+        return (await Core.Storage.kvGet('short_calibration_drift')) || null;
+      } catch (e) { return null; }
+    },
+
     // ========== T4 学习环: 业务入口 ==========
 
     /** 已验证短线交易汇总 (journals + 仓位跟踪 + 条件单 三源关联, 各块独立降级) */
@@ -1254,6 +1377,7 @@
       const CONSENSUS_N = 3;
       const CONSENSUS_THRESHOLD = 0.6;  // ≥2/3
       const tasks = [];
+      const aiStartMs = Date.now();
       for (let i = 0; i < CONSENSUS_N; i++) {
         tasks.push(callLLM({ systemPrompt: finalSystemPrompt, prompt }).then(raw => {
           const p = Core.AI.parseJsonOutput(raw, {
@@ -1265,6 +1389,7 @@
         }).catch(() => null));
       }
       const results = (await Promise.allSettled(tasks)).map(s => s.status === 'fulfilled' ? s.value : null);
+      const aiLatencyMs = Date.now() - aiStartMs;
       const valid = results.filter(r => r && Array.isArray(r.plans));
       if (valid.length === 0) throw new Error('AI 输出 3 路全失败');
 
@@ -1359,6 +1484,14 @@
         console.log('[ShortTrader] ⚠ self-consistency 低共识率:', consensusRate, '仅', consensusPlans.length, '条一致');
       }
       await Core.Storage.kvSet(PLAN_KEY, plan);
+      // P1-2: LLM 调用耗时/成功埋点 (不阻塞, 失败吞)
+      this._logAiPerf({
+        scenario: 't2-generatePlan',
+        votes: CONSENSUS_N,
+        latencyMs: aiLatencyMs,
+        successCount: valid.length,
+        failCount: CONSENSUS_N - valid.length
+      }).catch(() => {});
       // 每条丢弃写 paper_plan_log
       if (dropped.length) {
         let log = [];
@@ -1509,6 +1642,137 @@
           '</ul>';
       }
       el.innerHTML = html;
+    },
+
+    /**
+     * P2-1: 渲染"校准健康"卡片 (挂 #shortCalibrationCard, 模拟盘短线 tab)
+     * - 读最近一次 checkCalibrationDriftReport 结果
+     * - 漂移: 红色高亮 + 解释文案
+     * - 正常: 绿色 + 显示 Brier 走势
+     * - 无报告: 提示"启动中,稍候刷新"
+     */
+    async renderCalibrationCard() {
+      const el = document.getElementById('shortCalibrationCard');
+      if (!el) return;
+      try {
+        const report = await this._readCalibrationDrift();
+        if (!report) {
+          el.style.display = '';
+          el.innerHTML = '<div style="font-weight:600;margin-bottom:6px;">📈 校准健康</div>' +
+            '<div style="font-size:12px;color:var(--text-muted);">启动中, 等待首轮 Brier 漂移检查…</div>';
+          return;
+        }
+        const esc = (s) => Core.Util.escapeHtml(String(s));
+        const drift = report.drifted;
+        const direction = report.direction || 'flat';
+        const dirText = direction === 'up' ? '↗ 上升' : (direction === 'down' ? '↘ 下降' : '→ 平稳');
+        const dirColor = drift ? 'var(--down)' : (direction === 'up' ? 'var(--text-muted)' : 'var(--up)');
+        const recentBrier = report.recentBrier != null ? report.recentBrier.toFixed(4) : '-';
+        const baseBrier = report.baseBrier != null ? report.baseBrier.toFixed(4) : '-';
+        const delta = report.delta != null ? (report.delta >= 0 ? '+' : '') + report.delta.toFixed(4) : '-';
+        const adviceText = drift
+          ? '⚠ 近期 Brier 上升超阈值, AI 概率自评可能不可靠, 建议观察几笔 + 收紧 trigger 严格度'
+          : (direction === 'up' ? 'ℹ Brier 小幅上升, 仍在容忍区间 (阈值 0.05), 继续观察'
+            : (direction === 'down' ? '✓ Brier 下降, AI 自评越来越准' : '✓ 校准稳定'));
+        el.style.display = '';
+        el.innerHTML =
+          '<div style="font-weight:600;margin-bottom:6px;">📈 校准健康</div>' +
+          '<div style="font-size:12px;color:var(--text-muted);margin-bottom:6px;">' +
+            '报告日期: ' + esc(report.date || '-') + ' | 阈值: ±' + (report.threshold || 0.05) +
+          '</div>' +
+          '<table style="width:100%;font-size:12px;border-collapse:collapse;">' +
+            '<tr style="border-bottom:1px solid var(--border-color, #333);">' +
+              '<td style="padding:4px 8px;color:var(--text-muted);">近 7 日 Brier</td>' +
+              '<td style="padding:4px 8px;text-align:right;">' + recentBrier + ' (n=' + (report.recentN || 0) + ')</td>' +
+            '</tr>' +
+            '<tr style="border-bottom:1px solid var(--border-color, #333);">' +
+              '<td style="padding:4px 8px;color:var(--text-muted);">前 7 日 Brier</td>' +
+              '<td style="padding:4px 8px;text-align:right;">' + baseBrier + ' (n=' + (report.baseN || 0) + ')</td>' +
+            '</tr>' +
+            '<tr>' +
+              '<td style="padding:4px 8px;color:var(--text-muted);">变化 / 方向</td>' +
+              '<td style="padding:4px 8px;text-align:right;color:' + dirColor + ';">' +
+                delta + ' ' + esc(dirText) +
+              '</td>' +
+            '</tr>' +
+          '</table>' +
+          '<div style="margin-top:8px;padding:6px 8px;background:' + (drift ? 'rgba(255,80,80,0.1)' : 'rgba(80,200,120,0.08)') +
+            ';border-radius:4px;font-size:12px;">' + adviceText + '</div>';
+      } catch (e) {
+        console.warn('[ShortTrader] renderCalibrationCard 失败:', e);
+        el.style.display = 'none';
+      }
+    },
+
+    // ========== P2-2: 校准漂移飞书推送 (跟 paper._pushEodToFeishu 同模式) ==========
+
+    /**
+     * 飞书推送校准漂移报告: kv feishu_webhook 已配置才 POST
+     * CORS/网络失败 console.warn 返回 false, 不影响功能
+     * 只在 drifted=true 时推送, 避免每次启动都打扰
+     */
+    async _pushCalibrationToFeishu(report) {
+      if (!report || !report.drifted) return false;
+      let webhook = null;
+      try {
+        webhook = await Core.Storage.kvGet('feishu_webhook');
+      } catch (e) {
+        console.warn('[ShortTrader] 读 feishu_webhook 失败:', e);
+      }
+      if (!webhook) return false;
+      const text = this._formatCalibrationDriftText(report);
+      try {
+        const resp = await fetch(webhook, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ msg_type: 'text', content: { text } })
+        });
+        if (!resp.ok) {
+          console.warn('[ShortTrader] 飞书推送 HTTP', resp.status);
+          return false;
+        }
+        return true;
+      } catch (e) {
+        console.warn('[ShortTrader] 飞书推送失败 (CORS/网络):', e);
+        return false;
+      }
+    },
+
+    /** 格式化校准漂移报告 → 飞书 text (短消息, ≤ 200 字) */
+    _formatCalibrationDriftText(report) {
+      const recent = report.recentBrier != null ? report.recentBrier.toFixed(3) : '?';
+      const base = report.baseBrier != null ? report.baseBrier.toFixed(3) : '?';
+      const delta = report.delta != null ? (report.delta >= 0 ? '+' : '') + report.delta.toFixed(3) : '?';
+      const dirEmoji = report.direction === 'up' ? '↗' : (report.direction === 'down' ? '↘' : '→');
+      return `⚠ AI 短线校准漂移告警 (${report.date})\n\n` +
+        `近 7 日 Brier: ${recent} (n=${report.recentN})\n` +
+        `前 7 日 Brier: ${base} (n=${report.baseN})\n` +
+        `变化: ${delta} ${dirEmoji} 上升 (阈值 0.05)\n\n` +
+        `建议: 收紧 trigger 严格度, 观察 3-5 笔, 必要时降低仓位`;
+    },
+
+    /**
+     * 校准漂移日报 (业务入口): 跑 checkCalibrationDriftReport → 漂移时推飞书
+     * 调一次 (盘后/启动), 自动完成报告+推送
+     * @param {{ skipFeishu?: boolean, nowMs?: number }} [opts]
+     * @returns {Promise<{persisted: boolean, drifted: boolean, pushed: boolean, report: object}>}
+     */
+    async runDailyCalibrationReport(opts = {}) {
+      try {
+        const r = await this.checkCalibrationDriftReport({ nowMs: opts.nowMs });
+        const report = r.report || null;
+        if (!report || report.skipped) {
+          return { persisted: false, drifted: false, pushed: false, report: { skipped: true } };
+        }
+        let pushed = false;
+        if (!opts.skipFeishu && report.drifted) {
+          pushed = await this._pushCalibrationToFeishu(report).catch(() => false);
+        }
+        return { persisted: r.persisted, drifted: !!report.drifted, pushed, report };
+      } catch (e) {
+        console.warn('[ShortTrader] runDailyCalibrationReport 失败:', e);
+        return { persisted: false, drifted: false, pushed: false, report: { error: String(e.message || e) } };
+      }
     }
   };
 

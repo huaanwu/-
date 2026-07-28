@@ -4,7 +4,7 @@
  */
 
 var APP_VERSION = 'v0.1.0';
-var APP_BUILD_DATE = '2026-07-26';
+var APP_BUILD_DATE = '2026-07-28';
 var APP_GIT_COMMIT = '';
 // build-web.mjs 写入 www/version.json, 启动时读它覆盖 (保证 package.json 是单一来源)
 (function _syncVersionFromBuild() {

@@ -83,6 +83,8 @@ www/
 │   ├── ai-service.js       # LLM 客户端 (支持 deepseek/openai/moonshot/qwen/zhipu + 自定义 baseURL + callWithTimeout)
 │   ├── ai-call-log.js      # AI 调用 trace (Z6: prompt/provider/latency/tokens/error, 200 条滚动截断)
 │   ├── self-consistency.js # 多模型投票 (Z4: 替代多空辩论, 取一致答案)
+│   ├── risk-mine.js        # 排雷聚合 (Phase Y: 商誉/减持/业绩/资金 4 类 → Map + 扫描 + 6h 缓存)
+│   └── similar-market.js   # 历史相似 RAG (Phase P1-4: 4 维特征 + Pearson top3 + 5 日后收益)
 │   ├── toast.js            # 吐司提示
 │   ├── router.js           # 页面切换 (switchPage / goSettings,会触发 window._onShow_{pageId})
 │   ├── macro.js            # 宏观新闻分析 (macro.py seed → JSON)
@@ -97,6 +99,9 @@ www/
 │   ├── journal.js     (复盘笔记,Markdown 渲染)
 │   ├── screener.js    (选股筛选,待确认卡片走 Core.Portfolio.getAssets)
 │   ├── stock-advisor.js (单股 AI 简评 + 历史验证 + 第二意见)
+│   ├── short-trader.js   (Phase T2/T4: 短线盘前 AI 计划 + 学习环 + 校准漂移)
+│   ├── long-trader.js    (Phase L: 长线周一 AI 自动选股 + 业绩归因)
+│   ├── intraday-trader.js (Phase T5: 盘中 1 分钟轮询 + 本地 LLM 实时调仓)
 │   ├── backtest.js    (策略回测)
 │   ├── alerts.js      (提醒/监控,本地通知)
 │   ├── fund.js        (基金专项主文件 ~400 行,7 个 DOMAINS 公共方法)

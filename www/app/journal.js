@@ -800,13 +800,21 @@
 3. 没把握的字段填 "其他" / "pending"
 4. 严禁自由发挥或解释`;
 
+        // Regime 状态注入 (跟 5 调用方对齐: 让 LLM 知道当前市场状态, 影响 assumption 判定)
+        let regimeBlock = '';
+        try {
+          if (Core.Regime && typeof Core.Regime._formatRegimeBlock === 'function') {
+            regimeBlock = Core.Regime._formatRegimeBlock() || '';
+          }
+        } catch (e) { /* 降级空串 */ }
+
         const userPrompt = `【复盘笔记】
 标题: ${savedNote.title || '(无)'}
 关联股票: ${savedNote.code || '(无)'}
 正文:
 ${content.slice(0, 800)}
 
-【候选值】
+${regimeBlock ? regimeBlock + '\n' : ''}【候选值】
 买入假设: ${ASSUMPTIONS.join(' / ')}
 情绪标签: ${EMOTIONS.join(' / ')}
 事后验证: pending(还没回头看) / 1w(1 周后回看) / 1m(1 月后回看) / 3m(3 月后回看) / verified(已验证)

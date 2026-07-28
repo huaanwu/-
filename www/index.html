@@ -10,7 +10,7 @@
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="apple-touch-icon" href="/icons/icon-192.png">
 
-
+
   <link rel="stylesheet" crossorigin href="/styles.src.css">
 </head>
 <body>
@@ -68,6 +68,7 @@
     </div>
     <div id="paperSleeveNote" style="font-size:12px;color:var(--text-muted);margin-bottom:8px;"></div>
     <div id="paperSummary" class="summary-cards"></div>
+    <div id="longTraderTrackSection" class="data-card" style="margin-top:8px;display:none;"></div>  <!-- Phase L1.6 长线业绩归因卡片 -->
     <div class="filter-form" style="margin-top:8px;">
       <div class="form-row">
         <label>代码</label>
@@ -112,6 +113,7 @@
       <!-- T4: 学习曲线 (Brier/校准分桶/已验证对照/我的教训; ShortTrader.renderLearningCurve 渲染) -->
       <h3 style="margin-top:16px;font-size:14px;color:var(--text-muted);">📊 学习曲线</h3>
       <div id="shortTraderLearning" class="data-card" style="margin-top:8px;"></div>
+      <div id="shortCalibrationCard" class="data-card" style="margin-top:8px;display:none;"></div>  <!-- Phase P2-1 校准健康卡片 -->
     </div>
     <!-- T3: 条件单区块 (仅短线 tab 显示, paper.js renderPage 控制) -->
     <div id="paperCondSection" style="display:none;">
@@ -190,6 +192,7 @@
     </div>
     <div id="screenerForm" class="filter-form"></div>
     <div id="screenerResult" class="data-card"></div>
+    <div id="screenerRiskMineCard" class="data-card" style="margin-top:8px;display:none;"></div>  <!-- Phase Y.5 排雷命中提示 -->
   </section>
 
   <!-- 资金账户 -->

@@ -156,10 +156,137 @@
     return out;
   }
 
+  // ========== Phase Y.2: 排雷命中扫描 + 行高亮 ==========
+
+  /** 严重度映射: 多条 reason 叠加 → 高风险 (level=2) */
+  const SEVERITY = {
+    LOW: 1,    // 1 条 reason
+    HIGH: 2    // ≥ 2 条 reasons (多维度共振, 真雷)
+  };
+
+  /**
+   * 纯函数: 给定 codes 数组 + reasonMap → 返命中 [{code, reasons, level}]
+   * - 容忍 code 不齐 (自动 pad 6 位对齐)
+   * - 容忍 reasonMap 非 Map (视为空)
+   * @param {string[]} codes 6 位代码数组
+   * @param {Map<string, Set<string>>|null} reasonMap
+   * @returns {Array<{code: string, reasons: string[], level: number}>}
+   */
+  function scanHits(codes, reasonMap) {
+    if (!Array.isArray(codes) || !codes.length) return [];
+    // duck typing: 跨 vm context 时 instanceof Map 不可靠, 用 .get 方法探测
+    const map = (reasonMap && typeof reasonMap.get === 'function') ? reasonMap : null;
+    const out = [];
+    for (const c of codes) {
+      const code = _pad(c);
+      if (!code) continue;
+      const reasons = map && map.get(code);
+      if (reasons && (reasons.size || (Array.isArray(reasons) && reasons.length))) {
+        const arr = Array.from(reasons);
+        out.push({ code, reasons: arr, level: arr.length >= 2 ? SEVERITY.HIGH : SEVERITY.LOW });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 纯函数: 给定行数组 + reasonMap → 返新数组, 每行加 riskFields 标记
+   * 不修改原行 (返回新数组, 命中的行是浅拷贝)
+   * @param {Array<object>} rows 行数组 (持仓/自选/选股结果)
+   * @param {string} codeField 行上代码字段名 (默认 'code')
+   * @param {Map<string, Set<string>>|null} reasonMap
+   * @returns {Array<object>} 新数组, 含 riskFields 字段
+   */
+  function checkRows(rows, codeField, reasonMap) {
+    if (!Array.isArray(rows)) return [];
+    const cf = codeField || 'code';
+    const map = (reasonMap && typeof reasonMap.get === 'function') ? reasonMap : null;
+    return rows.map(r => {
+      if (!r) return r;
+      const reasons = map ? map.get(_pad(r[cf])) : null;
+      if (!reasons || !(reasons.size || (Array.isArray(reasons) && reasons.length))) return r;
+      const arr = Array.from(reasons);
+      return Object.assign({}, r, {
+        riskFields: { reasons: arr, level: arr.length >= 2 ? SEVERITY.HIGH : SEVERITY.LOW }
+      });
+    });
+  }
+
+  // ========== Phase Y.3: 排雷缓存 (kv 持久化) ==========
+
+  const CACHE_KEY = 'risk_mine_cache';
+  const CACHE_TTL_MS = 6 * 60 * 60 * 1000;  // 6 小时 (盘前/盘中各刷一次)
+
+  /**
+   * 读排雷缓存 (从 kv 读 serialize 后的 reasonMap)
+   * @returns {Promise<{ts: number, hits: Array<{code, reasons}>}|null>}
+   *   null = 无缓存 或 缓存过期
+   */
+  async function getCache() {
+    try {
+      if (!window.Core || !Core.Storage) return null;
+      const rec = await Core.Storage.kvGet(CACHE_KEY);
+      if (!rec || !rec.ts) return null;
+      if (Date.now() - rec.ts > CACHE_TTL_MS) return null;  // 过期
+      // 还原 Map
+      const map = new Map();
+      (Array.isArray(rec.hits) ? rec.hits : []).forEach(h => {
+        if (h && h.code) map.set(h.code, new Set(Array.isArray(h.reasons) ? h.reasons : []));
+      });
+      return { ts: rec.ts, map };
+    } catch (e) {
+      console.warn('[RiskMine] 读缓存失败:', e);
+      return null;
+    }
+  }
+
+  /**
+   * 刷排雷缓存: 拉 4 类数据 → buildReasonSet → 写 kv
+   * @param {{fetchers?: {goodwill?: function, decrease?: function,
+   *           profit?: function, capital?: function}}} [opts]
+   *   fetcher 默认走 Core.Data.fetch
+   * @returns {Promise<{ok: boolean, map?: Map, ts?: number, error?: string}>}
+   */
+  async function refreshCache(opts = {}) {
+    try {
+      const Data = (window.Core && Core.Data) || {};
+      const f = opts.fetchers || {};
+      const get = (name, path) => {
+        if (typeof f[name] === 'function') return Promise.resolve().then(() => f[name]());
+        if (typeof Data.fetch === 'function') return Data.fetch(path, {});
+        return Promise.resolve([]);
+      };
+      // 4 类数据并行拉, 失败单类降级 (返空数组)
+      const [goodwillList, decreaseList, profitList, capitalList] = await Promise.all([
+        get('goodwill', 'stock_sy_em').catch(() => []),
+        get('decrease', 'stock_sj_em').catch(() => []),
+        get('profit', 'stock_yjyg_em').catch(() => []),
+        get('capital', 'stock_individual_fund_flow_rank').catch(() => [])
+      ]);
+      const map = buildReasonSet(goodwillList, decreaseList, profitList, capitalList);
+      const hits = serialize(map);
+      const ts = Date.now();
+      if (window.Core && Core.Storage) {
+        await Core.Storage.kvSet(CACHE_KEY, { ts, hits });
+      }
+      return { ok: true, map, ts };
+    } catch (e) {
+      console.warn('[RiskMine] refreshCache 失败:', e);
+      return { ok: false, error: String(e.message || e) };
+    }
+  }
+
   window.Core = window.Core || {};
   window.Core.RiskMine = {
     buildReasonSet,
     serialize,
-    REASONS
+    REASONS,
+    SEVERITY,
+    scanHits,
+    checkRows,
+    getCache,
+    refreshCache,
+    CACHE_KEY,
+    CACHE_TTL_MS
   };
 })();

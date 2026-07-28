@@ -371,7 +371,7 @@ vite.config.js              # root=www,域脚本 external 列表,dev proxy
 | L1.3 机械 verify | `www/app/long-trader.js` `verifyLongTrades` | 拉 journals 找 long+auto+无 verifyOutcome + entryDate 90 天内 → 拉近 100 根日 K (无复权, 24h 缓存) → 找 entryDate 后首根 → 算 lastPrice/entryPrice 浮盈浮亏 → 调 _judgeLongOutcome 写回 verifyOutcome/verifyFailureReason/verifiedAt/pnlPct; 失败 code 跳过; 返 {scanned, verified, skipped} |
 | L1.4 成绩单 | `www/app/long-trader.js` `_buildLongTrackRecord` | 按 reason 关键词自动分类 (题材/业绩/资金/技术/其他) → 每组 {total, correctRate(0~1), avgPnl(%), topReason} → 升序按 total; 样本 < LONG_VERIFY_MIN_SAMPLES 返 null |
 | L1.5 启动钩子 | `www/app/long-trader.js` `init` | init 末尾异步调 `verifyLongTrades()` (失败吞, 不阻塞 runNow 启动轮询) |
-| L1.6 UI 入口 | (后续) | 模拟盘页长线 tab 加"📊 长线业绩归因"卡片: 显示累计 verify 数 / correct 占比 / 按 reason 分组的胜率表 |
+| L1.6 UI 入口 | `www/index.html` + `www/app/long-trader.js` + `www/app/paper.js` | 模拟盘页长线 tab 加"📊 长线业绩归因"卡片 (`#longTraderTrackSection`): 拉 journals 找 long+auto+有 verifyOutcome → `_buildLongTrackRecord` 聚合 → 渲染 4 类型分组表(题材/业绩/资金/技术) 胜率+平均涨跌+主因; 样本 <3 显示"积累中"; `LongTrader.renderTrackRecord()` 暴露, `Paper.renderPage` 仅 long sleeve 调; 全 escapeHtml, 失败 `display:none` 兜底 |
 
 
 
@@ -417,6 +417,18 @@ vite.config.js              # root=www,域脚本 external 列表,dev proxy
 | F.3 AI 体验补丁 | `www/core/ai-service.js` + `www/app/*.js` | `callWithTimeout` (60s 默认); `cachedCall` 缓存; V 重新生成按钮 |
 | F.4 财报日历提醒 | `www/app/alerts.js` + `www/core/data.js` | 业绩预告/财报日历数据源 + 提醒创建 |
 
+### Phase Y 排雷聚合 + 扫描 + 缓存 + UI (Y.1 → Y.3 → Y.5)
+
+> 给极度保守用户**避雷针**: 不接券商接口, 但开盘前知道自选/持仓 哪些股票被商誉/减持/业绩亏损/主力流出 命中。
+> 跟 regime gate 互补: regime 管"市场行不行", risk-mine 管"个股坑不坑"。
+
+| 子项 | 实现位置 | 关键方法 |
+|------|----------|----------|
+| Y.1.2 排雷数据聚合 | `www/core/risk-mine.js` | `buildReasonSet(goodwill, decrease, profit, capital)` 4 类原始数据 → `Map<code, Set<reason>>`; 阈值: 商誉占比 > 30% / 减持变动 > 1% / 业绩首亏/续亏/预减 / 主力净流入 < -1000 万; `serialize(map)` → `[{code, reasons}]` |
+| Y.2 命中扫描 + 行高亮 | `www/core/risk-mine.js` | `scanHits(codes, reasonMap)` 纯函数 → `[{code, reasons, level}]`; `checkRows(rows, codeField, reasonMap)` 给行数组 → 加 `riskFields: {reasons, level}` 标记 (不修改原行); `SEVERITY.LOW=1` (1 条 reason) / `HIGH=2` (≥2 维度共振); 跨 vm context 用 duck typing (`.get` 方法) 避免 instanceof Map bug |
+| Y.3 缓存 + 异步刷 | `www/core/risk-mine.js` | `getCache()` 读 kv `risk_mine_cache` → 还原 Map (6h TTL); `refreshCache({fetchers})` 拉 4 类数据 → buildReasonSet → 写 kv; 默认走 `Core.Data.fetch`, 失败单类降级 (返空), 全部失败不抛; screener.init 异步调一次 (不阻塞) |
+| Y.5 UI 卡片 | `www/index.html` + `www/app/screener.js` | 选股页 `#screenerRiskMineCard`: 拿自选+持仓 code → scanHits → 按 level 分组显示 (🔴 高风险 ≥2 维度 / 🟡 提醒 单维度); 切到选股页 `_onShow_pageScreener` 渲染; 全 escapeHtml, 缓存无/失败隐藏 |
+
 ### Phase P AI 决策准确性升级 (P0 全部 + P1 全部)
 
 > 目标: 让 AI 短线操盘手 (T2-T5) 的买入/出场判断更准。P0 是必做, P1 是增强。
@@ -426,9 +438,11 @@ vite.config.js              # root=www,域脚本 external 列表,dev proxy
 |------|----------|----------|
 | **P0-1** T2 接 self-consistency 3 票投票 | `www/app/short-trader.js` | `generatePlan({votes=3})` 调 3 次同 prompt, `_votePlans(parsed, threshold=0.5)` 用 `code+triggerDirection+triggerPrice` 三元组 key 投票; plan 落库带 `votes/consensusRate/lowConsensus` (存 kv `paper_short_plan`); 测试可注入 `votes:1` 单票 |
 | **P0-2** T4 归因扩 8 类 | `www/core/constants.js` + `www/app/short-trader.js` | `VERIFY_FAILURE_REASONS` 加 `positionOverload`(仓位过重)/`timingEarly`(时机过早)/`stockPicking`(选股错); `_judgeClosedTrade` 签名加 `holdDays/pnlAbs`, 仓位过重=holdDays≥1 且 pnl 绝对值>1000; 强平盈利归 correct, 强平亏损归 partial+时机过早 |
-| **P0-3** T2 system prompt 注入 Regime 段 | `www/app/short-trader.js` | `_buildSystemPrompt(ctx)` 签名加 ctx 入参, 拼 `## 大盘状态机 (Regime)` 段: 状态/bear 自动减仓提醒; context 直接调 `Core.Regime.gateMultipliers()` 实时读 |
+| **P0-3** T2 system prompt 注入 Regime 段 | `www/app/short-trader.js` + `screener.js` + `stock-advisor.js` + `fund/ai-advisor.js` + `journal.js` | `_buildSystemPrompt(ctx)` 签名加 ctx 入参, 拼 `## 大盘状态机 (Regime)` 段: 状态/bear 自动减仓提醒; context 直接调 `Core.Regime.gateMultipliers()` 实时读; **6 个调用方都注入 `_formatRegimeBlock`**: T2 盘前 / ShortTrader 学习环 / 选股 / 单股简评 / 单股第二意见 / 基金 AI 顾问 / 复盘 AI 助手 |
 | **P1-1** T2 CoT 4 步模板 | `www/app/short-trader.js` | `_buildSystemPrompt` 加 `## 决策框架 (Chain-of-Thought)` 段: 趋势→信号→风险→决策 4 步; 每个 plan 必填 `reasoning` 字段 (短, 不超 200 字); 推理不充分视为弱信号 (低 consensus) |
-| **P1-2** LLM 性能埋点 | `www/app/short-trader.js` | `_logAiPerf({scenario, votes, latencyMs, successCount})` 异步写 kv `paper_ai_perf_log` (滚动 200); 接 P0-1 投票, votes=3 时记聚合延迟; 失败不阻塞主流程 |
+| **P1-2** LLM 性能埋点 | `www/app/short-trader.js` | `_logAiPerf({scenario, votes, latencyMs, successCount, failCount})` 异步写 kv `paper_ai_perf_log` (滚动 200); 接 P0-1 投票, votes=3 时记聚合延迟 (`aiStartMs`/`aiLatencyMs` 测 3 路总耗时); 失败不阻塞主流程; `_readAiPerfLog(limit)` 读出供诊断 |
+| **P2-1** 校准漂移检测 | `www/app/short-trader.js` | `_checkCalibrationDrift(trades, {recentDays=7, baseDays=7, threshold=0.05, nowMs})` 纯函数: 算最近 7 天 vs 前 7 天 Brier → 差 > 阈值返 `drifted=true`; 返 `{drifted, recentBrier, baseBrier, delta, direction: up/down/flat}`; `checkCalibrationDriftReport(opts)` 业务入口: 拉已验证 trades → 调漂移检测 → 写 kv `short_calibration_drift`; `init()` 启动时跑一次; UI: `renderCalibrationCard` 挂 `#shortCalibrationCard` (短线 tab), 漂移时高亮 + 建议文案; `_readCalibrationDrift()` 读最新报告 |
+| **P2-2** 校准漂移飞书推送 | `www/app/short-trader.js` | `_pushCalibrationToFeishu(report)` 跟 paper._pushEodToFeishu 同模式 (读 kv `feishu_webhook`, POST msg_type=text); `_formatCalibrationDriftText` 中文短文 (≤200 字); `runDailyCalibrationReport({skipFeishu})` 端到端: 跑 checkCalibrationDriftReport → 漂移时推飞书, 失败吞不阻塞; `init()` 启动时调 |
 | **P1-3** T4 加夏普/最大回撤/盈亏比 | `www/app/short-trader.js` | `_computeSharpe(trades, periodsPerYear=48)` (年化假设周频); `_computeMaxDrawdown(trades)` (累计收益曲线峰谷比, 返 0~-1); `_computePayoffRatio(trades)` (avgWin/avgLoss 绝对值); 浮点误差 sd<1e-12 兜底 null; `_buildTrackRecord` 集成 3 字段, `_formatTrackRecord` prompt 注入 "风险/收益: 夏普 X / 最大回撤 Y% / 盈亏比 Z" |
 | **P1-4** 历史相似行情 RAG | `www/core/similar-market.js` (新建) | `find(code, {days=20, lookahead=5, topK=3, histWindow=240})` 拉近 240+ 根 K → 4 维特征 (5日%/量比/RSI14/20日波动率, 标准化) → Pearson 算相似度 (跳过 NaN) → top3 段后续 5 日平均收益; `formatForPrompt(rec)` 中文短文 ≤200 字; 数据不足返 null 不阻塞 |
 | **P1-4 集成** | `www/app/short-trader.js` + `index.html` + `vite.config.js` | `_buildPlanContext` 末尾预计算 `similarByCode` Map (取候选池前 5 只); `_buildUserPrompt` 渲染 "## 历史相似" 段; similar-market.js 加到 index.html (data.js 之后) + vite external |
