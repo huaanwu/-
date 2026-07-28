@@ -670,12 +670,18 @@ window.selfCheckServices = async function() {
       desc: 'Python AKShare 后端 (深度财务/龙虎榜 等)',
       test: async () => {
         const start = Date.now();
-        const url = _apiUrl('/api/akshare/stock_zh_a_spot?symbol=000001');
-        // aktools 真限流会卡很久, 8s 超时够了 (stock_zh_a_spot 正常 < 2s)
+        // 用 /health 拿 dev-proxy 反馈的 akshare_status, 避免 stock_zh_a_spot?symbol (aktools 0.0.91+ 报 500)
+        const url = _apiUrl('/health');
         const r = await _fetchWithTimeout(url, { cache: 'no-store' }, 8000);
         const t = await r.text();
-        const ok = r.ok && t.length > 100 && t.trim().startsWith('[');
-        return { ok, latencyMs: Date.now() - start, detail: 'GET ' + url + ' → HTTP ' + r.status + (t.length > 200 ? `, ${t.length} bytes` : `, ${t.slice(0, 80)}`) };
+        let j = null;
+        try { j = JSON.parse(t); } catch (e) { /* 非 JSON */ }
+        const akshareOk = j && j.akshare_status === 'ok';
+        return {
+          ok: r.ok && akshareOk,
+          latencyMs: Date.now() - start,
+          detail: 'GET ' + url + ' → ' + (j ? 'akshare_status=' + j.akshare_status : 'HTTP ' + r.status + ' (无 JSON)')
+        };
       }
     },
     {
