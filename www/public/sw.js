@@ -59,6 +59,16 @@ self.addEventListener('fetch', (e) => {
   }
   // 4) 其他 GET (静态资源): cache-first
   if (e.request.method !== 'GET') return;
+  // KB JSON: network-first, 不缓存 (Tier 3B 教训)
+  //   - KB 升级后必须立即生效, 不能被 SW 旧缓存拦截
+  //   - KB 文本小 (~30KB), 没必要 cache-first
+  //   - Dexie 的 KB_TTL (7 天) 才是真正的缓存控制点
+  if (url.pathname.startsWith('/kb_data/')) {
+    e.respondWith(
+      fetch(e.request).catch(() => caches.match(e.request))
+    );
+    return;
+  }
   e.respondWith(
     caches.match(e.request).then((cached) => {
       if (cached) return cached;

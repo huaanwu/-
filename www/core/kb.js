@@ -40,9 +40,11 @@
         }
       } catch (e) { console.warn('[KB] Dexie 读失败:', e.message); }
 
-      // 最后 fetch
+      // 最后 fetch: cache:'no-store' 强制绕开 HTTP cache + Service Worker
+      // Tier 3B 教训: 'force-cache' 会让 SW 永久缓存旧 JSON, KB 升级后用户拿不到新版
+      // Dexie 的 7 天 TTL (KB_TTL) 才是真正的缓存控制点
       try {
-        const resp = await fetch(KB_URL, { cache: 'force-cache' });
+        const resp = await fetch(KB_URL, { cache: 'no-store' });
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
         const data = await resp.json();
         if (!data || !Array.isArray(data.entries)) throw new Error('KB 格式错误');
@@ -91,7 +93,7 @@
     }
     // 来自 context (数据可用时)
     if (context.valuation && context.valuation.length > 0) queries.push('估值', 'PE', '分位');
-    if (context.north) queries.push('北向', '外资');
+    if (context.north) queries.push('北向', '外资', 'T+1', '聪明钱');
     if (context.money) queries.push('货币', 'M2', '流动性');
     if (context.sectors) queries.push('板块', '风格轮动');
     if (context.earnings && context.earnings.surprise && context.earnings.surprise.length > 0) {
@@ -100,9 +102,24 @@
     if (context.calendar && context.calendar.next_14d && context.calendar.next_14d.length > 0) {
       queries.push('政策', '央行', '国常会', 'LPR', '降准');
     }
-    if (context.lhb) queries.push('龙虎榜', '游资');
+    if (context.lhb) queries.push('龙虎榜', '游资', '异动', '机构', '席位');
     if (context.margin) queries.push('两融', '杠杆');
     if (context.futures) queries.push('期货', '基差', '升水');
+    // Tier 3B: reasonTag 6 类直接 trigger (screener/short-trader 注入 prompt 时附带)
+    if (context.reasonTags && Array.isArray(context.reasonTags)) {
+      const TAG_QUERY = {
+        surge: ['涨幅异动', '涨停', '强势'],
+        plunge: ['跌幅异动', '下跌', '回撤'],
+        turnover: ['换手异动', '高换手', '流动性'],
+        amplitude: ['振幅异动', '波动'],
+        st_risk: ['ST风险', '退市', '风险'],
+        normal: ['龙虎榜', '上榜']
+      };
+      for (const tag of context.reasonTags) {
+        const qs = TAG_QUERY[tag];
+        if (qs) queries.push(...qs);
+      }
+    }
     // 通用兜底
     if (queries.length === 0) queries.push('基金', '估值', '风险', '分散');
 
@@ -139,14 +156,21 @@
 
   /**
    * 把条目格式化为 prompt 片段
+   * Tier 3B: 每条带 category 标签 (LLM 引用时知道来源类型)
    * @param {Array<entry>} entries
    * @returns {string} - markdown 块
    */
   function formatForPrompt(entries) {
     if (!Array.isArray(entries) || entries.length === 0) return '';
+    const CATEGORY_ICON = {
+      valuation: '估值', risk: '风险', cycle: '周期', position: '仓位',
+      policy: '政策', behavior: '行为', case: '案例', fixed_income: '固收',
+      fund: '基金', rule: '规则', discipline: '纪律'
+    };
     const lines = ['## 投资百科参考 (Phase N, 引用条目号)'];
     for (const e of entries) {
-      lines.push(`- **${e.id}** (${e.title}): ${e.summary}`);
+      const cat = CATEGORY_ICON[e.category] || e.category || '其它';
+      lines.push(`- **${e.id}** [${cat}] ${e.title}: ${e.summary}`);
     }
     lines.push('\n> 引用建议: 回答时如有相关条目, 在句末标注 (例如 "..., 符合 KB-VAL-001 PE 估值原则")');
     return lines.join('\n');

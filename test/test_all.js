@@ -11101,6 +11101,65 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
     fail('75 调用方注入', e.message);
   }
 
+  // ========== [76] Tier 3B: KB 扩展 (NORTH/LHB 条目 + reasonTag 触发器 + source 标签) ==========
+  section('76] Tier 3B: KB 扩展');
+  try {
+    const kbSrc = JSON.parse(readFileSafe(path.join(WWW, 'kb_data/investment_kb.json')));
+    // 76.1 新增 NORTH-001/002
+    if (kbSrc.entries.find(e => e.id === 'NORTH-001' && /北向/.test(e.title)))
+      ok('76.1 NORTH-001 北向 5 日净流入信号条目');
+    else fail('76.1 NORTH-001 缺失', '');
+    if (kbSrc.entries.find(e => e.id === 'NORTH-002' && /拐点/.test(e.title)))
+      ok('76.2 NORTH-002 北向拐点信号条目');
+    else fail('76.2 NORTH-002 缺失', '');
+    // 76.3 新增 LHB-001/002/003
+    if (kbSrc.entries.find(e => e.id === 'LHB-001' && /6 类|6类|异动/.test(e.title)))
+      ok('76.3 LHB-001 6 类异动标签解读条目');
+    else fail('76.3 LHB-001 缺失', '');
+    if (kbSrc.entries.find(e => e.id === 'LHB-002' && /机构/.test(e.title) && /游资/.test(e.summary)))
+      ok('76.4 LHB-002 机构 vs 游资席位条目');
+    else fail('76.4 LHB-002 缺失', '');
+    if (kbSrc.entries.find(e => e.id === 'LHB-003' && /追板|回撤/.test(e.title)))
+      ok('76.5 LHB-003 龙虎追板风险条目');
+    else fail('76.5 LHB-003 缺失', '');
+    // 76.6 pickRelevant 加 reasonTag 触发器
+    const kbJs = readFileSafe(path.join(WWW, 'core/kb.js'));
+    if (/context\.reasonTags/.test(kbJs) && /TAG_QUERY/.test(kbJs) && /surge.*plunge.*turnover/s.test(kbJs))
+      ok('76.6 pickRelevant 加 reasonTag 6 类触发器');
+    else fail('76.6 reasonTag 触发器缺失', '');
+    // 76.7 formatForPrompt 加 source 标签
+    if (/CATEGORY_ICON/.test(kbJs) && /\[估值\]|\[规则\]|\[风险\]/.test(kbJs) === false) {
+      // 改检查: formatForPrompt 里包含 CATEGORY_ICON + 11 类映射
+      if (/valuation.*risk.*cycle.*position.*policy.*behavior.*case.*fixed_income.*fund.*rule.*discipline/s.test(kbJs))
+        ok('76.7 formatForPrompt 加 CATEGORY_ICON (11 类映射)');
+      else fail('76.7 CATEGORY_ICON 11 类映射缺失', '');
+    }
+  } catch (e) {
+    fail('76 Tier 3B', e.message);
+  }
+
+  // ========== [77] Tier 3B B-fix: KB cache 不走 SW/HTTP cache, SW network-first 例外 ==========
+  section('77] Tier 3B B-fix: KB cache 策略修复');
+  try {
+    const kbJs = readFileSafe(path.join(WWW, 'core/kb.js'));
+    const swSrc = readFileSafe(path.join(WWW, 'public/sw.js'));
+    // 77.1 kb.js fetch 用 cache:'no-store' (不让 HTTP cache 拦截)
+    if (/cache:\s*['"]no-store['"]/.test(kbJs))
+      ok('77.1 kb.js fetch 用 cache:"no-store" (Tier 3B B-fix)');
+    else fail('77.1 kb.js fetch cache 策略未改', '');
+    // 77.2 kb.js 不再用 cache:'force-cache'
+    if (!/cache:\s*['"]force-cache['"]/.test(kbJs))
+      ok('77.2 kb.js 弃用 cache:"force-cache"');
+    else fail('77.2 仍用 force-cache, SW 会永久拦截', '');
+    // 77.3 SW 对 /kb_data/ 走 network-first
+    if (/url\.pathname\.startsWith\(['"]\/kb_data\/['"]\)/.test(swSrc)
+        && /fetch\(e\.request\)\.catch\(\(\) => caches\.match/.test(swSrc))
+      ok('77.3 SW 对 /kb_data/ 走 network-first (SW 拦截修复)');
+    else fail('77.3 SW kb_data network-first 例外缺失', '');
+  } catch (e) {
+    fail('77 B-fix', e.message);
+  }
+
 waitForIIFEsDrain().then(() => {
   console.log(`\n\x1b[1m===== 测试结果 =====\x1b[0m`);
   console.log(`\x1b[32m通过: ${passed}\x1b[0m  |  \x1b[${failed > 0 ? '31' : '32'}]m失败: ${failed}\x1b[0m`);
