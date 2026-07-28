@@ -11587,6 +11587,77 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
     else fail('95.8 FACTOR_KEYS 未含 forecast', '');
   } catch (e) { fail('95.x 业绩预告因子', e.message); }
 
+  // ===== 96.x: V2 P3 主营构成 chokepoint 探测 =====
+  try {
+    const dataJs96 = fs.readFileSync(path.join(__dirname, '..', 'www', 'core', 'data.js'), 'utf8');
+    if (dataJs96.indexOf('async function getStockBusinessComposition(code)') !== -1 &&
+        dataJs96.indexOf('stock_zygc_em') !== -1)
+      ok('96.1 data.js 含 getStockBusinessComposition + stock_zygc_em');
+    else fail('96.1 缺失', '');
+
+    if (dataJs96.indexOf('async function getStockBusinessCompositionBatch') !== -1 &&
+        dataJs96.indexOf('_ZYGC_TTL = 30 * 24 * 60 * 60 * 1000') !== -1)
+      ok('96.2 data.js 含 Batch + 30 天 in-memory 缓存');
+    else fail('96.2 Batch / TTL 缺失', '');
+
+    if (dataJs96.indexOf('_summarizeZygc') !== -1 &&
+        dataJs96.indexOf("按产品分类") !== -1 &&
+        dataJs96.indexOf("其他(补充)") !== -1 &&
+        dataJs96.indexOf('top.pct > 0.40') !== -1)
+      ok('96.3 _summarizeZygc 启发式 (按产品 + 剔除其他(补充) + 40% 阈值)');
+    else fail('96.3 chokepoint 启发式缺失', '');
+
+    if (dataJs96.indexOf('getStockBusinessComposition, getStockBusinessCompositionBatch') !== -1)
+      ok('96.4 data.js 暴露 getStockBusinessCompositionBatch');
+    else fail('96.4 未暴露', '');
+
+    const sc96 = fs.readFileSync(path.join(__dirname, '..', 'www', 'core', 'scoring.js'), 'utf8');
+    if (sc96.indexOf('getStockBusinessCompositionBatch') !== -1 &&
+        sc96.indexOf('zygcMap = new Map()') !== -1 &&
+        sc96.indexOf('r._chokepoint = z.chokepoint') !== -1)
+      ok('96.5 scoring 拉 zygc + 附 _chokepoint 标签');
+    else fail('96.5 scoring 未附 chokepoint', '');
+
+    const lt96 = fs.readFileSync(path.join(__dirname, '..', 'www', 'app', 'long-trader.js'), 'utf8');
+    if (lt96.indexOf('s._chokepoint === true') !== -1 &&
+        lt96.indexOf('【单一产品依赖】') !== -1 &&
+        lt96.indexOf('紫苏叶瓶颈 SKL-001') !== -1)
+      ok('96.6 long-trader 注入 chokepoint 标签 + SKL-001 提示');
+    else fail('96.6 long-trader 未注入', '');
+
+    // 96.7 单测: 茅台 2025 → chokepoint=true 茅台酒 86.8%
+    // 用 indexOf 提取 _summarizeZygc 函数体 (避开 regex escape)
+    const fnStart = dataJs96.indexOf('function _summarizeZygc(rows)');
+    if (fnStart === -1) {
+      fail('96.7 _summarizeZygc 函数未找到', '');
+    } else {
+      // 函数体: 找末尾 (CR LF + 2 空格 + }) 作为函数体结束标记
+      // 用字面字符串拼装 (不要在 JS literal 里写换行, 否则会被解析为真换行截断 string)
+      // 函数体结束: data.js 是 CRLF, 函数结尾是 CRLF + 2空格 + }
+      const CR = String.fromCharCode(13);
+      const NL = String.fromCharCode(10);
+      const endMarker = CR + NL + '  }' + CR + NL;
+      const fnEnd = dataJs96.indexOf(endMarker, fnStart);
+      if (fnEnd === -1) {
+        fail('96.7 _summarizeZygc 函数体结束符未找到', '');
+      } else {
+        const fnSrc = dataJs96.substr(fnStart, fnEnd - fnStart + endMarker.length);
+        const vm = require('vm');
+        const sandbox = { console };
+        vm.createContext(sandbox);
+        // 把 CRLF 转 LF, vm sandbox 兼容
+        const fnSrcLF = fnSrc.replace(new RegExp('\r\n', 'g'), NL);
+        vm.runInContext(fnSrcLF + NL + 'this._summarizeZygc = _summarizeZygc;', sandbox);        const sample = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'zygc_600519.json'), 'utf8'));
+        const sum = sandbox._summarizeZygc(sample);
+        if (sum && sum.chokepoint === true && sum.topProduct === '茅台酒' && Math.abs(sum.topProductPct - 0.867695) < 0.001)
+          ok('96.7 茅台 2025 → chokepoint=true 茅台酒 86.8%');
+        else fail('96.7 判定不符', JSON.stringify(sum));
+      }
+    }
+  } catch (e) { fail('96.x chokepoint', e.message); }
+
+
+
 
 
 

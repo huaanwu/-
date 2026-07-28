@@ -794,6 +794,96 @@
   }
 
   /**
+   * 主营构成 (V2 P3: chokepoint 自动探测)
+   * 数据源: stock_zygc_em (东方财富)
+   *   - 单股接口, 无 batch
+   *   - 字段: 股票代码/报告日期/分类类型/主营构成/主营收入/收入比例/主营成本/成本比例/主营利润/利润比例/毛利率
+   *   - 分类类型 ∈ {按行业分类, 按产品分类, 按地区分类} (peer 实测)
+   *   - 噪音行: "其他(补充)" 收入比例 < 0.005 应剔除, 否则 max() 永远接近 1.0
+   *   - chokepoint 启发式: 最新年报 × 按产品分类 × 剔除"其他(补充)" × max(收入比例) > 0.40
+   */
+  async function getStockBusinessComposition(code) {
+    return await fetchWithCache(
+      `zygc_${code}`,
+      'stock_zygc_em',
+      { symbol: code },
+      30 * 24 * 60 * 60 * 1000  // 30 天 (年报季度更新)
+    );
+  }
+
+  /**
+   * 批量: 给定 codes → Map<code, { chokepoint:bool, topProduct, topProductPct, reportDate }>
+   * 并发 5 逐批, 30 天 in-memory 缓存
+   */
+  const _zygcCache = new Map();
+  const _ZYGC_TTL = 30 * 24 * 60 * 60 * 1000;
+  async function getStockBusinessCompositionBatch(codes) {
+    const results = new Map();
+    const toFetch = [];
+    for (const c of codes) {
+      const hit = _zygcCache.get(c);
+      if (hit && Date.now() - hit.ts < _ZYGC_TTL) {
+        results.set(c, hit.value);
+      } else {
+        toFetch.push(c);
+      }
+    }
+    if (toFetch.length === 0) return results;
+    const chunked = [];
+    for (let i = 0; i < toFetch.length; i += 5) chunked.push(toFetch.slice(i, i + 5));
+    for (const chunk of chunked) {
+      const batch = await Promise.allSettled(
+        chunk.map(c => getStockBusinessComposition(c).catch(() => null))
+      );
+      chunk.forEach((c, i) => {
+        if (batch[i]?.status === 'fulfilled' && batch[i].value) {
+          const summary = _summarizeZygc(batch[i].value);
+          _zygcCache.set(c, { value: summary, ts: Date.now() });
+          results.set(c, summary);
+        }
+      });
+    }
+    return results;
+  }
+
+  /**
+   * 把主营构成原始数据汇总成 chokepoint 判定
+   * @returns {{ chokepoint:bool, topProduct, topProductPct, reportDate }}
+   */
+  function _summarizeZygc(rows) {
+    if (!Array.isArray(rows) || rows.length === 0) return null;
+    // 1. 找最新报告日期
+    let maxDate = null;
+    for (const r of rows) {
+      const d = r['报告日期'] || r.报告日期;
+      if (!d) continue;
+      if (!maxDate || new Date(d) > new Date(maxDate)) maxDate = d;
+    }
+    if (!maxDate) return null;
+    // 2. 过滤: 最新报告 + 按产品分类 + 剔除"其他(补充)"
+    const filtered = rows.filter(r => {
+      const d = r['报告日期'] || r.报告日期;
+      const cat = r['分类类型'] || r.分类类型;
+      const name = r['主营构成'] || r.主营构成;
+      return d === maxDate && cat === '按产品分类' && name && name !== '其他(补充)';
+    });
+    if (filtered.length === 0) return null;
+    // 3. max(收入比例)
+    let top = null;
+    for (const r of filtered) {
+      const pct = parseFloat(r['收入比例'] || 0);
+      if (!top || pct > top.pct) top = { name: r['主营构成'] || r.主营构成, pct };
+    }
+    if (!top) return null;
+    return {
+      chokepoint: top.pct > 0.40,
+      topProduct: top.name,
+      topProductPct: top.pct,
+      reportDate: maxDate
+    };
+  }
+
+  /**
    * 业绩预告 (V2 P2: long-trader earnings forecast factor)
    * 数据源: stock_yjyg_em (东方财富, 季度预告)
    *   - date 必填 YYYYMMDD, 必须季度末 (0331/0630/0930/1231), 季度内不变 → TTL 7d
@@ -2287,6 +2377,7 @@
     getSectorPerformance,
     getConceptBoardPerformance, getConceptMembership,  // Tier 6+: 概念板块涨幅 + 反查
     getStockEarningForecast, getStockEarningForecastBatch,  // V2 P2: 业绩预告
+    getStockBusinessComposition, getStockBusinessCompositionBatch,  // V2 P3: 主营构成/chokepoint
     getStockVolumeAnomaly,
     // 基金
     getFundSpot, getFundHistory, getFundPortfolio,

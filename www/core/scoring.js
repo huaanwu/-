@@ -279,9 +279,29 @@
       } catch (e) { console.warn('[Scoring] 业绩预告拉取失败:', e); }
     }
 
+    // V2 P3: 主营构成 chokepoint (30d TTL, 失败降级)
+    let zygcMap = new Map();
+    if (Core.Data.getStockBusinessCompositionBatch) {
+      try {
+        zygcMap = await Core.Data.getStockBusinessCompositionBatch(codes);
+      } catch (e) { console.warn('[Scoring] 主营构成拉取失败:', e); }
+    }
+
     // 5. 硬过滤 + 打分
     const filtered = applyHardFilters(all, opts, forecastMap);
     const ranked = rank(filtered, finMap, industryMap, northMap, heldByInd, weights, conceptMap, conceptPerf, sectorPerf, forecastMap);
+
+    // V2 P3: 把 chokepoint 标签附加到 ranked 候选上 (供 long-trader LLM 决策)
+    if (zygcMap && zygcMap.size > 0) {
+      for (const r of ranked) {
+        const z = zygcMap.get(r.代码);
+        if (z) {
+          r._chokepoint = z.chokepoint;
+          r._topProduct = z.topProduct;
+          r._topProductPct = z.topProductPct;
+        }
+      }
+    }
 
     return includeFiltered ? ranked : ranked.slice(0, topN);
   }

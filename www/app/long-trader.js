@@ -283,7 +283,16 @@
               }
             }
           }
-          return `[${i}] ${code} ${name} | 涨跌幅=${chg}% | 换手=${turn}% | 市值=${mcapStr}${finPart}`;
+          // V2 P3: chokepoint 标签 (主营构成: max(收入比例) > 40% = 单一产品依赖)
+          let ckPart = '';
+          if (s._chokepoint === true) {
+            const pct = (s._topProductPct * 100).toFixed(1);
+            ckPart = ` | 【单一产品依赖】${s._topProduct} ${pct}%`;
+          } else if (s._chokepoint === false && s._topProduct) {
+            const pct = (s._topProductPct * 100).toFixed(1);
+            ckPart = ` | 产品分散: ${s._topProduct} ${pct}%`;
+          }
+          return `[${i}] ${code} ${name} | 涨跌幅=${chg}% | 换手=${turn}% | 市值=${mcapStr}${finPart}${ckPart}`;
         }).join('\n');
 
         // SKL v1.4: 长线 sleeve 默认 trigger 全部 3 类方法论 (紫苏叶瓶颈 / NAV 折价 / 反共识)
@@ -326,6 +335,7 @@
           '\n- 避免选高负债率（> 70%）且 ROE < 5% 的（价值陷阱）' +
           '\n- 硬筛已排除: ROE < 5%、毛利率 < 10% 的股票' +
           '\n- 排除 ST/退市风险股' +
+          '\n- 【紫苏叶瓶颈 SKL-001】优先选【单一产品依赖】标签 (主营产品占比 > 40%), 这是产业链卡脖子环节' +
           '\n' + (kbBlock || '') +
           '\n' + regimeLine +
           (poolText ? '\n- 【全系统学习池】' + poolText.replace(/\n/g, ' ').slice(0, 200) : '') +
