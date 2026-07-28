@@ -349,6 +349,11 @@
       // 等以后 schema 扩展 (LLM 报 probability 0-100 + 3 件套价格),
       // 在 picks[] 里加这些字段, 在落地前用 _kellyFraction 算 positionPct
       // 替代当前按 confidence 类别硬映射。
+      //
+      // TODO H2 校准 接入: 当前 screener 没有 (predict → actual) 机械
+      // 验证数据 (不像 short-trader T4 学习环有完整闭环), 校准注入会误导 LLM。
+      // 等以后周度机械 verify 落实后, 在这里拼 _calibrationBuckets →
+      // Core.Calibration._formatCalibrationPrompt 段, samples < 5 自动不渲染。
       const systemPrompt = `你是 Phase O 高手版 A 股个股投资顾问, 风格稳健, 严守数据边界。
 
 【投资框架】价值 + 趋势 + 风险平价 混合:

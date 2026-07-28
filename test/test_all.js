@@ -7197,11 +7197,12 @@ section('[40] ShortTrader T4 学习环: _judgeClosedTrade 全分支 / verify 扫
     } else fail('41.d', '故障展示不完整');
 
     // 41.e runtime 行为模拟: 把 selfCheckServices 拉到 vm 里跑 (mock fetch + Core.AI.discoverLocalLLM)
+    // 注意: aktools 项已改用 /health 探测 (避免 stock_zh_a_spot?symbol 在 aktools 0.0.91+ 报 500), 见 app.js line 793
     const fetchCalls = [];
     const fetchMock = async (url) => {
       fetchCalls.push(url);
-      if (url.includes('/health')) return { ok: true, status: 200, json: async () => ({ status: 'ok', akshare_target: 'http://127.0.0.1:8088' }) };
-      if (url.includes('stock_zh_a_spot')) return { ok: true, status: 200, text: async () => '[' + 'x'.repeat(200) };
+      if (url.includes('/health')) return { ok: true, status: 200, json: async () => ({ status: 'ok', akshare_target: 'http://127.0.0.1:8088', akshare_status: 'ok' }) };
+      if (url.includes('/api/discover/local-llm')) return { ok: true, status: 200, json: async () => ({ found: [{ host: '127.0.0.1', port: 8082, models: ['qwen3'] }], scanned: 4, host: '127.0.0.1' }) };
       return { ok: false, status: 500, text: async () => '' };
     };
     const ctx41 = vm.createContext({
@@ -7243,10 +7244,10 @@ section('[40] ShortTrader T4 学习环: _judgeClosedTrade 全分支 / verify 扫
     vm.runInContext(appSrc, ctx41);
     if (typeof ctx41.window.selfCheckServices !== 'function') { fail('41.e selfCheckServices 不可调用', ''); return; }
     await ctx41.window.selfCheckServices();
-    const healthHit = fetchCalls.some(u => u.includes('/health'));
-    const spotHit = fetchCalls.some(u => u.includes('stock_zh_a_spot'));
-    if (healthHit && spotHit) ok('41.e 自检函数运行时: 同时触发 dev-proxy /health + aktools /stock_zh_a_spot');
-    else fail('41.e runtime', 'fetch 调用不完整: ' + fetchCalls.join(' | '));
+    const healthCount = fetchCalls.filter(u => u.includes('/health')).length;
+    const llmHit = fetchCalls.some(u => u.includes('/api/discover/local-llm'));
+    if (healthCount >= 2 && llmHit) ok('41.e 自检运行时: dev-proxy /health + aktools /health + 本地 LLM discover 全部命中');
+    else fail('41.e runtime', `fetch 调用不完整 (health×${healthCount}, llm=${llmHit}): ` + fetchCalls.join(' | '));
   } catch (e) {
     fail('41 Z 自检', e.message + ' / ' + (e.stack || ''));
   }
@@ -8938,6 +8939,85 @@ section('[59] core/calibration.js: _formatCalibrationPrompt');
     } else fail('59.g', r7 ? r7.slice(0, 150) : 'null');
   } catch (e) {
     fail('59 Calibration', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [59.H2] H2 集成: short-trader._buildLearningPromptText 拼入校准段 ==========
+section('[59.H2] H2: short-trader._buildLearningPromptText 拼入校准段');
+(async () => {
+  try {
+    // 独立沙盒: 跟 39.x buildCtx 同模式, 但只 mock _buildLearningPromptText 所需依赖
+    const stSrc = readFileSafe(path.join(WWW, 'app', 'short-trader.js'));
+    if (!stSrc) throw new Error('short-trader.js 读不到');
+    const calSrc = readFileSafe(path.join(WWW, 'core', 'calibration.js'));
+    if (!calSrc) throw new Error('calibration.js 读不到');
+    const K = _loadRealConstants();
+    const storageData = { puts: [], kv: {}, all: { journals: [] } };
+    // 单独沙盒加载 Calibration 模块
+    const calCtx = vm.createContext({ window: {}, console });
+    vm.runInContext(calSrc, calCtx);
+    const realCalibration = calCtx.window.Core.Calibration;
+    const sctx = {
+      window: {},
+      console,
+      escapeHtml: (s) => String(s == null ? '' : s),
+      fmtNum: (n, d) => (typeof n === 'number' ? n.toFixed(d || 0) : '0'),
+      fmtDateTime: () => '2026-07-27 08:30',
+      confirm: () => true,
+      document: { getElementById: () => null }
+    };
+    sctx.window = sctx;
+    sctx.Core = {
+      Storage: {
+        kvGet: async () => null,
+        all: async () => storageData.all.journals
+      },
+      Constants: K,
+      Calibration: realCalibration
+    };
+    sctx.window.Core = sctx.Core;
+    vm.createContext(sctx);
+    vm.runInContext(stSrc, sctx);
+    const ST = sctx.window.ShortTrader;
+    if (!ST) throw new Error('ShortTrader 未挂到 window');
+
+    // 59.H2.a: 样本 <5 → 校准段不渲染
+    const realCollect = ST._collectVerifiedTrades;
+    const fakeTradesSmall = [
+      { probability: 60, outcome: 'correct' },
+      { probability: 70, outcome: 'wrong' },
+      { probability: 80, outcome: 'correct' }
+    ];
+    ST._collectVerifiedTrades = async () => fakeTradesSmall;
+    const textSmall = await ST._buildLearningPromptText();
+    if (typeof textSmall === 'string' && !textSmall.includes('【你的概率校准偏差】')) {
+      ok('59.H2.a <5 样本不渲染校准段');
+    } else fail('59.H2.a', textSmall ? textSmall.slice(0, 200) : 'null');
+
+    // 59.H2.b: 样本 ≥5 → 渲染校准段
+    const fakeTradesOver = [
+      { probability: 30, outcome: 'wrong' },
+      { probability: 35, outcome: 'wrong' },
+      { probability: 40, outcome: 'wrong' },
+      { probability: 75, outcome: 'wrong' },
+      { probability: 80, outcome: 'wrong' },
+      { probability: 85, outcome: 'wrong' }
+    ];
+    ST._collectVerifiedTrades = async () => fakeTradesOver;
+    const textOver = await ST._buildLearningPromptText();
+    if (typeof textOver === 'string' && textOver.includes('【你的概率校准偏差】')) {
+      ok('59.H2.b ≥5 样本渲染校准段');
+    } else fail('59.H2.b', textOver ? textOver.slice(0, 200) : 'null');
+
+    // 59.H2.c: 校准段含"系统性高估"或"系统性低估"提示
+    if (textOver.includes('系统性高估') || textOver.includes('系统性低估')) {
+      ok('59.H2.c 校准段含偏差结论');
+    } else fail('59.H2.c', textOver ? textOver.slice(-300) : 'null');
+
+    // 59.H2.d: 恢复原 method
+    ST._collectVerifiedTrades = realCollect;
+  } catch (e) {
+    fail('59.H2 集成', e.message + ' / ' + (e.stack || ''));
   }
 })();
 

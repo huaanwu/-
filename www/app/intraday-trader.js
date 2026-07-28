@@ -245,6 +245,12 @@ ${trackText || '(样本不足, 不显示)'}
       // 等以后 schema 扩展 (LLM 报 probability 0-100 + 3 件套价格), 在这里
       // 拼一段 schema 描述, 在 _aiDecide 出口前调 _kellyFraction 重算
       // 决策仓位 (shares 或 trim% 而非 shares 数)。
+      //
+      // TODO H2 校准 接入: 当前 intraday-trader 没有出 (predict → actual) 机械
+      // 验证数据 (不像 short-trader T4 学习环有完整闭环), 校准注入会误导 LLM。
+      // 等以后 settleIntraday(hold-trader 走 paper_cond_orders 验证) 落实后,
+      // 在这里拼 _calibrationBuckets → Core.Calibration._formatCalibrationPrompt
+      // 段, 复用 short-trader 的 _buildLearningPromptText 模式。
       return `你是短线操盘手, 正在做"盘中实时盯盘"决策。
 
 【职责】

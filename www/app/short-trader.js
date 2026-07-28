@@ -1047,13 +1047,25 @@
       }
     },
 
-    /** 盘前 prompt 注入文本: 【你的历史成绩单】(样本 ≥3 才有) +【我的教训】; 任何失败返 '' 不影响主流程 */
+    /** 盘前 prompt 注入文本: 【你的历史成绩单】(样本 ≥3 才有) + 【你的概率校准偏差】(样本 ≥5 才有) + 【我的教训】; 任何失败返 '' 不影响主流程 */
     async _buildLearningPromptText() {
       try {
         const trades = await this._collectVerifiedTrades();
         const parts = [];
         const recText = this._formatTrackRecord(this._buildTrackRecord(trades));
         if (recText) parts.push('', recText);
+        // H2 校准反向注入: trades 已是 pairs 形式 (含 probability + outcome),
+        // 直接调 _calibrationBuckets 渲染段 (样本 ≥5 才有, <5 返 null 不渲染)
+        // 这段让 LLM 下次报 probability 时能看到自己的偏差, 调整自评分寸
+        if (trades.length >= 3) {
+          try {
+            const buckets = this._calibrationBuckets(trades);
+            const calBlock = Core.Calibration._formatCalibrationPrompt(buckets);
+            if (calBlock) parts.push('', calBlock);
+          } catch (e) {
+            console.warn('[ShortTrader] 校准块渲染失败:', e);
+          }
+        }
         let lessons = null;
         try { lessons = await Core.Storage.kvGet(SHORT_LESSONS_KEY); }
         catch (e) { console.warn('[ShortTrader] 读 lessons 失败:', e); }

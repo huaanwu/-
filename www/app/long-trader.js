@@ -179,6 +179,12 @@
         // 等以后 schema 扩展 (LLM 报 probability 0-100 + 3 件套价格),
         // 在这里拼 schema 描述, 在 pick 落地前用 _kellyFraction 算仓位,
         // 替换现行 acc.positionPct 固定上限的 fallback。
+        //
+        // TODO H2 校准 接入: 当前 long-trader 没有 (predict → actual) 机械
+        // 验证数据 (不像 short-trader T4 学习环有完整闭环), 校准注入会误导 LLM。
+        // 等以后机械 verify 落实后, 在这里拼 _calibrationBuckets →
+        // Core.Calibration._formatCalibrationPrompt 段, 短期先用 entries.cap
+        // 限制 _formatCalibrationPrompt 不渲染 (samples < 5 走 null 路径)。
         const systemPrompt = `你是 A 股长线选股助手, 帮用户从硬筛池里挑 ${topN} 只作为本周模拟盘长线 sleeve 的买入标的。
 - 选有真实上涨逻辑的 (题材/业绩/资金/技术突破)
 - 优先选市值 ≥ 50 亿的 (流动性好)
