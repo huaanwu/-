@@ -8745,9 +8745,10 @@ section('[55] state.js init() 必须还原 state_userProfile (否则重启后丢
     if (!stateSrc) throw new Error('state.js 读不到');
 
     // 55.a init() 内 kvGet('state_userProfile') 调用
-    const initMatch = stateSrc.match(/async function init\(\)\s*\{([\s\S]*?)\n\s*\}/);
+    // V8: init() 增加了嵌套 {} 块, 改用 'async function init() { ... }' 到文件末尾匹配 (宽容)
+    const initMatch = stateSrc.match(/async function init\(\)[\s\S]*?\n  \}/);
     if (!initMatch) throw new Error('init() 函数未找到');
-    const initBody = initMatch[1];
+    const initBody = initMatch[0];
 
     if (/kvGet\(['"]state_userProfile['"]\)/.test(initBody)) {
       ok('55.a state.js init() 含 kvGet(\'state_userProfile\') 还原调用');
@@ -11907,6 +11908,26 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
       ok('101.7 journal 读 transactions 失败 → 用户 toast (V6)');
     else fail('101.7 journal toast 缺失', '');
   } catch (e) { fail('101.x V6 silent failure 提示', e.message); }
+
+  // ===== 102.x: V8 APK 局域网服务端连通修复 =====
+  try {
+    const s102 = readFileSafe(path.join(WWW, 'core', 'state.js'));
+
+    // 102.1: state.js init() 检测 _isNative + 残留相对路径 → 强制覆盖 LAN IP
+    if (/async function init\(\)[\s\S]*?_isNative[\s\S]*?_state\.proxyBase\s*=\s*'http:\/\/192\.168\.1\.3/.test(s102))
+      ok('102.1 init() APK 检测 + 强制覆盖 proxyBase 为 LAN IP (V8)');
+    else fail('102.1 APK proxyBase 强制覆盖缺失', '');
+
+    // 102.2: 同样修正 ai.localEndpoint.baseURL (含 127.0.0.1 → LAN IP)
+    if (/localEndpoint[\s\S]{0,200}127\.0\.0\.1|localhost[\s\S]{0,200}192\.168\.1\.3/.test(s102))
+      ok('102.2 init() APK 检测 + 修正 ai.localEndpoint.baseURL (V8)');
+    else fail('102.2 localEndpoint 修正缺失', '');
+
+    // 102.3: 注释里说明 LAN IP 覆盖原因
+    if (/相对路径[\s\S]{0,100}手机自己|localhost[\s\S]{0,100}数据全断/.test(s102))
+      ok('102.3 注释说明 APK 残留相对路径 → 数据全断 (V8)');
+    else fail('102.3 注释说明缺失', '');
+  } catch (e) { fail('102.x V8 APK 局域网修复', e.message); }
 
 
 

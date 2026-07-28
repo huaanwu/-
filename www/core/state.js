@@ -86,14 +86,36 @@
 
   /**
    * 启动时从 IndexedDB 还原
+   * V8: APK 启动时如果 kv 残留的是浏览器相对路径 (/api/akshare), 强制改写为 LAN IP
+   *      否则 APK 会用相对路径打到手机自己 localhost → 数据全断
    */
   async function init() {
     const proxyBase = await Core.Storage.kvGet('state_proxyBase');
-    if (proxyBase) _state.proxyBase = proxyBase;
+    if (proxyBase && /^https?:\/\//i.test(proxyBase)) {
+      // 绝对 URL → 直接用
+      _state.proxyBase = proxyBase;
+    } else if (_isNative) {
+      // APK + kv 值无效 (undefined 或相对路径) → 强制硬编码 LAN IP
+      console.log('[State] APK 启动, proxyBase 强制覆盖为 LAN IP (原值:', proxyBase || 'null', ')');
+      _state.proxyBase = 'http://192.168.1.3:8089/api/akshare';
+      Core.Storage.kvSet('state_proxyBase', _state.proxyBase).catch(() => {});
+    } else if (proxyBase) {
+      // 浏览器 dev 保留相对路径
+      _state.proxyBase = proxyBase;
+    }
     const apiKeys = await Core.Storage.kvGet('state_apiKeys');
     if (apiKeys) _state.apiKeys = apiKeys;
     const ai = await Core.Storage.kvGet('state_ai');
     if (ai) _state.ai = { ..._state.ai, ...ai };
+    // V8: APK + ai.localEndpoint.baseURL 含 127.0.0.1 → 强制改写为 LAN IP
+    if (_isNative && _state.ai && _state.ai.localEndpoint) {
+      const le = _state.ai.localEndpoint;
+      if (le.baseURL && /127\.0\.0\.1|localhost/.test(le.baseURL)) {
+        console.log('[State] APK 启动, localEndpoint.baseURL 强制改写为 LAN IP');
+        le.baseURL = 'http://192.168.1.3:8082/v1';
+        Core.Storage.kvSet('state_ai', _state.ai).catch(() => {});
+      }
+    }
     const accountCash = await Core.Storage.kvGet('state_accountCash');
     if (typeof accountCash === 'number') _state.accountCash = accountCash;
     const sync = await Core.Storage.kvGet('state_sync');
