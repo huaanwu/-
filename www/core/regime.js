@@ -190,10 +190,15 @@
       const ma60 = _avg(closes.slice(-MA_PERIOD));
       const ma60Prev = _avg(closes.slice(-MA_PERIOD - SLOPE_LOOKBACK, -SLOPE_LOOKBACK));
       const band = _computeBand(closes, close);
+      // Bug 1 修复: 每个指数用自己的历史 aboveStreak，不能用共识层的 _mem.aboveMa60Streak
+      // 否则 3 指数并行时互相污染 bear 退出判定（需 EXIT_STREAK=3）
+      const prevIdx = (_mem && _mem.indices && _mem.indices[code]) || {};
+      const prevState = (_mem && _mem.state) || 'range';
+      const prevAboveStreak = (typeof prevIdx.aboveStreak === 'number') ? prevIdx.aboveStreak : 0;
       const r = _classifyPerIndex({
         close, ma60, ma60Prev,
-        prevState: _mem && _mem.state,
-        aboveStreak: _mem && _mem.aboveMa60Streak,
+        prevState,
+        aboveStreak: prevAboveStreak,
         band
       });
       return { code, state: r.state, aboveStreak: r.aboveStreak, close, ma60, band };
@@ -297,7 +302,8 @@
       close: isFinite(x.close) ? +x.close.toFixed(2) : null,
       ma60: isFinite(x.ma60) ? +x.ma60.toFixed(2) : null,
       band: isFinite(x.band) ? +x.band.toFixed(4) : null,
-      reason: x.reason || null
+      reason: x.reason || null,
+      aboveStreak: x.aboveStreak || 0
     }]));
 
     const rec = {
@@ -317,7 +323,9 @@
       })(),
       stale: false,
       indices,
-      staleFailures: 0    // 成功路径重置
+      // Bug 3 修复: 部分成功时不应强制清零 staleFailures
+      // 仅当 usableCount >= MIN_INDEX_AGREE (达成共识) 才清零, 否则保留
+      staleFailures: (usableCount >= MIN_INDEX_AGREE) ? 0 : old.staleFailures || 0
     };
     try {
       await window.Core.Storage.kvSet(KV_KEY, rec);

@@ -130,12 +130,19 @@ function showRegimeAlertBanner(g) {
   const codes = (g && g.indices) ? Object.keys(g.indices) : [];
   const failedList = codes.filter(c => g.indices[c] && g.indices[c].state == null).join(', ') || '未知指数';
   const retryBtn = (failCount !== '' && failCount >= Core.Constants.STALE_FAIL_THRESHOLD)
-    ? '<button class="btn btn-sm" onclick="Core.Regime.refresh().then(_renderRegimeBadge)">🔄 重试</button>' : '';
+    ? '<button class="btn btn-sm" id="retryRegimeBtn">🔄 重试</button>' : '';
   banner.innerHTML = `
     <span class="regime-alert-icon">⚠</span>
     <span class="regime-alert-text">大盘状态机失灵 (连续失败 ${failCount} 次, 受影响指数: ${Core.Util.escapeHtml(failedList)}) — 已强制按"震荡市"保守处理, AI 建议自动降仓位 ×${Core.Regime.GATES.range.positionScale}, 建议门槛 0.5。${retryBtn}</span>
     <span class="regime-alert-close" onclick="this.parentElement.remove()">×</span>
   `;
+  // Bug 2 修复: 用 addEventListener 替代 onclick 内联, 避免未来引入 XSS 风险
+  const retryEl = banner.querySelector('#retryRegimeBtn');
+  if (retryEl) {
+    retryEl.addEventListener('click', () => {
+      Core.Regime.refresh().then(_renderRegimeBadge).catch(e => console.warn('[App] 手动 regime 重试失败:', e));
+    });
+  }
 }
 
 function hideRegimeAlertBanner() {
@@ -182,8 +189,14 @@ function hideRegimeAlertBanner() {
           _renderRegimeBadge();
         });
       }
-      // H3: 启动后即渲染徽章 (走内存缓存, 不触发新一次 refresh)
-      _renderRegimeBadge();
+      // H3: 启动后仅确保徽章 DOM 存在 + 设初始类名, 真正渲染由 refresh().then() 和 subscribe 负责
+      // Bug 4 修复: 去掉立即 _renderRegimeBadge(), refresh() 异步结束后自然会调
+      // 如果 _mem 已有当日值 (refresh 早返回), setInterval 5min 后也会补渲染
+      // 不在此调 — 避免跟 L176 refresh 完成后的渲染竞态
+      if (window.Core && Core.Regime && Core.Regime.gateMultipliers) {
+        // 仅确保 DOM 存在, 内容留给 refresh().then() 或 subscribe 填充
+        _ensureRegimeBadge();
+      }
       // H3: 5 分钟轮询一次, 兜底处理"setInterval 失灵"导致 stale 累计
       setInterval(() => {
         Core.Regime.refresh().then(_renderRegimeBadge).catch(e => console.warn('[App] Regime 周期 refresh 失败:', e && e.message || e));
