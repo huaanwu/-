@@ -349,6 +349,9 @@ vite.config.js              # root=www,域脚本 external 列表,dev proxy
 | L.3 硬筛 | `www/app/long-trader.js` `runNow` | 调 `Core.Data.getStockSpot()` 拿全市场 → 过滤涨跌幅 > 0 → 排序取前 30 只; 不复用 `Screener.run()` (强依赖 DOM) |
 | L.4 LLM 解读 | `www/app/long-trader.js` `_llmPickTop` | systemPrompt 注入"长线选股助手"人设 + 优先级规则 (市值≥50亿/涨幅 3-9% 区间/排 ST); 喂 30 只让 LLM 挑 3 只; 严格 JSON `{picks: [{code, name, reason}]}` → `Core.AI.callWithTimeout` + `parseJsonOutput` 走 `{ok, obj}` 协议; 非 6 位 code 被过滤 |
 | L.5 自动成交 | `www/app/long-trader.js` `runNow` | 遍历 picks → 调 `Paper.autoTradeFromPick({ code, name, sleeve: 'long' })` → 纪律引擎 (单票上限/重复错误/月度回撤) 自动卡; 失败 console.warn 不 throw; cashBefore/After 记日志 |
+| L.5.1 **跑空防护 (Bug #1 修复)** | `www/app/long-trader.js` `runNow` 步骤 2 | 跑前用 `Paper._planAutoTrade(acc.cash, acc.positionPct, 30)` 探测 1 手 30 元股能否成交, 不能 → 跳过, 避免 LLM 推 N 只全部 `autoTradeFromPick` 返 null (比硬定 `MIN_CASH` 数字更鲁棒, 不依赖股价假设) |
+| L.5.2 **Regime gate (Bug #2 修复)** | `www/app/long-trader.js` `runNow` 步骤 2.5 | 调 `Core.Regime.get()` + `Core.Regime.gateMultipliers()`; bear + `positionScale < 0.5` → 跳过 (防买在熊市反弹半山腰); range/bull 或 bear+≥0.5 → 照跑 |
+| L.5.3 **排除已持仓 (Bug #3 修复)** | `www/app/long-trader.js` `runNow` 步骤 4 | 硬筛前 `Paper._getPaperHoldings('long')` 拿已持仓 code Set, 过滤掉 (防反复追涨已持仓; 纪律引擎挡单票上限是兜底, 但用户疑惑"为啥又推同一只"该在源头挡) |
 | L.6 决策日志 + lastRun | `www/app/long-trader.js` `_appendLog` | kv `paper_long_trader_log` (上限 100, 滚动截断): {ts, date, trigger, picks: [{code, name, ok, reason}], cashBefore, cashAfter, cashUsed}; kv `paper_long_trader_last` {date, ts} 防重复 |
 | L.7 启动钩子 | `www/app.js` | init 后 `LongTrader.init()` 同步调 (内部起 30 分钟定时器, 跑首轮 runNow 异步不阻塞) |
 | L.8 UI 入口 | (后续) | 模拟盘页长线 tab 加"🤖 本周自动选股"区块: 显示 lastRun 日期 + 本次 picks 卡片 + 累计自动成交金额/笔数; 调 `LongTrader.listLog(10)` 渲染 |

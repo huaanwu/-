@@ -67,6 +67,23 @@
           console.log(`[LongTrader] long sleeve 现金 ${acc.cash} < ${MIN_CASH}, 跳过`);
           return;
         }
+        // Bug #1 修复 (跑空防护): 跑前用 _planAutoTrade 探测 1 手 30 元股能否成交
+        // 比硬定 MIN_CASH 数字更鲁棒 — 30 元是中盘股典型价, 1 手 3000 块 + 仓位 10% 要求 ≥ 3 万 cash
+        // 现金不够买 1 手 → 跳过, 避免 LLM 推 N 只全部 autoTradeFromPick 返 null
+        const testShares = Paper._planAutoTrade(acc.cash, acc.positionPct || 0.10, 30);
+        if (!testShares || testShares < Core.Constants.LOT_SIZE) {
+          console.log(`[LongTrader] 现金 ${acc.cash} × ${acc.positionPct || 0.10} 买不起 1 手 30 元股, 跳过`);
+          return;
+        }
+        // Bug #2 修复 (Regime gate): 熊市 + 仓位系数 < 0.5 → 跳过, 防买在反弹半山腰
+        try {
+          const rec = await Core.Regime.get();
+          const gate = Core.Regime.gateMultipliers();
+          if (rec && rec.state === 'bear' && gate && gate.positionScale < 0.5) {
+            console.log(`[LongTrader] Regime bear + positionScale ${gate.positionScale} < 0.5, 跳过`);
+            return;
+          }
+        } catch (e) { console.warn('[LongTrader] Regime 检查跳过:', e); }
         // 3. 拉全市场行情
         let all;
         try {
@@ -76,9 +93,16 @@
           return;
         }
         if (!Array.isArray(all) || all.length === 0) return;
-        // 4. 简单硬筛: 涨跌幅 > 0, 取前 30 (看涨池)
+        // Bug #3 修复 (排除已持仓): 防反复追涨已持仓 (靠纪律引擎挡单票上限是兜底,
+        // 但用户疑惑"为啥又推同一只" — 直接从候选池里去掉)
+        let heldCodes = new Set();
+        try {
+          const held = (await Paper._getPaperHoldings('long')) || [];
+          heldCodes = new Set(held.map(h => h.code).filter(Boolean));
+        } catch (e) { /* */ }
+        // 4. 简单硬筛: 涨跌幅 > 0 + 不在已持仓, 取前 30 (看涨池)
         const sorted = all
-          .filter(s => s && s.代码 && s.名称 && parseFloat(s.涨跌幅) > 0)
+          .filter(s => s && s.代码 && s.名称 && parseFloat(s.涨跌幅) > 0 && !heldCodes.has(s.代码))
           .sort((a, b) => parseFloat(b.涨跌幅) - parseFloat(a.涨跌幅))
           .slice(0, HARD_TOP);
         if (sorted.length === 0) return;
