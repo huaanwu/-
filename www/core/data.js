@@ -309,18 +309,24 @@
   }
 
   // ===== 东方财富 fetcher (C 全市场 screener 用) =====
-  // clist/get 一次拉所有 A股 (5000+), CORS 友好
-  // URL: https://push2.eastmoney.com/api/qt/clist/get
-  //   pn=1&pz=5000&po=1&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23
+  // 端点 1 (主): push2.eastmoney.com (实时) — WebView 里 ERR_EMPTY_RESPONSE (Node/Chromium push2 ban)
+  // 端点 2 (兜底): push2delay.eastmoney.com (延迟 15min) — 限 100/页, 分页拉
+  // 端点 3 (兜底): aktools /stock_zh_a_spot_em (历史端点) — 但需要 dev-proxy
+  // URL: ?pn=1&pz=100&po=1&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23
   //   fields=f12,f14,f2,f3,f4,f5,f6,f8,f9,f10,f20,f23
   // 字段(注意: f3/f8/f10/f20 是基点 0.01% 精度, f9 是市盈率 * 100):
   //   f12=代码 f14=名称 f2=最新价
   //   f3=涨跌幅(基点) f4=涨跌额 f5=成交量(手) f6=成交额(元)
   //   f8=换手率(基点) f9=市盈率(动, *100) f10=量比(基点)
   //   f20=流通市值(元) f23=市净率(*100)
-  const EM_URL = 'https://push2.eastmoney.com/api/qt/clist/get';
+  const EM_URLS = [
+    'https://push2.eastmoney.com/api/qt/clist/get',         // 实时, 大多 fail
+    'https://push2delay.eastmoney.com/api/qt/clist/get'    // 延迟 15min, 限制 100/页但稳
+  ];
   const EM_FS = 'm:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23';  // 沪主+科创+深主+创业
   const EM_FIELDS = 'f12,f14,f2,f3,f4,f5,f6,f8,f9,f10,f20,f23';
+  const EM_PAGE_SIZE = 100;  // push2delay 限 100/页, push2 5000
+  const EM_MAX_PAGES = 5;     // 最多 5 页 = 500 只 (避免被 ban)
 
   async function _efinanceFetch() {
     // 限流检查 (跟 _fetch 一致: 限流期内不发起请求)
@@ -328,54 +334,91 @@
     if (s.blocked) {
       throw new Error(`数据源限流, ${Math.ceil(s.retryIn/1000)}s 后可重试 (上次: ${s.lastError.slice(0, 100)})`);
     }
-    const url = `${EM_URL}?pn=1&pz=5000&po=1&fs=${EM_FS}&fields=${EM_FIELDS}`;
-    let resp;
-    try {
-      // 加 Referer + UA: 东方财富 ban Node 默认 UA
-      resp = await fetch(url, {
-        method: 'GET',
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Referer': 'https://quote.eastmoney.com/'
-        }
-      });
-    } catch (e) {
-      throw new Error(`东方财富网络错误: ${e.message}`);
+    // 逐端点尝试: push2 (实时) → push2delay (延迟 15min, 限 100/页但稳)
+    let lastErr = null;
+    for (const baseUrl of EM_URLS) {
+      try {
+        const out = await _efinanceFetchOne(baseUrl, EM_MAX_PAGES);
+        if (!_limitByPath['efinance_full']) _limitByPath['efinance_full'] = { blocked: false, until: 0, lastError: '', lastSuccess: 0 };
+        _limitByPath['efinance_full'].lastSuccess = Date.now();
+        return out;
+      } catch (e) {
+        console.warn(`[Data] 东财 ${baseUrl} 失败:`, e.message);
+        lastErr = e;
+        // 继续试下一个端点
+      }
     }
-    if (!resp.ok) {
-      // 5xx 不当限流 (东财对裸请求常 500/403, 走降级更快), 仅 429 / 关键字触发限流
-      if (resp.status === 429) _setLimit('efinance_full', 60 * 1000, `HTTP ${resp.status}`);
-      throw new Error(`东方财富 HTTP ${resp.status}`);
+    throw lastErr || new Error('所有东财端点都失败');
+  }
+
+  /**
+   * 单端点拉取, 支持分页
+   * @param {string} baseUrl - push2 或 push2delay
+   * @param {number} maxPages - 最多拉几页
+   */
+  async function _efinanceFetchOne(baseUrl, maxPages = 1) {
+    const isDelay = baseUrl.includes('push2delay');
+    const pageSize = isDelay ? Math.min(EM_PAGE_SIZE, 100) : 5000;
+    // 延迟端点限 100/页, 必须分页; 实时端点 pz=5000 一次就行
+    const pages = isDelay ? Math.min(maxPages, 5) : 1;
+    const all = [];
+    for (let pn = 1; pn <= pages; pn++) {
+      const url = `${baseUrl}?pn=${pn}&pz=${pageSize}&po=1&fs=${EM_FS}&fields=${EM_FIELDS}`;
+      let resp;
+      try {
+        resp = await fetch(url, {
+          method: 'GET',
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Referer': 'https://quote.eastmoney.com/'
+          }
+        });
+      } catch (e) {
+        if (pn === 1) throw new Error(`东财网络错误: ${e.message}`);
+        // 后续页失败就 break, 已拉的够用
+        console.warn(`[Data] 东财分页 ${pn} 失败:`, e.message);
+        break;
+      }
+      if (!resp.ok) {
+        if (resp.status === 429) _setLimit('efinance_full', 60 * 1000, `HTTP ${resp.status}`);
+        if (pn === 1) throw new Error(`东财 HTTP ${resp.status}`);
+        break;
+      }
+      let j;
+      try { j = await resp.json(); } catch (e) {
+        if (pn === 1) throw new Error('东财返非 JSON: ' + e.message);
+        break;
+      }
+      if (!j.data || !j.data.diff || Object.keys(j.data.diff).length === 0) {
+        if (pn === 1) throw new Error(`东财返空 (rc=${j.rc}, rt=${j.rt})`);
+        // 后续页空就 break
+        break;
+      }
+      // 字段映射成 aktools 风格
+      for (const k of Object.keys(j.data.diff)) {
+        const r = j.data.diff[k];
+        all.push({
+          '代码': r.f12 || '',
+          '名称': r.f14 || '',
+          '最新价': _num(r.f2) / 100,
+          '涨跌幅': _num(r.f3) / 100,
+          '涨跌额': _num(r.f4) / 100,
+          '成交量': _num(r.f5),
+          '成交额': _num(r.f6),
+          '换手率': _num(r.f8) / 100,
+          '市盈率': _num(r.f9) / 100,
+          '量比': _num(r.f10) / 100,
+          '流通市值': _num(r.f20),
+          '市净率': _num(r.f23) / 100
+        });
+      }
+      if (isDelay && pn < pages) {
+        // 分页间隔 200ms, 避免被 ban
+        await new Promise(r => setTimeout(r, 200));
+      }
     }
-    let j;
-    try { j = await resp.json(); } catch (e) {
-      throw new Error('东方财富返非 JSON: ' + e.message);
-    }
-    if (!j.data || !j.data.diff) {
-      throw new Error(`东方财富返空 (rc=${j.rc}, rt=${j.rt})`);
-    }
-    if (!_limitByPath['efinance_full']) _limitByPath['efinance_full'] = { blocked: false, until: 0, lastError: '', lastSuccess: 0 };
-    _limitByPath['efinance_full'].lastSuccess = Date.now();
-    // 字段映射成 aktools 风格
-    const out = [];
-    for (const k of Object.keys(j.data.diff)) {
-      const r = j.data.diff[k];
-      out.push({
-        '代码': r.f12 || '',
-        '名称': r.f14 || '',
-        '最新价': _num(r.f2) / 100,           // 实际是元 * 100
-        '涨跌幅': _num(r.f3) / 100,           // 基点 → %
-        '涨跌额': _num(r.f4) / 100,           // 元 * 100
-        '成交量': _num(r.f5),                  // 手 (实际数据是手, 但东方财富单位是"手"? 让我看)
-        '成交额': _num(r.f6),                  // 元
-        '换手率': _num(r.f8) / 100,           // 基点 → %
-        '市盈率': _num(r.f9) / 100,           // *100 → 倍
-        '量比': _num(r.f10) / 100,
-        '流通市值': _num(r.f20),               // 元
-        '市净率': _num(r.f23) / 100           // *100 → 倍
-      });
-    }
-    return out;
+    if (all.length === 0) throw new Error('东财解析后为空');
+    return all;
   }
 
   /**
@@ -455,6 +498,34 @@
     return { blocked: false, retryIn: 0, until: 0, lastError: '', lastSuccess: 0 };
   }
 
+  /**
+   * 统一拼 API URL — 浏览器 dev 环境返相对路径, APK 环境基于 proxyBase 拼绝对路径
+   *
+   * 背景: APK 里 webview 启动 URL 是 http://localhost (手机自己),
+   * 任何相对路径 '/api/xxx' 都会打到手机自己, 不通.
+   * 必须基于 proxyBase (用户设置 http://192.168.x.x:8089/api/akshare)
+   * 抽 origin 部分 + 目标 path 拼绝对 URL.
+   *
+   * @param {string} path - 形如 '/api/eastmoney/...' / '/api/llm/...' / '/api/local/...'
+   * @returns {string} - 浏览器 dev: path 原样返回; APK: 'http://192.168.x.x:8089' + path
+   */
+  function apiUrl(path) {
+    if (!path || typeof path !== 'string') return path;
+    // 绝对 URL 直接返
+    if (/^https?:\/\//i.test(path)) return path;
+    const base = (window.Core && Core.State && Core.State.get('proxyBase')) || DEFAULT_PROXY;
+    // proxyBase 是相对路径 (浏览器 dev) → 直接返原 path (走 vite proxy)
+    if (!/^https?:\/\//i.test(base)) return path;
+    // proxyBase 是绝对 URL (APK) → 抽 origin 拼 path
+    try {
+      const u = new URL(base);
+      return `${u.origin}${path.startsWith('/') ? path : '/' + path}`;
+    } catch (e) {
+      console.warn('[Data] proxyBase 解析失败, 退到相对路径:', e.message);
+      return path;
+    }
+  }
+
   // 通用 fetch + JSON + 错误处理 + retry
   // 不在顶部检查限流 (留给 fetchWithCache 决定: 缓存命中不限流, 没缓存才限流)
   // 限流按 path 独立: 同一时间 stock_zh_a_hist 限流不影响 stock_zh_a_spot
@@ -462,6 +533,7 @@
     const { retries = 2, baseDelay = 1500 } = opts;  // 第一次失败等 1.5s, 第二次 3s
     const base = (window.Core && Core.State && Core.State.get('proxyBase')) || DEFAULT_PROXY;
     const qs = new URLSearchParams(params).toString();
+    // base 已是绝对 URL (APK) 直接用; 是相对路径 (浏览器 dev) 也直接用, 走 vite proxy
     const url = qs ? `${base}/${path}?${qs}` : `${base}/${path}`;
 
     let lastErr = null;
@@ -1047,7 +1119,7 @@
    * 归一化到 aktools 风格: [{日期, 单位净值, 日增长率, 累计净值(null 该端点不返)}]
    */
   async function _fetchTiantianFundHistory(code) {
-    const url = `/api/fund/eastmoney/pingzhongdata/${code}.js`;
+    const url = apiUrl(`/api/fund/eastmoney/pingzhongdata/${code}.js`);
     // cache: 'no-store' 强制不走 HTTP cache: 浏览器曾因 301/302 链缓存 opaqueredirect,
     // 后续不带 query string 的同 URL 默认 fetch 永久返 "TypeError: Failed to fetch"。
     // 历史数据走 IndexedDB 缓存(fetchWithCache), 此处不需要 HTTP 缓存。
@@ -1761,6 +1833,7 @@
   window.Core = window.Core || {};
   window.Core.Data = {
     fetch: fetchWithCache,
+    apiUrl,  // 统一拼 API URL (APK 内基于 proxyBase origin 拼绝对路径)
     health,
     getLimitStatus,  // c: UI 读这个显示限流状态
     resetLimit: _clearAllLimit,  // 测试/手动重置 (全部端点; _clearLimit 需带 path)

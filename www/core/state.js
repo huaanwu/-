@@ -5,9 +5,18 @@
 (function() {
   'use strict';
 
+  // 平台检测: Capacitor webview 的 UA 含 'wv' (Android WebView) 或者 '; wv)' 标记
+  // 浏览器 dev (Chrome/Edge) UA 没这个标记
+  // 参考: https://developer.chrome.com/docs/multidevice/user-agent/#webview_user_agent
+  const _isNative = (typeof navigator !== 'undefined' && /; wv\)|\bwv\b/.test(navigator.userAgent || ''));
+
   const _state = {
     currentPage: 'pageWatchlist',
-    proxyBase: '/api/akshare',   // 运行时可改
+    // proxyBase 启动时按平台自动填:
+    //   - 浏览器 dev (vite) → '/api/akshare' (走 vite proxy)
+    //   - APK / Capacitor   → 'http://192.168.1.3:8089/api/akshare' (PC 局域网 IP)
+    // 用户改后从 IndexedDB 读, 这里的默认仅首次启动生效
+    proxyBase: _isNative ? 'http://192.168.1.3:8089/api/akshare' : '/api/akshare',
     apiKeys: {
       tushare: ''                // 付费 Tushare token(可选)
     },
@@ -21,7 +30,8 @@
       maxTokens: 8000,            // 推理模型需更多 token
       preferLocal: true,          // ✅ 默认优先本地 (无本地时降级远程)
       localEndpoint: {
-        baseURL: 'http://127.0.0.1:8082/v1',  // 本地 qwen3 OpenAI 兼容
+        // APK 平台用 PC 局域网 IP, 浏览器 dev 用 127.0.0.1
+        baseURL: _isNative ? 'http://192.168.1.3:8082/v1' : 'http://127.0.0.1:8082/v1',
         apiKey: '',                            // 运行时 UI 输入
         model: 'qwen36-35b-a3b'                // 本地模型实测名称
       }

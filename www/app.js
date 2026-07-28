@@ -226,7 +226,11 @@ window._renderSettings = function() {
     <div class="form-row">
       <label>AKShare 代理地址</label>
       <input type="text" id="settingProxyBase" value="${escapeHtml(state.proxyBase)}"
-             placeholder="/api/akshare 或 http://192.168.1.3:8089/api/akshare">
+             placeholder="http://192.168.1.3:8089/api/akshare">
+      <div style="font-size:11px;color:var(--text-muted);margin-top:4px;line-height:1.5;">
+        💡 浏览器 dev 用 <code>/api/akshare</code> (走 vite proxy);<br>
+        📱 APK/手机 用 <code>http://192.168.1.3:8089/api/akshare</code> (你的 PC 局域网 IP)
+      </div>
     </div>
     <div class="form-row">
       <label>Tushare Token</label>
@@ -477,8 +481,9 @@ window.onAIUseProxyChange = function() {
   if (!baseEl) return;
   if (useProxy && p !== 'custom') {
     // 自动填本地代理 URL
-    const proxyURL = `/api/llm/${p}/v1`;
-    if (!baseEl.value || baseEl.value.startsWith('/api/llm/')) {
+    const _apiUrl = (window.Core && Core.Data && Core.Data.apiUrl) ? Core.Data.apiUrl : (x) => x;
+    const proxyURL = _apiUrl(`/api/llm/${p}/v1`);
+    if (!baseEl.value || baseEl.value.startsWith('/api/llm/') || /^https?:\/\/.+\/api\/llm\//.test(baseEl.value)) {
       baseEl.value = proxyURL;
     }
     if (hint) hint.innerHTML = '✓ 通过 dev-proxy 转发, 浏览器无 CORS。生产 APK 部署时改为局域网 IP 即可。';
@@ -546,7 +551,8 @@ window.discoverDevProxy = async function() {
   window._discoveredDevProxies = [];
   let info;
   try {
-    const r = await fetch('/api/discover/dev-proxy', { cache: 'no-store' });
+    const _apiUrl = (window.Core && Core.Data && Core.Data.apiUrl) ? Core.Data.apiUrl : (x) => x;
+    const r = await fetch(_apiUrl('/api/discover/dev-proxy'), { cache: 'no-store' });
     if (!r.ok) throw new Error('dev-proxy 返回 HTTP ' + r.status);
     info = await r.json();
   } catch (e) {

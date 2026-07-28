@@ -97,22 +97,26 @@
 
   async function _fetchIndustryEastmoney() {
     const q = 'pn=1&pz=100&po=1&fs=m:90+t:2&fields=f12,f14,f2,f3,f4,f8';
-    const proxyUrl = `/api/eastmoney/api/qt/clist/get?${q}`;
-    const directUrl = `https://push2.eastmoney.com/api/qt/clist/get?${q}`;
-    let resp;
-    try {
-      resp = await fetch(proxyUrl);
-    } catch (e) {
-      console.warn('[Market] 行业 dev-proxy 失败, 尝试直连:', e.message);
+    // 多个候选端点: 1) dev-proxy 转发 (开发环境) 2) 东财实时直连 (webview 常 fail) 3) 东财延迟直连 (兜底)
+    const _apiUrl = (window.Core && Core.Data && Core.Data.apiUrl) ? Core.Data.apiUrl : (p) => p;
+    const candidates = [
+      { url: _apiUrl(`/api/eastmoney/api/qt/clist/get?${q}`), label: 'eastmoney-proxy' },
+      { url: `https://push2.eastmoney.com/api/qt/clist/get?${q}`, label: 'push2-direct' },
+      { url: `https://push2delay.eastmoney.com/api/qt/clist/get?${q}`, label: 'push2delay-direct' }
+    ];
+    let resp, used = null, lastErr = null;
+    for (const c of candidates) {
       try {
-        resp = await fetch(directUrl);
-      } catch (e2) {
-        throw new Error('行业接口网络错误: ' + e2.message);
+        resp = await fetch(c.url, { headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://quote.eastmoney.com/' } });
+        if (resp.ok) { used = c.label; break; }
+        lastErr = new Error(`${c.label} HTTP ${resp.status}`);
+      } catch (e) {
+        lastErr = new Error(`${c.label} ${e.message}`);
       }
     }
-    if (!resp.ok) throw new Error('东方财富行业 HTTP ' + resp.status);
+    if (!resp || !resp.ok) throw lastErr || new Error('行业所有源失败');
     const j = await resp.json();
-    if (!j.data || !j.data.diff) throw new Error('东方财富行业返空');
+    if (!j.data || !j.data.diff) throw new Error(`东方财富行业返空 (源: ${used})`);
     // 字段映射: f12 板块代码, f14 名称, f2 总成交额(万元), f3 涨跌幅(基点), f4 涨跌额(万元), f8 换手率(基点)
     const parsed = Object.values(j.data.diff).map(r => ({
       code: r.f12 || '',
@@ -128,7 +132,7 @@
     return {
       top: parsed.slice(0, 5),
       bottom: parsed.slice(-5).reverse(),
-      source: 'eastmoney'
+      source: used || 'eastmoney'
     };
   }
 
@@ -139,9 +143,23 @@
    * 注意: 新浪端点只支持 HTTP;https 会返 [];proxy 时强制 changeOrigin:true 让上游认 HTTP
    */
   async function _fetchIndustrySina() {
-    const url = '/api/sina/q/view/newFLJK.php?param=industry';
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error('新浪行业 HTTP ' + resp.status);
+    // 多个候选: 1) dev-proxy 转发 (开发环境) 2) 新浪直接 (APK 兜底, 但 CORS 可能拒, 用 no-cors 不行; 用 origin 头)
+    const _apiUrl = (window.Core && Core.Data && Core.Data.apiUrl) ? Core.Data.apiUrl : (p) => p;
+    const candidates = [
+      { url: _apiUrl('/api/sina/q/view/newFLJK.php?param=industry'), label: 'sina-proxy' },
+      { url: 'http://vip.stock.finance.sina.com.cn/q/view/newFLJK.php?param=industry', label: 'sina-direct' }
+    ];
+    let resp, used = null, lastErr = null;
+    for (const c of candidates) {
+      try {
+        resp = await fetch(c.url, { headers: { 'Referer': 'https://finance.sina.com.cn/' } });
+        if (resp.ok) { used = c.label; break; }
+        lastErr = new Error(`${c.label} HTTP ${resp.status}`);
+      } catch (e) {
+        lastErr = new Error(`${c.label} ${e.message}`);
+      }
+    }
+    if (!resp || !resp.ok) throw lastErr || new Error('新浪行业所有源失败');
     // 上游返回 GBK 编码 (text/html; charset=gbk),浏览器 text() 不会自动转码,需要手动 GBK → UTF-8
     let text;
     try {
