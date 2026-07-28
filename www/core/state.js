@@ -10,13 +10,17 @@
   // 参考: https://developer.chrome.com/docs/multidevice/user-agent/#webview_user_agent
   const _isNative = (typeof navigator !== 'undefined' && /; wv\)|\bwv\b/.test(navigator.userAgent || ''));
 
+  // V9: 标记 init() 完成后是否需要打"未配 LAN IP"的引导 toast
+  //   供 app.js 在 Core.State.on('initComplete') 时读
+  let _needProxyToast = false;
+
   const _state = {
     currentPage: 'pageWatchlist',
-    // proxyBase 启动时按平台自动填:
-    //   - 浏览器 dev (vite) → '/api/akshare' (走 vite proxy)
-    //   - APK / Capacitor   → 'http://192.168.1.3:8089/api/akshare' (PC 局域网 IP)
-    // 用户改后从 IndexedDB 读, 这里的默认仅首次启动生效
-    proxyBase: _isNative ? 'http://192.168.1.3:8089/api/akshare' : '/api/akshare',
+    // proxyBase 启动时按平台 + kv 值自动填:
+    //   - 浏览器 dev (vite) 无 kv → '/api/akshare' (走 vite proxy)
+    //   - APK 无 kv → '' (空, 等用户在设置页点「🔍 找 PC 上的 dev-proxy」)
+    //   - 有合法绝对 URL 的 kv → 直接信任, 任何 LAN IP / 域名 / 端口
+    proxyBase: _isNative ? '' : '/api/akshare',
     apiKeys: {
       tushare: ''                // 付费 Tushare token(可选)
     },
@@ -30,8 +34,8 @@
       maxTokens: 8000,            // 推理模型需更多 token
       preferLocal: true,          // ✅ 默认优先本地 (无本地时降级远程)
       localEndpoint: {
-        // APK 平台用 PC 局域网 IP, 浏览器 dev 用 127.0.0.1
-        baseURL: _isNative ? 'http://192.168.1.3:8082/v1' : 'http://127.0.0.1:8082/v1',
+        // V9: 默认空, 等用户输入; 浏览器 dev 显式 127.0.0.1 (同机)
+        baseURL: _isNative ? '' : 'http://127.0.0.1:8082/v1',
         apiKey: '',                            // 运行时 UI 输入
         model: 'qwen36-35b-a3b'                // 本地模型实测名称
       }
@@ -86,19 +90,20 @@
 
   /**
    * 启动时从 IndexedDB 还原
-   * V8: APK 启动时如果 kv 残留的是浏览器相对路径 (/api/akshare), 强制改写为 LAN IP
-   *      否则 APK 会用相对路径打到手机自己 localhost → 数据全断
+   * V9: 不再强制覆盖 proxyBase/localEndpoint — 用户在设置页输入的值就是权威
+   *   - 浏览器 dev: kv 缺值 → 用 vite proxy 默认 '/api/akshare'
+   *   - APK: kv 缺值 → 不填默认 (空字符串), 等用户去设置页点「🔍 找 PC 上的 dev-proxy」
+   *     打一次性 toast 提醒, 不偷偷改写用户配置
    */
   async function init() {
     const proxyBase = await Core.Storage.kvGet('state_proxyBase');
     if (proxyBase && /^https?:\/\//i.test(proxyBase)) {
-      // 绝对 URL → 直接用
+      // 绝对 URL → 直接用 (任何 LAN IP / 域名 / 端口, 一律信任用户)
       _state.proxyBase = proxyBase;
     } else if (_isNative) {
-      // APK + kv 值无效 (undefined 或相对路径) → 强制硬编码 LAN IP
-      console.log('[State] APK 启动, proxyBase 强制覆盖为 LAN IP (原值:', proxyBase || 'null', ')');
-      _state.proxyBase = 'http://192.168.1.3:8089/api/akshare';
-      Core.Storage.kvSet('state_proxyBase', _state.proxyBase).catch(() => {});
+      // APK + kv 无合法绝对 URL → 留空, 等用户填
+      _state.proxyBase = '';
+      _needProxyToast = true;  // 标记 init 完成后打一次引导 toast
     } else if (proxyBase) {
       // 浏览器 dev 保留相对路径
       _state.proxyBase = proxyBase;
@@ -107,15 +112,8 @@
     if (apiKeys) _state.apiKeys = apiKeys;
     const ai = await Core.Storage.kvGet('state_ai');
     if (ai) _state.ai = { ..._state.ai, ...ai };
-    // V8: APK + ai.localEndpoint.baseURL 含 127.0.0.1 → 强制改写为 LAN IP
-    if (_isNative && _state.ai && _state.ai.localEndpoint) {
-      const le = _state.ai.localEndpoint;
-      if (le.baseURL && /127\.0\.0\.1|localhost/.test(le.baseURL)) {
-        console.log('[State] APK 启动, localEndpoint.baseURL 强制改写为 LAN IP');
-        le.baseURL = 'http://192.168.1.3:8082/v1';
-        Core.Storage.kvSet('state_ai', _state.ai).catch(() => {});
-      }
-    }
+    // V9: 信任用户输入 — 任何合法绝对 URL 一律直接用, 不再过滤 127.0.0.1/localhost
+    //   (用户可能故意用手机模拟器/同机端口转发)
     const accountCash = await Core.Storage.kvGet('state_accountCash');
     if (typeof accountCash === 'number') _state.accountCash = accountCash;
     const sync = await Core.Storage.kvGet('state_sync');
@@ -123,8 +121,24 @@
     // Phase W-1.5: 还原 Core.UserProfile (否则重启浏览器/APK 后用户画像丢回默认)
     const userProfile = await Core.Storage.kvGet('state_userProfile');
     if (userProfile) _state.userProfile = userProfile;
+    // V9: 触发 initComplete 事件, 让 app.js 知道是否需要打"未配 LAN IP"引导 toast
+    //   _needProxyToast 在 init() 内已按需置 true
+    _emit('initComplete', { needProxyToast: _needProxyToast });
+  }
+
+  /**
+   * V9: 触发 init 之类的无 key 监听 (set() 的监听器都是按 key 注册, 不能复用)
+   */
+  const _eventListeners = new Map();
+  function _emit(event, payload) {
+    const list = _eventListeners.get(event);
+    if (list) list.forEach(fn => { try { fn(payload); } catch (e) { console.warn('[State] event listener error:', e); } });
+  }
+  function onEvent(event, fn) {
+    if (!_eventListeners.has(event)) _eventListeners.set(event, []);
+    _eventListeners.get(event).push(fn);
   }
 
   window.Core = window.Core || {};
-  window.Core.State = { get, set, on, off, init };
+  window.Core.State = { get, set, on, off, init, onEvent };
 })();

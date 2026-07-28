@@ -160,6 +160,22 @@ function hideRegimeAlertBanner() {
     // 2. 还原 state
     await Core.State.init();
 
+    // V9: 监听 initComplete, 若 APK 启动时无合法 proxyBase URL, 引导用户去设置页
+    //   (不偷偷改写, 尊重"配置页输入即生效"契约)
+    if (Core.State.onEvent) {
+      Core.State.onEvent('initComplete', (payload) => {
+        if (payload && payload.needProxyToast && Core.Toast) {
+          Core.Toast.show('📡 APK 启动: 还没配 AKShare 代理地址 — 打开设置页点「🔍 找 PC 上的 dev-proxy」', 6000);
+        }
+      });
+      // 本轮 init 已完成, 同步触发一次 (上面 onEvent 是为下次启动)
+      if (Core.State.get('proxyBase') === '' && /; wv\)|\bwv\b/.test(navigator.userAgent || '')) {
+        setTimeout(() => {
+          if (Core.Toast) Core.Toast.show('📡 APK 启动: 还没配 AKShare 代理地址 — 打开设置页点「🔍 找 PC 上的 dev-proxy」', 6000);
+        }, 1000);
+      }
+    }
+
     // 3. 市场状态
     updateMarketStatus();
     setInterval(updateMarketStatus, 60 * 1000);
