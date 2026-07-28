@@ -66,6 +66,7 @@ export default defineConfig({
     }
   },
   server: {
+    host: '0.0.0.0',  // V12: LAN 访问用 (手机浏览器 / APK 调试)
     port: 3003,
     // 开发环境用 vite proxy 转后端
     // aktools 0.0.91+ 接口路径是 /api/public/{item_id}
