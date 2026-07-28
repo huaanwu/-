@@ -36,7 +36,67 @@ function spawnChild(name, cmd, args, cwd, color) {
   return child;
 }
 
+/** 找一个可用的 Python 可执行文件, 优先 python3 / python, 被 pip 隔离时 fallback sys.executable */
+function _pickPython() {
+  const cand = ['python', 'python3', process.env.PYTHON || ''];
+  const cp = require('child_process');
+  for (const c of cand) {
+    if (!c) continue;
+    try { cp.execFileSync(c, ['--version'], { timeout: 5000 }); return c; } catch (_) {}
+  }
+  return null;
+}
+
+/** 自动启动 aktools Python 后端 (端口 8088), 如果已经在跑则跳过 */
+async function _ensureAktools() {
+  const http = require('http');
+  const aktoolsTarget = process.env.AKSHARE_TARGET || 'http://127.0.0.1:8088';
+  const url = new URL(aktoolsTarget);
+  // 先探一下, 通就跳过
+  const alreadyUp = await new Promise((resolve) => {
+    const req = http.get(`${aktoolsTarget}/api/public/macro_china_lpr`, { timeout: 3000 }, (res) => {
+      resolve(res.statusCode === 200 || res.statusCode === 422);
+    });
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+  });
+  if (alreadyUp) {
+    process.stdout.write(`[aktools] 已有外部进程在 ${aktoolsTarget}, 不自动拉起\n`);
+    return;
+  }
+  const py = _pickPython();
+  if (!py) {
+    process.stdout.write(`[aktools] ${aktoolsTarget} 不通, 且没找到 python/python3, 跳过自动拉起\n`);
+    return;
+  }
+  // 确认 aktools 模块已装
+  const cp = require('child_process');
+  try { cp.execFileSync(py, ['-c', 'import aktools'], { timeout: 5000 }); }
+  catch (_) {
+    process.stdout.write(`[aktools] ${py} 在但 aktools 没装, 跳过自动拉起 (手动: ${py} -m pip install aktools)\n`);
+    return;
+  }
+  process.stdout.write(`[aktools] ${aktoolsTarget} 不通, 自动拉起: ${py} -m aktools --host ${url.hostname} --port ${url.port}\n`);
+  spawnChild('aktools', py, ['-m', 'aktools', '--host', url.hostname, '--port', url.port], ROOT, '3');
+  // 等端口起来 (最多 20s)
+  const deadline = Date.now() + 20000;
+  while (Date.now() < deadline) {
+    const ok = await new Promise(resolve => {
+      const req = http.get(`${aktoolsTarget}/api/public/macro_china_lpr`, { timeout: 2000 }, (res) => {
+        resolve(res.statusCode === 200 || res.statusCode === 422);
+      });
+      req.on('error', () => resolve(false));
+      req.on('timeout', () => { req.destroy(); resolve(false); });
+    });
+    if (ok) break;
+    await new Promise(r => setTimeout(r, 1000));
+  }
+}
+
 async function startBackend() {
+  // 0) 自动拉起 aktools (生产/开发 都一样)
+  await _ensureAktools();
+
   if (IS_DEV) {
     // dev mode: 启动 dev-proxy + vite (跟 npm run dev 一致)
     const proxyScript = path.join(ROOT, 'scripts', 'dev-proxy.mjs');
