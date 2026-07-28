@@ -896,6 +896,57 @@
       return outcome === 'correct' ? 1 : (outcome === 'partial' ? 0.5 : 0);
     },
 
+    /**
+     * 夏普比率 (纯函数): 假设按 trade 频次年化 (无风险=0)
+     * @param {Array<{pnl: number}>} trades  - pnl 用 return (小数) 而非金额, 跨账户可比
+     * @param {number} [periodsPerYear=48]    - 短线约 48 笔/年 (周频), 拉平到年化
+     * @returns {number|null} 样本 <2 返 null
+     */
+    _computeSharpe(trades, periodsPerYear = 48) {
+      const list = (Array.isArray(trades) ? trades : []).filter(t => t && isFinite(t.pnl));
+      if (list.length < 2) return null;
+      const mean = list.reduce((s, t) => s + t.pnl, 0) / list.length;
+      const variance = list.reduce((s, t) => s + Math.pow(t.pnl - mean, 2), 0) / (list.length - 1);
+      const sd = Math.sqrt(variance);
+      if (sd === 0) return null;  // 全部相同 → 无风险收益, 比率无意义
+      const sharpe = (mean / sd) * Math.sqrt(periodsPerYear);
+      return +sharpe.toFixed(3);
+    },
+
+    /**
+     * 最大回撤 (纯函数): 累计收益曲线峰值到谷底的最大跌幅
+     * @param {Array<{pnl: number}>} trades  - 按时间升序 (调用方排序)
+     * @returns {number|null} 样本 <1 返 null, 返 0~1 负数 (如 -0.15 = 15% 回撤)
+     */
+    _computeMaxDrawdown(trades) {
+      const list = (Array.isArray(trades) ? trades : []).filter(t => t && isFinite(t.pnl));
+      if (!list.length) return null;
+      let peak = 0, cum = 0, maxDD = 0;
+      for (const t of list) {
+        cum += t.pnl;
+        if (cum > peak) peak = cum;
+        const dd = peak > 0 ? (cum - peak) / peak : 0;  // 归一化到 peak
+        if (dd < maxDD) maxDD = dd;
+      }
+      return +maxDD.toFixed(4);
+    },
+
+    /**
+     * 盈亏比 (纯函数): 平均盈利 / 平均亏损 (亏损取绝对值)
+     * @param {Array<{pnl: number}>} trades
+     * @returns {number|null} 无盈利或无亏损 → null
+     */
+    _computePayoffRatio(trades) {
+      const list = (Array.isArray(trades) ? trades : []).filter(t => t && isFinite(t.pnl));
+      const wins = list.filter(t => t.pnl > 0).map(t => t.pnl);
+      const losses = list.filter(t => t.pnl < 0).map(t => t.pnl);
+      if (!wins.length || !losses.length) return null;
+      const avgWin = wins.reduce((s, x) => s + x, 0) / wins.length;
+      const avgLoss = Math.abs(losses.reduce((s, x) => s + x, 0) / losses.length);
+      if (avgLoss === 0) return null;
+      return +(avgWin / avgLoss).toFixed(2);
+    },
+
     /** Brier score (纯函数): mean((prob/100 - outcomeScore)^2), 0 最好; 空样本返 null */
     _brierScore(pairs) {
       const list = (Array.isArray(pairs) ? pairs : []).filter(p => p && isFinite(p.probability) && p.outcome);
