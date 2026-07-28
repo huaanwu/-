@@ -529,7 +529,13 @@
               if (!cur || (t.date || '') < (cur.date || '')) buyTxByHolding[t.holdingId] = t;
             }
           }
-        } catch (e) { console.warn('[Journal] 读 transactions 失败:', e); }
+        } catch (e) {
+          // V6: 用户可见提示 — 读不到 transactions 时复盘业绩归因会缺数据, 用户看到空值但不报错
+          console.warn('[Journal] 读 transactions 失败:', e);
+          if (window.Core && Core.Toast && Core.Toast.warning) {
+            Core.Toast.warning('复盘读交易流水失败, 业绩归因可能不全', 5000);
+          }
+        }
         const snapshotDate = date ? new Date(date) : new Date();
         const withPL = [];
         for (const h of holdings) {

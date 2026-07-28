@@ -111,6 +111,13 @@
           sorted = await Core.Scoring.rankCandidates({ topN: HARD_TOP });
           // 排除已持仓 (跟 Bear 之前一样)
           sorted = sorted.filter(s => s && s.代码 && !heldCodes.has(s.代码));
+          // V6: 评分成功但部分维度 fetch 失败 — 用户告知候选质量降级 (例 forecast 失败 = 首亏过滤关闭)
+          if (Core.Scoring.getLastDegraded) {
+            const degraded = Core.Scoring.getLastDegraded();
+            if (degraded.length > 0 && window.Core && Core.Toast && Core.Toast.warning) {
+              Core.Toast.warning('Scoring 维度降级 (' + degraded.join('/') + '), 候选质量受影响', 5000);
+            }
+          }
         } catch (e) {
           console.warn('[LongTrader] Scoring 失败, 降级为涨跌幅排序:', e);
           sorted = all
@@ -347,7 +354,13 @@
         let warnings = [];
         try {
           warnings = await this._bearReview(bullPicks);
-        } catch (e) { console.warn('[LongTrader] bear 审查失败:', e); }
+        } catch (e) {
+          // V6: 用户可见提示 — bear 审查失败意味着 picks 未经风险筛选就直接交易, 比无审查更危险
+          console.warn('[LongTrader] bear 审查失败:', e);
+          if (window.Core && Core.Toast && Core.Toast.warning) {
+            Core.Toast.warning('Bear 风控审查失败, picks 未经风险筛选直接交易', 5000);
+          }
+        }
 
         // 综合: 过滤 high-severity 警告的 picks, medium/low 只标记不剔除
         const final = bullPicks.filter(p => {

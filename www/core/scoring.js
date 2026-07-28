@@ -24,6 +24,10 @@
 (function() {
   'use strict';
 
+  // V6: 记录最近一次 rankCandidates 的 fetch 失败, 供 long-trader 等调用方提示用户
+  //   模块级 var 避免每次改签名; 调用方用 Core.Scoring.getLastDegraded() 读
+  let _lastDegraded = [];
+
   // 静态默认权重 (LLM 调不通时 fallback)
   const FACTOR_KEYS = ['roe', 'ep', 'hot', 'turnover', 'north', 'industryPenalty', 'forecast', 'rps'];
   const DEFAULT_WEIGHTS = {
@@ -221,6 +225,7 @@
   async function rankCandidates(opts = {}) {
     const topN = opts.topN || 30;
     const includeFiltered = opts.includeFiltered || false;
+    _lastDegraded = [];  // V6: 重置, 重新记录本轮的 fetch 失败
 
     // 1. 拉全市场行情
     let all;
@@ -237,14 +242,14 @@
     let finMap = new Map(), industryMap = new Map(), northMap = new Map();
     try {
       finMap = await Core.Data.getStockFinancialBatch(codes);
-    } catch (e) { console.warn('[Scoring] finMap 失败:', e); }
+    } catch (e) { _lastDegraded.push('finMap'); console.warn('[Scoring] finMap 失败:', e); }
     try {
       industryMap = await Core.Data.getStockIndustryBatch(codes);
-    } catch (e) { console.warn('[Scoring] indMap 失败:', e); }
+    } catch (e) { _lastDegraded.push('industryMap'); console.warn('[Scoring] indMap 失败:', e); }
     if (Core.Data.getStockNorthFlowBatch) {
       try {
         northMap = await Core.Data.getStockNorthFlowBatch(codes);
-      } catch (e) { console.warn('[Scoring] northMap 失败:', e); }
+      } catch (e) { _lastDegraded.push('northMap'); console.warn('[Scoring] northMap 失败:', e); }
     }
 
     // 3. 拉已持仓行业市值
@@ -255,7 +260,7 @@
     if (Core.Data.getSectorPerformance) {
       try {
         sectorPerf = await Core.Data.getSectorPerformance();
-      } catch (e) { console.warn('[Scoring] 板块涨幅拉取失败:', e); }
+      } catch (e) { _lastDegraded.push('sectorPerf'); console.warn('[Scoring] 板块涨幅拉取失败:', e); }
     }
 
     // 3.6 拉概念板块涨幅 + 建 code → [概念名...] 反向索引 (Tier 6+ 概念热点)
@@ -264,7 +269,7 @@
     if (Core.Data.getConceptBoardPerformance && Core.Data.getConceptMembership) {
       try {
         conceptPerf = await Core.Data.getConceptBoardPerformance();
-      } catch (e) { console.warn('[Scoring] 概念板块涨幅拉取失败:', e); }
+      } catch (e) { _lastDegraded.push('conceptPerf'); console.warn('[Scoring] 概念板块涨幅拉取失败:', e); }
     }
 
     // 4. 拉动态权重 (LLM 周度) — 失败 fallback 默认
@@ -272,7 +277,7 @@
     if (Core.WeightAdvisor && typeof Core.WeightAdvisor.getWeights === 'function') {
       try {
         weights = await Core.WeightAdvisor.getWeights();
-      } catch (e) { console.warn('[Scoring] WeightAdvisor 失败, 用默认:', e); }
+      } catch (e) { _lastDegraded.push('weightAdvisor'); console.warn('[Scoring] WeightAdvisor 失败, 用默认:', e); }
     }
 
     // V2 P2: 拉业绩预告 (季度 batch, 7d TTL, 失败降级)
@@ -281,7 +286,7 @@
     if (Core.Data.getStockEarningForecastBatch) {
       try {
         forecastMap = await Core.Data.getStockEarningForecastBatch(codes);
-      } catch (e) { console.warn('[Scoring] 业绩预告拉取失败:', e); }
+      } catch (e) { _lastDegraded.push('forecast'); console.warn('[Scoring] 业绩预告拉取失败:', e); }
     }
 
     // V2 P4: RPS 快照 (60 日涨幅 vs 中位数, 24h TTL, 失败降级)
@@ -290,7 +295,7 @@
     if (Core.Data.getRpsSnapshot) {
       try {
         rpsMap = await Core.Data.getRpsSnapshot({ days: 60 });
-      } catch (e) { console.warn('[Scoring] RPS 快照拉取失败:', e); }
+      } catch (e) { _lastDegraded.push('rps'); console.warn('[Scoring] RPS 快照拉取失败:', e); }
     }
 
     // 5. 硬过滤 + 打分
@@ -464,6 +469,7 @@
     applyHardFilters,
     DEFAULT_WEIGHTS,
     FACTOR_KEYS,      // 单点 source-of-truth, 供 weight-advisor / test 引用
-    NEW_STOCK_RULE_DAYS
+    NEW_STOCK_RULE_DAYS,
+    getLastDegraded: () => _lastDegraded.slice()  // V6: 返回最近一次 rankCandidates 失败维度
   };
 })();

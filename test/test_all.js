@@ -11863,6 +11863,51 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
     else fail('100.6 scoring 仍有空 catch', '');
   } catch (e) { fail('100.x V5 审计修复', e.message); }
 
+  // ===== 101.x: V6 用户可见 silent failure 提示 =====
+  try {
+    const sc101 = readFileSafe(path.join(WWW, 'core', 'scoring.js'));
+    const lt101 = readFileSafe(path.join(WWW, 'app', 'long-trader.js'));
+    const h101 = readFileSafe(path.join(WWW, 'app', 'holdings.js'));
+    const j101 = readFileSafe(path.join(WWW, 'app', 'journal.js'));
+
+    // 101.1: scoring._lastDegraded 模块级 + 重置 + push 失败维度
+    if (sc101.indexOf('_lastDegraded = []') !== -1 && sc101.indexOf('_lastDegraded.push') !== -1)
+      ok('101.1 scoring 内部记录 fetch 失败维度 (_lastDegraded)');
+    else fail('101.1 _lastDegraded 未初始化', '');
+
+    // 101.2: 至少 4 个失败源被追踪 (forecast/rps/finMap/industryMap/northMap/sectorPerf/conceptPerf/weightAdvisor)
+    const trackedCount = (sc101.match(/_lastDegraded\.push/g) || []).length;
+    if (trackedCount >= 4)
+      ok('101.2 至少 ' + trackedCount + ' 个失败源被追踪 (forecast/rps/finMap/industryMap 等)');
+    else fail('101.2 tracked 失败源不足 4', '');
+
+    // 101.3: getLastDegraded 暴露给 long-trader
+    if (sc101.indexOf('getLastDegraded: () => _lastDegraded.slice()') !== -1)
+      ok('101.3 Core.Scoring.getLastDegraded 暴露');
+    else fail('101.3 getLastDegraded 未暴露', '');
+
+    // 101.4: long-trader 消费 getLastDegraded + toast 提示
+    if (/getLastDegraded\(\)/.test(lt101) && lt101.indexOf('Core.Toast.warning') !== -1 &&
+        lt101.indexOf('维度降级') !== -1)
+      ok('101.4 long-trader 提示 Scoring 维度降级 (V6)');
+    else fail('101.4 long-trader 未消费 degraded', '');
+
+    // 101.5: long-trader bear 审查失败 → 用户 toast
+    if (/bear 审查失败/.test(lt101) && /Bear 风控审查失败/.test(lt101))
+      ok('101.5 long-trader bear 审查失败 → 用户 toast (V6)');
+    else fail('101.5 long-trader bear 失败 toast 缺失', '');
+
+    // 101.6: holdings 行情拉取失败 → 用户 toast
+    if (/持仓估值可能不准/.test(h101))
+      ok('101.6 holdings 行情拉取失败 → 用户 toast (V6)');
+    else fail('101.6 holdings toast 缺失', '');
+
+    // 101.7: journal 读 transactions 失败 → 用户 toast
+    if (/业绩归因可能不全/.test(j101))
+      ok('101.7 journal 读 transactions 失败 → 用户 toast (V6)');
+    else fail('101.7 journal toast 缺失', '');
+  } catch (e) { fail('101.x V6 silent failure 提示', e.message); }
+
 
 
 

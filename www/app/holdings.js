@@ -567,7 +567,13 @@
           const shares = parseFloat(h.shares) || 0;
           if (price) appValue += shares * price;
         });
-      } catch (e) { console.warn('[Holdings] 行情拉取失败:', e); }
+      } catch (e) {
+        // V6: 用户可见提示 — 持仓快照估值拉不到时 portfolio 总值会用旧价或 0, 影响决策
+        console.warn('[Holdings] 行情拉取失败:', e);
+        if (window.Core && Core.Toast && Core.Toast.warning) {
+          Core.Toast.warning('行情快照拉取失败, 持仓估值可能不准', 5000);
+        }
+      }
       // 现金 = 所有 cashflow 净额(正=收入,负=支出)
       cashflows.forEach(f => { appCash += parseFloat(f.amount) || 0; });
       const appTotal = appValue + appCash;
