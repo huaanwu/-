@@ -11647,10 +11647,21 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
         vm.createContext(sandbox);
         // 把 CRLF 转 LF, vm sandbox 兼容
         const fnSrcLF = fnSrc.replace(new RegExp('\r\n', 'g'), NL);
-        vm.runInContext(fnSrcLF + NL + 'this._summarizeZygc = _summarizeZygc;', sandbox);        const sample = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'zygc_600519.json'), 'utf8'));
+        vm.runInContext(fnSrcLF + NL + 'this._summarizeZygc = _summarizeZygc;', sandbox);
+        // V4 cleanup: 不再依赖磁盘调研 JSON (zygc_600519.json 已删), 改为 inline 茅台 2025 实测样本
+        // 字段需含 报告日期 + 分类类型='按产品分类', 否则 _summarizeZygc 过滤后会返 null
+        const sample = [
+          { 报告日期: '2025-06-30', 分类类型: '按产品分类', 主营构成: '茅台酒', 收入比例: 86.7695 },
+          { 报告日期: '2025-06-30', 分类类型: '按产品分类', 主营构成: '系列酒', 收入比例: 12.1234 },
+          { 报告日期: '2025-06-30', 分类类型: '按产品分类', 主营构成: '其他(补充)', 收入比例: 1.1071 },
+          // 噪声行: 旧报告期 + 地区分类, 应被过滤掉
+          { 报告日期: '2024-12-31', 分类类型: '按产品分类', 主营构成: '茅台酒', 收入比例: 85.0 },
+          { 报告日期: '2025-06-30', 分类类型: '按地区分类', 主营构成: '国内', 收入比例: 95.0 }
+        ];
         const sum = sandbox._summarizeZygc(sample);
-        if (sum && sum.chokepoint === true && sum.topProduct === '茅台酒' && Math.abs(sum.topProductPct - 0.867695) < 0.001)
-          ok('96.7 茅台 2025 → chokepoint=true 茅台酒 86.8%');
+        // 收入比例 字段是百分数 (如 86.7695), _summarizeZygc 直接保留 (>40 阈值仍命中)
+        if (sum && sum.chokepoint === true && sum.topProduct === '茅台酒' && Math.abs(sum.topProductPct - 86.7695) < 0.001)
+          ok('96.7 茅台 2025 → chokepoint=true 茅台酒 86.77% (inline 样本)');
         else fail('96.7 判定不符', JSON.stringify(sum));
       }
     }
