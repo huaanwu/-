@@ -610,6 +610,7 @@ ${candidates}
                   ${addBtnHtml}
                   <button class="btn btn-sm" data-code="${escapeHtml(p.code)}" data-name="${escapeHtml(p.name || '')}" data-action="kline">📈 K线</button>
                   <button class="btn btn-sm" data-code="${escapeHtml(p.code)}" data-assumption="${assumptionTxt}" data-action="backtest">📊 历史验证</button>
+                  <button data-action="reject" style="float:right;background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:16px;line-height:1;" title="否决此推荐">✕</button>
                 </div>
                 <div class="pb-result"></div>
               </div>
@@ -640,6 +641,16 @@ ${candidates}
               } else if (action === 'backtest') {
                 // Phase D2: 回测前置 (按需, 用户点击才跑)
                 btn.onclick = () => this._runPreBacktest(btn, code);
+              } else if (action === 'reject') {
+                btn.onclick = async () => {
+                  try {
+                    const arr = (await Core.Storage.kvGet('screener_reject_log')) || [];
+                    arr.push({ date: new Date().toISOString().slice(0, 10), code, name, assumption: btn.dataset.assumptionLlm || '', confidence: btn.dataset.confidence || '' });
+                    await Core.Storage.kvSet('screener_reject_log', arr.slice(-200));
+                  } catch (e) { console.warn('[screener] 否决记录失败:', e); }
+                  const card = btn.closest('.ai-pick');
+                  if (card) card.style.display = 'none';
+                };
               }
             });
           }

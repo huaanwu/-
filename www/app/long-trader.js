@@ -108,13 +108,59 @@
           .sort((a, b) => parseFloat(b.涨跌幅) - parseFloat(a.涨跌幅))
           .slice(0, HARD_TOP);
         if (sorted.length === 0) return;
-        // 5. LLM 挑 TOP_N
-        const picks = await this._llmPickTop(sorted, TOP_N);
+        // Phase 5: 预拉前 30 只基本面 (并发 5 逐批)
+        let finMap = new Map();
+        try {
+          finMap = await Core.Data.getStockFinancialBatch(sorted.map(s => s.代码));
+        } catch (e) { console.warn('[LongTrader] 基本面拉取失败:', e); }
+        // Phase 5 Commit D: 批量拉行业归属
+        let industryMap = new Map();
+        try {
+          industryMap = await Core.Data.getStockIndustryBatch(sorted.map(s => s.代码));
+        } catch (e) { console.warn('[LongTrader] 行业拉取失败:', e); }
+        // Phase 5 Commit C: 基本面硬筛 — 排除 ROE<5% 和毛利率<10%
+        const finFiltered = [];
+        for (const s of sorted) {
+          const raw = finMap.get(s.代码);
+          if (!raw) { finFiltered.push(s); continue; }
+          const fe = _extractFundamentals(raw);
+          if (!fe) { finFiltered.push(s); continue; }
+          if (fe.roe != null && fe.roe < 5) continue;
+          if (fe.grossProfitMargin != null && fe.grossProfitMargin < 10) continue;
+          finFiltered.push(s);
+        }
+        const pool = finFiltered.length >= 3 ? finFiltered : sorted;
+        if (pool.length === 0) return;
+        // Phase 5 Commit D: 行业集中度检测
+        let heldList = [];
+        try {
+          heldList = (await Paper._getPaperHoldings('long')) || [];
+        } catch (e) { /* 无需处理 */ }
+        const heldByInd = {};
+        for (const h of heldList) {
+          const ind = industryMap.get(h.code);
+          if (ind) heldByInd[ind] = (heldByInd[ind] || 0) + (h.mkt || 0);
+        }
+        const totalAssets = acc.cash + (acc.stockMkt || 0);
+        const indCap = 0.25;                                    // 单个行业 ≤ 25%
+        // 5. LLM 挑 TOP_N (带基本面)
+        const picks = await this._llmPickTop(pool, TOP_N, finMap);
         if (!picks || picks.length === 0) return;
         // 6. 自动成交到 long sleeve (纪律引擎自动卡)
         const cashBefore = acc.cash;
         const results = [];
         for (const p of picks) {
+          // Phase 5 Commit D: 行业集中度 cap 检测
+          const pInd = industryMap.get(p.code);
+          if (pInd) {
+            const currentIndValue = heldByInd[pInd] || 0;
+            const pMkt = acc.positionPct * acc.cash;         // 估算单票买入市值
+            if ((currentIndValue + pMkt) / totalAssets > indCap) {
+              console.log('[LongTrader] ' + p.code + ' 行业 ' + pInd + ' 集中度超标,跳过');
+              results.push({ code: p.code, name: p.name, ok: false, reason: p.reason, error: '行业集中度超标' });
+              continue;
+            }
+          }
           try {
             const h = await Paper.autoTradeFromPick({ code: p.code, name: p.name, sleeve: 'long' });
             results.push({ code: p.code, name: p.name, ok: !!h, reason: p.reason, costPrice: h && h.costPrice, shares: h && h.shares });
@@ -165,7 +211,7 @@
      * LLM 解读: 从硬筛池挑 TOP_N
      * @returns {Promise<Array<{code, name, reason}>|null>}
      */
-    async _llmPickTop(stocks, topN) {
+    async _llmPickTop(stocks, topN, finMap) {
       try {
         const list = stocks.map((s, i) => {
           const code = s.代码;
@@ -174,7 +220,18 @@
           const turn = parseFloat(s.换手率 || 0).toFixed(2);
           const mcap = parseFloat(s.总市值 || 0);
           const mcapStr = isNaN(mcap) || mcap === 0 ? '?' : (mcap / 1e8).toFixed(1) + '亿';
-          return `[${i}] ${code} ${name} | 涨跌幅=${chg}% | 换手=${turn}% | 市值=${mcapStr}`;
+          // Phase 5: 基本面
+          let finPart = '';
+          if (finMap && finMap instanceof Map) {
+            const raw = finMap.get(s.代码);
+            if (raw) {
+              const fe = _extractFundamentals(raw);
+              if (fe) {
+                finPart = ` | ROE=${fe.roe ?? '?'}% PE=${fe.pe ?? '?'} PB=${fe.pb ?? '?'} 毛利=${fe.grossProfitMargin ?? '?'}%`;
+              }
+            }
+          }
+          return `[${i}] ${code} ${name} | 涨跌幅=${chg}% | 换手=${turn}% | 市值=${mcapStr}${finPart}`;
         }).join('\n');
 
         // H3 大盘状态机 (commit 6): 仅一行提示, 不影响 schema (只返 {code, name, reason})
@@ -197,6 +254,9 @@
           '\n- 选有真实上涨逻辑的 (题材/业绩/资金/技术突破)' +
           '\n- 优先选市值 ≥ 50 亿的 (流动性好)' +
           '\n- 优先选当日涨幅在 3-9% 区间的 (避免追高/避冷门)' +
+          '\n- 优先选 ROE > 10% 且 PE 不极端（< 80）的（盈利质量）' +
+          '\n- 避免选高负债率（> 70%）且 ROE < 5% 的（价值陷阱）' +
+          '\n- 硬筛已排除: ROE < 5%、毛利率 < 10% 的股票' +
           '\n- 排除 ST/退市风险股' +
           '\n' + regimeLine +
           (poolText ? '\n- 【全系统学习池】' + poolText.replace(/\n/g, ' ').slice(0, 200) : '') +
@@ -227,14 +287,92 @@
         const parsed = await Core.AI.parseJsonOutput(raw, 'long-trader');
         if (!parsed || !parsed.ok || !parsed.obj) return null;
         const arr = (parsed.obj.picks || []);
-        return arr.slice(0, topN).map(p => ({
+        const bullPicks = arr.slice(0, topN).map(p => ({
           code: String(p.code || '').padStart(6, '0'),
           name: String(p.name || ''),
           reason: String(p.reason || '').slice(0, 200)
         })).filter(p => /^\d{6}$/.test(p.code));
+        if (bullPicks.length === 0) return null;
+
+        // Phase 5 Commit B: Bear agent 双视角辩论 — 质疑 bull 选股
+        let warnings = [];
+        try {
+          warnings = await this._bearReview(bullPicks);
+        } catch (e) { console.warn('[LongTrader] bear 审查失败:', e); }
+
+        // 综合: 过滤 high-severity 警告的 picks, medium/low 只标记不剔除
+        const final = bullPicks.filter(p => {
+          const w = warnings.find(w => w.code === p.code);
+          return !w || w.severity !== 'high';
+        });
+        // 对 medium/low 警告注入 reason 后缀
+        for (const p of final) {
+          const w = warnings.find(w => w.code === p.code);
+          if (w && w.severity !== 'high') p.reason += ' ⚠' + w.risk;
+        }
+        return final;
       } catch (e) {
         console.warn('[LongTrader] LLM pick 失败:', e);
         return null;
+      }
+    },
+
+    /**
+     * Phase 5 Commit B: Bear agent — 质疑 bull 选股的价值陷阱/成长陷阱
+     */
+    async _bearReview(picks) {
+      const candidates = picks.map((p, i) => '[' + i + '] ' + p.code + ' ' + p.name + ' — bull认为:' + p.reason).join('\n');
+      const prompt = '你是风控专家, 对以下 bull agent 的选股提出质疑, 找价值陷阱/成长陷阱/追高风险:\n\n' +
+        candidates + '\n\n针对每只, 判断:\n' +
+        '- value_trap: ROE<5% 的高负债股票, 低 PE 陷阱\n' +
+        '- growth_trap: 高市盈率但盈利质量差\n' +
+        '- chase_risk: 近期涨幅过大, 追高在半山腰\n\n' +
+        '输出 JSON: { "warnings": [{ "code": "000001", "risk": "简短风险描述", "severity": "high"|"medium"|"low" }] }\n' +
+        '无风险则 warnings: []。只输出 JSON。';
+      const raw = await Core.AI.callWithTimeout({
+        prompt,
+        temperature: 0.5,
+        maxTokens: 800,
+        timeoutMs: 60000,
+        page: 'long-trader',
+        purpose: 'long-trader-bear'
+      });
+      if (!raw) return [];
+      const parsed = await Core.AI.parseJsonOutput(raw, 'long-trader-bear');
+      if (!parsed || !parsed.ok || !parsed.obj) return [];
+      const arr = parsed.obj.warnings || [];
+      return arr.map(w => ({
+        code: String(w.code || '').padStart(6, '0'),
+        risk: String(w.risk || '').slice(0, 100),
+        severity: ['high', 'medium', 'low'].includes(w.severity) ? w.severity : 'low'
+      })).filter(w => /^\d{6}$/.test(w.code));
+    },
+
+    /**
+     * Phase 5 Commit D: 持股再评估 — 检查持有逻辑是否仍成立
+     */
+    async reviewHoldings() {
+      try {
+        const held = (await Paper._getPaperHoldings('long')) || [];
+        if (held.length === 0) return { reviewed: 0, actions: [] };
+        const codes = held.map(h => h.code).filter(Boolean);
+        const finMap = await Core.Data.getStockFinancialBatch(codes);
+        const actions = [];
+        for (const h of held) {
+          const raw = finMap.get(h.code);
+          if (!raw) continue;
+          const fe = _extractFundamentals(raw);
+          if (!fe) continue;
+          // 恶化信号: ROE < 3% 或毛利率 < 5%
+          if ((fe.roe != null && fe.roe < 3) || (fe.grossProfitMargin != null && fe.grossProfitMargin < 5)) {
+            actions.push({ code: h.code, name: h.name, action: 'reduce', reason: '基本面恶化: ROE=' + fe.roe + '% 毛利率=' + fe.grossProfitMargin + '%' });
+          }
+        }
+        console.log('[LongTrader] reviewHoldings:', actions.length + '/' + held.length + ' 需处理');
+        return { reviewed: held.length, actions };
+      } catch (e) {
+        console.warn('[LongTrader] reviewHoldings 失败:', e);
+        return { reviewed: 0, actions: [] };
       }
     },
 
@@ -497,6 +635,31 @@
       }
     }
   };
+
+  /**
+   * 从 stock_financial_abstract 提取关键字段 (同 stock-advisor.js _extractFundamentals)
+   */
+  function _extractFundamentals(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const fields = {
+      pe: ['市盈率', 'PE', 'pe', 'pe_ttm'],
+      pb: ['市净率', 'PB', 'pb'],
+      roe: ['净资产收益率', 'ROE', 'roe', '加权平均净资产收益率'],
+      grossProfitMargin: ['销售毛利率', '毛利率'],
+      revenueGrowth: ['营业总收入同比增长', '营收增速', 'revenue_yoy'],
+      netProfitGrowth: ['净利润同比增长', '净利增速', 'profit_yoy']
+    };
+    const out = {};
+    for (const [k, keys] of Object.entries(fields)) {
+      for (const key of keys) {
+        if (raw[key] != null && !isNaN(parseFloat(raw[key]))) {
+          out[k] = parseFloat(raw[key]);
+          break;
+        }
+      }
+    }
+    return Object.keys(out).length > 0 ? out : null;
+  }
 
   window.LongTrader = LongTrader;
 })();

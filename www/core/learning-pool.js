@@ -75,6 +75,15 @@
       }
     } catch (e) { console.warn('[LearningPool] IntradayTrader 收集失败:', e); }
 
+    // 4) Screener reject log (Phase 5): 近 30 天否决统计
+    try {
+      const log = (await Core.Storage.kvGet('screener_reject_log')) || [];
+      const cutoff = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+      const recent = log.filter(e => (e.date || '') >= cutoff).length;
+      out.rejectedCount = recent;
+      out.recentRejects = log.slice(-10);
+    } catch (e) { out.rejectedCount = -1; }
+
     return out;
   }
 
@@ -113,6 +122,11 @@
       for (const [src, s] of Object.entries(bySource)) {
         const srcHit = s.total ? (s.correct + s.partial * 0.5) / s.total : 0;
         lines.push(`  ${src}: ${s.total}笔 命中率${(srcHit * 100).toFixed(0)}%`);
+      }
+
+      // Phase 5: 否决反馈 (只在有记录时追加)
+      if (all.rejectedCount > 0) {
+        lines.push(`拒绝反馈: 近 30 天否决 ${all.rejectedCount} 次 (提示 LLM 避免推相似的)`);
       }
 
       return lines.join('\n');

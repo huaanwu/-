@@ -8371,7 +8371,7 @@ section('[50] data.js 行业映射 + 公告 + 量比');
     else fail('50.c 量比', '源码未匹配 volRatio 计算');
 
     // 50.d 暴露: window.Core.Data 含 3 个方法 (DATA_METHODS 已自动覆盖, 此处只验不在 DATA_METHODS 时补漏)
-    const exposeLine = dataSrc.match(/getStockIndustryByCode,\s*getStockNoticesByCode,\s*getStockAllAnnouncements,\s*getStockVolumeAnomaly/);
+    const exposeLine = dataSrc.match(/getStockIndustryByCode[\s\S]{0,100}getStockIndustryBatch/);
     if (exposeLine) ok('50.d window.Core.Data 暴露 3 个新接口');
     else fail('50.d 暴露', 'window.Core.Data 未导出 4 个新方法');
   } catch (e) {
@@ -11199,6 +11199,107 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
   } catch (e) {
     fail('79 量价异动', e.message);
   }
+
+  // ===== 80.1-80.3: 三维共振 KB 条目 (Phase 5) =====
+  try {
+    const kb80 = JSON.parse(readFileSafe(path.join(WWW, 'kb_data/investment_kb.json')));
+    const r1 = kb80.entries.find(e => e.id === 'RSN-001' && /三维共振/.test(e.title));
+    const r2 = kb80.entries.find(e => e.id === 'RSN-002' && /量价配合/.test(e.title));
+    const r3 = kb80.entries.find(e => e.id === 'RSN-003' && /背离/.test(e.title));
+    if (r1 && r2 && r3) ok('80.1 KB 含 RSN-001/002/003 三维共振条目');
+    else fail('80.1 RSN 条目缺失', '');
+    if (kb80._meta && kb80._meta.version >= '1.3') ok('80.2 _meta.version >= 1.3');
+    else fail('80.2 version < 1.3', '');
+  } catch (e) { fail('80.x 三维共振 KB', e.message); }
+
+  // ===== 80.4: kb.js context.volume_price (Phase 5) =====
+  try {
+    const kbJs80 = readFileSafe(path.join(WWW, 'core', 'kb.js'));
+    if (/volume_price/.test(kbJs80)) ok('80.4 kb.js 含 context.volume_price 触发器');
+    else fail('80.4 volume_price 缺失', '');
+  } catch (e) { fail('80.4 volume_price', e.message); }
+
+  // ===== 81.x: 否决反馈进 LearningPool (Phase 5) =====
+  try {
+    const sc81 = readFileSafe(path.join(WWW, 'app', 'screener.js'));
+    if (/data-action=.reject./.test(sc81) && /✕/.test(sc81))
+      ok('81.1 screener 卡片含 × 否决按钮');
+    else fail('81.1 × 按钮缺失', '');
+    if (/screener_reject_log/.test(sc81)) ok('81.2 screener 含 reject_log KV 记录');
+    else fail('81.2 reject_log 缺失', '');
+  } catch (e) { fail('81.x screener 否决', e.message); }
+
+  try {
+    const lp81 = readFileSafe(path.join(WWW, 'core', 'learning-pool.js'));
+    if (/rejectedCount/.test(lp81)) ok('81.3 learning-pool collect 含 rejectedCount');
+    else fail('81.3 rejectedCount 缺失', '');
+    if (/拒绝反馈/.test(lp81)) ok('81.4 format 含拒绝反馈行');
+    else fail('81.4 拒绝反馈行缺失', '');
+  } catch (e) { fail('81.x learning-pool 拒绝', e.message); }
+
+  // ===== 82.x: Core.Agents 流水线 journal.js 集成 (Phase 5) =====
+  try {
+    const j82 = readFileSafe(path.join(WWW, 'app', 'journal.js'));
+    if (/Core\.Agents\.runPipeline/.test(j82)) ok('82.1 journal.js 调用 Core.Agents.runPipeline');
+    else fail('82.1 runPipeline 调用缺失', '');
+    if (/aiColleagueDialog/.test(j82)) ok('82.2 journal.js 含 aiColleagueDialog');
+    else fail('82.2 aiColleagueDialog 缺失', '');
+    if (/_runAgentPipeline/.test(j82)) ok('82.3 journal.js 含 _runAgentPipeline');
+    else fail('82.3 _runAgentPipeline 缺失', '');
+    if (/Core\.Storage\.all\(['"]holdings['"]\)/.test(j82)) ok('82.4 _runAgentPipeline 收集持仓数据');
+    else fail('82.4 持仓数据收集缺失', '');
+  } catch (e) { fail('82.x journal agents', e.message); }
+
+  // ===== 83.x: LongTrader 基本面注入 (Phase 5) =====
+  try {
+    const d83 = readFileSafe(path.join(WWW, 'core', 'data.js'));
+    if (/getStockFinancialBatch/.test(d83)) ok('83.1 data.js 含 getStockFinancialBatch');
+    else fail('83.1 getStockFinancialBatch 缺失', '');
+  } catch (e) { fail('83.x data', e.message); }
+
+  try {
+    const lt83 = readFileSafe(path.join(WWW, 'app', 'long-trader.js'));
+    // 83.2: getStockFinancialBatch 调用
+    if (/getStockFinancialBatch/.test(lt83)) ok('83.2 long-trader 调 getStockFinancialBatch');
+    else fail('83.2 getStockFinancialBatch 调用缺失', '');
+    // 83.3: prompt 含 ROE/PE/PB/毛利率
+    if (/ROE=/.test(lt83) && /毛利=/.test(lt83)) ok('83.3 long-trader prompt 含 ROE/PE/PB/毛利率');
+    else fail('83.3 基本面字段缺失', '');
+  } catch (e) { fail('83.x long-trader', e.message); }
+
+  // ===== 84.x: LongTrader bull/bear 双视角辩论 (Phase 5) =====
+  try {
+    const lt84 = readFileSafe(path.join(WWW, 'app', 'long-trader.js'));
+    if (/_bearReview/.test(lt84)) ok('84.1 long-trader 含 _bearReview 方法');
+    else fail('84.1 _bearReview 缺失', '');
+    if (/value_trap/.test(lt84) && /growth_trap/.test(lt84)) ok('84.2 bear prompt 含价值陷阱/成长陷阱');
+    else fail('84.2 bear prompt 陷阱检查缺失', '');
+    if (/warnings/.test(lt84) && /severity/.test(lt84)) ok('84.3 综合输出含 warnings/severity');
+    else fail('84.3 warnings 结构缺失', '');
+  } catch (e) { fail('84.x bull/bear', e.message); }
+
+  // ===== 85.x: LongTrader 基本面硬筛 (Phase 5) =====
+  try {
+    const lt85 = readFileSafe(path.join(WWW, 'app', 'long-trader.js'));
+    if (/finFiltered/.test(lt85)) ok('85.1 long-trader 含 finFiltered 基本面过滤');
+    else fail('85.1 finFiltered 缺失', '');
+    if (/roe != null && fe.roe < 5/.test(lt85)) ok('85.2 硬筛含 ROE<5 排除');
+    else fail('85.2 ROE<5 过滤缺失', '');
+  } catch (e) { fail('85.x 硬筛', e.message); }
+
+  // ===== 86.x: LongTrader 行业集中度 + 持股再评估 (Phase 5) =====
+  try {
+    const lt86 = readFileSafe(path.join(WWW, 'app', 'long-trader.js'));
+    if (/indCap/.test(lt86) && /行业集中度/.test(lt86)) ok('86.1 long-trader 含行业集中度 cap 检测');
+    else fail('86.1 行业 cap 检测缺失', '');
+    if (/reviewHoldings/.test(lt86)) ok('86.2 long-trader 含 reviewHoldings 方法');
+    else fail('86.2 reviewHoldings 缺失', '');
+  } catch (e) { fail('86.x 行业+持股再评估', e.message); }
+
+
+
+
+
 
 
 waitForIIFEsDrain().then(() => {

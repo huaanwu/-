@@ -106,6 +106,8 @@
     if (context.margin) queries.push('两融', '杠杆');
     if (context.futures) queries.push('期货', '基差', '升水');
     // Tier 3B: reasonTag 6 类直接 trigger (screener/short-trader 注入 prompt 时附带)
+    // Phase 5: volume_price 量价触发器
+    if (context.volume_price) queries.push('量价', '放量', '缩量', '量比', '成交量');
     if (context.reasonTags && Array.isArray(context.reasonTags)) {
       const TAG_QUERY = {
         surge: ['涨幅异动', '涨停', '强势'],

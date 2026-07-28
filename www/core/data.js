@@ -758,6 +758,27 @@
   }
 
   /**
+   * 批量财务摘要 (Phase 5 long-trader)
+   * 并发 5 逐批拉, 返回 Map<code, rawData>
+   */
+  async function getStockFinancialBatch(codes) {
+    const results = new Map();
+    const chunked = [];
+    for (let i = 0; i < codes.length; i += 5) chunked.push(codes.slice(i, i + 5));
+    for (const chunk of chunked) {
+      const batch = await Promise.allSettled(
+        chunk.map(c => getStockFinancial(c).catch(() => null))
+      );
+      chunk.forEach((c, i) => {
+        if (batch[i]?.status === 'fulfilled' && batch[i].value) {
+          results.set(c, batch[i].value);
+        }
+      });
+    }
+    return results;
+  }
+
+  /**
    * 个股近 N 期财务指标对比 (Phase R)
    * 数据源: stock_financial_analysis_indicator_em (东方财富, AKShare 1.13+ 替换 stock_zh_a_financial_indicator)
    *   - symbol 必须带市场后缀: '600519.SH' / '301389.SZ'
@@ -952,6 +973,27 @@
       console.warn('[Data] getStockIndustryByCode 失败:', e.message);
       return null;
     }
+  }
+
+  /**
+   * 批量行业归属查询 (Phase 5 long-trader)
+   * 并发 5 逐批拉, 返回 Map<code, industryName>
+   */
+  async function getStockIndustryBatch(codes) {
+    const results = new Map();
+    const chunked = [];
+    for (let i = 0; i < codes.length; i += 5) chunked.push(codes.slice(i, i + 5));
+    for (const chunk of chunked) {
+      const batch = await Promise.allSettled(
+        chunk.map(c => getStockIndustryByCode(c).catch(() => null))
+      );
+      chunk.forEach((c, i) => {
+        if (batch[i]?.status === 'fulfilled' && batch[i].value) {
+          results.set(c, batch[i].value);
+        }
+      });
+    }
+    return results;
   }
 
   /**
@@ -2044,7 +2086,7 @@
     getLimitStatus,  // c: UI 读这个显示限流状态
     resetLimit: _clearAllLimit,  // 测试/手动重置 (全部端点; _clearLimit 需带 path)
     // 股票
-    getStockSpot, getStockQuote, getStockKLine, getStockFinancial, getStockList,
+    getStockSpot, getStockQuote, getStockKLine, getStockFinancial, getStockFinancialBatch, getStockList,
     getStockSpotTencent,    // C: 腾讯 fetcher (codes 参数, 实时)
     _sinaFetch, _sinaParse,  // Z13: 新浪 fetcher + 解析 (腾讯失败兜底, 测试用)
     _tencentKLine,          // Y12: 腾讯 K 线 fetcher (内部)
@@ -2056,6 +2098,7 @@
     getStockEarningsForecastFresh, getStockCapitalFlight,  // 业绩亏损 / 主力出逃
     // 短线两阶段选品资料 (阶段 1: 行业映射 + 公告 + 量比)
     getStockIndustryByCode, getStockNoticesByCode, getStockAllAnnouncements,
+    getStockIndustryBatch,
     getStockVolumeAnomaly,
     // 基金
     getFundSpot, getFundHistory, getFundPortfolio,
