@@ -39,7 +39,8 @@ const LLM_TARGETS = {
   openai:   'https://api.openai.com',
   moonshot: 'https://api.moonshot.cn',
   qwen:     'https://dashscope.aliyuncs.com',
-  zhipu:    'https://open.bigmodel.cn'
+  zhipu:    'https://open.bigmodel.cn',
+  minimax:  'https://api.minimax.chat'
 };
 
 // ===== 自动发现 (本地大模型端点扫描) =====

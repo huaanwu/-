@@ -54,6 +54,15 @@
       models: ['glm-4-flash', 'glm-4', 'glm-4-plus'],
       docs: 'https://open.bigmodel.cn/'
     },
+    minimax: {
+      // 用户授权预填的 Minimax Coding (Anthropic 兼容 + Claude 模型族)
+      // 与 stock-master 上原有的本地 qwen3 互补: 本地跑不出/稳定性差时切远端
+      name: 'Minimax Coding',
+      baseURL: 'https://api.minimax.chat/v1',
+      defaultModel: 'minimax-coding',
+      models: ['minimax-coding'],
+      docs: 'https://api.minimax.chat/'
+    },
     custom: {
       name: '自定义 (OpenAI 兼容)',
       baseURL: '',
@@ -75,11 +84,12 @@
 
     // baseURL 解析优先级: 本地代理 (勾了) > 用户填的 > provider 默认
     // 勾本地代理时强制走 /api/llm/{provider}/v1, 解决 CORS
+    const _apiUrl = (window.Core && Core.Data && Core.Data.apiUrl) ? Core.Data.apiUrl : (p) => p;
     const useProxyWanted = ai.useProxy !== false && provider !== 'custom';
     let baseURL;
     let useProxy = false;
     if (useProxyWanted) {
-      baseURL = `/api/llm/${provider}/v1`;
+      baseURL = _apiUrl(`/api/llm/${provider}/v1`);
       useProxy = true;
     } else if (ai.baseURL) {
       baseURL = ai.baseURL;
@@ -97,7 +107,7 @@
       // dev / 本机访问场景: 重写为 /api/local/v1
       try {
         const u = new URL(localBaseURL);
-        localBaseURL = `/api/local${u.pathname}`.replace(/\/v1\/v1$/, '/v1');
+        localBaseURL = _apiUrl(`/api/local${u.pathname}`.replace(/\/v1\/v1$/, '/v1'));
       } catch (e) { console.warn('[AI] 本地 LLM baseURL 解析失败, 保留原值:', e.message); }
     }
     const localConfig = {
@@ -371,7 +381,8 @@
    * @returns {Promise<{found: Array<{baseURL, host, port, type, label, models, latencyMs}>, scanned, serverIPs, host}>}
    */
   async function discoverLocalLLM() {
-    const resp = await fetch('/api/discover/local-llm', { method: 'GET' });
+    const _apiUrl = (window.Core && Core.Data && Core.Data.apiUrl) ? Core.Data.apiUrl : (p) => p;
+    const resp = await fetch(_apiUrl('/api/discover/local-llm'), { method: 'GET' });
     if (!resp.ok) throw new Error('自动发现端点 HTTP ' + resp.status);
     const j = await resp.json();
     return {

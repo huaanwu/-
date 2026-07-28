@@ -15,7 +15,7 @@
   'use strict';
 
   // provider 候选顺序 (与 Core.AI.PROVIDERS key 顺序一致; custom 不走 dev-proxy, 排除)
-  const PROVIDER_ORDER = ['deepseek', 'openai', 'moonshot', 'qwen', 'zhipu'];
+  const PROVIDER_ORDER = ['deepseek', 'openai', 'moonshot', 'qwen', 'zhipu', 'minimax'];
 
   /**
    * 挑第二意见的 provider (纯函数, 可 Node 测试)
@@ -47,8 +47,9 @@
     if (typeof Core === 'undefined' || !Core.AI || !Core.AI.getProviderConfig) return null;
     const pcfg = Core.AI.getProviderConfig(provider);
     // 与 ai-service.getConfig 同款逻辑: 勾了本地代理 (默认勾) → /api/llm/{provider}/v1
+    const _apiUrl = (window.Core && Core.Data && Core.Data.apiUrl) ? Core.Data.apiUrl : (p) => p;
     const useProxy = ai.useProxy !== false;
-    const baseURL = useProxy ? `/api/llm/${provider}/v1` : (pcfg.baseURL || '');
+    const baseURL = useProxy ? _apiUrl(`/api/llm/${provider}/v1`) : (pcfg.baseURL || '');
     if (!baseURL) return null;
     return {
       provider,
