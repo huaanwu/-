@@ -606,6 +606,46 @@
     return { ...parsed, text };
   }
 
+  /**
+   * formatUserProfile (Phase W: 用户画像注入) - 统一把 Core.UserProfile 渲染成中文 prompt 段
+   * 返回多行字符串, 调用方直接拼到 systemPrompt
+   * 数据源: Core.UserProfile (7 字段 schema). 失败降级返 ""
+   *
+   * 用法 (screener.js / fund/ai-advisor.js):
+   *   const seg = Core.AI.formatUserProfile();
+   *   systemPrompt = base + '\n\n【用户画像】\n' + seg;
+   */
+  function formatUserProfile() {
+    try {
+      const UP = window.Core && window.Core.UserProfile;
+      if (!UP || typeof UP.load !== 'function') return '';
+      const p = UP.load();
+      if (!p) return '';
+      const lines = [];
+      lines.push('- 风险偏好: ' + (UP.riskLabel ? UP.riskLabel(p.risk) : p.risk));
+      lines.push('- 投资期限: ' + (UP.horizonLabel ? UP.horizonLabel(p.horizon) : p.horizon));
+      lines.push('- 是否允许权益类: ' + (UP.allowEquityLabel
+        ? UP.allowEquityLabel(p.allowEquity)
+        : p.allowEquity));
+      if (typeof p.targetReturn === 'number' && isFinite(p.targetReturn)) {
+        lines.push('- 目标年化收益率: ' + p.targetReturn + '%');
+      }
+      if (typeof p.maxDrawdown === 'number' && isFinite(p.maxDrawdown)) {
+        lines.push('- 可接受最大回撤: ' + p.maxDrawdown + '%');
+      }
+      if (p.preference && String(p.preference).trim()) {
+        lines.push('- 个人偏好: ' + String(p.preference).trim());
+      }
+      if (p.blacklist && String(p.blacklist).trim()) {
+        lines.push('- 行业/品种黑名单: ' + String(p.blacklist).trim());
+      }
+      return lines.join('\n');
+    } catch (e) {
+      console.warn('[AI] formatUserProfile 失败:', e);
+      return '';
+    }
+  }
+
   window.Core = window.Core || {};
   window.Core.AI = {
     call,
@@ -619,6 +659,7 @@
     getProviderConfig,
     resolveEndpoint,
     selfCheck,
+    formatUserProfile,
     PROVIDERS
   };
 })();

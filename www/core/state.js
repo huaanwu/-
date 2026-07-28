@@ -67,7 +67,7 @@
       });
     }
     // 持久化重要 key
-    if (['proxyBase', 'apiKeys', 'ai', 'accountCash', 'sync'].includes(key)) {
+    if (['proxyBase', 'apiKeys', 'ai', 'accountCash', 'sync', 'userProfile'].includes(key)) {
       Core.Storage.kvSet('state_' + key, value);
     }
   }
@@ -98,6 +98,9 @@
     if (typeof accountCash === 'number') _state.accountCash = accountCash;
     const sync = await Core.Storage.kvGet('state_sync');
     if (sync) _state.sync = { ..._state.sync, ...sync };
+    // Phase W-1.5: 还原 Core.UserProfile (否则重启浏览器/APK 后用户画像丢回默认)
+    const userProfile = await Core.Storage.kvGet('state_userProfile');
+    if (userProfile) _state.userProfile = userProfile;
   }
 
   window.Core = window.Core || {};

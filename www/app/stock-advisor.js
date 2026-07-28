@@ -249,7 +249,12 @@
     if (ld) ld.textContent = '⏳ AI 简评中, 大约 10-20 秒...';
 
     const systemPrompt = [
-      '你是一名 A 股个股投资顾问 (高手版, Phase O), 服务长期稳健型投资者。',
+      '你是一名 A 股个股投资顾问 (高手版, Phase O), 服务对象按 Core.UserProfile 渲染。',
+      '',
+      '【用户画像】(Core.UserProfile 单次动态注入)',
+      Core.AI.formatUserProfile() || '长期稳健型 (年化 3-5%), 不追短期暴利。',
+      '',
+      '【输出风格】先证据后结论, 每条 reason 引用具体数据; 给信心等级 (高/中/低)。',
       '',
       '【投资框架】价值 + 趋势 + 风险平价 混合:',
       '  - 价值: PE/PB/ROE 与历史分位',
@@ -409,7 +414,12 @@
     if (ld) ld.textContent = `⏳ AI 财报深度读中 (基于 ${data.history.length} 期对比), 大约 15-30 秒...`;
 
     const systemPrompt = [
-      '你是一名 A 股财报分析师 (Phase R 深度读模式), 服务长期稳健型投资者。',
+      '你是一名 A 股财报分析师 (Phase R 深度读模式), 服务对象按 Core.UserProfile 渲染。',
+      '',
+      '【用户画像】(Core.UserProfile 单次动态注入)',
+      Core.AI.formatUserProfile() || '长期稳健型 (年化 3-5%), 不追短期暴利。',
+      '',
+      '【输出风格】先证据后结论, 每条 reason 引用具体数据; 给信心等级 (高/中/低)。',
       '',
       '【数据】下面是该股近 4 期财报核心指标 (营收/净利/毛利/ROE/ROA/资产负债率/经营现金流):',
       '  - 已按"最近→最远"排序,最新一期在最前面',

@@ -196,7 +196,8 @@
 - 趋势: 利率方向 / 板块轮动 / 北向流向
 - 风险平价: 跨资产相关性 / 组合最大回撤 / 夏普
 
-【用户画像】长期稳健型 (年化 3-5% 跑赢通胀), 不追求暴利。
+【用户画像】(Core.UserProfile 单次动态注入)
+${Core.AI.formatUserProfile() || '长期稳健型 (年化 3-5% 跑赢通胀), 不追求暴利。'}
 
 【输出风格】先证据后结论, 每条 reason 引用具体数据; 给信心等级 (高/中/低)。
 
@@ -237,12 +238,15 @@
 9. **pre-mortem 必填**: 每只 pick 必须给 bullCase/bearCase/falsifyCondition/invalidation 四字段; bearCase 禁止"无明显风险/暂无风险"空话 (利率/信用/流动性/政策风险至少写一条具体的), falsifyCondition 必须具体可观测 (如"10 年期国债收益率上行超 X bp"/"单月回撤 >X%")
 10. 禁止用"建议投资""一定赚钱"等绝对化表述`;
 
-    const userPrompt = `【用户画像】
+    const userPrompt = `【用户画像】(本单口径, 可覆盖 Core.UserProfile 的全局设置)
 - 总金额: ${amount} 元
 - 风险偏好: ${riskText}
 - 投资期限: ${horizonText}
 - 是否允许权益类: ${allowEquity === 'no' ? '不允许 (100% 债基)' : '允许最多 30%'}
 - 用户关注点: ${userNotes || '(无)'}
+
+【全局用户画像】(Core.UserProfile - 本次 AI 调用生效)
+${Core.AI.formatUserProfile() || '(未设置, 走默认)'}
 
 ${macroText}
 

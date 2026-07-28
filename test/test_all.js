@@ -124,7 +124,13 @@ const DOMAINS = {
     // T4 学习环
     'verifyClosedTrades', '_extractExitInfo', '_judgeClosedTrade', '_barOf', '_linkVerifiedTrades',
     '_buildTrackRecord', '_formatTrackRecord', '_outcomeScore', '_brierScore', '_calibrationBuckets',
-    '_collectVerifiedTrades', 'maybeDistillLessons', '_buildLearningPromptText', 'renderLearningCurve']
+    '_collectVerifiedTrades', 'maybeDistillLessons', '_buildLearningPromptText', 'renderLearningCurve'],
+  // 盘中操盘手 (Intraday Trader): 文件名 intraday-trader.js, key 用 'Intraday-Trader' (toLowerCase 对得上)
+  'Intraday-Trader': ['init', 'runNow', 'stopPolling', 'listLog',
+    '_processPosition', '_decideWithLlm', '_executeAction', '_appendLog',
+    '_isTradingTime', '_isCooldownOver', '_isUnderDailyLimit', '_mechanicalExit', '_isMinHoldPassed', '_parseDecision'],
+  // 长线操盘手 (Long Trader): 文件名 long-trader.js, key 用 'Long-Trader' (toLowerCase 对得上)
+  'Long-Trader': ['init', 'runNow', 'stopPolling', 'listLog', '_shouldRun', '_llmPickTop', '_appendLog']
 };
 for (const [name, methods] of Object.entries(DOMAINS)) {
   const file = path.join(WWW, 'app', name.toLowerCase() + '.js');
@@ -155,7 +161,8 @@ const CORE_MODULES = {
   'core/news.js':   'Core.News',
   'core/premortem.js': 'Core.Premortem',
   'core/prebacktest.js': 'Core.PreBacktest',
-  'core/crosscheck.js': 'Core.CrossCheck'
+  'core/crosscheck.js': 'Core.CrossCheck',
+  'core/user-profile.js': 'Core.UserProfile'
 };
 for (const [file, ns] of Object.entries(CORE_MODULES)) {
   const content = readFileSafe(path.join(WWW, file));
@@ -8254,6 +8261,1085 @@ section('[50] data.js 行业映射 + 公告 + 量比');
     else fail('50.d 暴露', 'window.Core.Data 未导出 4 个新方法');
   } catch (e) {
     fail('50 data.js 接口', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [51] Core.UserProfile 基础模块 (Commit 1) ==========
+section('[51] Core.UserProfile 7 字段 schema');
+(async () => {
+  try {
+    // vm sandbox 加载 user-profile.js (独立运行, 不依赖其他 Core)
+    const src = readFileSafe(path.join(WWW, 'core', 'user-profile.js'));
+    if (!src) throw new Error('user-profile.js 读不到');
+    const mem = {};
+    const upCtx = vm.createContext({
+      window: {},
+      console,
+      Core: {
+        State: {
+          get: function (k, d) { return (k in mem) ? mem[k] : d; },
+          set: function (k, v) { mem[k] = v; }
+        }
+      }
+    });
+    vm.runInContext(src, upCtx);
+    const UP = upCtx.window.Core && upCtx.window.Core.UserProfile;
+    if (!UP) throw new Error('Core.UserProfile 未挂载');
+
+    // 51.a 静态数据 (DEFAULTS + 3 个 *_TEXT 字典)
+    if (UP && typeof UP === 'object') ok('51.a Core.UserProfile 命名空间存在');
+    else fail('51.a 命名空间', '未挂到 window.Core.UserProfile');
+
+    if (UP.DEFAULTS && UP.DEFAULTS.risk === 'moderate'
+        && UP.DEFAULTS.horizon === '1-3y'
+        && UP.DEFAULTS.allowEquity === 'no'
+        && UP.DEFAULTS.targetReturn === 5
+        && UP.DEFAULTS.maxDrawdown === 10) {
+      ok('51.b DEFAULTS: risk=moderate/horizon=1-3y/allowEquity=no/targetReturn=5/maxDrawdown=10');
+    } else fail('51.b DEFAULTS', JSON.stringify(UP.DEFAULTS));
+
+    if (UP.SCHEMA.length === 7 && UP.SCHEMA.includes('risk')
+        && UP.SCHEMA.includes('targetReturn') && UP.SCHEMA.includes('maxDrawdown')) {
+      ok('51.c SCHEMA 含 7 字段 (risk/horizon/allowEquity/preference/blacklist/targetReturn/maxDrawdown)');
+    } else fail('51.c SCHEMA', JSON.stringify(UP.SCHEMA));
+
+    if (UP.RISK_TEXT.conservative && UP.RISK_TEXT.conservative.includes('极度保守')
+        && UP.RISK_TEXT.moderate && UP.RISK_TEXT.moderate.includes('稳健')
+        && UP.RISK_TEXT.balanced && UP.RISK_TEXT.balanced.includes('平衡')) {
+      ok('51.d RISK_TEXT 3 档中文 (极度保守/稳健/平衡)');
+    } else fail('51.d RISK_TEXT', '缺中文文案');
+
+    // 51.e 纯函数 mergeWithDefaults: null → 全默认
+    const m1 = UP.mergeWithDefaults(null);
+    if (m1.risk === 'moderate' && m1.targetReturn === 5 && m1.maxDrawdown === 10 && m1.preference === '') {
+      ok('51.e mergeWithDefaults(null) → 全默认');
+    } else fail('51.e mergeWithDefaults(null)', JSON.stringify(m1));
+
+    // 51.f mergeWithDefaults: 部分覆盖
+    const m2 = UP.mergeWithDefaults({ risk: 'conservative', targetReturn: 8, preference: 'ESG' });
+    if (m2.risk === 'conservative' && m2.targetReturn === 8 && m2.preference === 'ESG'
+        && m2.horizon === '1-3y' && m2.maxDrawdown === 10 && m2.blacklist === '') {
+      ok('51.f mergeWithDefaults 部分覆盖 + 未指定字段走默认');
+    } else fail('51.f mergeWithDefaults 部分覆盖', JSON.stringify(m2));
+
+    // 51.g mergeWithDefaults: 数字字段 coerce (字符串 "8" → 8)
+    const m3 = UP.mergeWithDefaults({ targetReturn: '8.5', maxDrawdown: '15' });
+    if (m3.targetReturn === 8.5 && m3.maxDrawdown === 15) ok('51.g mergeWithDefaults 数字字段字符串 coerce');
+    else fail('51.g coerce', JSON.stringify(m3));
+
+    // 51.h validate: 合法 profile → ok
+    const v1 = UP.validate({
+      risk: 'balanced', horizon: '3y+', allowEquity: 'yes',
+      preference: 'X', blacklist: 'Y', targetReturn: 8, maxDrawdown: 20
+    });
+    if (v1.valid === true && v1.errors.length === 0) ok('51.h validate 合法 profile → valid=true');
+    else fail('51.h validate 合法', JSON.stringify(v1));
+
+    // 51.i validate: 非法 risk → errors
+    const v2 = UP.validate({
+      risk: 'invalid', horizon: '1y', allowEquity: 'no',
+      targetReturn: 5, maxDrawdown: 10
+    });
+    if (v2.valid === false && v2.errors.some(e => /risk/.test(e))) ok('51.i validate 非法 risk → valid=false + errors');
+    else fail('51.i validate 非法', JSON.stringify(v2));
+
+    // 51.j validate: 数值越界
+    const v3 = UP.validate({
+      risk: 'moderate', horizon: '1y', allowEquity: 'no',
+      targetReturn: 200, maxDrawdown: -5
+    });
+    if (v3.valid === false && v3.errors.length >= 2) ok('51.j validate targetReturn=200 / maxDrawdown=-5 → 拒');
+    else fail('51.j validate 越界', JSON.stringify(v3));
+
+    // 51.k riskLabel / horizonLabel / allowEquityLabel: 已知值返回中文
+    if (UP.riskLabel('conservative').includes('极度保守')
+        && UP.horizonLabel('1y').includes('1 年内')
+        && UP.allowEquityLabel('yes').includes('允许')) {
+      ok('51.k label 函数 (riskLabel/horizonLabel/allowEquityLabel)');
+    } else fail('51.k label', 'label 函数未返回中文');
+
+    // 51.l label 容错: 未知值返回默认
+    if (UP.riskLabel('???').includes('稳健')
+        && UP.horizonLabel('???').includes('1-3')) {
+      ok('51.l label 容错 (未知值 → 默认)');
+    } else fail('51.l label 容错', 'label 未知值未走默认');
+
+    // 51.m save / load round-trip (走 mock State 隔离)
+    const r = UP.save({ risk: 'balanced', targetReturn: 12 });
+    const loaded = UP.load();
+    if (r === true && loaded.risk === 'balanced' && loaded.targetReturn === 12 && loaded.horizon === '1-3y') {
+      ok('51.m save → load round-trip (字段覆盖 + 默认填充)');
+    } else fail('51.m round-trip', `save=${r}, load=${JSON.stringify(loaded)}`);
+
+    // 51.n save 校验失败: 非法 profile 不写入
+    const beforeReject = JSON.stringify(mem);
+    const r2 = UP.save({ risk: 'INVALID', horizon: '1y', allowEquity: 'no', targetReturn: 5, maxDrawdown: 10 });
+    const afterReject = JSON.stringify(mem);
+    if (r2 === false && beforeReject === afterReject) {
+      ok('51.n save 拒绝非法 profile (State 未变)');
+    } else fail('51.n save 拒绝', `r=${r2}, before=${beforeReject}, after=${afterReject}`);
+
+    // 51.o load 失败降级 (mock Core.State.get 抛错 → 返回 DEFAULTS)
+    const failCtx = vm.createContext({
+      window: {},
+      console,
+      Core: {
+        State: {
+          get: function () { throw new Error('mock fail'); },
+          set: function () {}
+        }
+      }
+    });
+    vm.runInContext(src, failCtx);
+    const UP2 = failCtx.window.Core.UserProfile;
+    const fallback = UP2.load();
+    if (fallback.risk === 'moderate' && fallback.targetReturn === 5) {
+      ok('51.o load 失败 → 返回 DEFAULTS (降级)');
+    } else fail('51.o load 降级', JSON.stringify(fallback));
+  } catch (e) {
+    fail('51 Core.UserProfile', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [52] Core.AI.formatUserProfile (Commit 2: 用户画像统一格式化) ==========
+section('[52] Core.AI.formatUserProfile: 把 UserProfile 渲染成中文 prompt 段');
+(async () => {
+  try {
+    // vm sandbox 同时加载 user-profile.js + ai-service.js
+    // (ai-service 依赖 Core.UserProfile, 所以先建 ctx, 再注入 UserProfile 后加载 ai-service)
+    const upSrc = readFileSafe(path.join(WWW, 'core', 'user-profile.js'));
+    const aiSrc = readFileSafe(path.join(WWW, 'core', 'ai-service.js'));
+    if (!upSrc) throw new Error('user-profile.js 读不到');
+    if (!aiSrc) throw new Error('ai-service.js 读不到');
+
+    // 1) 完整 render: 全字段
+    const fullMem = {};
+    const fullCtx = vm.createContext({
+      window: {},
+      console,
+      Core: {
+        State: {
+          get: (k, d) => (k in fullMem) ? fullMem[k] : d,
+          set: (k, v) => { fullMem[k] = v; }
+        },
+        Util: {}
+      }
+    });
+    vm.runInContext(upSrc, fullCtx);
+    vm.runInContext(aiSrc, fullCtx);
+
+    fullCtx.window.Core.UserProfile.save({
+      risk: 'balanced',
+      horizon: '3y+',
+      allowEquity: 'yes',
+      preference: '重仓蓝筹',
+      blacklist: 'ST,教育',
+      targetReturn: 12,
+      maxDrawdown: 20
+    });
+    const seg = fullCtx.window.Core.AI.formatUserProfile();
+
+    // 52.a 全字段渲染 (7 行都包含)
+    if (seg && seg.includes('风险偏好') && seg.includes('平衡')
+        && seg.includes('3 年以上')
+        && seg.includes('允许股票类资产')
+        && seg.includes('目标年化收益率: 12%')
+        && seg.includes('可接受最大回撤: 20%')
+        && seg.includes('重仓蓝筹')
+        && seg.includes('ST,教育')) {
+      ok('52.a 全字段: 7 行完整中文 + 含用户偏好/黑名单');
+    } else fail('52.a 全字段', seg);
+
+    // 52.b 仅渲染有值的字段 (空 preference/blacklist 应不渲染)
+    fullCtx.window.Core.UserProfile.save({
+      risk: 'conservative', horizon: '1y', allowEquity: 'no',
+      targetReturn: 3, maxDrawdown: 2
+    });
+    const seg2 = fullCtx.window.Core.AI.formatUserProfile();
+    if (seg2.includes('极度保守') && seg2.includes('1 年内') && seg2.includes('仅基金')
+        && seg2.includes('3%') && seg2.includes('2%')
+        && !seg2.includes('个人偏好:') && !seg2.includes('黑名单:')) {
+      ok('52.b 默认保守: 5 行基础字段, 偏好/黑名单省略');
+    } else fail('52.b 默认保守', seg2);
+
+    // 52.c 缺 Core.UserProfile → 降级返空串 (不抛错)
+    const noUpCtx = vm.createContext({
+      window: {}, console,
+      Core: {
+        State: { get: () => null, set: () => {} },
+        Util: {}
+      }
+    });
+    vm.runInContext(aiSrc, noUpCtx);
+    const seg3 = noUpCtx.window.Core.AI.formatUserProfile();
+    if (seg3 === '') ok('52.c 无 Core.UserProfile → 返空串 (降级)');
+    else fail('52.c 降级', `expected "", got ${JSON.stringify(seg3)}`);
+
+    // 52.d Core.UserProfile.load() 抛错 → UserProfile 内部 catch 返 DEFAULTS, formatUserProfile 仍能返稳定 profile (5 行)
+    const brokenCtx = vm.createContext({
+      window: {}, console,
+      Core: {
+        State: {
+          get: () => { throw new Error('mock fail'); },
+          set: () => {}
+        },
+        Util: {}
+      }
+    });
+    vm.runInContext(upSrc, brokenCtx);
+    vm.runInContext(aiSrc, brokenCtx);
+    const seg4 = brokenCtx.window.Core.AI.formatUserProfile();
+    if (seg4 && seg4.includes('稳健') && seg4.includes('1-3 年') && seg4.includes('5%') && seg4.includes('10%')) {
+      ok('52.d load 抛错 → UserProfile 兜底 → formatUserProfile 仍稳定返默认 profile');
+    } else fail('52.d 异常降级', JSON.stringify(seg4));
+
+    // 52.e formatUserProfile 挂载到 Core.AI
+    if (typeof fullCtx.window.Core.AI.formatUserProfile === 'function') {
+      ok('52.e Core.AI.formatUserProfile 已挂载');
+    } else fail('52.e 挂载', 'Core.AI.formatUserProfile 未挂载');
+  } catch (e) {
+    fail('52 Core.AI.formatUserProfile', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [53] fund/ai-advisor.js: prompt 含 Core.UserProfile 注入 (Commit 3) ==========
+section('[53] fund/ai-advisor.js: systemPrompt 不再硬编码"长期稳健型", 改用 Core.AI.formatUserProfile');
+(async () => {
+  try {
+    const advSrc = readFileSafe(path.join(WWW, 'app', 'fund', 'ai-advisor.js'));
+    if (!advSrc) throw new Error('fund/ai-advisor.js 读不到');
+
+    // 53.1 静态扫描: systemPrompt【用户画像】段不再直接硬编码"长期稳健型"
+    // (允许作为 *降级兜底文案* 在 formatUserProfile() 返空时出现, 不能直接写在主体段)
+    const sysPromptMatch = advSrc.match(/const systemPrompt = `([\s\S]*?)`;/);
+    if (!sysPromptMatch) throw new Error('systemPrompt 模板字符串未找到');
+    const sysTpl = sysPromptMatch[1];
+
+    // 53.a 【用户画像】段已迁移成 Core.AI.formatUserProfile() 调用
+    // (允许 || 之后的降级文案含"长期稳健型"作为 formatUserProfile 抛错时的兜底)
+    const upSegMatch = sysTpl.match(/【用户画像】([\s\S]*?)(?=\n【|\n```|$)/);
+    const userProfileSeg = upSegMatch ? upSegMatch[1] : '';
+    // 检查"长期稳健型"只出现在 || 之后 (降级路径), 不能独立成行
+    const hardCodedLines = (userProfileSeg || '').split('\n')
+      .filter(line => /长期稳健型/.test(line) && !line.includes('||'));
+    if (userProfileSeg && /Core\.AI\.formatUserProfile\(\)/.test(userProfileSeg)
+        && hardCodedLines.length === 0) {
+      ok('53.a 【用户画像】段: 调 formatUserProfile, 主体无硬编码"长期稳健型" (|| 降级文案允许)');
+    } else fail('53.a', `段=${JSON.stringify(userProfileSeg).slice(0, 200)}, 硬编码行=${hardCodedLines.length}`);
+
+    // 53.b 含 Core.AI.formatUserProfile 注入 (全局断言)
+    if (/Core\.AI\.formatUserProfile\(\)/.test(sysTpl)) ok('53.b systemPrompt 调用 Core.AI.formatUserProfile()');
+    else fail('53.b', 'systemPrompt 未调 formatUserProfile');
+
+    // 53.c 含"用户画像"段标记
+    if (/【用户画像】/.test(sysTpl)) ok('53.c systemPrompt 含【用户画像】段');
+    else fail('53.c', 'systemPrompt 缺【用户画像】');
+
+    // 53.2 动态 vm 验证: 默认 profile → prompt 含 "稳健" + 不再含 "长期稳健型 (年化 3-5%"
+    const upSrc = readFileSafe(path.join(WWW, 'core', 'user-profile.js'));
+    const aiSrc = readFileSafe(path.join(WWW, 'core', 'ai-service.js'));
+    const runMem = {};
+    const runCtx = vm.createContext({
+      window: {}, console,
+      Core: {
+        State: {
+          get: (k, d) => (k in runMem) ? runMem[k] : d,
+          set: (k, v) => { runMem[k] = v; }
+        }
+      }
+    });
+    vm.runInContext(upSrc, runCtx);
+    vm.runInContext(aiSrc, runCtx);
+    // 默认 profile (无 userProfile 持久化) → render 稳定
+    const profileSeg = runCtx.window.Core.AI.formatUserProfile();
+    if (profileSeg && profileSeg.includes('稳健')) ok('53.d 默认 profile (空持久化) → formatUserProfile 返"稳健"');
+    else fail('53.d', JSON.stringify(profileSeg));
+
+    // 53.3 设 balanced 后 → formatUserProfile 返"平衡"
+    runCtx.window.Core.UserProfile.save({
+      risk: 'balanced', horizon: '3y+', allowEquity: 'yes',
+      targetReturn: 15, maxDrawdown: 25
+    });
+    const seg2 = runCtx.window.Core.AI.formatUserProfile();
+    if (seg2.includes('平衡') && seg2.includes('3 年以上')
+        && seg2.includes('允许股票类资产') && seg2.includes('15%') && seg2.includes('25%')) {
+      ok('53.e balanced profile → 完整 5 行中文渲染');
+    } else fail('53.e', JSON.stringify(seg2));
+
+    // 53.f userPrompt 部分: 注入全局 userProfile 段
+    const userPromptMatch = advSrc.match(/const userPrompt = `([\s\S]*?)`;/);
+    if (userPromptMatch && /全局用户画像/.test(userPromptMatch[1])
+        && /Core\.UserProfile|Core\.AI\.formatUserProfile/.test(userPromptMatch[1])) {
+      ok('53.f userPrompt 含【全局用户画像】段 + 调 formatUserProfile');
+    } else fail('53.f', 'userPrompt 未注全局画像');
+
+    // 53.g 保留: form-driven 本单用户画像 (单次覆盖)
+    if (/风险偏好: \$\{riskText\}/.test(userPromptMatch[1])
+        && /投资期限: \$\{horizonText\}/.test(userPromptMatch[1])) {
+      ok('53.g userPrompt 保留本单字段 (riskText/horizonText 模板)');
+    } else fail('53.g', '本单字段模板丢失');
+  } catch (e) {
+    fail('53 fund/ai-advisor.js', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [54] screener.js: prompt 含 Core.UserProfile 注入 (Commit 4) ==========
+section('[54] screener.js: systemPrompt 改用 Core.AI.formatUserProfile (与选基共用同一来源)');
+(async () => {
+  try {
+    const scSrc = readFileSafe(path.join(WWW, 'app', 'screener.js'));
+    if (!scSrc) throw new Error('screener.js 读不到');
+
+    // 54.a systemPrompt 模板【用户画像】段调 Core.AI.formatUserProfile()
+    const sysMatch = scSrc.match(/const systemPrompt = `([\s\S]*?)`;/);
+    if (!sysMatch) throw new Error('systemPrompt 模板字符串未找到');
+    const sysTpl = sysMatch[1];
+
+    const segMatch = sysTpl.match(/【用户画像】([\s\S]*?)(?=\n【|\n```|$)/);
+    const upSeg = segMatch ? segMatch[1] : '';
+    const hardCodedLines = (upSeg || '').split('\n')
+      .filter(line => /长期稳健型/.test(line) && !line.includes('||'));
+    if (upSeg && /Core\.AI\.formatUserProfile\(\)/.test(upSeg) && hardCodedLines.length === 0) {
+      ok('54.a screener【用户画像】段: 调 formatUserProfile, 主体无硬编码');
+    } else fail('54.a', `upSeg=${JSON.stringify(upSeg).slice(0, 200)}, 硬编码行=${hardCodedLines.length}`);
+
+    // 54.b 选股 prompt 与 选基 (53.b) 用同一个 Core.AI.formatUserProfile
+    // (静态一致性检查: 两文件都出现这个函数调用)
+    const advSrc = readFileSafe(path.join(WWW, 'app', 'fund', 'ai-advisor.js'));
+    if (scSrc.includes('Core.AI.formatUserProfile()') && advSrc.includes('Core.AI.formatUserProfile()')) {
+      ok('54.b 选股 + 选基 都用 Core.AI.formatUserProfile() (单一来源)');
+    } else fail('54.b', '两文件至少有一个未引 Core.AI.formatUserProfile');
+
+    // 54.c screener.js 与 ai-advisor.js 的"硬编码长期稳健型"已下线
+    // 检查文件层面剩余出现次数 (只允许作为 || 降级文案, 不能独立成行)
+    const scHardCount = (scSrc.match(/长期稳健型/g) || []).length;
+    const advHardCount = (advSrc.match(/长期稳健型/g) || []).length;
+    if (scHardCount <= 1 && advHardCount <= 1) {
+      ok(`54.c 硬编码兜底 ≤ 1 次/文件 (screener=${scHardCount}, advisor=${advHardCount}, 都用作 || 降级)`);
+    } else fail('54.c', `screener=${scHardCount} advisor=${advHardCount} 超出`);
+  } catch (e) {
+    fail('54 screener.js', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [55] state.js init() 还原 Core.UserProfile (Commit 5: 修复丢画像 bug) ==========
+section('[55] state.js init() 必须还原 state_userProfile (否则重启后丢回默认)');
+(async () => {
+  try {
+    const stateSrc = readFileSafe(path.join(WWW, 'core', 'state.js'));
+    if (!stateSrc) throw new Error('state.js 读不到');
+
+    // 55.a init() 内 kvGet('state_userProfile') 调用
+    const initMatch = stateSrc.match(/async function init\(\)\s*\{([\s\S]*?)\n\s*\}/);
+    if (!initMatch) throw new Error('init() 函数未找到');
+    const initBody = initMatch[1];
+
+    if (/kvGet\(['"]state_userProfile['"]\)/.test(initBody)) {
+      ok('55.a state.js init() 含 kvGet(\'state_userProfile\') 还原调用');
+    } else fail('55.a', 'init() 内未还原 userProfile');
+
+    // 55.b init() 内还原后赋值给 _state.userProfile
+    if (/userProfile[^a-zA-Z_$].*_state\.userProfile\s*=/.test(initBody)
+        || /_state\.userProfile\s*=\s*userProfile/.test(initBody)) {
+      ok('55.b init() 还原结果写回 _state.userProfile');
+    } else fail('55.b', 'init() 还原结果未写回 _state');
+
+    // 55.c set() 持久化白名单还含 'userProfile' (C1 已加, 需保留)
+    if (/['"]userProfile['"]/.test(stateSrc)) {
+      ok('55.c state.js 仍含字面量 \'userProfile\' (set() 白名单保留)');
+    } else fail('55.c', 'state.js 找不到 userProfile 字面量');
+  } catch (e) {
+    fail('55 state.js init()', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [56] stock-advisor.js + fund/weekly-report.js: 全部用 Core.AI.formatUserProfile (Commit 6: 全站清硬编码) ==========
+section('[56] stock-advisor.js + weekly-report.js: 不再有硬编码"长期稳健型"主体段');
+(async () => {
+  try {
+    const files = [
+      { path: path.join(WWW, 'app', 'stock-advisor.js'), label: 'stock-advisor' },
+      { path: path.join(WWW, 'app', 'fund', 'weekly-report.js'), label: 'weekly-report' }
+    ];
+    for (const f of files) {
+      const src = readFileSafe(f.path);
+      if (!src) { fail(`56.${f.label} 源`, '读不到'); continue; }
+
+      // 56.a 文件含 Core.AI.formatUserProfile()
+      if (/Core\.AI\.formatUserProfile\(\)/.test(src)) {
+        ok(`56.a.${f.label} 文件已调 Core.AI.formatUserProfile()`);
+      } else fail(`56.a.${f.label}`, '未调 formatUserProfile');
+
+      // 56.b "服务长期稳健型" / "服务对象是长期稳健型" 主体句已下线
+      // (允许作为 || 降级文案, 主体行不能含 "服务长期稳健型" / "服务对象是长期稳健型")
+      const offending = src.split('\n')
+        .filter(line => /服务.*长期稳健型/.test(line) && !line.includes('||'))
+        .map(line => line.trim());
+      if (offending.length === 0) ok(`56.b.${f.label} 主体无"服务长期稳健型"硬编码`);
+      else fail(`56.b.${f.label}`, `${offending.length} 行残留: ${offending[0].slice(0, 80)}`);
+
+      // 56.c 硬编码兜底 ≤ N 处 (每 systemPrompt 允许 1 处 || 降级)
+      // stock-advisor.js 有 2 个 systemPrompt (个股简评 + 财报深度读), 上限 = 2
+      // weekly-report.js 有 1 个 systemPrompt, 上限 = 1
+      const sysCount = (src.match(/const systemPrompt\s*=\s*\[/g) || []).length || 1;
+      const limit = Math.max(1, sysCount);
+      const hard = (src.match(/长期稳健型/g) || []).length;
+      if (hard <= limit) ok(`56.c.${f.label} 硬编码 ≤ ${limit} (实际 ${hard}, ${sysCount} 个 systemPrompt)`);
+      else fail(`56.c.${f.label}`, `硬编码 ${hard} 超过 ${limit}`);
+    }
+
+    // 56.d 全站覆盖率: screener + ai-advisor + stock-advisor + weekly-report 都用 Core.AI.formatUserProfile
+    const all = ['www/app/screener.js', 'www/app/fund/ai-advisor.js',
+      'www/app/stock-advisor.js', 'www/app/fund/weekly-report.js'];
+    const using = all.filter(p => {
+      const s = readFileSafe(path.join(WWW, p.replace(/^www\//, '')));
+      return s && /Core\.AI\.formatUserProfile\(\)/.test(s);
+    });
+    if (using.length === all.length) {
+      ok(`56.d 全站 ${all.length} 处都调 Core.AI.formatUserProfile (单一来源收口)`);
+    } else fail('56.d', `未用: ${all.filter(p => !using.includes(p)).join(', ')}`);
+  } catch (e) {
+    fail('56 stock-advisor + weekly-report', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [57] screener scPreference: 走 fallback 链 (D1: 本次>全局>空) ==========
+section('[57] screener.js scPreference 优先级链: scPreference > userProfile.preference > 空');
+(async () => {
+  try {
+    const scSrc = readFileSafe(path.join(WWW, 'app', 'screener.js'));
+    if (!scSrc) throw new Error('screener.js 读不到');
+
+    // 57.a scPreference 取值增加 Core.UserProfile.load().preference fallback
+    // 找 preference = ... 赋值行 (在 _lastResults 解构之后)
+    const fallbackMatch = scSrc.match(/scPref\s*=\s*document[^;]+;[\s\S]*?Core\.UserProfile[^;]*;[\s\S]*?preference\s*=\s*(?:scPref[^;]+;)/);
+    if (fallbackMatch || (scSrc.includes('Core.UserProfile') && scSrc.includes('upPref') && /scPref\s*\|\|\s*upPref\.trim\(\)/.test(scSrc))) {
+      ok('57.a screener scPreference 含 Core.UserProfile.load().preference fallback');
+    } else fail('57.a', '未见 fallback 链');
+
+    // 57.b UI 文案提示"留空走设置页"
+    if (/留空/.test(scSrc) && /设置页|用户画像/.test(scSrc)) {
+      ok('57.b scPreference UI 提示"留空走设置页"');
+    } else fail('57.b', 'UI 未提示 fallback');
+  } catch (e) {
+    fail('57 D1 scPreference', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [59] IntradayTrader 盘中操盘手 (T5: 1 分钟轮询 + 本地 LLM 实时调仓) ==========
+section('[59] IntradayTrader: 纯函数 (交易时段/冷却/日限/机械止盈止损/最短持有/解析)');
+(async () => {
+  try {
+    const itSrc = readFileSafe(path.join(WWW, 'app', 'intraday-trader.js'));
+    if (!itSrc) throw new Error('intraday-trader.js 读不到');
+    const K = _loadRealConstants();
+
+    // vm sandbox: mock 全套依赖 (Core.Storage / Core.AI / Paper / Core.Data / Core.Regime)
+    const buildCtx = (opts = {}) => {
+      const sctx = {
+        window: {}, console,
+        escapeHtml: (s) => String(s == null ? '' : s),
+        fmtMoney: (n) => (typeof n === 'number' ? n.toFixed(2) : '0.00'),
+        fmtNum: (n, d) => (typeof n === 'number' ? n.toFixed(d || 0) : '0'),
+        fmtPct: (n) => (typeof n === 'number' ? (n * 100).toFixed(2) + '%' : '-'),
+        pctClass: () => '',
+        fmtDate: () => '2026-07-28',
+        Date,
+        document: { getElementById: () => null }
+      };
+      // INTRADAY_* 常量在 _REAL_CONSTANTS 缓存中可能缺失 (缓存时 constants.js 还未加这些常量),
+      // 这里显式注入兜底, 保证纯函数计算正确
+      const Kx = Object.assign({
+        INTRADAY_TICK_MS: 60 * 1000,
+        INTRADAY_KLINE_BARS: 30,
+        INTRADAY_MIN_HOLD_MINUTES: 15,
+        INTRADAY_COOLDOWN_MS: 10 * 60 * 1000,
+        INTRADAY_LLM_TIMEOUT_MS: 20 * 1000,
+        INTRADAY_LOG_LIMIT: 200,
+        INTRADAY_MAX_DAILY_ACTIONS: 4,
+        TRADING_WINDOWS: [[9 * 60 + 30, 11 * 60 + 30], [13 * 60, 15 * 60]],
+        LOT_SIZE: 100
+      }, K || {});
+      sctx.window.Core = {
+        Constants: Kx,
+        Storage: {
+          kvGet: async (k) => opts.kv && (k in opts.kv) ? opts.kv[k] : null,
+          kvSet: async (k, v) => { opts.kv = opts.kv || {}; opts.kv[k] = v; }
+        },
+        AI: {
+          callWithTimeout: async () => opts.llmRaw || '',
+          parseJsonOutput: async (raw) => {
+            // 简单 JSON 抽取 (与 real parseJsonOutput 同款行为)
+            if (typeof raw !== 'string') return { ok: false };
+            const i = raw.indexOf('{'); const j = raw.lastIndexOf('}');
+            if (i < 0 || j < 0) return { ok: false };
+            try { return { ok: true, obj: JSON.parse(raw.slice(i, j + 1)) }; }
+            catch (e) { return { ok: false }; }
+          }
+        },
+        Data: { getStockQuote: async () => opts.quote || { 最新价: 10, 涨跌幅: 1.5, 换手率: 2 },
+                getStockKLine: async () => opts.bars || [] },
+        Regime: { get: async () => ({ state: 'range' }), gateMultipliers: () => ({ state: 'range', label: '震荡市', positionScale: 1 }) }
+      };
+      sctx.Core = sctx.window.Core;
+      // Paper mock: getPositions / buy / sell 可注入
+      sctx.window.Paper = {
+        getPositions: async () => opts.positions || [],
+        buy: async (code, name, market, shares, o) => ({ id: 'h-new', code, shares, ...o }),
+        sell: async (id, shares, o) => ({ id, shares, ...o })
+      };
+      sctx.Paper = sctx.window.Paper;
+      // ShortTrader mock: 成绩单接口可注入
+      sctx.window.ShortTrader = {
+        _buildTrackRecord: async () => null,
+        _formatTrackRecord: async () => ''
+      };
+      sctx.ShortTrader = sctx.window.ShortTrader;
+      sctx.window.document = sctx.document;
+      vm.createContext(sctx);
+      vm.runInContext(itSrc, sctx);
+      return sctx;
+    };
+
+    // 52.1 _isTradingTime: 周末/午间/夜盘都 false
+    const ctx1 = buildCtx();
+    const IT1 = ctx1.window.IntradayTrader;
+    if (!IT1) throw new Error('IntradayTrader 未挂到 window');
+    const tests1 = [
+      { d: new Date(2026, 6, 27, 10, 0), want: true, label: '周一 10:00' },
+      { d: new Date(2026, 6, 27, 9, 30), want: true, label: '周一 09:30 边界开' },
+      { d: new Date(2026, 6, 27, 11, 30), want: true, label: '周一 11:30 边界收' },
+      { d: new Date(2026, 6, 27, 13, 0), want: true, label: '周一 13:00 午后开' },
+      { d: new Date(2026, 6, 27, 15, 0), want: true, label: '周一 15:00 边界收' },
+      { d: new Date(2026, 6, 27, 9, 29), want: false, label: '周一 09:29 开盘前' },
+      { d: new Date(2026, 6, 27, 11, 31), want: false, label: '周一 11:31 午休' },
+      { d: new Date(2026, 6, 27, 12, 0), want: false, label: '周一 12:00 午休中' },
+      { d: new Date(2026, 6, 27, 15, 1), want: false, label: '周一 15:01 收盘后' },
+      { d: new Date(2026, 6, 25, 10, 0), want: false, label: '周六 10:00' },
+      { d: new Date(2026, 6, 26, 10, 0), want: false, label: '周日 10:00' }
+    ];
+    let tradingPass = 0, tradingFail = 0;
+    for (const t of tests1) {
+      if (IT1._isTradingTime(t.d) === t.want) tradingPass++;
+      else { tradingFail++; console.log(`    失败: ${t.label} 期望 ${t.want} 实际 ${IT1._isTradingTime(t.d)}`); }
+    }
+    if (tradingFail === 0) ok(`52.1 _isTradingTime 11 个用例全过 (周一开盘/边界/午休/收盘/周末)`);
+    else fail('52.1 _isTradingTime', `${tradingPass}/${tradingPass + tradingFail}`);
+
+    // 52.2 _mechanicalExit: 止损/止盈/无信号
+    if (IT1._mechanicalExit(8, 10, 12) === 'stop') ok('52.2.a 现价 ≤ 止损 → stop');
+    else fail('52.2.a', IT1._mechanicalExit(8, 10, 12));
+    if (IT1._mechanicalExit(13, 10, 12) === 'target') ok('52.2.b 现价 ≥ 目标 → target');
+    else fail('52.2.b', IT1._mechanicalExit(13, 10, 12));
+    if (IT1._mechanicalExit(11, 10, 12) === null) ok('52.2.c 现价在区间内 → null');
+    else fail('52.2.c', IT1._mechanicalExit(11, 10, 12));
+    if (IT1._mechanicalExit(5, 0, 0) === null) ok('52.2.d 止损/目标都 0 → null (无信号)');
+    else fail('52.2.d', IT1._mechanicalExit(5, 0, 0));
+
+    // 52.3 _isMinHoldPassed: 不足最短持有期 / 超过
+    const now = Date.now();
+    if (IT1._isMinHoldPassed(now - 16 * 60 * 1000, now) === true) ok('52.3.a 持有 16 分钟 (>15) → true');
+    else fail('52.3.a');
+    if (IT1._isMinHoldPassed(now - 5 * 60 * 1000, now) === false) ok('52.3.b 持有 5 分钟 (<15) → false');
+    else fail('52.3.b');
+    if (IT1._isMinHoldPassed(null, now) === true) ok('52.3.c createdAt=null → true (跳过)');
+    else fail('52.3.c');
+
+    // 52.4 _isCooldownOver: 冷却中 / 冷却过
+    if (IT1._isCooldownOver({ lastAt: now - 11 * 60 * 1000 }, now) === true) ok('52.4.a 距上次 11 分钟 (>10) → true');
+    else fail('52.4.a');
+    if (IT1._isCooldownOver({ lastAt: now - 5 * 60 * 1000 }, now) === false) ok('52.4.b 距上次 5 分钟 (<10) → false');
+    else fail('52.4.b');
+    if (IT1._isCooldownOver(null, now) === true) ok('52.4.c 首次 → true');
+    else fail('52.4.c');
+    if (IT1._isCooldownOver({}, now) === true) ok('52.4.d lastAt=undefined → true');
+    else fail('52.4.d');
+
+    // 52.5 _isUnderDailyLimit: 今日/跨日/未超限/已满
+    const today = '2026-07-28';
+    if (IT1._isUnderDailyLimit(null, today) === true) ok('52.5.a 首次 → true');
+    else fail('52.5.a');
+    if (IT1._isUnderDailyLimit({ date: today, todayCount: 0 }, today) === true) ok('52.5.b 今日 0 次 → true');
+    else fail('52.5.b');
+    if (IT1._isUnderDailyLimit({ date: today, todayCount: 3 }, today) === true) ok('52.5.c 今日 3 次 (<4) → true');
+    else fail('52.5.c');
+    if (IT1._isUnderDailyLimit({ date: today, todayCount: 4 }, today) === false) ok('52.5.d 今日 4 次 (达上限) → false');
+    else fail('52.5.d');
+    if (IT1._isUnderDailyLimit({ date: '2026-07-27', todayCount: 4 }, '2026-07-28') === true) ok('52.5.e 跨日 (昨日满) → true');
+    else fail('52.5.e');
+
+    // 52.6 _parseDecision: LLM 各种输出
+    const pdTests = [
+      { raw: '{"action":"hold","reason":"观望","confidence":"high"}', wantAction: 'hold' },
+      { raw: '建议: {"action":"close","reason":"跌势","confidence":"mid"}', wantAction: 'close' },
+      { raw: '```json\n{"action":"add","shares":100,"reason":"回调","confidence":"low"}\n```', wantAction: 'add' },
+      { raw: '{"action":"trim","shares":200,"reason":"减仓"}', wantAction: 'trim' },
+      { raw: '{"action":"unknown"}', wantAction: null },
+      { raw: 'not json', wantAction: null },
+      { raw: null, wantAction: null }
+    ];
+    let pdPass = 0;
+    for (const t of pdTests) {
+      const r = IT1._parseDecision(t.raw);
+      if ((t.wantAction === null && r === null) || (r && r.action === t.wantAction)) pdPass++;
+    }
+    if (pdPass === pdTests.length) ok(`52.6 _parseDecision ${pdTests.length} 个用例全过 (hold/close/add/trim + 非法)`);
+    else fail('52.6 _parseDecision', `${pdPass}/${pdTests.length}`);
+
+    // 52.7 _parseDecision: shares 是 100 倍数 (LLM 输出 50 应原样保留, 上层调仓前再 roundLot)
+    const r = IT1._parseDecision('{"action":"add","shares":150,"reason":"x"}');
+    if (r && r.shares === 150) ok('52.7 _parseDecision 保留 LLM 原始 shares (150, 由上层 roundLot 兜底)');
+    else fail('52.7', JSON.stringify(r));
+
+    // 52.8 _buildSystemPrompt 含关键约束
+    const sp = IT1._buildSystemPrompt();
+    const requiredPhrases = ['不开新仓', 'add', 'trim', 'close', 'hold', 'shares', 'confidence', 'JSON'];
+    const missing = requiredPhrases.filter(p => !sp.includes(p));
+    if (missing.length === 0) ok('52.8 _buildSystemPrompt 含 8 个关键短语 (不开新仓/4 动作/JSON)');
+    else fail('52.8 _buildSystemPrompt 缺短语', missing.join(','));
+
+  } catch (e) {
+    fail('59 IntradayTrader 纯函数', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [60] IntradayTrader 集成: 持仓 → 拉价 → 机械止盈止损 → LLM 决策 → 调仓落地 ==========
+section('[60] IntradayTrader 集成: 整轮 runNow + 机械止盈/止损优先 + LLM 调仓 + 日志');
+(async () => {
+  try {
+    const itSrc = readFileSafe(path.join(WWW, 'app', 'intraday-trader.js'));
+    if (!itSrc) throw new Error('intraday-trader.js 读不到');
+    const K = _loadRealConstants();
+
+    // 53.1 机械止盈: 现价 ≥ 目标 → 不调 LLM 直接平仓
+    const buildCtx53 = (opts = {}) => {
+      // Mock Date: 找一个固定交易时段, 同时保证 mock now - createdAt = 足够 (>=15 分钟)
+      // 关键: createdAt 必须用 MOCK_NOW_MS 而不是真实 Date.now(), 否则 heldMs = 负 → 被最小持有守卫拦截
+      const _realNow = Date.now();
+      const _realDate = new Date(_realNow);
+      // 选今天 11:00 (上午交易时段), 如果 > realNow 则用昨天 11:00
+      let MOCK_NOW_MS = new Date(_realDate.getFullYear(), _realDate.getMonth(), _realDate.getDate(), 11, 0, 0).getTime();
+      if (MOCK_NOW_MS > _realNow) MOCK_NOW_MS -= 24 * 60 * 60 * 1000;
+      const MOCK_TODAY = (() => {
+        const d = new Date(MOCK_NOW_MS);
+        return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+      })();
+      const sctx = {
+        window: {}, console,
+        escapeHtml: (s) => String(s == null ? '' : s),
+        fmtMoney: (n) => (typeof n === 'number' ? n.toFixed(2) : '0.00'),
+        fmtNum: (n, d) => (typeof n === 'number' ? n.toFixed(d || 0) : '0'),
+        fmtPct: (n) => (typeof n === 'number' ? (n * 100).toFixed(2) + '%' : '-'),
+        pctClass: () => '',
+        // fmtDate 走 mock 日期, 跟 IntradayTrader 内 today 一致
+        fmtDate: () => MOCK_TODAY,
+        Date: class extends Date {
+          constructor(...args) { if (args.length === 0) super(MOCK_NOW_MS); else super(...args); }
+          static now() { return MOCK_NOW_MS; }
+        },
+        document: { getElementById: () => null }
+      };
+      // 暴露 MOCK_NOW_MS 让调用方设置 createdAt (避免被最小持有守卫误伤)
+      sctx.MOCK_NOW_MS = MOCK_NOW_MS;
+      const _sold = opts._sold || [];
+      const _bought = opts._bought || [];
+      const _log = opts._log || [];
+      // 同 52 段: 显式注入 INTRADAY_* 兜底
+      const Kx = Object.assign({
+        INTRADAY_TICK_MS: 60 * 1000, INTRADAY_KLINE_BARS: 30,
+        INTRADAY_MIN_HOLD_MINUTES: 15, INTRADAY_COOLDOWN_MS: 10 * 60 * 1000,
+        INTRADAY_LLM_TIMEOUT_MS: 20 * 1000, INTRADAY_LOG_LIMIT: 200,
+        INTRADAY_MAX_DAILY_ACTIONS: 4, LOT_SIZE: 100,
+        TRADING_WINDOWS: [[9 * 60 + 30, 11 * 60 + 30], [13 * 60, 15 * 60]]
+      }, K || {});
+      sctx.window.Core = {
+        Constants: Kx,
+        Storage: {
+          kvGet: async (k) => {
+            if (k === 'paper_intraday_log') return _log;
+            if (k === 'paper_intraday_cooldown') return opts.cooldown || {};
+            return null;
+          },
+          kvSet: async (k, v) => {
+            if (k === 'paper_intraday_log') { _log.length = 0; _log.push(...v); }
+            if (k === 'paper_intraday_cooldown') opts.cooldown = v;
+          }
+        },
+        AI: {
+          callWithTimeout: async () => opts.llmRaw || '{"action":"hold","reason":"观望","confidence":"low"}',
+          parseJsonOutput: async (raw) => {
+            if (typeof raw !== 'string') return { ok: false };
+            const i = raw.indexOf('{'); const j = raw.lastIndexOf('}');
+            if (i < 0 || j < 0) return { ok: false };
+            try { return { ok: true, obj: JSON.parse(raw.slice(i, j + 1)) }; }
+            catch (e) { return { ok: false }; }
+          }
+        },
+        Data: {
+          getStockQuote: async () => opts.quote || { 最新价: 10, 涨跌幅: 1.5, 换手率: 2 },
+          getStockKLine: async () => []
+        },
+        Regime: { get: async () => ({ state: 'range' }), gateMultipliers: () => ({ state: 'range', label: '震荡市', positionScale: 1 }) }
+      };
+      sctx.Core = sctx.window.Core;
+      sctx.window.Paper = {
+        getPositions: async () => opts.positions || [],
+        buy: async (code, name, market, shares, o) => { _bought.push({ code, shares, o }); return { id: 'h-new', code, shares, ...o }; },
+        sell: async (id, shares, o) => { _sold.push({ id, shares, o }); return { id, shares, ...o }; }
+      };
+      sctx.Paper = sctx.window.Paper;
+      sctx.window.ShortTrader = { _buildTrackRecord: async () => null, _formatTrackRecord: async () => '' };
+      sctx.ShortTrader = sctx.window.ShortTrader;
+      sctx.window.document = sctx.document;
+      vm.createContext(sctx);
+      vm.runInContext(itSrc, sctx);
+      return { sctx, _sold, _bought, _log, positions: opts.positions, cooldown: opts.cooldown };
+    };
+
+    // 53.1.a 机械止盈触发: 现价 13 ≥ 目标 12, 不调 LLM
+    const ctx1 = buildCtx53({
+      positions: [{ id: 'h1', code: '000001', name: '平安银行', market: 'sz', costPrice: 10, shares: 100, stopLoss: 9, targetPrice: 12, createdAt: 'MOCK' }],
+      quote: { 最新价: 13, 涨跌幅: 30 }
+    });
+    // 注入真实 createdAt (mock now - 30 分钟, 满足最小持有)
+    ctx1.positions[0].createdAt = ctx1.sctx.MOCK_NOW_MS - 30 * 60 * 1000;
+    await ctx1.sctx.window.IntradayTrader.runNow();
+    // 验证: Paper.sell 触发 + 日志 source=mechanical-target + 日志 reason 含 "机械止盈"
+    if (ctx1._sold.length === 1 && ctx1._sold[0].shares === 100 && ctx1._sold[0].o.reason === 'intraday-mechanical-target'
+        && ctx1._log.length === 1 && ctx1._log[0].source === 'mechanical-target' && ctx1._log[0].reason.includes('机械止盈')) {
+      ok('53.1.a 机械止盈: 现价 ≥ 目标 → 不调 LLM 直接平仓 + 写日志');
+    } else fail('53.1.a', 'sold=' + JSON.stringify(ctx1._sold) + ' log=' + JSON.stringify(ctx1._log));
+
+    // 53.1.b 机械止损触发: 现价 8 ≤ 止损 9
+    const ctx2 = buildCtx53({
+      positions: [{ id: 'h2', code: '000002', name: '万科A', market: 'sz', costPrice: 10, shares: 100, stopLoss: 9, targetPrice: 12, createdAt: 'MOCK' }],
+      quote: { 最新价: 8, 涨跌幅: -20 }
+    });
+    ctx2.positions[0].createdAt = ctx2.sctx.MOCK_NOW_MS - 30 * 60 * 1000;
+    await ctx2.sctx.window.IntradayTrader.runNow();
+    if (ctx2._sold.length === 1 && ctx2._sold[0].o.reason === 'intraday-mechanical-stop'
+        && ctx2._log[0].source === 'mechanical-stop' && ctx2._log[0].reason.includes('机械止损')) {
+      ok('53.1.b 机械止损: 现价 ≤ 止损 → 不调 LLM 直接平仓 + 写日志');
+    } else fail('53.1.b', JSON.stringify(ctx2._sold));
+
+    // 53.2 LLM 决策 add: 现价在区间内 + 持有超 15 分钟 + LLM 给 add 100
+    const ctx3 = buildCtx53({
+      positions: [{ id: 'h3', code: '000003', name: '招行', market: 'sz', costPrice: 10, shares: 100, stopLoss: 9, targetPrice: 12, createdAt: 'MOCK' }],
+      quote: { 最新价: 10.5, 涨跌幅: 5 },
+      llmRaw: '{"action":"add","shares":100,"reason":"回调到位","confidence":"mid"}'
+    });
+    ctx3.positions[0].createdAt = ctx3.sctx.MOCK_NOW_MS - 30 * 60 * 1000;
+    await ctx3.sctx.window.IntradayTrader.runNow();
+    if (ctx3._bought.length === 1 && ctx3._bought[0].code === '000003' && ctx3._bought[0].shares === 100
+        && ctx3._log[0].action === 'add' && ctx3._log[0].source === 'llm') {
+      ok('53.2 LLM add 100: 走 Paper.buy + 日志 source=llm');
+    } else fail('53.2', 'bought=' + JSON.stringify(ctx3._bought) + ' log=' + JSON.stringify(ctx3._log));
+
+    // 53.3 LLM hold: 现价在区间 + LLM hold → 不动
+    const ctx4 = buildCtx53({
+      positions: [{ id: 'h4', code: '000004', name: 'A', market: 'sz', costPrice: 10, shares: 100, stopLoss: 9, targetPrice: 12, createdAt: 'MOCK' }],
+      quote: { 最新价: 10.5, 涨跌幅: 5 },
+      llmRaw: '{"action":"hold","reason":"观望","confidence":"low"}'
+    });
+    ctx4.positions[0].createdAt = ctx4.sctx.MOCK_NOW_MS - 30 * 60 * 1000;
+    await ctx4.sctx.window.IntradayTrader.runNow();
+    if (ctx4._sold.length === 0 && ctx4._bought.length === 0 && ctx4._log.length === 0) {
+      ok('53.3 LLM hold: 不动, 不写日志');
+    } else fail('53.3', 'sold=' + ctx4._sold.length + ' bought=' + ctx4._bought.length);
+
+    // 53.4 最小持有时间: 持仓刚 5 分钟 → 跳过
+    const ctx5 = buildCtx53({
+      positions: [{ id: 'h5', code: '000005', name: 'B', market: 'sz', costPrice: 10, shares: 100, stopLoss: 0, targetPrice: 0, createdAt: 'MOCK' }],
+      quote: { 最新价: 8, 涨跌幅: -20 }  // 即便现价击穿止损, 也不动 (持有期不足)
+    });
+    ctx5.positions[0].createdAt = ctx5.sctx.MOCK_NOW_MS - 5 * 60 * 1000;  // 5 分钟前
+    await ctx5.sctx.window.IntradayTrader.runNow();
+    if (ctx5._sold.length === 0 && ctx5._bought.length === 0) {
+      ok('53.4 最小持有时间 (5 分钟 < 15): 跳过, 也不机械止损 (防开仓秒平)');
+    } else fail('53.4', JSON.stringify(ctx5._sold));
+
+    // 53.5 冷却: 上次 5 分钟前已调仓 → 跳过
+    const ctx6 = buildCtx53({
+      positions: [{ id: 'h6', code: '000006', name: 'C', market: 'sz', costPrice: 10, shares: 100, stopLoss: 0, targetPrice: 0, createdAt: 'MOCK' }],
+      quote: { 最新价: 10, 涨跌幅: 0 },
+      llmRaw: '{"action":"add","shares":100,"reason":"x","confidence":"low"}',
+      cooldown: { '000006': { date: '__TODAY__', lastAt: '__MOCK__', todayCount: 1 } }
+    });
+    ctx6.positions[0].createdAt = ctx6.sctx.MOCK_NOW_MS - 30 * 60 * 1000;
+    ctx6.cooldown['000006'].date = (() => { const d = new Date(ctx6.sctx.MOCK_NOW_MS); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); })();
+    ctx6.cooldown['000006'].lastAt = ctx6.sctx.MOCK_NOW_MS - 5 * 60 * 1000;  // 5 分钟前
+    await ctx6.sctx.window.IntradayTrader.runNow();
+    if (ctx6._bought.length === 0) ok('53.5 冷却中 (5 分钟 < 10): 跳过 LLM 调仓');
+    else fail('53.5', 'bought=' + JSON.stringify(ctx6._bought));
+
+    // 53.6 日动作上限: 今日已 4 次 → 跳过
+    const ctx7 = buildCtx53({
+      positions: [{ id: 'h7', code: '000007', name: 'D', market: 'sz', costPrice: 10, shares: 100, stopLoss: 0, targetPrice: 0, createdAt: 'MOCK' }],
+      quote: { 最新价: 10, 涨跌幅: 0 },
+      llmRaw: '{"action":"add","shares":100,"reason":"x","confidence":"low"}',
+      cooldown: { '000007': { date: '__TODAY__', lastAt: '__MOCK__', todayCount: 4 } }
+    });
+    ctx7.positions[0].createdAt = ctx7.sctx.MOCK_NOW_MS - 30 * 60 * 1000;
+    ctx7.cooldown['000007'].date = (() => { const d = new Date(ctx7.sctx.MOCK_NOW_MS); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); })();
+    ctx7.cooldown['000007'].lastAt = ctx7.sctx.MOCK_NOW_MS - 60 * 60 * 1000;
+    await ctx7.sctx.window.IntradayTrader.runNow();
+    if (ctx7._bought.length === 0) ok('53.6 日动作上限 (今日 4 次): 跳过 LLM 调仓');
+    else fail('53.6', 'bought=' + JSON.stringify(ctx7._bought));
+
+    // 53.7 LLM trim 200: 减仓 200 股
+    const ctx8 = buildCtx53({
+      positions: [{ id: 'h8', code: '000008', name: 'E', market: 'sz', costPrice: 10, shares: 500, stopLoss: 0, targetPrice: 0, createdAt: 'MOCK' }],
+      quote: { 最新价: 10.5, 涨跌幅: 5 },
+      llmRaw: '{"action":"trim","shares":200,"reason":"减仓","confidence":"mid"}'
+    });
+    ctx8.positions[0].createdAt = ctx8.sctx.MOCK_NOW_MS - 30 * 60 * 1000;
+    await ctx8.sctx.window.IntradayTrader.runNow();
+    if (ctx8._sold.length === 1 && ctx8._sold[0].shares === 200 && ctx8._log[0].action === 'trim') {
+      ok('53.7 LLM trim 200: 走 Paper.sell + 日志 action=trim');
+    } else fail('53.7', JSON.stringify(ctx8._sold));
+
+    // 53.8 LLM 给 shares=50 (不足一手) → 跳过
+    const ctx9 = buildCtx53({
+      positions: [{ id: 'h9', code: '000009', name: 'F', market: 'sz', costPrice: 10, shares: 100, stopLoss: 0, targetPrice: 0, createdAt: 'MOCK' }],
+      quote: { 最新价: 10, 涨跌幅: 0 },
+      llmRaw: '{"action":"add","shares":50,"reason":"x","confidence":"low"}'
+    });
+    ctx9.positions[0].createdAt = ctx9.sctx.MOCK_NOW_MS - 30 * 60 * 1000;
+    await ctx9.sctx.window.IntradayTrader.runNow();
+    if (ctx9._bought.length === 0) ok('53.8 LLM shares<100 (不足一手): 跳过, 不买');
+    else fail('53.8', 'bought=' + JSON.stringify(ctx9._bought));
+
+    // 53.9 交易时段守卫: 非交易时间 → runNow 直接 return
+    const ctx10 = buildCtx53({
+      positions: [{ id: 'h10', code: '000010', name: 'G', market: 'sz', costPrice: 10, shares: 100, stopLoss: 9, targetPrice: 12, createdAt: 'MOCK' }],
+      quote: { 最新价: 13, 涨跌幅: 30 }
+    });
+    ctx10.positions[0].createdAt = ctx10.sctx.MOCK_NOW_MS - 30 * 60 * 1000;
+    // 模拟非交易时间: 把 Date 设为周日
+    const origDate = ctx10.sctx.Date;
+    ctx10.sctx.Date = class extends origDate {
+      constructor(...args) { if (args.length === 0) super(2026, 6, 26, 10, 0); else super(...args); }  // 周日
+      static now() { return new Date(2026, 6, 26, 10, 0).getTime(); }
+    };
+    await ctx10.sctx.window.IntradayTrader.runNow();
+    if (ctx10._sold.length === 0 && ctx10._bought.length === 0) {
+      ok('53.9 交易时段守卫 (周日): runNow 直接 return, 不调价不调仓');
+    } else fail('53.9', 'sold=' + ctx10._sold.length);
+    ctx10.sctx.Date = origDate;
+
+    // 53.10 init 起定时器 + 跑一轮 (mock setInterval / clearInterval 计数)
+    const ctx11 = buildCtx53({ positions: [] });
+    const setCount = { n: 0 };
+    const clearCount = { n: 0 };
+    ctx11.sctx.window.IntradayTrader._setInterval = (fn, ms) => { setCount.n++; return 'timer-' + setCount.n; };
+    ctx11.sctx.window.IntradayTrader._clearInterval = (t) => { clearCount.n++; };
+    await ctx11.sctx.window.IntradayTrader.init();
+    if (setCount.n === 1 && ctx11.sctx.window.IntradayTrader._timers.tick === 'timer-1') {
+      ok('53.10 init 起 1 分钟轮询 (1 次 setInterval)');
+    } else fail('53.10', JSON.stringify(setCount));
+    ctx11.sctx.window.IntradayTrader.stopPolling();
+    if (clearCount.n === 1) ok('53.11 stopPolling 清掉定时器 (1 次 clearInterval)');
+    else fail('53.11', JSON.stringify(clearCount));
+
+  } catch (e) {
+    fail('60 IntradayTrader 集成', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [54] LongTrader 长线操盘手: 触发判定 (周一 + ≥7 天) + LLM 选股 + 自动成交 =============
+section('[54] LongTrader: _shouldRun 触发判定 + LLM 选股 + 整轮 runNow');
+(async () => {
+  try {
+    const ltSrc = readFileSafe(path.join(WWW, 'app', 'long-trader.js'));
+    if (!ltSrc) throw new Error('long-trader.js 读不到');
+    const K = _loadRealConstants();
+
+    // vm sandbox: 注入常量 (缓存兜底) + 模拟 Core.Storage + Paper + Core.Data + Core.AI
+    const buildCtx = (opts = {}) => {
+      const sctx = {
+        window: {}, console,
+        escapeHtml: (s) => String(s == null ? '' : s),
+        fmtMoney: (n) => (typeof n === 'number' ? n.toFixed(2) : '0.00'),
+        fmtNum: (n, d) => (typeof n === 'number' ? n.toFixed(d || 0) : '0'),
+        fmtPct: (n) => (typeof n === 'number' ? (n * 100).toFixed(2) + '%' : '-'),
+        fmtDate: () => '2026-07-28',
+        Date,
+        document: { getElementById: () => null }
+      };
+      const Kx = Object.assign({
+        LONG_TRADER_CHECK_MS: 30 * 60 * 1000,
+        LONG_TRADER_TOP_N: 3, LONG_TRADER_HARD_SCREEN_TOP: 30,
+        LONG_TRADER_RERUN_DAYS: 7, LONG_TRADER_MIN_CASH: 5000,
+        LONG_TRADER_LOG_LIMIT: 100
+      }, K || {});
+      const _autoTrades = opts._autoTrades || [];
+      sctx.window.Core = {
+        Constants: Kx,
+        Storage: {
+          kvGet: async (k) => opts.kv && (k in opts.kv) ? opts.kv[k] : null,
+          kvSet: async (k, v) => { opts.kv = opts.kv || {}; opts.kv[k] = v; }
+        },
+        AI: {
+          callWithTimeout: async () => opts.llmRaw || '{"picks":[]}',
+          parseJsonOutput: async (raw) => {
+            if (typeof raw !== 'string') return { ok: false };
+            const i = raw.indexOf('{'); const j = raw.lastIndexOf('}');
+            if (i < 0 || j < 0) return { ok: false };
+            try { return { ok: true, obj: JSON.parse(raw.slice(i, j + 1)) }; }
+            catch (e) { return { ok: false }; }
+          }
+        },
+        Data: {
+          getStockSpot: async () => opts.stocks || []
+        }
+      };
+      sctx.Core = sctx.window.Core;
+      sctx.window.Paper = {
+        _getAccountRaw: async (sleeve) => ({
+          long: { cash: opts.cash ?? 100000, initialCash: 100000, positionPct: 0.10 },
+          short: { cash: 30000, initialCash: 30000, positionPct: 0.20 }
+        })[sleeve || 'long'] || { cash: 0, initialCash: 0, positionPct: 0 },
+        autoTradeFromPick: async (pick) => { _autoTrades.push(pick); return { id: 'h-new', ...pick }; }
+      };
+      sctx.Paper = sctx.window.Paper;
+      sctx.window.document = sctx.document;
+      vm.createContext(sctx);
+      vm.runInContext(ltSrc, sctx);
+      // 始终保证 opts.kv 存在, 闭包内部 kvSet 改 opts.kv, ctx.kv 引用同一对象 → 测试能读到最新值
+      opts.kv = opts.kv || {};
+      return { sctx, _autoTrades, kv: opts.kv };
+    };
+
+    // 54.1 _shouldRun: 纯函数判定 (10 个用例)
+    const ctx1 = buildCtx();
+    const LT1 = ctx1.sctx.window.LongTrader;
+    if (!LT1) throw new Error('LongTrader 未挂到 window');
+    const cases = [
+      [new Date(2026, 6, 27, 10, 0), null, true],     // 周一 + 从未跑过
+      [new Date(2026, 6, 27, 9, 0), null, true],      // 周一开盘前
+      [new Date(2026, 6, 27, 15, 0), null, true],     // 周一收盘后
+      [new Date(2026, 6, 28, 10, 0), null, false],    // 周二
+      [new Date(2026, 6, 29, 10, 0), null, false],    // 周三
+      [new Date(2026, 6, 25, 10, 0), null, false],    // 周日
+      [new Date(2026, 6, 26, 10, 0), null, false],    // 周六
+      [new Date(2026, 6, 27, 10, 0), new Date(2026, 6, 26, 10, 0).getTime(), false],  // 周一 + 1 天前 (< 7)
+      [new Date(2026, 6, 27, 10, 0), new Date(2026, 6, 19, 10, 0).getTime(), true],   // 周一 + 8 天前 (≥ 7)
+      [new Date(2026, 6, 27, 10, 0), new Date(2026, 6, 21, 10, 0).getTime(), false]   // 周一 + 6 天前 (< 7)
+    ];
+    let pass = 0;
+    for (const [now, last, want] of cases) {
+      if (LT1._shouldRun(now, last) === want) pass++;
+    }
+    if (pass === cases.length) ok(`54.1 _shouldRun ${cases.length} 个用例全过 (周一/工作日/周末 + 7 天冷却)`);
+    else fail('54.1 _shouldRun', `${pass}/${cases.length}`);
+
+    // 54.2 整轮 runNow: 周一 + 现金充足 + LLM 给 3 picks + 自动成交
+    const ctx2 = buildCtx({
+      stocks: [
+        { 代码: '000001', 名称: '平安银行', 涨跌幅: 5.0, 换手率: 1.5, 总市值: 900000000000 },
+        { 代码: '000002', 名称: '万科A', 涨跌幅: 4.5, 换手率: 1.2, 总市值: 120000000000 },
+        { 代码: '600519', 名称: '贵州茅台', 涨跌幅: 4.0, 换手率: 0.5, 总市值: 2000000000000 },
+        { 代码: '000003', 名称: '招行', 涨跌幅: 3.5, 换手率: 0.8, 总市值: 800000000000 },
+        { 代码: '000004', 名称: 'A', 涨跌幅: 3.0, 换手率: 1.0, 总市值: 100000000000 }
+      ],
+      llmRaw: '{"picks":[{"code":"000001","name":"平安银行","reason":"业绩拐点"},{"code":"000002","name":"万科A","reason":"政策预期"},{"code":"600519","name":"贵州茅台","reason":"龙头"}]}'
+    });
+    // 2026-07-27 是周一
+    await ctx2.sctx.window.LongTrader.runNow({ now: new Date(2026, 6, 27, 10, 0) });
+    if (ctx2._autoTrades.length === 3
+        && ctx2._autoTrades[0].code === '000001' && ctx2._autoTrades[0].sleeve === 'long'
+        && ctx2._autoTrades[1].code === '000002' && ctx2._autoTrades[2].code === '600519'
+        && ctx2.kv && ctx2.kv.paper_long_trader_last && ctx2.kv.paper_long_trader_last.ts
+        && ctx2.kv.paper_long_trader_log && ctx2.kv.paper_long_trader_log.length === 1
+        && ctx2.kv.paper_long_trader_log[0].picks.length === 3
+        && ctx2.kv.paper_long_trader_log[0].picks.every(p => p.ok === true)) {
+      ok('54.2 runNow 周一自动跑: LLM 挑 3 只 → Paper.autoTradeFromPick × 3 + 写 lastRun + 写决策日志');
+    } else fail('54.2', 'autoTrades=' + JSON.stringify(ctx2._autoTrades) + ' kv=' + JSON.stringify(ctx2.kv));
+
+    // 54.3 非周一: 不跑
+    const ctx3 = buildCtx({ stocks: [{ 代码: '000001', 名称: 'A', 涨跌幅: 5, 换手率: 1, 总市值: 1e10 }], llmRaw: '{"picks":[{"code":"000001","name":"A","reason":"x"}]}' });
+    await ctx3.sctx.window.LongTrader.runNow({ now: new Date(2026, 6, 28, 10, 0) });  // 周二
+    if (ctx3._autoTrades.length === 0) ok('54.3 非周一: 不跑, 不调 LLM 不调 autoTradeFromPick');
+    else fail('54.3', 'autoTrades=' + JSON.stringify(ctx3._autoTrades));
+
+    // 54.4 现金不足: 不跑
+    const ctx4 = buildCtx({
+      cash: 3000,  // < 5000 下限
+      stocks: [{ 代码: '000001', 名称: 'A', 涨跌幅: 5, 换手率: 1, 总市值: 1e10 }],
+      llmRaw: '{"picks":[{"code":"000001","name":"A","reason":"x"}]}'
+    });
+    await ctx4.sctx.window.LongTrader.runNow({ now: new Date(2026, 6, 27, 10, 0) });
+    if (ctx4._autoTrades.length === 0) ok('54.4 long sleeve 现金 3000 < 5000: 跳过, 不调 LLM');
+    else fail('54.4', 'autoTrades=' + JSON.stringify(ctx4._autoTrades));
+
+    // 54.5 7 天内已跑过: 不跑
+    const ctx5 = buildCtx({
+      kv: { paper_long_trader_last: { date: '2026-07-26', ts: new Date(2026, 6, 26, 10, 0).getTime() } },
+      stocks: [{ 代码: '000001', 名称: 'A', 涨跌幅: 5, 换手率: 1, 总市值: 1e10 }],
+      llmRaw: '{"picks":[{"code":"000001","name":"A","reason":"x"}]}'
+    });
+    await ctx5.sctx.window.LongTrader.runNow({ now: new Date(2026, 6, 27, 10, 0) });
+    if (ctx5._autoTrades.length === 0) ok('54.5 距上次 1 天 (< 7): 跳过, 不重复跑');
+    else fail('54.5', 'autoTrades=' + JSON.stringify(ctx5._autoTrades));
+
+    // 54.6 LLM 给空 picks: 不调 autoTrade
+    const ctx6 = buildCtx({
+      stocks: [{ 代码: '000001', 名称: 'A', 涨跌幅: 5, 换手率: 1, 总市值: 1e10 }],
+      llmRaw: '{"picks":[]}'
+    });
+    await ctx6.sctx.window.LongTrader.runNow({ now: new Date(2026, 6, 27, 10, 0) });
+    if (ctx6._autoTrades.length === 0) ok('54.6 LLM 给空 picks: 不调 autoTradeFromPick');
+    else fail('54.6', 'autoTrades=' + JSON.stringify(ctx6._autoTrades));
+
+    // 54.7 LLM 给非法 JSON: 整轮降级
+    const ctx7 = buildCtx({
+      stocks: [{ 代码: '000001', 名称: 'A', 涨跌幅: 5, 换手率: 1, 总市值: 1e10 }],
+      llmRaw: 'not json at all'
+    });
+    await ctx7.sctx.window.LongTrader.runNow({ now: new Date(2026, 6, 27, 10, 0) });
+    if (ctx7._autoTrades.length === 0) ok('54.7 LLM 返非法 JSON: parseJsonOutput 失败 → 不成交');
+    else fail('54.7', 'autoTrades=' + JSON.stringify(ctx7._autoTrades));
+
+    // 54.8 硬筛: 涨跌幅 ≤ 0 被过滤
+    const ctx8 = buildCtx({
+      stocks: [
+        { 代码: '000001', 名称: 'A', 涨跌幅: -1, 换手率: 1, 总市值: 1e10 },
+        { 代码: '000002', 名称: 'B', 涨跌幅: 0, 换手率: 1, 总市值: 1e10 },
+        { 代码: '000003', 名称: 'C', 涨跌幅: 5, 换手率: 1, 总市值: 1e10 }
+      ],
+      llmRaw: '{"picks":[{"code":"000003","name":"C","reason":"x"}]}'
+    });
+    await ctx8.sctx.window.LongTrader.runNow({ now: new Date(2026, 6, 27, 10, 0) });
+    if (ctx8._autoTrades.length === 1 && ctx8._autoTrades[0].code === '000003') {
+      ok('54.8 硬筛: 涨跌幅 ≤ 0 的被过滤, 只把正股喂 LLM');
+    } else fail('54.8', 'autoTrades=' + JSON.stringify(ctx8._autoTrades));
+
+    // 54.9 init 起 30 分钟轮询
+    const ctx9 = buildCtx({ stocks: [] });
+    const setCount = { n: 0 };
+    const clearCount = { n: 0 };
+    ctx9.sctx.window.LongTrader._setInterval = (fn, ms) => { setCount.n++; return 'timer-' + setCount.n; };
+    ctx9.sctx.window.LongTrader._clearInterval = (t) => { clearCount.n++; };
+    await ctx9.sctx.window.LongTrader.init();
+    if (setCount.n === 1 && ctx9.sctx.window.LongTrader._timers.check === 'timer-1') {
+      ok('54.9 init 起 30 分钟轮询 (1 次 setInterval)');
+    } else fail('54.9', JSON.stringify(setCount));
+    ctx9.sctx.window.LongTrader.stopPolling();
+    if (clearCount.n === 1) ok('54.10 stopPolling 清掉定时器 (1 次 clearInterval)');
+    else fail('54.10', JSON.stringify(clearCount));
+
+    // 54.11 LLM 返非法 code 被过滤
+    const ctx11 = buildCtx({
+      stocks: [{ 代码: '000001', 名称: 'A', 涨跌幅: 5, 换手率: 1, 总市值: 1e10 }],
+      llmRaw: '{"picks":[{"code":"abc","name":"X","reason":"x"},{"code":"000001","name":"A","reason":"valid"}]}'
+    });
+    await ctx11.sctx.window.LongTrader.runNow({ now: new Date(2026, 6, 27, 10, 0) });
+    if (ctx11._autoTrades.length === 1 && ctx11._autoTrades[0].code === '000001') {
+      ok('54.11 LLM 返非法 code (abc) 被过滤, 只成交合法 code');
+    } else fail('54.11', 'autoTrades=' + JSON.stringify(ctx11._autoTrades));
+
+  } catch (e) {
+    fail('54 LongTrader', e.message + ' / ' + (e.stack || ''));
   }
 })();
 

@@ -15,6 +15,8 @@ export default defineConfig({
         '/app/holdings.js',
         '/app/paper.js',
         '/app/short-trader.js',
+        '/app/intraday-trader.js',
+        '/app/long-trader.js',
         '/app/journal.js',
         '/app/screener.js',
         '/app/backtest.js',
@@ -54,7 +56,8 @@ export default defineConfig({
         '/core/kb.js',
         '/core/alerts-agent.js',
         '/core/util.js',
-        '/core/risk-mine.js'  // Phase Y.1.2: 排雷数据聚合
+        '/core/risk-mine.js',  // Phase Y.1.2: 排雷数据聚合
+        '/core/user-profile.js'  // Commit 1: 用户画像 (7 字段 schema)
       ]
     }
   },

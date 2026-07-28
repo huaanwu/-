@@ -60,6 +60,53 @@
   /** 短线持仓最长持有交易日数: 止损/止盈都未触发且持满 N 日 → 按当日收盘价强平 */
   const SHORT_MAX_HOLD_DAYS = 5;
 
+  // ==================== 盘中操盘手 (Intraday Trader) ====================
+  // AI 短线操盘手的盘中实时层: 1 分钟轮询, 本地 LLM 实时决策已持仓的止盈/止损/加仓/减仓
+  // 新仓仍走 T2-T3 条件单, 跟盘中盯盘并存, 不替换
+
+  /** 盘中操盘手轮询间隔: 1 分钟 (与 alerts.js 短线规则同节奏, 共享交易时段守卫) */
+  const INTRADAY_TICK_MS = 60 * 1000;
+
+  /** 拉多少根 5 分钟 K 线喂给本地 LLM 看盘 (近 30 根 ≈ 2.5 小时, 覆盖上午 + 下午开盘) */
+  const INTRADAY_KLINE_BARS = 30;
+
+  /** 单只持仓的最小持有分钟数: 不足不调仓 (防开仓后立刻被 LLM 反悔) */
+  const INTRADAY_MIN_HOLD_MINUTES = 15;
+
+  /** 同一只持仓相邻两次调仓的冷却期: 10 分钟 (防 LLM 反复横跳) */
+  const INTRADAY_COOLDOWN_MS = 10 * 60 * 1000;
+
+  /** 单次盘中决策本地 LLM 调用超时: 20 秒 (盯盘场景, 超时即放弃本轮不调仓) */
+  const INTRADAY_LLM_TIMEOUT_MS = 20 * 1000;
+
+  /** kv paper_intraday_log: 调仓决策日志, 上限 (滚动截断) */
+  const INTRADAY_LOG_LIMIT = 200;
+
+  /** 调仓动作上限: 单只持仓 1 天内最多调仓 N 次 (额外冷却, 跟 cooldown 互补) */
+  const INTRADAY_MAX_DAILY_ACTIONS = 4;
+
+  // ==================== 长线操盘手 (Long Trader) ====================
+  // AI 长线 sleeve 自动选股 (对接 Screener 选股逻辑): 周一开盘前自动跑 AI 选股
+  // → top N picks 自动成交到 long sleeve → 纪律引擎自动卡
+
+  /** 长线操盘手检查间隔: 30 分钟 (不需要分钟级, 周频触发) */
+  const LONG_TRADER_CHECK_MS = 30 * 60 * 1000;
+
+  /** 自动选股挑几只成交到 long sleeve (默认 3 只, 适配 10 万现金 + 单票上限 20%) */
+  const LONG_TRADER_TOP_N = 3;
+
+  /** 喂 LLM 的硬筛上限: 取全市场涨跌幅前 30 只 (避免 token 爆) */
+  const LONG_TRADER_HARD_SCREEN_TOP = 30;
+
+  /** 重新运行间隔: 一周内已跑过不重复 (避免频繁调仓) */
+  const LONG_TRADER_RERUN_DAYS = 7;
+
+  /** long sleeve 现金下限: 不足 5000 不跑 (买不起单票) */
+  const LONG_TRADER_MIN_CASH = 5000;
+
+  /** kv paper_long_trader_log: 选股决策日志上限 (滚动截断) */
+  const LONG_TRADER_LOG_LIMIT = 100;
+
   // ==================== 基金再平衡 ====================
 
   /** 默认基金组合再平衡目标配置

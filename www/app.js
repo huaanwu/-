@@ -141,6 +141,14 @@ function updateMarketStatus() {
     if (window.ShortTrader && ShortTrader.maybeDistillLessons) {
       ShortTrader.maybeDistillLessons().catch(e => console.warn('[App] 短线教训提炼失败:', e));
     }
+    // IntradayTrader: 盘中盯盘层 — 1 分钟轮询, 交易时段守卫, 本地 LLM 实时调仓
+    if (window.IntradayTrader && IntradayTrader.init) {
+      IntradayTrader.init();
+    }
+    // LongTrader: 长线 sleeve 自动选股 — 30 分钟检查, 周一距上次 ≥7 天自动跑 AI 选股 → 成交到 long sleeve
+    if (window.LongTrader && LongTrader.init) {
+      LongTrader.init();
+    }
     if (window.Journal && Journal.init) Journal.init();
     if (window.Screener && Screener.init) Screener.init();
     if (window.Fund && Fund.init) Fund.init();
@@ -197,6 +205,7 @@ window._renderSettings = function() {
     onSecondProviderChange();
     _refreshAIStatus();
     _refreshSyncStatus();
+    if (window._bindUserProfileLive) _bindUserProfileLive();
   }, 0);
   root.innerHTML = `
     <div class="form-row" style="border-top:1px solid var(--border);padding-top:12px;margin-top:12px;">
@@ -424,6 +433,7 @@ window._renderSettings = function() {
         <a href="https://github.com/akfamily/akshare" target="_blank" style="color:var(--link);">数据源 AKShare</a>
       </div>
     </div>
+    ${_renderUserProfileSection()}
     <div class="form-row" style="position:sticky;bottom:0;background:var(--bg-base);padding:12px 0;margin-top:8px;border-top:1px solid var(--border);z-index:10;">
       <label></label>
       <button class="btn btn-primary" id="saveSettingsBtn" onclick="saveSettings()">💾 保存所有设置</button>
@@ -431,6 +441,116 @@ window._renderSettings = function() {
     </div>
   `;
 };
+
+// ===== 用户画像 (Core.UserProfile) 设置区块 =====
+// 数据源: Core.UserProfile, 单一事实来源, 选股/选基 prompt 都从这里读
+// persist 走 Core.State('userProfile') → kv 'state_userProfile' (state.js 白名单已含)
+
+function _renderUserProfileSection() {
+  if (!window.Core || !window.Core.UserProfile) return '';
+  const p = window.Core.UserProfile.load();
+  const UP = window.Core.UserProfile;
+  const riskOpts = Object.keys(UP.RISK_TEXT).map(k =>
+    `<option value="${k}" ${p.risk === k ? 'selected' : ''}>${k}</option>`).join('');
+  const horizonOpts = Object.keys(UP.HORIZON_TEXT).map(k =>
+    `<option value="${k}" ${p.horizon === k ? 'selected' : ''}>${k}</option>`).join('');
+  const allowEquityOpts = Object.keys(UP.ALLOW_EQUITY_TEXT).map(k =>
+    `<option value="${k}" ${p.allowEquity === k ? 'selected' : ''}>${k}</option>`).join('');
+  return `
+    <div class="form-row" style="border-top:1px solid var(--border);padding-top:12px;margin-top:12px;">
+      <label style="font-size:14px;font-weight:600;">👤 用户画像 (选股/选基 AI prompt 统一来源)</label>
+      <div style="font-size:11px;color:var(--text-muted);line-height:1.5;margin-bottom:6px;">
+        ✅ 改这里后, AI 选基/选股会立刻按新画像重新推荐 (不需要重启)。<br>
+        第一次跑 AI 时已自动注入 systemPrompt, 不再硬编码"长期稳健型"。
+      </div>
+    </div>
+    <div class="form-row">
+      <label>风险偏好 (3 档)</label>
+      <select id="settingUPRisk">${riskOpts}</select>
+    </div>
+    <div class="form-row">
+      <label>投资期限 (3 档)</label>
+      <select id="settingUPHorizon">${horizonOpts}</select>
+    </div>
+    <div class="form-row">
+      <label>是否允许权益类</label>
+      <select id="settingUPAllowEquity">${allowEquityOpts}</select>
+    </div>
+    <div class="form-row">
+      <label>个人偏好 (自由文本, 可空)</label>
+      <input type="text" id="settingUPPreference" value="${escapeHtml(p.preference || '')}"
+             placeholder="例: 重仓蓝筹, 不买 ST, 偏好红利">
+    </div>
+    <div class="form-row">
+      <label>行业/品种黑名单 (逗号分隔, 可空)</label>
+      <input type="text" id="settingUPBlacklist" value="${escapeHtml(p.blacklist || '')}"
+             placeholder="例: ST, 教育, 房地产">
+    </div>
+    <div class="form-row">
+      <label>目标年化收益率 (%)</label>
+      <input type="number" id="settingUPTargetReturn" value="${p.targetReturn}"
+             step="0.5" min="0" max="100">
+    </div>
+    <div class="form-row">
+      <label>可接受最大回撤 (%)</label>
+      <input type="number" id="settingUPMaxDrawdown" value="${p.maxDrawdown}"
+             step="0.5" min="0" max="100">
+    </div>
+    <div class="form-row">
+      <label>📋 当前 prompt 预览 (Core.AI.formatUserProfile)</label>
+      <pre id="settingUPPromptPreview"
+           style="background:var(--bg-base);padding:8px;font-size:11px;border-radius:4px;white-space:pre-wrap;max-height:200px;overflow:auto;margin:0;"></pre>
+    </div>
+  `;
+}
+
+function _refreshUserProfilePreview() {
+  const pre = document.getElementById('settingUPPromptPreview');
+  if (!pre || !window.Core || !window.Core.AI) return;
+  // 临时组装"用户编辑后"的 profile 用于预览, 不持久化
+  const draft = {
+    risk: document.getElementById('settingUPRisk')?.value,
+    horizon: document.getElementById('settingUPHorizon')?.value,
+    allowEquity: document.getElementById('settingUPAllowEquity')?.value,
+    preference: document.getElementById('settingUPPreference')?.value || '',
+    blacklist: document.getElementById('settingUPBlacklist')?.value || '',
+    targetReturn: parseFloat(document.getElementById('settingUPTargetReturn')?.value),
+    maxDrawdown: parseFloat(document.getElementById('settingUPMaxDrawdown')?.value)
+  };
+  // 直接复用 Core.UserProfile.mergeWithDefaults + 三个 *Label 函数模拟
+  const UP = window.Core.UserProfile;
+  const m = UP.mergeWithDefaults(draft);
+  const lines = [
+    '- 风险偏好: ' + UP.riskLabel(m.risk),
+    '- 投资期限: ' + UP.horizonLabel(m.horizon),
+    '- 是否允许权益类: ' + UP.allowEquityLabel(m.allowEquity),
+    '- 目标年化收益率: ' + m.targetReturn + '%',
+    '- 可接受最大回撤: ' + m.maxDrawdown + '%'
+  ];
+  if (m.preference && String(m.preference).trim()) lines.push('- 个人偏好: ' + m.preference);
+  if (m.blacklist && String(m.blacklist).trim()) lines.push('- 行业/品种黑名单: ' + m.blacklist);
+  pre.textContent = lines.join('\n');
+}
+
+function _saveUserProfile() {
+  const draft = {
+    risk: document.getElementById('settingUPRisk')?.value,
+    horizon: document.getElementById('settingUPHorizon')?.value,
+    allowEquity: document.getElementById('settingUPAllowEquity')?.value,
+    preference: document.getElementById('settingUPPreference')?.value || '',
+    blacklist: document.getElementById('settingUPBlacklist')?.value || '',
+    targetReturn: parseFloat(document.getElementById('settingUPTargetReturn')?.value),
+    maxDrawdown: parseFloat(document.getElementById('settingUPMaxDrawdown')?.value)
+  };
+  // 数字字段走 parseFloat (空字符串 → NaN → 默认值, 见 mergeWithDefaults 兜底)
+  const r = window.Core.UserProfile.save(draft);
+  if (!r) toastError('画像保存失败: 请检查风险/期限/收益/回撤是否在合法范围');
+  return r;
+}
+
+window._renderUserProfileSection = _renderUserProfileSection;
+window._saveUserProfile = _saveUserProfile;
+window._refreshUserProfilePreview = _refreshUserProfilePreview;
 
 // ===== Phase D2: 第二意见 (双模型交叉验证) 设置辅助 =====
 // key 存 Core.State.apiKeys.llm = { [provider]: key }, 与主 AI 配置的单一 apiKey 互不干扰
@@ -917,8 +1037,28 @@ window.saveSettings = function(silent) {
   const syncAuto = document.getElementById('settingSyncAuto')?.checked ?? true;
   Core.State.set('sync', { ...Core.State.get('sync'), url: syncUrl, anonKey: syncAnonKey, autoSync: syncAuto });
 
+  // 用户画像 (Core.UserProfile) - 校验失败不阻塞其他项保存, 弹 toastError
+  _saveUserProfile();
+
   if (!silent) toastSuccess('已保存');
   _renderSyncAuth();
+};
+
+// Settings UI 加载完后, 绑 UP 表单 onchange 实时刷新 preview
+document.addEventListener('DOMContentLoaded', () => {
+  const btn = document.getElementById('saveSettingsBtn');
+  if (btn) btn.onclick = saveSettings;
+  // UP 输入框实时预览 (在 _renderSettings 后由 goSettings 调 _refreshUserProfilePreview)
+});
+
+window._bindUserProfileLive = function() {
+  ['settingUPRisk', 'settingUPHorizon', 'settingUPAllowEquity',
+   'settingUPPreference', 'settingUPBlacklist',
+   'settingUPTargetReturn', 'settingUPMaxDrawdown'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('change', _refreshUserProfilePreview);
+  });
+  _refreshUserProfilePreview();
 };
 
 // ===== Supabase 同步 UI =====

@@ -70,7 +70,8 @@
 - 关注新能源/医药龙头
 - 中长线持有, 不看短线"></textarea>
           <div style="font-size:11px;color:var(--text-muted);">
-            跑完硬筛后, 点 [🤖 AI 解读结果] 会把这些偏好 + 宏观环境 + top 候选股 一起喂给 LLM。
+            跑完硬筛后, 点 [🤖 AI 解读结果] 会把这些偏好 + 宏观环境 + top 候选股 一起喂给 LLM。<br>
+            💡 <b>留空</b>走 ⚙️ 设置页"用户画像"里的<b>个人偏好</b> (选股/选基共用同一来源)。
           </div>
         </div>
         <fieldset style="border:1px solid var(--bg-base);border-radius:6px;padding:8px 12px;margin:8px 0;">
@@ -257,7 +258,12 @@
         return;
       }
       const { filtered, top, conditions, _riskMap, _riskErrors, _riskEnabled } = this._lastResults;
-      const preference = document.getElementById('scPreference')?.value.trim() || '';
+      // 优先用 scPreference 本次覆盖; 留空走 Core.UserProfile.preference 全局值; 都空才 (无)
+      const scPref = document.getElementById('scPreference')?.value.trim() || '';
+      let upPref = '';
+      try { upPref = (Core.UserProfile && Core.UserProfile.load()?.preference) || ''; }
+      catch (e) { console.warn('[Screener] UserProfile.preference 读不到:', e); }
+      const preference = scPref || upPref.trim() || '';
 
       const aiResultEl = document.getElementById('screenerAiResult');
       if (!aiResultEl) return;
@@ -344,7 +350,8 @@
 - 趋势: 板块轮动、北向方向、行业资金流
 - 风险: 个股波动、行业暴露、相关性
 
-【用户画像】长期稳健型 (年化 3-5%), 不追短期暴利。
+【用户画像】(Core.UserProfile 单次动态注入 - 选股/选基共用同一来源)
+${Core.AI.formatUserProfile() || '长期稳健型 (年化 3-5%), 不追短期暴利。'}
 
 【输出风格】先证据后结论, 每条 reason 引用具体数据; 给信心等级 (高/中/低)。
 
