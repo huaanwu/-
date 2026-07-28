@@ -11045,14 +11045,14 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
   section('73] Tier 2: 龙虎榜 fetcher');
   try {
     const dataSrc = readFileSafe(path.join(WWW, 'core/data.js'));
-    // 73.1 函数存在 + 调 stock_lhb_ggtj_em (无参, 全市场)
-    if (/async\s+function\s+getLhbSnapshotMap[\s\S]{0,300}stock_lhb_ggtj_em[\s\S]{0,80}\{\s*\}/.test(dataSrc))
-      ok('73.1 data.js getLhbSnapshotMap 调 stock_lhb_ggtj_em (全市场)');
+    // 73.1 函数存在 + 调 stock_lhb_stock_statistic_em (无参, 全市场) — 原 stock_lhb_ggtj_em 端点 HTTP 404 已替换
+    if (/async\s+function\s+getLhbSnapshotMap[\s\S]{0,400}stock_lhb_stock_statistic_em[\s\S]{0,80}\{\s*\}/.test(dataSrc))
+      ok('73.1 data.js getLhbSnapshotMap 调 stock_lhb_stock_statistic_em (全市场)');
     else fail('73.1 函数或端点缺失', '');
-    // 73.2 返回 Map<code, {name, net, reason}>
+    // 73.2 返回 Map<code, {name, lastDate, count, net, post1d/3d/6d}>
     const lhbFn = dataSrc.match(/async\s+function\s+getLhbSnapshotMap[\s\S]{0,1500}/)[0] || '';
-    if (/new Map\(\)/.test(lhbFn) && /reason/.test(lhbFn) && /net/.test(lhbFn))
-      ok('73.2 返回 Map<code, {name, net, reason}>');
+    if (/new Map\(\)/.test(lhbFn) && /lastDate/.test(lhbFn) && /net/.test(lhbFn) && /post1d/.test(lhbFn))
+      ok('73.2 返回 Map<code, {name, lastDate, count, net, post1d/3d/6d}>');
     else fail('73.2 Map 结构缺失', '');
     // 73.3 暴露
     const dataExpose = dataSrc.match(/window\.Core\.Data\s*=\s*\{[\s\S]*?\}\s*;/)[0] || '';
@@ -11069,7 +11069,7 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
     const dataSrc = readFileSafe(path.join(WWW, 'core/data.js'));
     if (/【北向资金 \(近 5 日/.test(dataSrc)) ok('74.1 formatNorthboundForPrompt 含【北向资金】标题');
     else fail('74.1 北向标题缺失', '');
-    if (/【今日龙虎榜/.test(dataSrc)) ok('74.2 formatLhbForPrompt 含【今日龙虎榜】标题');
+    if (/【龙虎榜 \(近 5 日/.test(dataSrc)) ok('74.2 formatLhbForPrompt 含【龙虎榜 (近 5 日)】标题');
     else fail('74.2 龙虎标题缺失', '');
   } catch (e) {
     fail('74 formatForPrompt', e.message);

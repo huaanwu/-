@@ -1650,18 +1650,20 @@
   }
 
   /**
-   * Tier 2: 全市场龙虎榜个股 Map (今日) — 24h 缓存
-   * aktools: stock_lhb_ggtj_em (无参) → 全市场今日上榜个股
-   * 数据 T+1 (今日收盘后公布)
-   * 与 _fetchLonghubang (line 1681, 6h 快照) 同端点不同: 这里返完整 Map, 不止 Top5
-   * @returns {Promise<Map<string, {name, net, reason}> | null>} code → {name, net(亿), reason}
+   * Tier 2: 全市场个股上榜统计 (近 5 个交易日) — 24h 缓存
+   * aktools: stock_lhb_stock_statistic_em (无参, 全市场)
+   *   实际字段: 代码/名称/最近上榜日/收盘价/涨跌幅/上榜次数/龙虎榜净买额/买入额/卖出额/总成交额
+   *   + 上榜后1日/3日/6日/1月 涨跌幅 (历史均值, 给 AI 看"上榜后表现")
+   * 端点 stock_lhb_ggtj_em 在 aktools 实际不存在 (HTTP 404),改用 stock_statistic
+   * 数据 T+1 (今日收盘后公布), 5 日滚动
+   * @returns {Promise<Map<string, LhbEntry> | null>} code → {name, lastDate, count, net, postN}
    */
   async function getLhbSnapshotMap() {
-    const cacheKey = 'lhb_ggtj_map_v1';
+    const cacheKey = 'lhb_stock_statistic_v1';
     try {
       const raw = await fetchWithCache(
         cacheKey,
-        'stock_lhb_ggtj_em',
+        'stock_lhb_stock_statistic_em',
         {},
         24 * 60 * 60 * 1000
       );
@@ -1670,12 +1672,16 @@
       for (const r of raw) {
         const code = String(r['代码'] || r.code || '').padStart(6, '0');
         if (!/^\d{6}$/.test(code)) continue;
-        const netYuan = parseFloat(r['净额'] || r['龙虎榜净额'] || r.net_amount || 0);
+        const netYuan = parseFloat(r['龙虎榜净买额'] || r.net_amount || 0);
         if (isNaN(netYuan)) continue;
         m.set(code, {
           name: r['名称'] || r.name || '',
-          net: +(netYuan / 1e8).toFixed(2),  // 亿
-          reason: r['上榜原因'] || r.reason || ''
+          lastDate: (r['最近上榜日'] || r.last_date || '').slice(0, 10),
+          count: parseInt(r['上榜次数'] || r.count || 0, 10) || 0,
+          net: +(netYuan / 1e8).toFixed(2),                // 亿
+          post1d: parseFloat(r['上榜后1日涨跌幅'] || r.post1d || 0),
+          post3d: parseFloat(r['上榜后3日涨跌幅'] || r.post3d || 0),
+          post6d: parseFloat(r['上榜后6日涨跌幅'] || r.post6d || 0)
         });
       }
       return m.size > 0 ? m : null;
@@ -1707,7 +1713,7 @@
 
   /**
    * Tier 2: 格式化龙虎榜 Map → 短文本(注入 LLM prompt)
-   * @param {Map<string, {name, net, reason}>} lhbMap
+   * @param {Map<string, {name, lastDate, count, net, post1d, post3d, post6d}>} lhbMap
    * @param {number} topN 默认 10
    */
   function formatLhbForPrompt(lhbMap, topN = 10) {
@@ -1718,10 +1724,13 @@
     if (!rows.length) return '';
     const lines = rows.map(([code, v]) => {
       const sign = v.net >= 0 ? '+' : '';
-      const r = (v.reason || '').slice(0, 12);
-      return `- ${code} ${v.name} ${sign}${v.net}亿 (${r})`;
+      // 上榜后 1/3/6 日 平均涨跌幅 → 上榜效应参考
+      const post = (v.post1d != null && !isNaN(v.post1d))
+        ? ` | 上榜后1日${v.post1d >= 0 ? '+' : ''}${v.post1d.toFixed(1)}%`
+        : '';
+      return `- ${code} ${v.name} ${sign}${v.net}亿 (近5日${v.count}次${post})`;
     });
-    return '【今日龙虎榜 (T+1, 全市场上榜个股)】\n' + lines.join('\n');
+    return '【龙虎榜 (近 5 日, T+1, 上榜个股)】\n' + lines.join('\n');
   }
 
   /**
@@ -1796,16 +1805,20 @@
 
   /**
    * 7) 龙虎榜 - 今日 Top 5 净买入 / 净卖出个股 (游资动向)
-   * aktools: stock_lhb_ggtj_em → 字段 (代码, 名称, 净额, ...)
+   * aktools: stock_lhb_stock_statistic_em (无参, 全市场近 5 日上榜统计)
+   *   字段: 代码/名称/最近上榜日/上榜次数/龙虎榜净买额/上榜后1日涨跌幅
+   * 注: 原 stock_lhb_ggtj_em 端点 HTTP 404,改用 stock_statistic (Tier 2 修复)
    */
   async function _fetchLonghubang() {
-    const data = await Core.Data.fetch('ai_ctx_lhb', 'stock_lhb_ggtj_em', {}, _CTX_TTL);
+    const data = await Core.Data.fetch('ai_ctx_lhb', 'stock_lhb_stock_statistic_em', {}, _CTX_TTL);
     if (!Array.isArray(data) || data.length === 0) return null;
     const rows = data.map(r => ({
       code: r['代码'] || r.code,
       name: r['名称'] || r.name,
-      net: parseFloat(r['净额'] || r['龙虎榜净额'] || r.net_amount),
-      reason: r['上榜原因'] || r.reason || ''
+      net: parseFloat(r['龙虎榜净买额'] || r['净额'] || r.net_amount || 0),
+      count: parseInt(r['上榜次数'] || r.count || 0, 10) || 0,
+      post1d: parseFloat(r['上榜后1日涨跌幅'] || 0),
+      reason: r['上榜原因'] || r.reason || (r['最近上榜日'] ? `最近上榜${(r['最近上榜日'] || '').slice(0,10)}` : '')
     })).filter(r => r.code && !isNaN(r.net));
     if (rows.length === 0) return null;
     const sorted = [...rows].sort((a, b) => b.net - a.net);
