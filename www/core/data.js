@@ -760,11 +760,25 @@
   /**
    * 批量财务摘要 (Phase 5 long-trader)
    * 并发 5 逐批拉, 返回 Map<code, rawData>
+   * Bug #8 修复: 加 7 天 in-memory 缓存, 跨 runNow / reviewHoldings 调用复用
+   * (财报季度才更新, 同 code 短期重复请求走 cache)
    */
+  const _finBatchCache = new Map();   // code -> { value, ts }
+  const _FIN_BATCH_TTL = 7 * 24 * 60 * 60 * 1000;
   async function getStockFinancialBatch(codes) {
     const results = new Map();
+    const toFetch = [];
+    for (const c of codes) {
+      const hit = _finBatchCache.get(c);
+      if (hit && Date.now() - hit.ts < _FIN_BATCH_TTL) {
+        results.set(c, hit.value);
+      } else {
+        toFetch.push(c);
+      }
+    }
+    if (toFetch.length === 0) return results;
     const chunked = [];
-    for (let i = 0; i < codes.length; i += 5) chunked.push(codes.slice(i, i + 5));
+    for (let i = 0; i < toFetch.length; i += 5) chunked.push(toFetch.slice(i, i + 5));
     for (const chunk of chunked) {
       const batch = await Promise.allSettled(
         chunk.map(c => getStockFinancial(c).catch(() => null))
@@ -772,6 +786,7 @@
       chunk.forEach((c, i) => {
         if (batch[i]?.status === 'fulfilled' && batch[i].value) {
           results.set(c, batch[i].value);
+          _finBatchCache.set(c, { value: batch[i].value, ts: Date.now() });
         }
       });
     }
@@ -978,11 +993,24 @@
   /**
    * 批量行业归属查询 (Phase 5 long-trader)
    * 并发 5 逐批拉, 返回 Map<code, industryName>
+   * Bug #8 修复: 行业归属基本不变, 24h 内存缓存
    */
+  const _indBatchCache = new Map();
+  const _IND_BATCH_TTL = 24 * 60 * 60 * 1000;
   async function getStockIndustryBatch(codes) {
     const results = new Map();
+    const toFetch = [];
+    for (const c of codes) {
+      const hit = _indBatchCache.get(c);
+      if (hit && Date.now() - hit.ts < _IND_BATCH_TTL) {
+        results.set(c, hit.value);
+      } else {
+        toFetch.push(c);
+      }
+    }
+    if (toFetch.length === 0) return results;
     const chunked = [];
-    for (let i = 0; i < codes.length; i += 5) chunked.push(codes.slice(i, i + 5));
+    for (let i = 0; i < toFetch.length; i += 5) chunked.push(toFetch.slice(i, i + 5));
     for (const chunk of chunked) {
       const batch = await Promise.allSettled(
         chunk.map(c => getStockIndustryByCode(c).catch(() => null))
@@ -990,6 +1018,7 @@
       chunk.forEach((c, i) => {
         if (batch[i]?.status === 'fulfilled' && batch[i].value) {
           results.set(c, batch[i].value);
+          _indBatchCache.set(c, { value: batch[i].value, ts: Date.now() });
         }
       });
     }

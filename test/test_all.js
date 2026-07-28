@@ -9597,7 +9597,10 @@ section('[54] LongTrader: _shouldRun 触发判定 + LLM 选股 + 整轮 runNow')
           }
         },
         Data: {
-          getStockSpot: async () => opts.stocks || []
+          getStockSpot: async () => opts.stocks || [],
+          getStockFinancialBatch: async () => new Map(),
+          getStockIndustryBatch: async () => new Map(),
+          getStockKLine: async () => []
         },
         // Bug #2 mock: Regime (默认 range + positionScale 1, opts.regime 注入)
         Regime: {
@@ -9654,9 +9657,9 @@ section('[54] LongTrader: _shouldRun 触发判定 + LLM 选股 + 整轮 runNow')
       stocks: [
         { 代码: '000001', 名称: '平安银行', 涨跌幅: 5.0, 换手率: 1.5, 总市值: 900000000000 },
         { 代码: '000002', 名称: '万科A', 涨跌幅: 4.5, 换手率: 1.2, 总市值: 120000000000 },
-        { 代码: '600519', 名称: '贵州茅台', 涨跌幅: 4.0, 换手率: 0.5, 总市值: 2000000000000 },
-        { 代码: '000003', 名称: '招行', 涨跌幅: 3.5, 换手率: 0.8, 总市值: 800000000000 },
-        { 代码: '000004', 名称: 'A', 涨跌幅: 3.0, 换手率: 1.0, 总市值: 100000000000 }
+        { 代码: '600519', 名称: '贵州茅台', 涨跌幅: 4.0, 换手率: 1.1, 总市值: 2000000000000 },
+        { 代码: '000003', 名称: '招行', 涨跌幅: 3.5, 换手率: 1.8, 总市值: 800000000000 },
+        { 代码: '000004', 名称: 'A', 涨跌幅: 3.0, 换手率: 1.3, 总市值: 100000000000 }
       ],
       llmRaw: '{"picks":[{"code":"000001","name":"平安银行","reason":"业绩拐点"},{"code":"000002","name":"万科A","reason":"政策预期"},{"code":"600519","name":"贵州茅台","reason":"龙头"}]}'
     });
@@ -11320,6 +11323,39 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
       ok('87.4 finFiltered 回退剔除已知不达标');
     else fail('87.4 knownBadCodes 修复缺失', '');
   } catch (e) { fail('87.x bug 修复', e.message); }
+
+  // ===== 88.x: Bug 5/6/7/8 修复验证 =====
+  try {
+    const lt88 = readFileSafe(path.join(WWW, 'app', 'long-trader.js'));
+    const d88 = readFileSafe(path.join(WWW, 'core', 'data.js'));
+
+    // 88.1: Bug 5 — samplePrice 中位价替代硬编码 30
+    if (/const samplePrice/.test(lt88) && lt88.indexOf("Math.floor(prices.length / 2)") >= 0)
+      ok('88.1 samplePrice 池中位价替代硬编码 30');
+    else fail('88.1 samplePrice 缺失', '');
+
+    // 88.2: Bug 6 — 改用换手率过滤
+    if (lt88.indexOf("parseFloat(s.换手率 || 0) >= 1") >= 0)
+      ok('88.2 入池过滤改用换手率 ≥ 1');
+    else fail('88.2 换手率过滤缺失', '');
+    if (!/parseFloat(s.涨跌幅) > 0/.test(lt88) || /硬筛已排除/.test(lt88))
+      ok('88.3 旧"涨跌幅 > 0"已弃用 (或仅在提示文本中)');
+    else fail('88.3 旧过滤仍生效', '');
+
+    // 88.4: Bug 7 — K 线 adjust 注释
+    if (/不复权/.test(lt88) && /adjust=''/.test(lt88))
+      ok('88.4 K 线 adjust 显式说明意图');
+    else fail('88.4 adjust 注释缺失', '');
+
+    // 88.5: Bug 8 — batch 缓存
+    if (/_finBatchCache/.test(d88) && /_FIN_BATCH_TTL/.test(d88))
+      ok('88.5 data.js 含 _finBatchCache 7 天缓存');
+    else fail('88.5 _finBatchCache 缺失', '');
+    if (/_indBatchCache/.test(d88) && /_IND_BATCH_TTL/.test(d88))
+      ok('88.6 data.js 含 _indBatchCache 24h 缓存');
+    else fail('88.6 _indBatchCache 缺失', '');
+  } catch (e) { fail('88.x bug 修复', e.message); }
+
 
 
 

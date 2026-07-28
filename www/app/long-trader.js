@@ -72,8 +72,9 @@
         // Bug #1 修复 (跑空防护): 跑前用 _planAutoTrade 探测 1 手 30 元股能否成交
         // 比硬定 MIN_CASH 数字更鲁棒 — 30 元是中盘股典型价, 1 手 3000 块 + 仓位 10% 要求 ≥ 3 万 cash
         // 现金不够买 1 手 → 跳过, 避免 LLM 推 N 只全部 autoTradeFromPick 返 null
-        const testShares = Paper._planAutoTrade(acc.cash, acc.positionPct || 0.10, 30);
-        if (!testShares || testShares < Core.Constants.LOT_SIZE) {
+        // (此处的 30 元是兜底值, 等 sorted 算完后会用中位价重新探测一次)
+        const testSharesProbe = Paper._planAutoTrade(acc.cash, acc.positionPct || 0.10, 30);
+        if (!testSharesProbe || testSharesProbe < Core.Constants.LOT_SIZE) {
           console.log(`[LongTrader] 现金 ${acc.cash} × ${acc.positionPct || 0.10} 买不起 1 手 30 元股, 跳过`);
           return;
         }
@@ -102,12 +103,25 @@
           const held = (await Paper._getPaperHoldings('long')) || [];
           heldCodes = new Set(held.map(h => h.code).filter(Boolean));
         } catch (e) { /* */ }
-        // 4. 简单硬筛: 涨跌幅 > 0 + 不在已持仓, 取前 30 (看涨池)
+        // 4. 简单硬筛: 换手率 ≥ 1% (有真实成交) + 不在已持仓
+        //    Bug #6 修复: 弃用'涨跌幅 > 0' (与长线理念冲突), 改用流动性指标
+        //    长线 sleeve 也要避免长期不动的僵尸股
         const sorted = all
-          .filter(s => s && s.代码 && s.名称 && parseFloat(s.涨跌幅) > 0 && !heldCodes.has(s.代码))
+          .filter(s => s && s.代码 && s.名称 && parseFloat(s.换手率 || 0) >= 1 && !heldCodes.has(s.代码))
           .sort((a, b) => parseFloat(b.涨跌幅) - parseFloat(a.涨跌幅))
           .slice(0, HARD_TOP);
         if (sorted.length === 0) return;
+        // Bug #5 修复 (跑空防护): 用 sorted 池中位价估算, 适配茅台/低价股
+        const samplePrice = (() => {
+          const prices = sorted.map(s => parseFloat(s.最新价 || s.收盘 || 0)).filter(p => p > 0).sort((a, b) => a - b);
+          if (prices.length === 0) return 30;
+          return prices[Math.floor(prices.length / 2)];
+        })();
+        const testShares = Paper._planAutoTrade(acc.cash, acc.positionPct || 0.10, samplePrice);
+        if (!testShares || testShares < Core.Constants.LOT_SIZE) {
+          console.log(`[LongTrader] 现金 ${acc.cash} × ${acc.positionPct || 0.10} 买不起 1 手 ${samplePrice.toFixed(2)} 元股 (池中位价), 跳过`);
+          return;
+        }
         // Phase 5: 预拉前 30 只基本面 (并发 5 逐批)
         let finMap = new Map();
         try {
@@ -283,7 +297,7 @@
         const systemPrompt = '你是 A 股长线选股助手, 帮用户从硬筛池里挑 ' + topN + ' 只作为本周模拟盘长线 sleeve 的买入标的。' +
           '\n- 选有真实上涨逻辑的 (题材/业绩/资金/技术突破)' +
           '\n- 优先选市值 ≥ 50 亿的 (流动性好)' +
-          '\n- 优先选当日涨幅在 3-9% 区间的 (避免追高/避冷门)' +
+          '\n- 候选池已按换手率 ≥ 1% 过滤 (有真实成交), 可在池内自由挑选不看单日涨幅' +
           '\n- 优先选 ROE > 10% 且 PE 不极端（< 80）的（盈利质量）' +
           '\n- 避免选高负债率（> 70%）且 ROE < 5% 的（价值陷阱）' +
           '\n- 硬筛已排除: ROE < 5%、毛利率 < 10% 的股票' +
@@ -515,6 +529,7 @@
         for (const j of targets) {
           scanned++;
           try {
+            // adjust='': 显式用不复权真实价格 (与 costPrice 对账, 避免分红配股带来的偏差)
             const kline = await fetcher(j.code, 'daily', undefined, undefined, '').catch(function() { return null; });
             if (!Array.isArray(kline) || kline.length < 5) { skipped++; continue; }
             const closes = kline.map(function(b) { return parseFloat(b.收盘 || b.close); }).filter(function(c) { return c > 0; });
