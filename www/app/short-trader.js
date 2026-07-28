@@ -394,6 +394,19 @@
       lines.push('');
       lines.push('## 指数快照');
       lines.push(ctx.marketText || '(市场数据不可用, 按常识谨慎判断)');
+      // Tier 2 Commit C: 北向 + 龙虎榜短线信号 (注: 在 ## 候选池 之前, 给 LLM 先看资金面再选)
+      const northText = Core.Data.formatNorthboundForPrompt(ctx.northByCode, 10);
+      const lhbText = Core.Data.formatLhbForPrompt(ctx.lhbMap, 10);
+      if (northText) {
+        lines.push('');
+        lines.push('## 北向资金 (近 5 日, T+1, 个股)');
+        lines.push(northText);
+      }
+      if (lhbText) {
+        lines.push('');
+        lines.push('## 龙虎榜 (今日 T+1, 全市场)');
+        lines.push(lhbText);
+      }
       lines.push('');
       lines.push('## 候选池 (只能从这里选 code, 价格为当前快照)');
       if (ctx.pool.length) {
@@ -601,6 +614,25 @@
             }
           }
         }
+        // Tier 2: 个股北向 (24h 缓存, 截断后并发拉)
+        ctx.northByCode = new Map();
+        try {
+          if (Array.isArray(ctx.pool) && ctx.pool.length) {
+            const nr = await Promise.allSettled(
+              ctx.pool.map(c => Core.Data.getNorthboundFlow(c.code).catch(() => null))
+            );
+            for (let i = 0; i < ctx.pool.length; i++) {
+              const r = nr[i];
+              if (r && r.status === 'fulfilled' && r.value) {
+                ctx.northByCode.set(ctx.pool[i].code, r.value);
+              }
+            }
+          }
+        } catch (e) { console.warn('[ShortTrader] 北向注入失败:', e); }
+        // Tier 2: 龙虎榜 (全市场 1 次, 24h 缓存, ctx.pool 不在也照拉 — 给 AI 看资金动向背景)
+        try {
+          ctx.lhbMap = await Core.Data.getLhbSnapshotMap();
+        } catch (e) { ctx.lhbMap = null; console.warn('[ShortTrader] 龙虎榜拉取失败:', e); }
       } catch (e) { console.warn('[ShortTrader] ctx 读自选股/注入现价失败:', e); }
       // 同代码 48h 冷却集合 (transactions 表短线卖出)
       try {

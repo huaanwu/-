@@ -445,7 +445,9 @@ try {
     window: {
       Core: {
         Storage: { all: async () => [], get: async () => null, add: async () => {} },
-        Data: { getIndexSpot: async () => [], getStockQuote: async () => null },
+        Data: { getIndexSpot: async () => [], getStockQuote: async () => null,
+          formatNorthboundForPrompt: () => '', formatLhbForPrompt: () => '',
+          getNorthboundFlow: async () => null, getLhbSnapshotMap: async () => null },
         State: { get: () => null, set: () => {} }
       }
     },
@@ -1057,7 +1059,9 @@ try {
     window: {
       Core: {
         Storage: { all: async () => [], get: async () => null, put: async () => {} },
-        Data: { getStockQuote: async () => null },
+        Data: { getStockQuote: async () => null,
+          formatNorthboundForPrompt: () => '', formatLhbForPrompt: () => '',
+          getNorthboundFlow: async () => null, getLhbSnapshotMap: async () => null },
         Market: { get: async (g) => ({
           group: g, items: [
             { code: '000001', name: '上证指数', price: 3245.67, change: 0.85 },
@@ -6486,7 +6490,10 @@ section('[39] ShortTrader 盘前 AI 交易计划 (T2): 交易日判定 / prompt 
           kvSet: async (k, v) => { storageData.kv[k] = v; },
           all: async (t) => storageData.tables[t] || []
         },
-        Data: { getIndexSpot: async () => storageData.indexSpot || [] },
+        Data: { getIndexSpot: async () => storageData.indexSpot || [],
+          // Tier 2: formatForPrompt mock (返空避免 throw, 不影响注入逻辑断言)
+          formatNorthboundForPrompt: () => '', formatLhbForPrompt: () => '',
+          getNorthboundFlow: async () => null, getLhbSnapshotMap: async () => null },
         Util: { stockCodePrefix: (c) => /^(60|68)/.test(c) ? 'sh' : 'sz' },
         Premortem: realPremortem,
         PositionSizing: _loadRealPositionSizing(),
@@ -6885,7 +6892,9 @@ section('[40] ShortTrader T4 学习环: _judgeClosedTrade 全分支 / verify 扫
         },
         Data: {
           getIndexSpot: async () => [],
-          getStockKLine: async () => { throw new Error('测试应注入 deps.getBars'); }
+          getStockKLine: async () => { throw new Error('测试应注入 deps.getBars'); },
+          formatNorthboundForPrompt: () => '', formatLhbForPrompt: () => '',
+          getNorthboundFlow: async () => null, getLhbSnapshotMap: async () => null
         },
         Util: { stockCodePrefix: (c) => /^(60|68)/.test(c) ? 'sh' : 'sz' },
         Premortem: { checkPick: () => [], PROMPT_SPEC: 'spec' },
@@ -7789,7 +7798,10 @@ section('[46] Bug B 现价锚定: _buildCandidatePool / _validatePlans 方向对
           kvSet: async () => {},
           all: async () => []
         },
-        Data: { getIndexSpot: async () => [] },
+        Data: { getIndexSpot: async () => [],
+          // Tier 2: formatForPrompt + fetcher mock
+          formatNorthboundForPrompt: () => '', formatLhbForPrompt: () => '',
+          getNorthboundFlow: async () => null, getLhbSnapshotMap: async () => null },
         Util: { stockCodePrefix: () => 'sz' },
         Premortem: realPremortem,
         PositionSizing: _loadRealPositionSizing(),
@@ -8255,7 +8267,7 @@ section('[45] short-trader.js 公告注入 prompt');
     else fail('45.a ctx.noticesByCode', '源码未匹配公告 Map 装配');
 
     // 45.b _buildUserPrompt 公告行渲染 ([公告:type+text|...])
-    if (/_buildUserPrompt[\s\S]{0,3000}noticesByCode[\s\S]{0,400}\[公告:\$\{notices\.map/.test(stSrc))
+    if (/_buildUserPrompt[\s\S]{0,4000}noticesByCode[\s\S]{0,400}\[公告:\$\{notices\.map/.test(stSrc))
       ok('45.b _buildUserPrompt 候选池行含 [公告:...] 渲染');
     else fail('45.b 公告渲染', 'userPrompt 未含公告行');
 
@@ -8265,7 +8277,7 @@ section('[45] short-trader.js 公告注入 prompt');
     else fail('45.c systemPrompt 准则', '源码未匹配公告准则');
 
     // 45.d 板块行渲染 ([行业:名 涨跌% (rank/total)])
-    if (/_buildUserPrompt[\s\S]{0,3000}industryChangeByCode[\s\S]{0,400}\[行业:\$\{indInfo\.industryName\}/.test(stSrc))
+    if (/_buildUserPrompt[\s\S]{0,4000}industryChangeByCode[\s\S]{0,400}\[行业:\$\{indInfo\.industryName\}/.test(stSrc))
       ok('45.d _buildUserPrompt 候选池行含 [行业:名 涨跌%] 渲染');
     else fail('45.d 板块渲染', 'userPrompt 未含板块行');
   } catch (e) {
@@ -9101,7 +9113,9 @@ section('[59] IntradayTrader: 纯函数 (交易时段/冷却/日限/机械止盈
           }
         },
         Data: { getStockQuote: async () => opts.quote || { 最新价: 10, 涨跌幅: 1.5, 换手率: 2 },
-                getStockKLine: async () => opts.bars || [] },
+                getStockKLine: async () => opts.bars || [],
+                formatNorthboundForPrompt: () => '', formatLhbForPrompt: () => '',
+                getNorthboundFlow: async () => null, getLhbSnapshotMap: async () => null },
         Regime: { get: async () => ({ state: 'range' }), gateMultipliers: () => ({ state: 'range', label: '震荡市', positionScale: 1 }) }
       };
       sctx.Core = sctx.window.Core;
@@ -11004,6 +11018,87 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
     else fail('71.10 【近期纪律拦截】段缺失', '');
   } catch (e) {
     fail('71 Tier 1 mirror 测试', e.message);
+  }
+
+  // ========== [72] Tier 2: 北向个股 fetcher (data.js getNorthboundFlow) ==========
+  section('72] Tier 2: 北向个股 fetcher');
+  try {
+    const dataSrc = readFileSafe(path.join(WWW, 'core/data.js'));
+    // 72.1 函数存在 + 调 stock_hsgt_individual_em (参数 symbol=)
+    if (/async\s+function\s+getNorthboundFlow[\s\S]{0,300}stock_hsgt_individual_em[\s\S]{0,80}symbol:\s*c/.test(dataSrc))
+      ok('72.1 data.js getNorthboundFlow 调 stock_hsgt_individual_em(symbol={code})');
+    else fail('72.1 函数/端点/参数缺失', '');
+    // 72.2 缓存键含 code (hsgt_individual_${c}_v1) + TTL ≥ 12h
+    if (/hsgt_individual_\$\{c\}_v1/.test(dataSrc) && /getNorthboundFlow[\s\S]{0,800}?24\s*\*\s*60\s*\*\s*60\s*\*\s*1000/.test(dataSrc))
+      ok('72.2 缓存键含 code + TTL ≥ 12h');
+    else fail('72.2 缓存键或 TTL 不达标', '');
+    // 72.3 暴露到 window.Core.Data
+    const dataExpose = dataSrc.match(/window\.Core\.Data\s*=\s*\{[\s\S]*?\}\s*;/)[0] || '';
+    if (/getNorthboundFlow/.test(dataExpose) && /formatNorthboundForPrompt/.test(dataExpose))
+      ok('72.3 getNorthboundFlow + formatNorthboundForPrompt 暴露 window.Core.Data');
+    else fail('72.3 未暴露', '');
+  } catch (e) {
+    fail('72 北向 fetcher', e.message);
+  }
+
+  // ========== [73] Tier 2: 龙虎榜 fetcher (data.js getLhbSnapshotMap, 全市场 24h 缓存) ==========
+  section('73] Tier 2: 龙虎榜 fetcher');
+  try {
+    const dataSrc = readFileSafe(path.join(WWW, 'core/data.js'));
+    // 73.1 函数存在 + 调 stock_lhb_ggtj_em (无参, 全市场)
+    if (/async\s+function\s+getLhbSnapshotMap[\s\S]{0,300}stock_lhb_ggtj_em[\s\S]{0,80}\{\s*\}/.test(dataSrc))
+      ok('73.1 data.js getLhbSnapshotMap 调 stock_lhb_ggtj_em (全市场)');
+    else fail('73.1 函数或端点缺失', '');
+    // 73.2 返回 Map<code, {name, net, reason}>
+    const lhbFn = dataSrc.match(/async\s+function\s+getLhbSnapshotMap[\s\S]{0,1500}/)[0] || '';
+    if (/new Map\(\)/.test(lhbFn) && /reason/.test(lhbFn) && /net/.test(lhbFn))
+      ok('73.2 返回 Map<code, {name, net, reason}>');
+    else fail('73.2 Map 结构缺失', '');
+    // 73.3 暴露
+    const dataExpose = dataSrc.match(/window\.Core\.Data\s*=\s*\{[\s\S]*?\}\s*;/)[0] || '';
+    if (/getLhbSnapshotMap/.test(dataExpose) && /formatLhbForPrompt/.test(dataExpose))
+      ok('73.3 getLhbSnapshotMap + formatLhbForPrompt 暴露 window.Core.Data');
+    else fail('73.3 未暴露', '');
+  } catch (e) {
+    fail('73 龙虎 fetcher', e.message);
+  }
+
+  // ========== [74] Tier 2: formatForPrompt 标签锁死 ==========
+  section('74] Tier 2: formatForPrompt 标签锁死');
+  try {
+    const dataSrc = readFileSafe(path.join(WWW, 'core/data.js'));
+    if (/【北向资金 \(近 5 日/.test(dataSrc)) ok('74.1 formatNorthboundForPrompt 含【北向资金】标题');
+    else fail('74.1 北向标题缺失', '');
+    if (/【今日龙虎榜/.test(dataSrc)) ok('74.2 formatLhbForPrompt 含【今日龙虎榜】标题');
+    else fail('74.2 龙虎标题缺失', '');
+  } catch (e) {
+    fail('74 formatForPrompt', e.message);
+  }
+
+  // ========== [75] Tier 2: 3 调用方注入 ==========
+  section('75] Tier 2: 3 调用方注入');
+  try {
+    // 75.1 screener.js 注入北向 + 龙虎 fetcher + formatForPrompt
+    const scSrc = readFileSafe(path.join(WWW, 'app/screener.js'));
+    if (/Core\.Data\.getNorthboundFlow/.test(scSrc) && /Core\.Data\.getLhbSnapshotMap/.test(scSrc)
+        && /Core\.Data\.formatNorthboundForPrompt/.test(scSrc) && /Core\.Data\.formatLhbForPrompt/.test(scSrc))
+      ok('75.1 screener.js 注入北向 + 龙虎 fetcher + formatForPrompt');
+    else fail('75.1 screener.js 注入缺失', '');
+    // 75.2 short-trader.js _buildPlanContext + _buildUserPrompt 调 fetcher
+    const stSrc = readFileSafe(path.join(WWW, 'app/short-trader.js'));
+    if (/Core\.Data\.getNorthboundFlow/.test(stSrc) && /Core\.Data\.getLhbSnapshotMap/.test(stSrc)
+        && /Core\.Data\.formatNorthboundForPrompt/.test(stSrc) && /Core\.Data\.formatLhbForPrompt/.test(stSrc)
+        && /ctx\.northByCode/.test(stSrc) && /ctx\.lhbMap/.test(stSrc))
+      ok('75.2 short-trader.js 注入 ctx.northByCode + ctx.lhbMap + formatForPrompt');
+    else fail('75.2 short-trader.js 注入缺失', '');
+    // 75.3 intraday-trader.js 仅注北向 (不注龙虎 — T+1 盘中无意义)
+    const itSrc = readFileSafe(path.join(WWW, 'app/intraday-trader.js'));
+    if (/Core\.Data\.getNorthboundFlow/.test(itSrc) && !/Core\.Data\.getLhbSnapshotMap/.test(itSrc)
+        && !/Core\.Data\.getLhbActivity/.test(itSrc) && /【北向资金 T\+1】/.test(itSrc))
+      ok('75.3 intraday-trader.js 仅注北向(不注龙虎) + 单行标签【北向资金 T+1】');
+    else fail('75.3 intraday 注入规则不对', '');
+  } catch (e) {
+    fail('75 调用方注入', e.message);
   }
 
 waitForIIFEsDrain().then(() => {

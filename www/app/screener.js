@@ -308,6 +308,27 @@
         industryLine = lines.join('\n');
       } catch (e) { console.warn('[screener] 行业拉取失败:', e); }
 
+      // Tier 2 Commit C: 个股北向 (30 只, 24h 缓存) + 全市场龙虎榜 (单次 Map)
+      let northByCode = new Map();
+      let lhbMap = null;
+      try {
+        const slice = top.slice(0, 30);
+        const northRes = await Promise.allSettled(
+          slice.map(s => Core.Data.getNorthboundFlow(s.代码).catch(() => null))
+        );
+        for (let i = 0; i < slice.length; i++) {
+          const r = northRes[i];
+          if (r && r.status === 'fulfilled' && r.value) {
+            northByCode.set(slice[i].代码, r.value);
+          }
+        }
+      } catch (e) { console.warn('[screener] 北向拉取失败:', e); }
+      try {
+        lhbMap = await Core.Data.getLhbSnapshotMap();
+      } catch (e) { console.warn('[screener] 龙虎榜拉取失败:', e); }
+      const northText = Core.Data.formatNorthboundForPrompt(northByCode, 10);
+      const lhbText = Core.Data.formatLhbForPrompt(lhbMap, 10);
+
       // 并行加载宏观 + 新闻 + Phase O: 13 维上下文 + KB + Y.3 P-A 持仓
       const macroP = Core.Macro.get().catch(e => null);
       const newsP = Core.News.get().catch(e => null);
@@ -428,7 +449,9 @@ ${Core.AI.formatUserProfile() || '长期稳健型 (年化 3-5%), 不追短期暴
 7. **pre-mortem 必填**: 每只 pick 必须给 bullCase/bearCase/falsifyCondition/invalidation 四字段; bearCase 禁止"无明显风险/暂无风险"空话, falsifyCondition 必须具体可观测 (价格/指标/财报数字)
 8. **已有持仓友好**: 用户持仓超过 10 万的代码视为"重复持仓", 应在 marketView / risks 中提示, 不强制进 picks
 9. **排雷标签 ✓ 必须尊重**: 候选池中如已被前端标 [排雷] 的代码 (商誉偏高/股东减持/业绩亏损/主力出逃), 一律不进 picks, 除非 KB 经典模式能给出反转理由 (例如"高商誉但 ROE 持续 > 20% 的特例")
-10. 严禁绝对化表述 ("一定涨" 等)${poolBlock}${discBlock}`;
+10. 严禁绝对化表述 ("一定涨" 等)${poolBlock}${discBlock}
+11. **北向资金 (T+1 滞后)**: 个股北向 5 日净流入 + 当日净买 → 中线加分信号; 大额流出 → 减分
+12. **龙虎榜 (T+1 滞后)**: 全市场今日上榜个股只作为"知情资金动向"参考, 不强求候选池与上榜名单匹配`;
 
       const userPrompt = `【我的现有持仓 (前 10, Y.3 P-A)】
 ${portfolioLine}
@@ -453,6 +476,9 @@ ${ctxText}
 ${intlText}
 
 ${kbText}
+
+${northText ? '\n' + northText : ''}
+${lhbText ? '\n' + lhbText : ''}
 
 【行业归属】(24h 缓存, 单只失败标 [降级])
 ${industryLine}

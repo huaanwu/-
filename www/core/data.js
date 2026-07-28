@@ -1605,6 +1605,126 @@
   }
 
   /**
+   * Tier 2: 个股北向持股变化 (近 5 日) — 24h 缓存
+   * aktools: stock_hsgt_individual_em + 参数 symbol={code}
+   * 实际字段(curl 验证 2026-07): 持股日期, 持股数量, 持股市值, 持股数量占A股百分比,
+   *   当日增持股数(万股), 当日增持资金(元, 不是亿), 当日持股市值变化(元)
+   * 数据 T+1 滞后 (持仓日是上一交易日)
+   * @param {string} code 6 位代码
+   * @returns {Promise<{todayNet:number, net5d:number, holdingChange:number, pct:number, date:string}|null>}
+   *   todayNet 单位:亿; net5d / holdingChange 单位:万股; pct = 持股占 A 股 %
+   */
+  async function getNorthboundFlow(code) {
+    const c = String(code || '').padStart(6, '0');
+    if (!/^\d{6}$/.test(c)) return null;
+    const cacheKey = `hsgt_individual_${c}_v1`;
+    try {
+      const raw = await fetchWithCache(
+        cacheKey,
+        'stock_hsgt_individual_em',
+        { symbol: c },
+        24 * 60 * 60 * 1000
+      );
+      if (!Array.isArray(raw) || raw.length === 0) return null;
+      // 仅取最近 5 个交易日
+      const tail = raw.slice(-5);
+      // 今日增持资金(元) → 亿
+      const todayDeltaYuan = tail.reduce((s, r) => s + parseFloat(r['今日增持资金'] || 0), 0);
+      const lastRow = tail[tail.length - 1];
+      const todayNetYuan = parseFloat(lastRow['今日增持资金'] || 0);
+      // 5 日持股变化 = 最新持股数 - 5 日前持股数 (万股 → 万股)
+      const holdingNow = parseFloat(lastRow['持股数量'] || 0);
+      const holding5dAgo = parseFloat(tail[0]['持股数量'] || 0);
+      const net5dShares = (holdingNow - holding5dAgo) / 10000;  // 股 → 万股
+      return {
+        todayNet: +(todayNetYuan / 1e8).toFixed(2),     // 亿
+        net5d: +net5dShares.toFixed(2),                 // 万股
+        holdingChange: +(parseFloat(lastRow['当日增持股数'] || 0)).toFixed(0),
+        pct: +parseFloat(lastRow['持股数量占A股百分比'] || 0).toFixed(2),
+        date: lastRow['持股日期'] || ''
+      };
+    } catch (e) {
+      console.warn('[Data] getNorthboundFlow 失败:', e.message);
+      return null;
+    }
+  }
+
+  /**
+   * Tier 2: 全市场龙虎榜个股 Map (今日) — 24h 缓存
+   * aktools: stock_lhb_ggtj_em (无参) → 全市场今日上榜个股
+   * 数据 T+1 (今日收盘后公布)
+   * 与 _fetchLonghubang (line 1681, 6h 快照) 同端点不同: 这里返完整 Map, 不止 Top5
+   * @returns {Promise<Map<string, {name, net, reason}> | null>} code → {name, net(亿), reason}
+   */
+  async function getLhbSnapshotMap() {
+    const cacheKey = 'lhb_ggtj_map_v1';
+    try {
+      const raw = await fetchWithCache(
+        cacheKey,
+        'stock_lhb_ggtj_em',
+        {},
+        24 * 60 * 60 * 1000
+      );
+      if (!Array.isArray(raw) || raw.length === 0) return null;
+      const m = new Map();
+      for (const r of raw) {
+        const code = String(r['代码'] || r.code || '').padStart(6, '0');
+        if (!/^\d{6}$/.test(code)) continue;
+        const netYuan = parseFloat(r['净额'] || r['龙虎榜净额'] || r.net_amount || 0);
+        if (isNaN(netYuan)) continue;
+        m.set(code, {
+          name: r['名称'] || r.name || '',
+          net: +(netYuan / 1e8).toFixed(2),  // 亿
+          reason: r['上榜原因'] || r.reason || ''
+        });
+      }
+      return m.size > 0 ? m : null;
+    } catch (e) {
+      console.warn('[Data] getLhbSnapshotMap 失败:', e.message);
+      return null;
+    }
+  }
+
+  /**
+   * Tier 2: 格式化北向 Map → 短文本(注入 LLM prompt)
+   * @param {Map<string, {todayNet, net5d, pct, date}>} flowMap
+   * @param {number} topN 默认 10
+   */
+  function formatNorthboundForPrompt(flowMap, topN = 10) {
+    if (!(flowMap instanceof Map) || flowMap.size === 0) return '';
+    const rows = [...flowMap.entries()]
+      .filter(([, v]) => v && (v.todayNet !== 0 || v.net5d !== 0))
+      .sort((a, b) => Math.abs(b[1].todayNet) - Math.abs(a[1].todayNet))
+      .slice(0, topN);
+    if (!rows.length) return '';
+    const lines = rows.map(([code, v]) => {
+      const sign = v.todayNet >= 0 ? '+' : '';
+      const sign5 = v.net5d >= 0 ? '+' : '';
+      return `- ${code} 今日${sign}${v.todayNet}亿 | 5日${sign5}${v.net5d}万股 | 占A股${v.pct}%`;
+    });
+    return '【北向资金 (近 5 日, T+1)】\n' + lines.join('\n');
+  }
+
+  /**
+   * Tier 2: 格式化龙虎榜 Map → 短文本(注入 LLM prompt)
+   * @param {Map<string, {name, net, reason}>} lhbMap
+   * @param {number} topN 默认 10
+   */
+  function formatLhbForPrompt(lhbMap, topN = 10) {
+    if (!(lhbMap instanceof Map) || lhbMap.size === 0) return '';
+    const rows = [...lhbMap.entries()]
+      .sort((a, b) => Math.abs(b[1].net) - Math.abs(a[1].net))
+      .slice(0, topN);
+    if (!rows.length) return '';
+    const lines = rows.map(([code, v]) => {
+      const sign = v.net >= 0 ? '+' : '';
+      const r = (v.reason || '').slice(0, 12);
+      return `- ${code} ${v.name} ${sign}${v.net}亿 (${r})`;
+    });
+    return '【今日龙虎榜 (T+1, 全市场上榜个股)】\n' + lines.join('\n');
+  }
+
+  /**
    * 4) 货币供应量 M2/M1/M0 同比
    * aktools: macro_china_money_supply
    */
@@ -1898,6 +2018,9 @@
     formatIntlForPrompt,
     // AI 上下文快照 (Phase M Tier 1: 估值/财报/北向/M2/板块)
     getAiContextSnapshot,
-    formatAiContextForPrompt
+    formatAiContextForPrompt,
+    // Tier 2: 北向个股 + 龙虎榜全市场 (注入 LLM 短线信号)
+    getNorthboundFlow, formatNorthboundForPrompt,
+    getLhbSnapshotMap, formatLhbForPrompt
   };
 })();

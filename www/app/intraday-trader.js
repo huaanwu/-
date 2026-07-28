@@ -235,6 +235,16 @@
 
         const systemPrompt = this._buildSystemPrompt(learningText + poolText);
         const finalSystemPrompt = regimePrefix + systemPrompt;
+        // Tier 2: 单只北向 (24h 缓存; 龙虎 T+1 盘中无意义, 不注)
+        let northLine = '';
+        try {
+          const nf = await Core.Data.getNorthboundFlow(p.code).catch(() => null);
+          if (nf) {
+            const sign = nf.todayNet >= 0 ? '+' : '';
+            const sign5 = nf.net5d >= 0 ? '+' : '';
+            northLine = `\n【北向资金 T+1】今日${sign}${nf.todayNet}亿 | 5日${sign5}${nf.net5d}万股 | 占A股${nf.pct}%`;
+          }
+        } catch (e) { /* 盘中可选, 静默 */ }
         const userPrompt = `【持仓: ${p.code} ${p.name || ''}】
 成本价: ${cost} | 现价: ${currentPrice} | 浮盈: ${(plPct * 100).toFixed(2)}%
 止损价: ${stop} | 目标价: ${target}
@@ -244,7 +254,7 @@
 ${shortLessons ? `\n【短线操盘手最近教训】\n${shortLessons}` : ''}
 
 【近 5 日 K】
-${klineText}
+${klineText}${northLine}
 
 【市场状态】
 ${regimeText}
