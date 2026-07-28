@@ -11400,6 +11400,38 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
     else fail('90.7 Scoring 调用缺失', '');
   } catch (e) { fail('90.x Tier 6', e.message); }
 
+  // ===== 91.x: Tier 6+ Hot Theme 因子 =====
+  try {
+    const d91 = readFileSafe(path.join(WWW, 'core', 'data.js'));
+    const sc91 = readFileSafe(path.join(WWW, 'core', 'scoring.js'));
+
+    // 91.1: data.js 含 getSectorPerformance
+    if (/getSectorPerformance/.test(d91) && /stock_board_industry_index_em/.test(d91))
+      ok('91.1 data.js 含 getSectorPerformance (板块涨幅 fetcher)');
+    else fail('91.1 getSectorPerformance 缺失', '');
+
+    // 91.2: data.js 导出 getSectorPerformance
+    if (/getSectorPerformance,/.test(d91))
+      ok('91.2 data.js 导出 getSectorPerformance');
+    else fail('91.2 导出缺失', '');
+
+    // 91.3: scoring.js 加 hot 因子 + _hotScore
+    if (/hot: 0\.16/.test(sc91) && /_hotScore/.test(sc91))
+      ok('91.3 scoring 含 hot 因子 + _hotScore');
+    else fail('91.3 hot 因子缺失', '');
+
+    // 91.4: scoring.rank 调用传 sectorPerf
+    if (/sectorPerf/.test(sc91) && /rank\(.*sectorPerf\)/.test(sc91))
+      ok('91.4 rank() 接收 sectorPerf');
+    else fail('91.4 sectorPerf 传参缺失', '');
+
+    // 91.5: rankCandidates 拉 getSectorPerformance
+    if (/getSectorPerformance/.test(sc91))
+      ok('91.5 rankCandidates 拉板块涨幅');
+    else fail('91.5 板块涨幅拉取缺失', '');
+  } catch (e) { fail('91.x Hot Theme', e.message); }
+
+
 
 
 

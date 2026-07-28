@@ -1026,6 +1026,31 @@
   }
 
   /**
+   * 板块实时涨幅 (Tier 6 hot theme 因子)
+   * 数据源 stock_board_industry_index_em (东方财富, 申万一级实时)
+   * 缓存 15min — 板块涨幅日内变化频繁但不需要 tick 级
+   * 输出标准化: [{ name, code, pctChange, leaderStock, leaderPct }]
+   */
+  async function getSectorPerformance() {
+    const raw = await fetchWithCache(
+      'sector_perf_v1',
+      'stock_board_industry_index_em',
+      {},
+      15 * 60 * 1000
+    );
+    if (!Array.isArray(raw)) return [];
+    return raw.map(r => ({
+      name: r['板块名称'] || r.name || '',
+      code: r['板块代码'] || r.code || '',
+      pctChange: parseFloat(r['涨跌幅'] || r.pctChange || 0),
+      leaderStock: r['领涨股票'] || '',
+      leaderPct: parseFloat(r['领涨股票-涨跌幅'] || 0),
+      upCount: parseInt(r['上涨家数'] || 0, 10),
+      downCount: parseInt(r['下跌家数'] || 0, 10)
+    })).filter(s => s.name);
+  }
+
+  /**
    * 全市场公告 (stock_announcement_em), 6h 缓存
    * 输出标准化: [{code, title, date}]
    */
@@ -2128,6 +2153,7 @@
     // 短线两阶段选品资料 (阶段 1: 行业映射 + 公告 + 量比)
     getStockIndustryByCode, getStockNoticesByCode, getStockAllAnnouncements,
     getStockIndustryBatch,
+    getSectorPerformance,
     getStockVolumeAnomaly,
     // 基金
     getFundSpot, getFundHistory, getFundPortfolio,

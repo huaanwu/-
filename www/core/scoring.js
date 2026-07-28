@@ -26,12 +26,26 @@
 
   // 静态默认权重 (LLM 调不通时 fallback)
   const DEFAULT_WEIGHTS = {
-    roe: 0.22,           // ROE/ROIC 质量
-    ep: 0.20,            // EP (盈利收益率 = 1/PE)
-    turnover: 0.16,      // 换手率反转 (低换手加分)
-    north: 0.16,         // 20 日北向净流入
-    industryPenalty: 0.26 // 行业集中度惩罚 (已持仓行业扣分)
+    roe: 0.20,           // ROE/ROIC 质量
+    ep: 0.18,            // EP (盈利收益率)
+    hot: 0.16,           // 板块动量 (热点因子, Tier 6+)
+    turnover: 0.14,      // 换手率反转
+    north: 0.14,         // 20 日北向净流入
+    industryPenalty: 0.18 // 行业集中度惩罚
   };
+
+  // 板块涨幅 → 热度分 (非线性, 防过热)
+  //   < 3%   → 0      (无热点)
+  //   3-5%   → 0.05   (萌芽)
+  //   5-10%  → 0.15   (成长期, 加权)
+  //   > 10%  → 0.25   (强主题期, 但封顶)
+  function _hotScore(pctChange) {
+    const p = parseFloat(pctChange || 0);
+    if (p < 3) return 0;
+    if (p < 5) return 0.05;
+    if (p < 10) return 0.15;
+    return 0.25;
+  }
 
   // 硬过滤阈值
   const NEW_STOCK_RULE_DAYS = 5;   // 上市 < 5 日: 一字板流动性枯竭, 硬剔除
@@ -56,7 +70,7 @@
    * @param {Object} weights - 权重表 (来自 WeightAdvisor 或 fallback)
    * @returns {Array} sorted by _score desc
    */
-  function rank(stocks, finMap, industryMap, northMap, heldByInd, weights) {
+  function rank(stocks, finMap, industryMap, northMap, heldByInd, weights, sectorPerf) {
     if (!Array.isArray(stocks) || stocks.length === 0) return [];
     const w = Object.assign({}, DEFAULT_WEIGHTS, weights || {});
 
@@ -76,23 +90,33 @@
 
     const roeRanks = rankNormalize(roeVals);
     const epRanks = rankNormalize(epVals);
-    const turnoverRanks = rankNormalize(turnoverVals, true);  // true = 反转 (低换手加分)
+    const turnoverRanks = rankNormalize(turnoverVals, true);
     const northRanks = rankNormalize(northVals);
 
-    // 行业惩罚: 同一行业已有持仓市值占比 → 惩罚分 (0-1, 1 = 完全打掉)
+    // 板块涨幅 → Map (industryName → pctChange)
+    const sectorMap = new Map();
+    if (Array.isArray(sectorPerf)) {
+      for (const sec of sectorPerf) {
+        if (sec && sec.name) sectorMap.set(sec.name, parseFloat(sec.pctChange || 0));
+      }
+    }
+    const hotRanks = enriched.map(e => _hotScore(sectorMap.get(e.industry)));
+
+    // 行业惩罚
     const totalHeld = Object.values(heldByInd || {}).reduce((s, v) => s + v, 0);
     const indPenalty = (ind) => {
       if (!ind || totalHeld === 0) return 0;
       const cur = heldByInd[ind] || 0;
-      return Math.min(1, cur / (totalHeld * 0.25));  // 25% 满 cap
+      return Math.min(1, cur / (totalHeld * 0.25));
     };
 
-    // 打分
+    // 打分 (6 因子)
     return enriched
       .map((e, i) => {
         const factors = {
           roe: roeRanks[i] || 0,
           ep: epRanks[i] || 0,
+          hot: hotRanks[i] || 0,
           turnover: turnoverRanks[i] || 0,
           north: northRanks[i] || 0,
           industryPenalty: indPenalty(e.industry)
@@ -100,6 +124,7 @@
         const score =
           w.roe * factors.roe +
           w.ep * factors.ep +
+          w.hot * factors.hot +
           w.turnover * factors.turnover +
           w.north * factors.north -
           w.industryPenalty * factors.industryPenalty;
@@ -145,6 +170,14 @@
     // 3. 拉已持仓行业市值
     const heldByInd = opts.heldByInd || await _loadHeldByInd(industryMap);
 
+    // 3.5 拉板块涨幅 (Tier 6+ hot theme), 15min 缓存, 失败降级 0 分
+    let sectorPerf = [];
+    if (Core.Data.getSectorPerformance) {
+      try {
+        sectorPerf = await Core.Data.getSectorPerformance();
+      } catch (e) { console.warn('[Scoring] 板块涨幅拉取失败:', e); }
+    }
+
     // 4. 拉动态权重 (LLM 周度) — 失败 fallback 默认
     let weights = DEFAULT_WEIGHTS;
     if (Core.WeightAdvisor && typeof Core.WeightAdvisor.getWeights === 'function') {
@@ -155,7 +188,7 @@
 
     // 5. 硬过滤 + 打分
     const filtered = applyHardFilters(all, opts);
-    const ranked = rank(filtered, finMap, industryMap, northMap, heldByInd, weights);
+    const ranked = rank(filtered, finMap, industryMap, northMap, heldByInd, weights, sectorPerf);
 
     return includeFiltered ? ranked : ranked.slice(0, topN);
   }
