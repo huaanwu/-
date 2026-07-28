@@ -9198,6 +9198,52 @@ section('[59] IntradayTrader: 纯函数 (交易时段/冷却/日限/机械止盈
   }
 })();
 
+// ========== [59.b] Core.Util.fmtDate 用本地时区 (修复 UTC 跨日错判) =============
+section('[59.b] Core.Util.fmtDate: 本地时区对齐 ShortTrader._todayStr (避免 08:00 前 UTC 跨日)');
+(async () => {
+  try {
+    const utilSrc = readFileSafe(path.join(WWW, 'core', 'util.js'));
+    if (!utilSrc) throw new Error('util.js 读不到');
+    const sctx = {
+      window: {}, console
+    };
+    vm.createContext(sctx);
+    vm.runInContext(utilSrc, sctx);
+    const fmtDate = sctx.window.Core.Util.fmtDate;
+    if (typeof fmtDate !== 'function') throw new Error('Core.Util.fmtDate 未挂载');
+
+    // 59.b.1 本地上午 (中国 2026-07-28 10:00 = UTC 2026-07-28 02:00, 不跨日): 期望 "2026-07-28"
+    const d1 = new Date(2026, 6, 28, 10, 0, 0);  // 本地 10:00
+    const r1 = fmtDate(d1);
+    if (r1 === '2026-07-28') ok('59.b.1 本地上午 10:00 → "2026-07-28" (本地时区)');
+    else fail('59.b.1', `期望 "2026-07-28" 实测 "${r1}"`);
+
+    // 59.b.2 本地跨日: 中国 2026-07-28 06:00, UTC 仍是 2026-07-27 22:00
+    // 旧实现 (toISOString) → "2026-07-27" (UTC, 错!); 新实现 (本地) → "2026-07-28" (对)
+    const d2 = new Date(2026, 6, 28, 6, 0, 0);  // 本地 06:00
+    const r2 = fmtDate(d2);
+    if (r2 === '2026-07-28') ok('59.b.2 本地 06:00 跨 UTC 日界 → "2026-07-28" (本地, 修复 UTC 跨日)');
+    else fail('59.b.2', `期望 "2026-07-28" 实测 "${r2}" (旧 toISOString 会返 "2026-07-27")`);
+
+    // 59.b.3 本地跨日 -1: 中国 2026-07-28 23:00, UTC 已是 2026-07-28 15:00 (不跨日), 本地也 2026-07-28
+    const d3 = new Date(2026, 6, 28, 23, 0, 0);
+    const r3 = fmtDate(d3);
+    if (r3 === '2026-07-28') ok('59.b.3 本地 23:00 → "2026-07-28"');
+    else fail('59.b.3', `期望 "2026-07-28" 实测 "${r3}"`);
+
+    // 59.b.4 接受 ISO 字符串入参
+    if (fmtDate('2026-07-28T10:00:00') === '2026-07-28') ok('59.b.4 接受 ISO 字符串入参');
+    else fail('59.b.4');
+
+    // 59.b.5 null/undefined 返 ''
+    if (fmtDate('') === '' && fmtDate(null) === '' && fmtDate(undefined) === '') ok('59.b.5 null/undefined 返 ""');
+    else fail('59.b.5');
+
+  } catch (e) {
+    fail('59.b fmtDate', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
 // ========== [60] IntradayTrader 集成: 持仓 → 拉价 → 机械止盈止损 → LLM 决策 → 调仓落地 ==========
 section('[60] IntradayTrader 集成: 整轮 runNow + 机械止盈/止损优先 + LLM 调仓 + 日志');
 (async () => {
@@ -9717,6 +9763,54 @@ section('[54] LongTrader: _shouldRun 触发判定 + LLM 选股 + 整轮 runNow')
 
   } catch (e) {
     fail('54 LongTrader', e.message + ' / ' + (e.stack || ''));
+  }
+})();
+
+// ========== [62] H3 getIndexKLine (Commit 4): 指数 K 线拉取 (routing + cache) ==========
+section('[62] H3 getIndexKLine: 符号 routing / 缓存命中 / 失败降级 (Commit 4)');
+(async () => {
+  try {
+    const dataSrc = readFileSafe(path.join(WWW, 'core/data.js'));
+    if (!dataSrc) throw new Error('data.js 读不到');
+
+    // 62.a: 函数存在
+    if (/async function getIndexKLine\(/.test(dataSrc)) {
+      ok('62.a getIndexKLine 函数定义在 data.js');
+    } else fail('62.a', '找不到 getIndexKLine 函数');
+
+    // 62.b: exports 表里有 getIndexKLine (在 指数 K 线 段附近)
+    const afterIndex = dataSrc.split('// 指数 K 线')[1] || dataSrc;
+    if (/getIndexKLine,/.test(afterIndex)) {
+      ok('62.b getIndexKLine 暴露在 Core.Data exports');
+    } else fail('62.b', 'exports 表缺 getIndexKLine');
+
+    // 62.c: 缓存 key 格式 (idx_kline_<code>... 含 code + period)
+    if (/idx_kline_\$\{code\}/.test(dataSrc)) {
+      ok('62.c 缓存 key 含 idx_kline_<code> 前缀 (跟个股 kline_ 区分)');
+    } else fail('62.c', '缓存 key 缺 idx_kline_ 前缀');
+
+    // 62.d: 优先腾讯 (_tencentKLine 复用)
+    const inGetIndex = dataSrc.split('getIndexKLine')[1] || '';
+    if (/await _tencentKLine\(/.test(inGetIndex)) {
+      ok('62.d 优先腾讯 (复用 _tencentKLine)');
+    } else fail('62.d', '没调用 _tencentKLine');
+
+    // 62.e: 失败降级 aktools stock_zh_index_daily
+    if (/stock_zh_index_daily/.test(dataSrc)) {
+      ok('62.e 失败降级 aktools stock_zh_index_daily');
+    } else fail('62.e', '缺 stock_zh_index_daily 降级');
+
+    // 62.f: TTL 24h (跟 getStockKLine 一致)
+    if (/24 \* 60 \* 60 \* 1000/.test(inGetIndex)) {
+      ok('62.f 24h TTL');
+    } else fail('62.f', 'TTL 缺 24h');
+
+    // 62.g: 注释里强调符号须带 sh/sz 前缀 (防止误用未前缀符号)
+    if (/必须带 sh\/sz 前缀/.test(dataSrc)) {
+      ok('62.g 注释明确: 指数必须带 sh/sz 前缀');
+    } else fail('62.g', '注释缺符号前缀说明');
+  } catch (e) {
+    fail('62 H3 getIndexKLine', e.message + ' / ' + (e.stack || ''));
   }
 })();
 

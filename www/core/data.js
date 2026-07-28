@@ -712,6 +712,39 @@
   }
 
   /**
+   * 指数 K 线 (H3: 多指数 regime 状态机, 取 HS300 / CSI1000 / CSI2000 周线)
+   * 数据源: 优先腾讯 (复用 _tencentKLine, 符号 sh000300 / sz399303 等), 失败降级 aktools stock_zh_index_daily
+   * 缓存: 24h (指数 K 线每日更新 ~16:00, 24h TTL 安全)
+   * @param {string} code - 必须带 sh/sz 前缀 (e.g. sh000300 / sh000852 / sz399303)
+   * @param {string} [period='daily'] - daily/weekly/monthly
+   * @param {string} [start] - YYYYMMDD (可省)
+   * @param {string} [end] - YYYYMMDD (可省)
+   * @param {string} [adjust='qfq'] - 指数通常无复权, 传空串或忽略
+   * @returns {Promise<Array>} 数组元素: {日期, 开盘, 收盘, 最高, 最低, 成交量, 涨跌幅, ...}
+   */
+  async function getIndexKLine(code, period = 'daily', start, end, adjust = 'qfq') {
+    const cacheKey = `idx_kline_${code}_${period}_${start || ''}_${end || ''}_${adjust}`;
+    const cached = await Core.Storage.cacheGet(cacheKey);
+    if (cached) return cached;
+
+    // 1) 优先腾讯 (复用 _tencentKLine; 指数符号 sh/sz + 6 位数字匹配 _tencentSymbol)
+    try {
+      const data = await _tencentKLine(code, period, start, end, 240, adjust);
+      await Core.Storage.cacheSet(cacheKey, data, 24 * 60 * 60 * 1000);
+      return data;
+    } catch (e) {
+      console.warn('[Data] 腾讯指数 K 线失败, 降级 aktools:', e.message);
+    }
+    // 2) 降级 aktools
+    return await fetchWithCache(
+      cacheKey,
+      'stock_zh_index_daily',
+      { symbol: code, period, start_date: start, end_date: end },
+      24 * 60 * 60 * 1000
+    );
+  }
+
+  /**
    * 个股财务摘要
    * 数据源: stock_zh_a_indicator 或 stock_financial_abstract
    */
@@ -1855,6 +1888,8 @@
     getFundSpot, getFundHistory, getFundPortfolio,
     // 指数
     getIndexSpot, getIndexSpotTencent,
+    // 指数 K 线 (H3 多指数 regime)
+    getIndexKLine,
     // 黄金 (Phase J)
     getGoldAu9999,
     formatGoldForPrompt,
