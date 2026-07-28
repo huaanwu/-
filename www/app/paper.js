@@ -1536,6 +1536,12 @@
       if (sleeve === 'short' && window.ShortTrader && ShortTrader.renderLearningCurve) {
         ShortTrader.renderLearningCurve().catch(e => console.warn('[Paper] ShortTrader 学习曲线渲染失败:', e));
       }
+      // L1.6: 长线业绩归因卡片 (挂 #longTraderTrackSection, 仅 long tab 显示)
+      const ltSection = document.getElementById('longTraderTrackSection');
+      if (ltSection) ltSection.style.display = sleeve === 'long' ? '' : 'none';
+      if (sleeve === 'long' && window.LongTrader && LongTrader.renderTrackRecord) {
+        LongTrader.renderTrackRecord().catch(e => console.warn('[Paper] LongTrader 业绩归因渲染失败:', e));
+      }
 
       // T3: 页面展示时异步触发每日结算 (当日已结算自动跳过; 有动作则重渲染刷新数据)
       this.settleCondOrders()

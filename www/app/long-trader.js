@@ -419,8 +419,82 @@
       return {
         total: list.length,
         correctRate: +(totalScore / list.length).toFixed(2),
-        byReason: byReason
+        byReason
       };
+    },
+
+    /**
+     * Phase L1.6: 渲染长线业绩归因卡片 (挂载 #longTraderTrackSection, 模拟盘长线 tab)
+     * - 拉 journal 表: long + auto + 有 verifyOutcome
+     * - 调 _buildLongTrackRecord 聚合
+     * - 样本 < 3 → 显示 "积累中" 提示
+     * - 全程 escapeHtml, 错误吞 (不阻塞 renderPage)
+     */
+    async renderTrackRecord() {
+      const el = document.getElementById('longTraderTrackSection');
+      if (!el) return;
+      try {
+        const all = (await Core.Storage.all('journals')) || [];
+        const trades = all
+          .filter(j => j && (j.sleeve || '') === 'long' && j.auto === true
+                  && j.verifyOutcome && j.pnlPct != null)
+          .map(j => ({
+            code: j.code,
+            reason: j.assumption || '',
+            outcome: j.verifyOutcome,
+            pnlPct: j.pnlPct,
+            verifiedAt: j.verifiedAt || 0
+          }));
+        const minSamples = Core.Constants.LONG_VERIFY_MIN_SAMPLES;
+        const rec = this._buildLongTrackRecord(trades);
+        if (!rec) {
+          const scanned = trades.length;
+          const remain = Math.max(0, minSamples - scanned);
+          el.style.display = '';
+          el.innerHTML = '<div style="font-weight:600;margin-bottom:6px;">📊 长线业绩归因</div>' +
+            '<div style="font-size:12px;color:var(--text-muted);">已 verify ' + scanned +
+            ' 笔, 积累中 (还差 ' + remain + ' 笔达到最低样本 ' + minSamples + ')</div>';
+          return;
+        }
+        // 累计 verify 笔数 + 综合胜率
+        const pctClass = (window.Core && Core.Util && Core.Util.pctClass)
+          || ((x) => x > 0 ? 'var(--up)' : (x < 0 ? 'var(--down)' : 'var(--text-muted)'));
+        const esc = (s) => Core.Util.escapeHtml(String(s));
+        const rows = rec.byReason.map(r =>
+          '<tr>' +
+            '<td style="padding:4px 8px;">' + esc(r.category) + '</td>' +
+            '<td style="padding:4px 8px;text-align:right;">' + r.total + '</td>' +
+            '<td style="padding:4px 8px;text-align:right;color:' + pctClass(r.correctRate - 0.5) + ';">' +
+              (r.correctRate * 100).toFixed(0) + '%</td>' +
+            '<td style="padding:4px 8px;text-align:right;color:' + pctClass(r.avgPnl / 100) + ';">' +
+              (r.avgPnl >= 0 ? '+' : '') + r.avgPnl.toFixed(2) + '%</td>' +
+            '<td style="padding:4px 8px;color:var(--text-muted);font-size:11px;">' +
+              esc(r.topReason || '-') + '</td>' +
+          '</tr>'
+        ).join('');
+        el.style.display = '';
+        el.innerHTML =
+          '<div style="font-weight:600;margin-bottom:8px;">📊 长线业绩归因</div>' +
+          '<div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">' +
+            '累计 verify <b>' + rec.total + '</b> 笔, 综合胜率 ' +
+            '<b style="color:' + pctClass(rec.correctRate - 0.5) + ';">' +
+            (rec.correctRate * 100).toFixed(0) + '%</b>' +
+            ' (correct=1 / partial=0.5 / wrong=0)' +
+          '</div>' +
+          '<table style="width:100%;font-size:12px;border-collapse:collapse;">' +
+            '<thead><tr style="border-bottom:1px solid var(--border-color, #333);">' +
+              '<th style="padding:4px 8px;text-align:left;">类型</th>' +
+              '<th style="padding:4px 8px;text-align:right;">笔数</th>' +
+              '<th style="padding:4px 8px;text-align:right;">胜率</th>' +
+              '<th style="padding:4px 8px;text-align:right;">平均涨跌</th>' +
+              '<th style="padding:4px 8px;text-align:left;">主因</th>' +
+            '</tr></thead>' +
+            '<tbody>' + rows + '</tbody>' +
+          '</table>';
+      } catch (e) {
+        console.warn('[LongTrader] renderTrackRecord 失败:', e);
+        el.style.display = 'none';
+      }
     }
   };
 
