@@ -253,7 +253,8 @@
       const f = opts.fetchers || {};
       const get = (name, path) => {
         if (typeof f[name] === 'function') return Promise.resolve().then(() => f[name]());
-        if (typeof Data.fetch === 'function') return Data.fetch(path, {});
+        // Core.Data.fetch 签名: fetchWithCache(cacheKey, path, params, ttl)
+        if (typeof Data.fetch === 'function') return Data.fetch(path, path, {});
         return Promise.resolve([]);
       };
       // 4 类数据并行拉, 失败单类降级 (返空数组)

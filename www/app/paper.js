@@ -1382,6 +1382,19 @@
       }
     },
 
+    /**
+     * v0.2.6: cond order 状态统计 (供 paper.js _renderCondOrders + AI 状态行复用)
+     * @returns {Promise<{pending: number, filled: number, expired: number, cancelled: number, total: number}>}
+     */
+    async getCondStats() {
+      const all = (await Core.Storage.kvGet('paper_cond_orders')) || [];
+      const stats = { pending: 0, filled: 0, expired: 0, cancelled: 0, total: all.length };
+      for (const o of all) {
+        if (o && o.status && stats[o.status] !== undefined) stats[o.status]++;
+      }
+      return stats;
+    },
+
     /** 条件单区块渲染: pending 单 + 近期已结算单 (全 escapeHtml) */
     async _renderCondOrders() {
       const el = document.getElementById('paperCondOrders');
@@ -1389,6 +1402,18 @@
       const all = await this.listCondOrders();
       const pending = all.filter(o => o.status === 'pending');
       const settled = all.filter(o => o.status !== 'pending').slice(-10).reverse();
+
+      // v0.2.6: 顶部统计行 — 让用户看到 AI 实际写了几条 cond, 触发/到期/等待各多少
+      const stats = await this.getCondStats();
+      const statsHtml = `
+        <div style="display:flex;gap:12px;flex-wrap:wrap;padding:8px 12px;background:var(--bg-elev);border-radius:6px;margin-bottom:8px;font-size:12px;">
+          <span>📊 <b>共 ${stats.total}</b> 条</span>
+          <span style="color:var(--up);">✅ 触发 ${stats.filled}</span>
+          <span style="color:var(--text-muted);">⌛ 到期 ${stats.expired}</span>
+          <span style="color:var(--warn, #d29922);">🚫 取消 ${stats.cancelled}</span>
+          <span style="color:var(--accent, #58a6ff);">⏳ 等待 ${stats.pending}</span>
+        </div>
+      `;
 
       const dirLabel = d => d === 'below' ? '回调买入' : '突破买入';
       const statusBadge = s => ({
@@ -1431,6 +1456,7 @@
 
       el.innerHTML = `
         <div class="card-title">📋 条件单 (日线级, 每日收盘后结算)</div>
+        ${statsHtml}
         ${pendingHtml}
         ${settledHtml}
       `;
@@ -1516,6 +1542,137 @@
       this.renderPage();
     },
 
+    /**
+     * v0.2.5: 渲染 AI 状态行到 paperSleeveNote 旁边的 paperAiStatusHint
+     * 不强制跑 AI, 只读 _lastLongRun / _todayShortPlan 状态, 让用户知道:
+     *   - AI 是不是在跑 (running)
+     *   - 上次跑什么时候 (lastRun)
+     *   - 触发条件是否满足 (下次预计时间)
+     */
+    async _renderAiStatusNote(sleeve) {
+      const hintEl = document.getElementById('paperAiStatusHint');
+      if (!hintEl) return;
+      let text = '';
+      try {
+        if (sleeve === 'long' && window.LongTrader && LongTrader.getStatus) {
+          const st = await LongTrader.getStatus();
+          if (st.running) {
+            text = '🤖 AI 长线正在跑...';
+          } else if (st.lastRunTs) {
+            const ago = this._fmtAgo(Date.now() - st.lastRunTs);
+            const next = st.nextRunAt ? new Date(st.nextRunAt) : null;
+            const nextStr = next ? next.toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', weekday: 'short', hour: '2-digit', minute: '2-digit' }) : '?';
+            text = `✅ 上次跑 ${ago}前 (${st.lastRunDate}), 下次预计 ${nextStr} (周一+${Core.Constants.LONG_TRADER_RERUN_DAYS}天冷却)`;
+          } else {
+            text = '⏳ 长线 AI 尚未跑过, 下一个周一 09:30 触发';
+          }
+        } else if (sleeve === 'short' && window.ShortTrader && ShortTrader.getStatus) {
+          const st = await ShortTrader.getStatus();
+          // v0.2.6: 拉 cond order 统计, 拼到文案里 — 让用户看到 AI 的"动作痕迹"
+          let condPart = '';
+          try {
+            const cs = await this.getCondStats();
+            if (cs.total > 0) {
+              condPart = ` | 条件单 ${cs.total} 条 (触发 ${cs.filled} / 到期 ${cs.expired} / 等待 ${cs.pending})`;
+            } else {
+              condPart = ' | 暂无条件单';
+            }
+          } catch (_) { /* 统计失败不影响 plan 状态 */ }
+          // v0.2.6+: 拉 plan.plans 长度, 让用户看到 LLM 选了几只 (空仓也是合法决策)
+          let planPart = '';
+          try {
+            const plan = await Core.Storage.kvGet('paper_short_plan');
+            const n = (plan && plan.date === ShortTrader._todayStr(new Date()) && Array.isArray(plan.plans)) ? plan.plans.length : null;
+            if (n === 0) planPart = ' [LLM 今日选 0 只, 观望]';
+            else if (n > 0) planPart = ` [LLM 选 ${n} 只]`;
+          } catch (_) {}
+          if (st.running) {
+            text = '🤖 AI 短线正在跑...' + condPart;
+          } else if (st.hasPlan) {
+            const ago = st.planTs ? this._fmtAgo(Date.now() - st.planTs) : '?';
+            text = `✅ 今日计划已生成 (${ago}前)${planPart}${condPart}, [📋 重新生成今日计划] 可强制重跑`;
+          } else if (st.lastFailure) {
+            text = `⚠️ 上次生成失败: ${st.lastFailure.error || '?'}${condPart}, 可点 [📋 重新生成今日计划] 重试`;
+          } else {
+            const today = ShortTrader._todayStr ? ShortTrader._todayStr(new Date()) : '';
+            text = `⏳ 短线今日 (${today}) 计划待生成${planPart}${condPart}, [📋 手动跑] 或等下次启动自动跑`;
+          }
+        }
+      } catch (e) {
+        console.warn('[Paper] AI 状态读取失败:', e);
+        text = '⚠️ AI 状态读取失败 (AI 模块未就绪?)';
+      }
+      hintEl.textContent = text;
+      hintEl.style.color = 'var(--text-muted)';
+      hintEl.style.fontSize = '11px';
+      hintEl.style.marginTop = '4px';
+    },
+
+    /** ms → "1小时23分" / "2天5小时" / "12秒" */
+    _fmtAgo(ms) {
+      if (ms < 60_000) return Math.floor(ms / 1000) + '秒';
+      if (ms < 3_600_000) return Math.floor(ms / 60_000) + '分';
+      if (ms < 86_400_000) {
+        const h = Math.floor(ms / 3_600_000);
+        const m = Math.floor((ms % 3_600_000) / 60_000);
+        return h + '小时' + (m ? m + '分' : '');
+      }
+      const d = Math.floor(ms / 86_400_000);
+      const h = Math.floor((ms % 86_400_000) / 3_600_000);
+      return d + '天' + (h ? h + '小时' : '');
+    },
+
+    /**
+     * v0.2.4: 手动跑 AI 按钮 — 长线/短线 tab 各一个, 放对应卡片前
+     * v0.2.5: 进入任何 sleeve 前先清两个旧 row, 避免切换时残留上一个 tab 的按钮
+     *         (用户报: 短线 tab 看到"手动跑长线 AI 选股"按钮 — 实际是 long tab 的按钮残留)
+     */
+    _renderManualTraderButtons(sleeve) {
+      // 全局清理: 先把两个 row 都清掉, 防止 sleeve 切换时旧按钮残留
+      const oldLong = document.getElementById('manualLongBtnRow');
+      if (oldLong) oldLong.remove();
+      const oldShort = document.getElementById('manualShortBtnRow');
+      if (oldShort) oldShort.remove();
+
+      // 长线按钮 — 放 longTraderTrackSection 前
+      if (sleeve === 'long') {
+        const anchor = document.getElementById('longTraderTrackSection');
+        if (anchor) {
+          // 移除旧按钮 (避免重复渲染)
+          const old = document.getElementById('manualLongBtnRow');
+          if (old) old.remove();
+          const row = document.createElement('div');
+          row.id = 'manualLongBtnRow';
+          row.className = 'data-card';
+          row.style.cssText = 'margin-top:8px;padding:8px 12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;';
+          row.innerHTML = `
+            <button class="btn btn-sm btn-primary" onclick="manualLongTrader()">🔍 手动跑长线 AI 选股</button>
+            <span style="font-size:11px;color:var(--text-muted);">绕过周一 / 7 天冷却, 强制重跑 (可能 30-60s)</span>
+            <div id="manualLongResult" style="flex-basis:100%;font-size:12px;color:var(--text-muted);margin-top:4px;"></div>
+          `;
+          anchor.parentNode.insertBefore(row, anchor);
+        }
+      }
+      // 短线按钮 — 放 shortTraderPlan 前
+      if (sleeve === 'short') {
+        const anchor = document.getElementById('shortTraderPlan');
+        if (anchor) {
+          const old = document.getElementById('manualShortBtnRow');
+          if (old) old.remove();
+          const row = document.createElement('div');
+          row.id = 'manualShortBtnRow';
+          row.className = 'data-card';
+          row.style.cssText = 'margin-top:8px;padding:8px 12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;';
+          row.innerHTML = `
+            <button class="btn btn-sm btn-primary" onclick="manualShortPlan()">📋 重新生成今日计划</button>
+            <span style="font-size:11px;color:var(--text-muted);">忽略今日已生成记录, 强制重跑 (可能 30-60s)</span>
+            <div id="manualShortResult" style="flex-basis:100%;font-size:12px;color:var(--text-muted);margin-top:4px;"></div>
+          `;
+          anchor.parentNode.insertBefore(row, anchor);
+        }
+      }
+    },
+
     /** 页面渲染 (挂 window._onShow_pagePaper) */
     async renderPage() {
       const summaryEl = document.getElementById('paperSummary');
@@ -1531,9 +1688,14 @@
       if (tabShort) tabShort.classList.toggle('btn-primary', sleeve === 'short');
       const noteEl = document.getElementById('paperSleeveNote');
       if (noteEl) {
-        noteEl.textContent = sleeve === 'short'
-          ? '⚡ AI 短线: ShortTrader 今日计划 (T2) + 条件单日线结算 (T3) + 学习曲线 (T4)'
-          : '';
+        // v0.2.5: 长线/短线 tab 都显示 AI 状态行, 让用户知道 AI 是不是在跑
+        if (sleeve === 'short') {
+          noteEl.textContent = '⚡ AI 短线: ShortTrader 今日计划 (T2) + 条件单日线结算 (T3) + 学习曲线 (T4)';
+          this._renderAiStatusNote('short').catch(e => console.warn('[Paper] 短线 AI 状态渲染失败:', e));
+        } else {
+          noteEl.textContent = '🔍 AI 长线: LongTrader 周一自动选股 (L) + 业绩归因 (L1.6)';
+          this._renderAiStatusNote('long').catch(e => console.warn('[Paper] 长线 AI 状态渲染失败:', e));
+        }
       }
       // T3: 条件单区块只在短线 tab 显示
       const condSection = document.getElementById('paperCondSection');
@@ -1570,6 +1732,9 @@
       if (sleeve === 'long' && window.LongTrader && LongTrader.renderTrackRecord) {
         LongTrader.renderTrackRecord().catch(e => console.warn('[Paper] LongTrader 业绩归因渲染失败:', e));
       }
+
+      // v0.2.4: 手动跑 AI 按钮 (长线/短线 tab 各一个, 放对应卡片前)
+      this._renderManualTraderButtons(sleeve);
 
       // T3: 页面展示时异步触发每日结算 (当日已结算自动跳过; 有动作则重渲染刷新数据)
       this.settleCondOrders()

@@ -72,13 +72,306 @@
   const _POOL_TARGET = 5;          // 阶段 1 排序后截断目标 (默认)
   const _STAGE1_WEIGHTS = { trend5pct: 0.4, range20: 0.3, drift20: 0.2, industryRank: 0.1 };
   const RECENT_VERIFIED_UI = 10;                                               // UI 最近已验证交易条数
+  // ---- v0.2.7 AI 调度器常量 ----
+  const DECISION_KEY = 'paper_short_ai_decisions';   // kv: 最近 N 条调度决策 trace
+  const DECISION_LOG_LIMIT = 30;                     // trace 上限
+  const DECIDE_TIMEOUT_MS = 8000;                    // 决策调用超时 (短, 失败快速降级)
+  const DECIDE_MODEL = 'qwen-turbo';                 // 便宜模型 (仅 provider=qwen 时生效)
+  const DECIDE_ACTIONS = ['plan', 'review', 'report', 'skip'];
+  // 物理时段 → 降级 action (AI 挂了按 v0.2.6d 原行为跑)
+  const PHASE_FALLBACK = { morning: 'plan', midday: 'review', close: 'report' };
 
   const ShortTrader = {
+
+    /**
+     * v0.2.6c: 9:00 早盘前自动跑今日 plan
+     * v0.2.6d: 升级成"日内三阶段"调度 — 早 9:00 (LLM) + 中 13:00 (机械 review) + 收 15:30 (机械日报)
+     * 修"AI 跑过没动作" — 之前只在 app.js init 调一次, 早盘前没保证.
+     * now maybeGeneratePlan (LLM) 只在早盘跑, 中盘/收盘走纯函数 _reviewPlan / _endOfDayReport
+     * v0.2.7: 定时器只负责"叫醒", 跑什么由 _aiDecideNextAction() (便宜模型) 决定;
+     *         AI 挂了按 PHASE_FALLBACK 走 v0.2.6d 原行为 (morning→plan / midday→review / close→report)
+     */
+    _scheduleIntradayPhases() {
+      if (this._phaseTimers) this._phaseTimers.forEach(t => clearTimeout(t));
+      this._phaseTimers = [];
+      const phases = [
+        { name: 'morning', hour: 9, minute: 0, fn: () => this._runPhase('morning') },
+        { name: 'midday',  hour: 13, minute: 0, fn: () => this._runPhase('midday') },
+        { name: 'close',   hour: 15, minute: 30, fn: () => this._runPhase('close') }
+      ];
+      for (const ph of phases) {
+        const next = this._nextPhaseTime(ph.hour, ph.minute);
+        const delay = Math.max(0, next.getTime() - Date.now());
+        console.log(`[ShortTrader] ${ph.name} (${ph.hour}:${String(ph.minute).padStart(2,'0')}) 下次: ${next.toLocaleString('zh-CN')} (${Math.round(delay/60000)} 分钟后)`);
+        const t = setTimeout(() => {
+          // v0.2.7 修: phase fn 抛错时 (同步 throw / promise reject) 必须保证 chain 继续,
+          // 否则当日剩余 2 个时段永久失踪, 必须重启 app 才能恢复.
+          const run = async () => {
+            try {
+              await ph.fn();
+            } catch (e) {
+              console.warn(`[ShortTrader] ${ph.name} fn 失败:`, e && e.message || e);
+            } finally {
+              this._phaseTimers = (this._phaseTimers || []).filter(x => x !== t);
+              this._scheduleIntradayPhases();
+            }
+          };
+          run();
+        }, delay);
+        this._phaseTimers.push(t);
+      }
+    },
+
+    /** 纯函数: 下一个 phaseTime (本地时间). 已过今天该时间 → 跳到下个工作日 */
+    _nextPhaseTime(hour, minute, now = new Date()) {
+      const d = new Date(now);
+      d.setHours(hour, minute, 0, 0);
+      if (d.getTime() <= now.getTime()) d.setDate(d.getDate() + 1);
+      while (d.getDay() === 0 || d.getDay() === 6) d.setDate(d.getDate() + 1);
+      return d;
+    },
+
+    stopIntradayPhases() {
+      if (this._phaseTimers) {
+        this._phaseTimers.forEach(t => clearTimeout(t));
+        this._phaseTimers = [];
+      }
+    },
+
+    /**
+     * v0.2.7: 定时器叫醒后的统一分流 — 先问 AI 跑什么, 再执行
+     * @param {'morning'|'midday'|'close'} phase 物理时段 (仅用于降级)
+     * @param {{ now?: Date, deps?: { callLLM?: function } }} [opts] 测试可注入 mock
+     */
+    async _runPhase(phase, opts = {}) {
+      const now = opts.now || new Date();
+      let decision;
+      try {
+        decision = await this._aiDecideNextAction({ phase, now, deps: opts.deps });
+      } catch (e) {
+        console.warn('[ShortTrader] AI 调度决策异常, 走物理时段降级:', e);
+        decision = { action: PHASE_FALLBACK[phase] || 'skip', reason: '决策异常降级', source: 'fallback' };
+      }
+      await this._logDecision({ phase, now, decision });
+      const act = String(decision.action || '').toLowerCase();   // v0.2.7: 归一化大小写, 防 LLM 大小写幻觉
+      console.log(`[ShortTrader] ${phase} 调度决策: ${act} (${decision.source}) — ${decision.reason}`);
+      try {
+        if (act === 'plan') return await this.maybeGeneratePlan(now);
+        if (act === 'review') return await this._reviewPlan();
+        if (act === 'report') return await this._endOfDayReport();
+        if (act === 'skip') return { skipped: true, action: 'skip', reason: 'ai 决定不操作' };
+        // v0.2.7: 非枚举显式 warn, 别再静默走 skip (回溯调试会被误导)
+        console.warn(`[ShortTrader] ${phase} 收到未知 action '${act}', 跳过本次`);
+        return { skipped: true, action: act, reason: 'unknown-action' };
+      } catch (e) {
+        console.warn(`[ShortTrader] ${phase} 执行 ${act} 失败:`, e);
+        return { error: String((e && e.message) || e), action: act };
+      }
+    },
+
+    /**
+     * v0.2.7: AI 调度器 — 用便宜模型判断当前该跑 plan / review / report / skip
+     * 失败 (超时/schema 不合法/action 非枚举) → 返回 PHASE_FALLBACK[phase], source='fallback'
+     * @returns {Promise<{action: string, reason: string, source: 'ai'|'fallback'}>}
+     */
+    async _aiDecideNextAction(o = {}) {
+      const phase = o.phase || 'morning';
+      const now = o.now || new Date();
+      const fallback = (reason) => ({ action: PHASE_FALLBACK[phase] || 'skip', reason, source: 'fallback' });
+      let prompt;
+      try {
+        prompt = await this._buildDecisionPrompt(now);
+      } catch (e) {
+        console.warn('[ShortTrader] 决策 prompt 组装失败:', e);
+        return fallback('prompt 组装失败');
+      }
+      const callLLM = (o.deps && o.deps.callLLM)
+        || (async ({ prompt: pr }) => Core.AI.callWithTimeout({
+          prompt: pr, model: DECIDE_MODEL, maxTokens: 200, temperature: 0.2,
+          timeout: DECIDE_TIMEOUT_MS, page: 'short-trader', purpose: 'short-schedule-decide'
+        }));
+      let text;
+      try { text = await callLLM({ prompt }); }
+      catch (e) {
+        console.warn('[ShortTrader] AI 调度调用失败, 降级:', (e && e.message) || e);
+        return fallback('LLM 调用失败: ' + String((e && e.message) || e).slice(0, 40));
+      }
+      const parsed = this._parseDecision(text);
+      if (!parsed) {
+        console.warn('[ShortTrader] AI 调度输出不合 schema, 降级. 原文:', String(text || '').slice(0, 120));
+        return fallback('输出不合 schema');
+      }
+      return { action: parsed.action, reason: parsed.reason, source: 'ai' };
+    },
+
+    /**
+     * v0.2.7: 决策 prompt (短, 只喂调度需要的状态; 读 kv 失败按 null 走, 不抛)
+     * @returns {Promise<string>}
+     */
+    async _buildDecisionPrompt(now = new Date()) {
+      const today = this._todayStr(now);
+      const plan = await Core.Storage.kvGet(PLAN_KEY).catch(e => { console.warn('[ShortTrader] 决策读 plan 失败:', e); return null; });
+      const orders = (await Core.Storage.kvGet('paper_cond_orders').catch(e => { console.warn('[ShortTrader] 决策读 cond 失败:', e); return null; })) || [];
+      const ys = await this._getYesterdaySummary().catch(e => { console.warn('[ShortTrader] 决策读昨日日报失败:', e); return null; });
+      const isToday = !!(plan && plan.date === today);
+      const cnt = s => orders.filter(o => o && o.status === s).length;
+      const hh = String(now.getHours()).padStart(2, '0');
+      const mm = String(now.getMinutes()).padStart(2, '0');
+      const planLine = isToday
+        ? `今日 plan 已生成 ${Array.isArray(plan.plans) ? plan.plans.length : 0} 只 (丢弃 ${Array.isArray(plan.dropped) ? plan.dropped.length : 0} 只)`
+        : '今日 plan 未生成';
+      const ysLine = ys ? `昨日 ${ys.date}: 计划 ${ys.plans} 成交 ${ys.filled} 到期 ${ys.expired} 盈亏 ${ys.realizedPL}` : '无昨日日报';
+      const mktLine = (window.Core && Core.State && Core.State.get && Core.State.get().marketOpen) ? '盘中' : '非交易时段';
+      return [
+        `你是短线调度器. 当前 ${hh}:${mm}, ${mktLine}, ${today}.`,
+        planLine + '.',
+        `条件单 pending ${cnt('pending')} / filled ${cnt('filled')} / expired ${cnt('expired')}.`,
+        ysLine + '.',
+        '决定跑什么 action: plan(生成今日计划) / review(中盘检查计划偏离) / report(收盘日报) / skip(什么都不做).',
+        '严格按两行输出, 30 字内理由:',
+        'action: <plan|review|report|skip>',
+        'reason: <理由>'
+      ].join('\n');
+    },
+
+    /**
+     * v0.2.7 纯函数: 解析调度决策输出
+     * action 必须命中枚举, reason 缺失给默认; 不合法返回 null (调用方降级)
+     * @returns {{action: string, reason: string}|null}
+     */
+    _parseDecision(text) {
+      if (!text || typeof text !== 'string') return null;
+      // 引号统一成空格, 这样 `action: plan` / `action=plan` / `"action": "plan"` (JSON) 一套 regex 全吃
+      const t = text.replace(/["'`]/g, ' ');
+      const am = t.match(/action\s*[:=]\s*(plan|review|report|skip)\b/i);
+      if (!am) return null;
+      const action = am[1].toLowerCase();
+      if (!DECIDE_ACTIONS.includes(action)) return null;
+      const rm = t.match(/reason\s*[:=]\s*([^\n]+)/i);
+      const reason = rm ? rm[1].trim().replace(/[\s,，。;；}\]]+$/, '').slice(0, 60) : '(无理由)';
+      return { action, reason: reason || '(无理由)' };
+    },
+
+    /** v0.2.7: 决策 trace 落 kv (最近 DECISION_LOG_LIMIT 条滚动), 失败不影响主流程 */
+    async _logDecision(o = {}) {
+      try {
+        const hist = (await Core.Storage.kvGet(DECISION_KEY)) || [];
+        const d = o.decision || {};
+        const entry = {
+          date: this._todayStr(o.now || new Date()),
+          ts: Date.now(),
+          phase: o.phase || '?',
+          action: d.action || 'skip',
+          reason: d.reason || '',
+          source: d.source || 'fallback'
+        };
+        await Core.Storage.kvSet(DECISION_KEY, [...hist, entry].slice(-DECISION_LOG_LIMIT));
+      } catch (e) {
+        console.warn('[ShortTrader] 决策 trace 落库失败:', e);
+      }
+    },
+
+    /**
+     * v0.2.6d: 中盘机械 review (13:00)
+     * 检查今日 plan 的 cond order 触发状态 + 偏离度 (实时价 vs 触发价)
+     * 不调 LLM, 落 kv `paper_short_midday_review`, 下午用户打开 pagePaper 看到
+     * @returns {Promise<{reviewed: number, triggered: number, expired: number, pending: number, alerts: Array}>}
+     */
+    async _reviewPlan() {
+      const plan = await Core.Storage.kvGet(PLAN_KEY).catch(() => null);
+      if (!plan || !Array.isArray(plan.plans)) return { reviewed: 0, triggered: 0, expired: 0, pending: 0, alerts: [] };
+      const orders = (await Core.Storage.kvGet('paper_cond_orders')) || [];
+      const reviewed = plan.plans.length;
+      const triggered = orders.filter(o => o.status === 'filled').length;
+      const expired = orders.filter(o => o.status === 'expired').length;
+      const pending = orders.filter(o => o.status === 'pending').length;
+      const alerts = [];
+      // 每个 pending cond: 拉实时价, 算偏离度, > 3% 提示"建议重评估"
+      for (const p of plan.plans) {
+        if (!p.condOrderId) continue;
+        const order = orders.find(o => o.id === p.condOrderId);
+        if (!order || order.status !== 'pending') continue;
+        try {
+          const spot = await Core.Data.getStockSpot([p.code]);
+          const it = (spot || []).find(s => s.代码 === p.code);
+          if (!it) continue;
+          const cur = parseFloat(it.最新价);
+          const trig = parseFloat(order.triggerPrice);
+          if (!cur || !trig) continue;
+          const dev = (cur - trig) / trig;
+          if (Math.abs(dev) > 0.03) {
+            alerts.push({ code: p.code, name: p.name, cur, trig, devPct: +(dev * 100).toFixed(2), msg: dev > 0 ? '当前价已高于触发价, 突破单可能错过' : '当前价远低于触发价, 回调单可能太远' });
+          }
+        } catch (e) { /* 拉不到实时价跳过 */ }
+      }
+      const summary = { date: this._todayStr(new Date()), reviewed, triggered, expired, pending, alerts, ts: Date.now() };
+      await Core.Storage.kvSet('paper_short_midday_review', summary);
+      console.log(`[ShortTrader] 中盘 review: ${reviewed} 计划, ${triggered} 触发, ${expired} 到期, ${pending} 等待, ${alerts.length} 偏离提示`);
+      return summary;
+    },
+
+    /**
+     * v0.2.6d: 收盘机械日报 (15:30)
+     * 统计今日: 成交 / 未成交 / 盈亏 / 教训
+     * 落 kv `paper_daily_summary`, 喂明早 prompt 作为 context
+     * @returns {Promise<Object>}
+     */
+    async _endOfDayReport() {
+      const today = this._todayStr(new Date());
+      const plan = await Core.Storage.kvGet(PLAN_KEY).catch(() => null);
+      const orders = (await Core.Storage.kvGet('paper_cond_orders')) || [];
+      // 只看今天的 (按 createdAt 过滤)
+      const todayOrders = orders.filter(o => o && o.createdDate === today);
+      const filled = todayOrders.filter(o => o.status === 'filled');
+      const expired = todayOrders.filter(o => o.status === 'expired');
+      const cancelled = todayOrders.filter(o => o.status === 'cancelled');
+      const pending = todayOrders.filter(o => o.status === 'pending');
+      // 算今日已实现盈亏 (从 transactions 表拿 sleeve='short' 的今日 sell)
+      const txs = (await Core.Storage.all('transactions')) || [];
+      const todayMs = new Date(today + 'T00:00:00').getTime();
+      const tomorrowMs = todayMs + 86400000;
+      const todaySells = txs.filter(t => t && t.sleeve === 'short' && t.type === 'sell' && t.createdAt >= todayMs && t.createdAt < tomorrowMs);
+      const realizedPL = todaySells.reduce((s, t) => s + (parseFloat(t.realizedPL) || 0), 0);
+      // 教训摘录 (从 shortPlanLog 拿今天 stage='discipline' 或 'schema' 的)
+      const planLog = (await Core.Storage.kvGet(PLAN_LOG_KEY)) || [];
+      const todayLog = planLog.filter(e => e && e.date === today);
+      const summary = {
+        date: today,
+        plans: plan?.plans?.length || 0,
+        llmDropped: plan?.dropped?.length || 0,
+        filled: filled.length,
+        expired: expired.length,
+        cancelled: cancelled.length,
+        pending: pending.length,
+        realizedPL: +realizedPL.toFixed(2),
+        disciplineNotes: todayLog.map(e => e.reason).filter(Boolean).slice(0, 3),
+        ts: Date.now()
+      };
+      // 累加历史 (保留最近 30 天, 给明早 prompt 用)
+      const hist = (await Core.Storage.kvGet('paper_daily_history')) || [];
+      const newHist = [...hist.filter(h => h && h.date !== today), summary].slice(-30);
+      await Core.Storage.kvSet('paper_daily_history', newHist);
+      // 当天 summary 也存一份
+      await Core.Storage.kvSet('paper_daily_summary', summary);
+      console.log(`[ShortTrader] 收盘日报: ${summary.plans} 计划, ${summary.filled} 成交, ${summary.expired} 到期, ${summary.pending} 等待, 盈亏 ${summary.realizedPL}`);
+      return summary;
+    },
+
+    /** 拿昨天日报给明早 prompt 用 */
+    async _getYesterdaySummary() {
+      const hist = (await Core.Storage.kvGet('paper_daily_history')) || [];
+      if (!hist.length) return null;
+      const today = this._todayStr(new Date());
+      const yesterday = hist.find(h => h && h.date && h.date < today);
+      return yesterday || hist[hist.length - 1];
+    },
 
     /** 无启动副作用: 生成走 maybeGeneratePlan (app.js init 异步调用, 不阻塞启动) */
     init() {
       // P2-1+P2-2: 启动时跑一次校准漂移日报 (检查 + 漂移时推飞书, 失败吞不阻塞)
       this.runDailyCalibrationReport().catch(e => console.warn('[ShortTrader] 启动校准日报失败:', e));
+      // v0.2.6d: 排好"日内三阶段"调度 — 早 9:00 LLM + 中 13:00 机械 review + 收 15:30 机械日报
+      this._scheduleIntradayPhases();
     },
 
     // ========== 纯函数 (不依赖 DOM/IndexedDB, Node 沙箱可测) ==========
@@ -458,7 +751,8 @@
         marketText: '',
         pool: [],
         recentSellCodes: new Set(),
-        todayCondCount: 0
+        todayCondCount: 0,
+        yesterdaySummary: null  // v0.2.6d: 昨天收盘日报 (喂明早 LLM, 闭环)
       };
       // 短线账户现金
       try {
@@ -660,6 +954,10 @@
           }
         }
       } catch (e) { console.warn('[ShortTrader] ctx similar-market 失败:', e); }
+      // v0.2.6d: 拉昨天收盘日报 — 喂明早 LLM, 让 AI 知道昨天战绩 (闭环)
+      try {
+        ctx.yesterdaySummary = await this._getYesterdaySummary();
+      } catch (e) { console.warn('[ShortTrader] ctx 昨天日报失败:', e); }
       return ctx;
     },
 
@@ -1367,7 +1665,25 @@
      * 交易日 + kv 无今日记录 → 自动生成; 失败不打扰 (console.warn + kv error 记录,
      * UI 区块显示"今日计划生成失败, 可手动重试")
      */
+    /**
+     * v0.2.5: 暴露状态给 pagePaper note 渲染
+     * @returns {Promise<{running: boolean, planDate: string|null, planTs: number|null, hasPlan: boolean, lastFailure: any}>}
+     */
+    async getStatus() {
+      const plan = await Core.Storage.kvGet(PLAN_KEY).catch(() => null);
+      const lastFail = await Core.Storage.kvGet('paper_short_plan_failure').catch(() => null);
+      return {
+        running: !!this._running,
+        planDate: plan && plan.date ? plan.date : null,
+        planTs: plan && plan.generatedAt ? new Date(plan.generatedAt).getTime() : null,
+        hasPlan: !!(plan && plan.date === this._todayStr(new Date())),
+        lastFailure: lastFail || null
+      };
+    },
+
     async maybeGeneratePlan(now = new Date()) {
+      // v0.2.7: 标记 _running, UI 渲染期间能看到 "🤖 AI 短线正在跑..."
+      this._running = true;
       try {
         if (!this._isTradingDay(now)) return { skipped: true, reason: 'non-trading-day' };
         const today = this._todayStr(now);
@@ -1381,6 +1697,8 @@
         console.warn('[ShortTrader] 今日计划生成失败:', e);
         await this._saveFailure(this._todayStr(now), e);
         return { skipped: false, error: String((e && e.message) || e) };
+      } finally {
+        this._running = false;
       }
     },
 
@@ -1537,16 +1855,16 @@
       return plan;
     },
 
-    /** 失败记录: kv 写 error 条 (同日覆盖), UI 据此显示"生成失败可手动重试" */
+    /** 失败记录: kv 写 error 条 (同日覆盖), UI 据此显示"生成失败可手动重跑"
+     *  v0.2.7 bug 修复: 之前错位写入 PLAN_KEY, 导致 paper._renderAiStatusNote 看到
+     *  `plan.date === today && plans.length === 0` 就显示 "[LLM 今日选 0 只, 观望]" (伪装成功);
+     *  真正语义是失败, 必须写到独立的 paper_short_plan_failure key, 跟 getStatus 的 lastFail 路径一致. */
     async _saveFailure(today, e) {
       try {
-        await Core.Storage.kvSet(PLAN_KEY, {
+        await Core.Storage.kvSet('paper_short_plan_failure', {
           date: today,
           error: String((e && e.message) || e),
-          marketView: '',
-          plans: [],
-          dropped: [],
-          generatedAt: Date.now()
+          ts: Date.now()
         });
       } catch (e2) { console.warn('[ShortTrader] 失败记录写库失败:', e2); }
     },

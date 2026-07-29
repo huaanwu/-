@@ -67,6 +67,7 @@
       <button class="btn btn-sm" id="paperTabShort" onclick="Paper.switchSleeve('short')">⚡ AI 短线</button>
     </div>
     <div id="paperSleeveNote" style="font-size:12px;color:var(--text-muted);margin-bottom:8px;"></div>
+    <div id="paperAiStatusHint" style="font-size:11px;color:var(--text-muted);margin-bottom:4px;"></div>  <!-- v0.2.5 AI 状态行 -->
     <div id="paperSummary" class="summary-cards"></div>
     <div id="longTraderTrackSection" class="data-card" style="margin-top:8px;display:none;"></div>  <!-- Phase L1.6 长线业绩归因卡片 -->
     <div class="filter-form" style="margin-top:8px;">
@@ -303,9 +304,8 @@
 <!-- ========== Core 模块 (按依赖顺序) ========== -->
 <script src="/core/util.js"></script>
 <script src="/core/storage.js"></script>
+<script src="/core/settings-sync.js"></script>  <!-- v0.2.3 设置项云同步 (WebDAV), 依赖 storage.onKvChange -->
 <script src="/core/data.js"></script>
-<script src="/core/market-width.js"></script>
-<script src="/core/regime.js"></script>
 <script src="/core/similar-market.js"></script>  <!-- Phase P1-4 历史相似 RAG -->
 <script src="/core/kb.js"></script>
 <script src="/core/alerts-agent.js"></script>
@@ -323,6 +323,8 @@
 <script src="/core/crosscheck.js"></script>
 <script src="/core/toast.js"></script>
 <script src="/core/ai-service.js"></script>
+<script src="/core/agent.js"></script>
+<script src="/core/agent-tools.js"></script>
 <script src="/core/ai-call-log.js"></script>
 <script src="/core/self-consistency.js"></script>
 <script src="/core/learning-pool.js"></script>
@@ -332,6 +334,8 @@
 <script src="/core/sync.js"></script>
 <script src="/core/agents.js"></script>
 <script src="/core/router.js"></script>
+<script src="/core/market-width.js"></script>
+<script src="/core/regime.js"></script>  <!-- 依赖 Core.Constants (state.js + constants.js 在前面) -->
 
 <!-- ========== 域脚本 (按域拆分) ========== -->
 <script src="/app/watchlist.js"></script>

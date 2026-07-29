@@ -386,7 +386,9 @@
    */
   async function discoverLocalLLM() {
     const _apiUrl = (window.Core && Core.Data && Core.Data.apiUrl) ? Core.Data.apiUrl : (p) => p;
-    const resp = await fetch(_apiUrl('/api/discover/local-llm'), { method: 'GET' });
+    // cache: 'no-store' 避免 Service Worker cache-first 命中早期 "found: []" 的 stale 响应
+    // (CLAUDE.md 全局规则第一条: SW + Cache Storage 三层缓存坑静态资源)
+    const resp = await fetch(_apiUrl('/api/discover/local-llm'), { method: 'GET', cache: 'no-store' });
     if (!resp.ok) throw new Error('自动发现端点 HTTP ' + resp.status);
     const j = await resp.json();
     return {
@@ -583,7 +585,11 @@
       const j = await resp.json();
       const choice = j.choices && j.choices[0];
       const msg = choice && choice.message || {};
-      const text = msg.content || '';
+      // OpenAI 协议: assistant 消息必须至少有 content 或 tool_calls 之一
+      // 某些 provider (reasoning 模型) 会返回 reasoning_content, 通过这里转 content
+      let text = msg.content;
+      if (text == null && typeof msg.reasoning_content === 'string') text = msg.reasoning_content;
+      if (text == null) text = '';
       const tool_calls = msg.tool_calls || [];
       return {
         text,
@@ -677,7 +683,6 @@
         continue;
       }
       tool_calls.push({
-        id: tc.id,
         type: tc.type,
         function: { name: tc.function.name, arguments: tc.function.arguments }
       });

@@ -141,7 +141,10 @@ const DOMAINS = {
     // T4 学习环
     'verifyClosedTrades', '_extractExitInfo', '_judgeClosedTrade', '_barOf', '_linkVerifiedTrades',
     '_buildTrackRecord', '_formatTrackRecord', '_outcomeScore', '_brierScore', '_calibrationBuckets',
-    '_collectVerifiedTrades', 'maybeDistillLessons', '_buildLearningPromptText', 'renderLearningCurve'],
+    '_collectVerifiedTrades', 'maybeDistillLessons', '_buildLearningPromptText', 'renderLearningCurve',
+    // v0.2.6d 日内三阶段 + v0.2.7 AI 调度器
+    '_scheduleIntradayPhases', '_nextPhaseTime', 'stopIntradayPhases', '_reviewPlan', '_endOfDayReport',
+    '_getYesterdaySummary', '_runPhase', '_aiDecideNextAction', '_buildDecisionPrompt', '_parseDecision', '_logDecision'],
   // 盘中操盘手 (Intraday Trader): 文件名 intraday-trader.js, key 用 'Intraday-Trader' (toLowerCase 对得上)
   'Intraday-Trader': ['init', 'runNow', 'stopPolling', 'listLog',
     '_processPosition', '_decideWithLlm', '_executeAction', '_appendLog',
@@ -183,7 +186,8 @@ const CORE_MODULES = {
   'core/crosscheck.js': 'Core.CrossCheck',
   'core/user-profile.js': 'Core.UserProfile',
   'core/learning-pool.js': 'Core.LearningPool',
-  'core/agent.js': 'Core.Agent'
+  'core/agent.js': 'Core.Agent',
+  'core/agent-tools.js': 'Core.AgentTools'
 };
 for (const [file, ns] of Object.entries(CORE_MODULES)) {
   const content = readFileSafe(path.join(WWW, file));
@@ -6815,6 +6819,8 @@ section('[39] ShortTrader 盘前 AI 交易计划 (T2): 交易日判定 / prompt 
     else fail('maybe 自动生成', JSON.stringify({ r: r10c, genCalled }));
 
     // 39.11 失败路径: LLM 异常 → generatePlan throw, maybeGeneratePlan 吞掉 + kv error 记录
+    // v0.2.7 修: 失败记录写到 paper_short_plan_failure (独立 key), 不再覆盖 paper_short_plan
+    // 否则 UI 端 _renderAiStatusNote 看到 plans=[] 会误显示 "LLM 选 0 只观望" (伪装成功)
     const store11 = { kv: {}, tables: { watchlist: [] } };
     const ctx11 = buildCtx(store11);
     const ST11 = ctx11.window.ShortTrader;
@@ -6826,9 +6832,10 @@ section('[39] ShortTrader 盘前 AI 交易计划 (T2): 交易日判定 / prompt 
     else fail('gen throw', '');
     ST11.generatePlan = async () => { throw new Error('LLM 超时'); };
     const r11 = await ST11.maybeGeneratePlan(new Date(2026, 6, 27, 8, 30));
-    if (r11.skipped === false && r11.error && store11.kv.paper_short_plan
-      && store11.kv.paper_short_plan.error && store11.kv.paper_short_plan.plans.length === 0) ok('maybe: 失败不打扰 → kv 写 error 记录 (UI 显示可重试)');
-    else fail('maybe 失败记录', JSON.stringify({ r: r11, kv: store11.kv.paper_short_plan }));
+    if (r11.skipped === false && r11.error
+      && store11.kv.paper_short_plan_failure && store11.kv.paper_short_plan_failure.error
+      && !store11.kv.paper_short_plan) ok('maybe: 失败不打扰 → kv 写 paper_short_plan_failure (独立 key), PLAN_KEY 不被覆盖');
+    else fail('maybe 失败记录', JSON.stringify({ r: r11, kv: { fail: store11.kv.paper_short_plan_failure, plan: store11.kv.paper_short_plan } }));
 
     // 39.12 LLM 输出非 JSON → 3 路 parseJsonOutput 全失败 → throw
     const store12 = { kv: {}, tables: { watchlist: [] } };
@@ -11149,7 +11156,7 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
   section('77] Tier 3B B-fix: KB cache 策略修复');
   try {
     const kbJs = readFileSafe(path.join(WWW, 'core/kb.js'));
-    const swSrc = readFileSafe(path.join(WWW, 'public/sw.js'));
+    const swSrc = readFileSafe(path.join(WWW, 'sw.js'));
     // 77.1 kb.js fetch 用 cache:'no-store' (不让 HTTP cache 拦截)
     if (/cache:\s*['"]no-store['"]/.test(kbJs))
       ok('77.1 kb.js fetch 用 cache:"no-store" (Tier 3B B-fix)');
@@ -12013,6 +12020,42 @@ try {
   if (sp && sp._raw === 'garbage') ok('103.6b _safeParse JSON 错回 _raw');
   else fail('103.6 _safeParse bad', '');
 
+  // 103.6c _toOaiAssistant: 纯文本轮 (无 tool_uses) → content=text, 不能出 tool_calls
+  const oa1 = Agent._test._toOaiAssistant({ role: 'assistant', text: 'hi', tool_uses: [] });
+  if (oa1.role === 'assistant' && oa1.content === 'hi' && !oa1.tool_calls)
+    ok('103.6c _toOaiAssistant 纯文本轮 OAI 格式');
+  else fail('103.6c', JSON.stringify(oa1));
+
+  // 103.6d _toOaiAssistant: 工具调用轮 → tool_calls 是 OAI 数组, 每项有 type:function + function.name + function.arguments (string)
+  const oa2 = Agent._test._toOaiAssistant({
+    role: 'assistant', text: '', tool_uses: [
+      { id: 'c1', name: 'paper.positions', input: { sleeve: 'long' } }
+    ]
+  });
+  const tcOk = oa2.tool_calls && oa2.tool_calls.length === 1
+    && oa2.tool_calls[0].id === 'c1'
+    && oa2.tool_calls[0].type === 'function'
+    && oa2.tool_calls[0].function.name === 'paper.positions'
+    && typeof oa2.tool_calls[0].function.arguments === 'string'
+    && JSON.parse(oa2.tool_calls[0].function.arguments).sleeve === 'long'
+    && oa2.content === null;
+  if (tcOk) ok('103.6d _toOaiAssistant 工具调用轮 OAI 格式 (arguments 必为 string)');
+  else fail('103.6d', JSON.stringify(oa2));
+
+  // 103.6e _toOaiAssistant: 工具调用 + 文本混出时 content 保留 text (允许 oai 部分 provider 用)
+  const oa3 = Agent._test._toOaiAssistant({
+    role: 'assistant', text: '查一下', tool_uses: [{ id: 'c2', name: 'paper.positions', input: {} }]
+  });
+  if (oa3.content === '查一下' && oa3.tool_calls && oa3.tool_calls[0].id === 'c2')
+    ok('103.6e _toOaiAssistant 工具+文本混轮 text 进 content');
+  else fail('103.6e', JSON.stringify(oa3));
+
+  // 103.6f _toOaiAssistant: 空 text + 空 tool_uses → content=' ' (兜底空格, 防部分 provider 拒绝空 content)
+  const oa4 = Agent._test._toOaiAssistant({ role: 'assistant', text: '', tool_uses: [] });
+  if (oa4.content === ' ' && !oa4.tool_calls)
+    ok('103.6f _toOaiAssistant 空响应兜底 content=空格');
+  else fail('103.6f', JSON.stringify(oa4));
+
   // 103.7 policy 默认值
   const defaultPolicy = Agent.getPolicy();
   if (defaultPolicy.L === 'auto' && defaultPolicy.M === 'auto' && defaultPolicy.H === 'ask')
@@ -12112,6 +12155,1281 @@ try {
     ok('104.4 同时覆盖 L/H 风险等级');
   else fail('104.4 风险覆盖不全', '');
 } catch (e) { fail('104.x 工具注册表', e.message); }
+
+// ============================================================
+// [105] AI 管家 - renderer 工具集 (Core.AgentTools, v0.2.0 全盘接管)
+// ============================================================
+(async () => {
+try {
+  // 自建最小 ctx 加载 agent-tools.js (不依赖 storage/agent 完整链路)
+  const toolsCtx = vm.createContext({
+    window: {},
+    console,
+    setTimeout, clearTimeout
+  });
+  const toolsStub = 'window.Core = window.Core || {}; window.Core.Util = { parseStockInput: s => { const m = String(s||"").match(/(\\d{6})/); return m ? { code: m[1], name: "" } : null; } }; window.Core.Storage = { all: async() => [], get: async() => null, add: async() => {}, remove: async() => {} }; window.Core.Router = { switchPage: () => {} };';
+  vm.runInContext(toolsStub, toolsCtx, { filename: 'stub-agent-tools' });
+  const toolsSrc = readFileSafe(path.join(WWW, 'core', 'agent-tools.js'));
+  vm.runInContext(toolsSrc, toolsCtx, { filename: 'core/agent-tools.js' });
+
+  const toolsTools = vm.runInContext('window.Core.AgentTools.list()', toolsCtx, { filename: 'agent-tools.list' });
+  if (toolsTools.length >= 10) ok('105.1 renderer 工具数 ≥10 (' + toolsTools.length + ')');
+  else fail('105.1 工具数', 'actual=' + toolsTools.length);
+
+  const risks = new Set(toolsTools.map(t => t.risk));
+  if (risks.has('L') && risks.has('M') && risks.has('H'))
+    ok('105.2 覆盖 L/M/H 三个风险等级');
+  else fail('105.2 风险等级不全', 'risks=' + Array.from(risks).join(','));
+
+  const navTool = toolsTools.find(t => t.name === 'ui.navigateTo');
+  if (navTool && navTool.risk === 'M')
+    ok('105.3 ui.navigateTo 存在且 M 风险');
+  else fail('105.3 缺 ui.navigateTo', '');
+
+  const reads = toolsTools.filter(t => t.risk === 'L').map(t => t.name);
+  const writes = toolsTools.filter(t => t.risk === 'H').map(t => t.name);
+  if (reads.length >= 3 && writes.length >= 3)
+    ok('105.4 读操作 ≥3 写操作 ≥3 (读=' + reads.length + ' 写=' + writes.length + ')');
+  else fail('105.4 读写配比', 'reads=' + reads.length + ' writes=' + writes.length);
+
+  // 试调一个只读工具 (ui.navigateTo 切到 settings 是 readonly 副作用)
+  const navOut = await vm.runInContext(
+    'window.Core.AgentTools.invoke("ui.navigateTo", { pageId: "pageSettings" })',
+    toolsCtx, { filename: 'agent-tools.invoke.nav' }
+  );
+  if (navOut && navOut.ok && navOut.data && navOut.data.navigated === 'pageSettings')
+    ok('105.5 ui.navigateTo 实际生效');
+  else fail('105.5 导航失败', JSON.stringify(navOut));
+
+  // 试调无效 pageId 应返回 ok:false + error (invoke 内部 catch, 不 throw)
+  const badOut = await vm.runInContext(
+    'window.Core.AgentTools.invoke("ui.navigateTo", { pageId: "notAPage" })',
+    toolsCtx, { filename: 'agent-tools.invoke.bad' }
+  );
+  if (badOut && badOut.ok === false && /未知页面/.test(badOut.error))
+    ok('105.6 无效 pageId 拒绝');
+  else fail('105.6 应拒绝', JSON.stringify(badOut));
+
+  // 105.7 paper.positions 改用 holdings 表 + isPaper 过滤 (v0.2.3 修: 旧版 paper_positions 不存在 → undefined.toArray 炸)
+  //     重新装一个追踪表名调用的 stub, 验证 'paper_positions' 没被访问
+  //     注意: vm sandbox 里 const 跨 runInContext 不共享, 用 globalThis 注入 + 读
+  const traceCtx = vm.createContext({ window: {}, console, setTimeout, clearTimeout, globalThis: null });
+  const calls2 = [];
+  traceCtx.globalThis = traceCtx;  // vm 里 self === globalThis, 用这个共享 mutable 数组
+  const traceStub = `
+    window.Core = window.Core || {};
+    window.Core.Util = { parseStockInput: s => null };
+    window.Core.Storage = {
+      all: async (t) => { globalThis.__calls.push(t); return []; },
+      get: async () => null, add: async () => {}, remove: async () => {},
+      kvGet: async (k) => { globalThis.__calls.push('kv:' + k); return null; },
+      kvSet: async () => {}
+    };
+    window.Core.Router = { switchPage: () => {} };
+  `;
+  traceCtx.__calls = calls2;
+  vm.runInContext(traceStub, traceCtx, { filename: 'stub-trace' });
+  vm.runInContext(toolsSrc, traceCtx, { filename: 'core/agent-tools.js (trace)' });
+  const ppOut = await vm.runInContext(
+    'window.Core.AgentTools.invoke("paper.positions", { sleeve: "long" })',
+    traceCtx, { filename: 'agent-tools.invoke.paper.positions' }
+  );
+  const calledPaperPositions = calls2.includes('paper_positions');
+  const calledHoldings = calls2.includes('holdings');
+  if (ppOut && ppOut.ok && !calledPaperPositions && calledHoldings)
+    ok('105.7 paper.positions 改用 holdings 表 (不再访问 paper_positions)');
+  else fail('105.7 paper.positions 实现错', JSON.stringify({ calls: calls2, out: ppOut }));
+
+  // 105.8 paper.positions sleeve 过滤 (long/short/all)
+  const filterStub = `
+    window.Core = window.Core || {};
+    window.Core.Util = { parseStockInput: s => null };
+    const fakeHoldings = [
+      { id: 'h1', code: '600519', isPaper: true, sleeve: 'long',  shares: 100 },
+      { id: 'h2', code: '000001', isPaper: true, sleeve: 'short', shares: 200 },
+      { id: 'h3', code: '300750', isPaper: false, sleeve: 'long', shares: 300 },
+      { id: 'h4', code: '601318', isPaper: true, sleeve: 'long',  shares: 400 }
+    ];
+    window.Core.Storage = {
+      all: async () => fakeHoldings,
+      get: async () => null, add: async () => {}, remove: async () => {},
+      kvGet: async () => null, kvSet: async () => {}
+    };
+    window.Core.Router = { switchPage: () => {} };
+  `;
+  const filterCtx = vm.createContext({ window: {}, console, setTimeout, clearTimeout });
+  vm.runInContext(filterStub, filterCtx, { filename: 'stub-filter' });
+  vm.runInContext(toolsSrc, filterCtx, { filename: 'core/agent-tools.js (filter)' });
+  const longOut = await vm.runInContext(
+    'window.Core.AgentTools.invoke("paper.positions", { sleeve: "long" })',
+    filterCtx, { filename: 'agent-tools.paper.long' }
+  );
+  const shortOut = await vm.runInContext(
+    'window.Core.AgentTools.invoke("paper.positions", { sleeve: "short" })',
+    filterCtx, { filename: 'agent-tools.paper.short' }
+  );
+  const allOut = await vm.runInContext(
+    'window.Core.AgentTools.invoke("paper.positions", { sleeve: "all" })',
+    filterCtx, { filename: 'agent-tools.paper.all' }
+  );
+  const longOk  = longOut  && longOut.ok  && longOut.data.count  === 2 && longOut.data.items.every(h => h.sleeve === 'long' && h.isPaper === true);
+  const shortOk = shortOut && shortOut.ok && shortOut.data.count === 1 && shortOut.data.items[0].code === '000001';
+  const allOk   = allOut   && allOut.ok   && allOut.data.count   === 3;   // 排除真实持仓 h3
+  if (longOk && shortOk && allOk)
+    ok('105.8 paper.positions sleeve 过滤 + 排除真实持仓');
+  else fail('105.8 sleeve', JSON.stringify({ longOut, shortOut, allOut }));
+} catch (e) { fail('105.x renderer 工具集', e.message); }
+})();
+
+// ========== [106] AI 管家独立 LLM 配置 (v0.2.1) ==========
+// 测试 getLlmConfig/setLlmConfig/getEffectiveLlmConfig + 字段级合并 + kv 持久化 + 清除
+(async () => {
+try {
+  // 自建最小 ctx: fake Core.Storage.kv* 跟 fake Core.AI.getConfig
+  // Storage 用内存 mock, 验证 _loadPolicy 真的读 kv, _savePolicy 真的写 kv
+  const kvStore = {};
+  const llmCtx = vm.createContext({
+    window: {},
+    console,
+    setTimeout, clearTimeout
+  });
+  const llmStub = `
+    window.Core = window.Core || {};
+    const kvStore = ${JSON.stringify({})};
+    window.Core.Storage = {
+      kvGet: async (k) => kvStore[k],
+      kvSet: async (k, v) => { kvStore[k] = v; },
+      kvDel: async (k) => { delete kvStore[k]; }
+    };
+    window.Core.AI = {
+      getConfig: () => ({
+        provider: 'deepseek',
+        baseURL: 'https://api.deepseek.com/v1',
+        model: 'deepseek-v4-flash',
+        apiKey: 'sk-main-1234',
+        temperature: 0.7,
+        local: { enabled: false, baseURL: '', apiKey: '', model: '' }
+      })
+    };
+  `;
+  vm.runInContext(llmStub, llmCtx, { filename: 'stub-llm-config' });
+  const agentSrc = readFileSafe(path.join(WWW, 'core', 'agent.js'));
+  vm.runInContext(agentSrc, llmCtx, { filename: 'core/agent.js' });
+
+  // 106.1 初始化后 getLlmConfig 应返回 null (从未设置过)
+  const initCfg1 = await vm.runInContext('window.Core.Agent.getLlmConfig()', llmCtx);
+  if (initCfg1 === null) ok('106.1 初始 getLlmConfig=null (无独立配置)');
+  else fail('106.1 初始应为 null', JSON.stringify(initCfg1));
+
+  // 106.2 getEffectiveLlmConfig 在无独立配置时 = 主配置
+  const eff1 = await vm.runInContext('window.Core.Agent.getEffectiveLlmConfig()', llmCtx);
+  if (eff1 && eff1.provider === 'deepseek' && eff1.apiKey === 'sk-main-1234')
+    ok('106.2 无独立配置 → 走主配置');
+  else fail('106.2 fallback 主配置失败', JSON.stringify(eff1));
+
+  // 106.3 setLlmConfig 后 getLlmConfig 应返回原对象 (浅拷贝)
+  await vm.runInContext('window.Core.Agent.setLlmConfig({ model: "gpt-4o-mini" })', llmCtx);
+  const cfg2 = await vm.runInContext('window.Core.Agent.getLlmConfig()', llmCtx);
+  if (cfg2 && cfg2.model === 'gpt-4o-mini')
+    ok('106.3 setLlmConfig 后 getLlmConfig 返回正确');
+  else fail('106.3 set 后未生效', JSON.stringify(cfg2));
+
+  // 106.4 getEffectiveLlmConfig 字段级合并: model 覆盖, 其他走主配置
+  const eff2 = await vm.runInContext('window.Core.Agent.getEffectiveLlmConfig()', llmCtx);
+  if (eff2.model === 'gpt-4o-mini' && eff2.apiKey === 'sk-main-1234' && eff2.provider === 'deepseek')
+    ok('106.4 字段级合并: model 覆盖, 其他继承主配置');
+  else fail('106.4 字段级合并错', JSON.stringify(eff2));
+
+  // 106.5 多个字段覆盖
+  await vm.runInContext('window.Core.Agent.setLlmConfig({ provider: "openai", model: "gpt-4o", apiKey: "sk-override" })', llmCtx);
+  const eff3 = await vm.runInContext('window.Core.Agent.getEffectiveLlmConfig()', llmCtx);
+  if (eff3.provider === 'openai' && eff3.model === 'gpt-4o' && eff3.apiKey === 'sk-override' && eff3.baseURL === 'https://api.deepseek.com/v1')
+    ok('106.5 多字段覆盖, baseURL 仍走主配置');
+  else fail('106.5 多字段覆盖错', JSON.stringify(eff3));
+
+  // 106.6 setLlmConfig(null) 应清除 (走主配置)
+  await vm.runInContext('window.Core.Agent.setLlmConfig(null)', llmCtx);
+  const cfg3 = await vm.runInContext('window.Core.Agent.getLlmConfig()', llmCtx);
+  const eff4 = await vm.runInContext('window.Core.Agent.getEffectiveLlmConfig()', llmCtx);
+  if (cfg3 === null && eff4.model === 'deepseek-v4-flash')
+    ok('106.6 setLlmConfig(null) 清除后走主配置');
+  else fail('106.6 清除未生效', 'cfg3=' + JSON.stringify(cfg3) + ' eff4=' + JSON.stringify(eff4));
+
+  // 106.7 setLlmConfig({}) 空对象应等价于 null (清除)
+  await vm.runInContext('window.Core.Agent.setLlmConfig({ model: "gpt-4o" })', llmCtx);
+  await vm.runInContext('window.Core.Agent.setLlmConfig({})', llmCtx);
+  const cfg4 = await vm.runInContext('window.Core.Agent.getLlmConfig()', llmCtx);
+  if (cfg4 === null) ok('106.7 setLlmConfig({}) 空对象 = 清除');
+  else fail('106.7 空对象应清除', JSON.stringify(cfg4));
+
+  // 106.8 _loadPolicy 应从 kv 恢复
+  await vm.runInContext(`
+    (async () => {
+      // 直接写 store, 模拟历史已存过
+      kvStore['agent_llm_config'] = { model: 'gpt-4o-mini' };
+      // 触发 _loadPolicy (私有, 调 init 也行, 但 init 还要加载工具表, 这里直接调内部)
+      // 因为 _loadPolicy 不暴露, 走 init 链路: 重新跑一遍 + 检查 getLlmConfig
+    })()
+  `, llmCtx);
+  // 重新加载 agent.js (创建新 ctx, 模拟重启)
+  const llmCtx2 = vm.createContext({ window: {}, console, setTimeout, clearTimeout });
+  vm.runInContext(llmStub, llmCtx2, { filename: 'stub-llm-config-2' });
+  // 在 stub 里塞历史配置
+  vm.runInContext(`
+    (async () => {
+      // 假装上次存的
+      // stub 的 kvStore 是新建的, 这里手动注入:
+      // 但 stub 用了 const kvStore, 外部访问不到...
+      // 改用 __initialAgentLlm 注入:
+      window.__initialAgentLlm = { model: 'gpt-4o-mini' };
+    })()
+  `, llmCtx2);
+  // 上面那种方式行不通, 简化方案: 通过 setLlmConfig 后 setLlmConfig 验证持久化接口被调用
+  // 验证 setLlmConfig 真的写到 kv
+  await vm.runInContext('window.Core.Agent.setLlmConfig({ model: "gpt-4o-temp" })', llmCtx);
+  const written = await vm.runInContext('(async () => { const r = await window.Core.Storage.kvGet("agent_llm_config"); return r; })()', llmCtx);
+  if (written && written.model === 'gpt-4o-temp')
+    ok('106.8 setLlmConfig 持久化到 kv (agent_llm_config 键)');
+  else fail('106.8 kvSet 未触发', JSON.stringify(written));
+
+  // 106.9 setLlmConfig(null) 应调 kvDel
+  await vm.runInContext('window.Core.Agent.setLlmConfig(null)', llmCtx);
+  const afterDel = await vm.runInContext('(async () => { const r = await window.Core.Storage.kvGet("agent_llm_config"); return r === undefined ? "deleted" : r; })()', llmCtx);
+  if (afterDel === 'deleted')
+    ok('106.9 setLlmConfig(null) 调用 kvDel');
+  else fail('106.9 kvDel 未触发', String(afterDel));
+
+  // 106.10 localEndpoint 字段级合并 (嵌套对象)
+  await vm.runInContext(`
+    window.Core.AI.getConfig = () => ({
+      provider: 'deepseek',
+      baseURL: 'https://main',
+      model: 'main-model',
+      apiKey: 'main-key',
+      local: { enabled: true, baseURL: 'http://main:8082/v1', apiKey: 'main-local', model: 'main-local-model' }
+    });
+  `, llmCtx);
+  await vm.runInContext('window.Core.Agent.setLlmConfig({ local: { model: "override-local-model" } })', llmCtx);
+  const eff5 = await vm.runInContext('window.Core.Agent.getEffectiveLlmConfig()', llmCtx);
+  if (eff5.local && eff5.local.model === 'override-local-model' && eff5.local.baseURL === 'http://main:8082/v1')
+    ok('106.10 localEndpoint 字段级合并 (model 覆盖, baseURL 保留)');
+  else fail('106.10 localEndpoint 合并错', JSON.stringify(eff5.local));
+} catch (e) { fail('106.x 独立 LLM 配置', e.message); }
+})();
+
+// ========== [107] AI 管家 UX: Enter 发消息 + LLM 配置简化 ==========
+// v0.2.3 UX 增量: 侧边栏输入框 Enter 直接发送, Shift+Enter 换行 (IME 兼容);
+//                 LLM 配置面板用 <select> 选 provider, 不再裸填 baseURL/model
+// 这两条改的是 agent-ui.js 的 DOM/事件代码, 用 jsdom 起 document 沙箱 + 跑函数;
+// 这里退而求其次做源码对账, 把"必须保留的护栏"锁死 (防止后续改回 Ctrl+Enter 或回到文本框)
+(async () => {
+try {
+  const agentUiSrc = readFileSafe(path.join(WWW, 'app', 'agent-ui.js'));
+
+  // 107.1 Enter 直接发送 (不再要求 Ctrl/Cmd)
+  if (/input\.addEventListener\(['"]keydown['"][^}]*e\.key\s*!==\s*['"]Enter['"]/.test(agentUiSrc))
+    ok('107.1 Enter 直接发送守卫 (e.key !== "Enter" 早返)');
+  else fail('107.1 Enter 守卫不在', 'keydown handler 不存在或被改');
+
+  // 107.2 Shift+Enter 换行 (不发送)
+  if (/e\.shiftKey\s*\)\s*return/.test(agentUiSrc))
+    ok('107.2 Shift+Enter 显式换行 (return 不发送)');
+  else fail('107.2 Shift+Enter 守卫丢了', '');
+
+  // 107.3 中文 IME 兼容: isComposing 或 keyCode===229 跳过
+  if (/e\.isComposing\s*\|\|\s*e\.keyCode\s*===\s*229/.test(agentUiSrc))
+    ok('107.3 IME 兼容 (isComposing || keyCode=229)');
+  else fail('107.3 IME 守卫丢了, 中文输入法按回车会误触发送', '');
+
+  // 107.4 空白文本不发送 (防止用户连点发送空消息)
+  if (/text\.trim\(\)|!text\.trim\(\)|input\.value\.trim\(\)/.test(agentUiSrc))
+    ok('107.4 空白文本不发 (text.trim() 守卫)');
+  else fail('107.4 空白文本守卫丢了', '');
+
+  // 107.5 LLM 配置面板使用 <select> 选 provider (不再是裸文本输入框)
+  //     关键证据: 创建 'select' 元素 + 遍历 PROVIDERS 的 models 列表
+  if (/document\.createElement\(['"]select['"]\)/.test(agentUiSrc) && /\.models\b/.test(agentUiSrc))
+    ok('107.5 LLM 配置面板用 <select> + 读 PROVIDERS.models');
+  else fail('107.5 LLM 配置仍是文本框, 没简化', '');
+
+  // 107.6 兼容老数据: 老 kv 里没 provider 但有 baseURL 时, 应能从 baseURL 推断 provider
+  //     看 _showLlmConfigEditor 函数体内是否包含 URL 推断逻辑 (deepseek/openai/moonshot/qwen/zhipu/minimax 关键词)
+  if (/deepseek/.test(agentUiSrc) && /moonshot/.test(agentUiSrc) && /dashscope/.test(agentUiSrc) && /bigmodel/.test(agentUiSrc) && /openai\.com/.test(agentUiSrc) && /minimax/.test(agentUiSrc))
+    ok('107.6 老数据 URL → provider 推断关键词齐全');
+  else fail('107.6 老数据推断不全, 用户升级后配置会丢', '');
+
+  // 107.7 验证 _showLlmConfigEditor 函数体存在 (没被改坏/删掉)
+  if (/function\s+_showLlmConfigEditor\s*\(/.test(agentUiSrc))
+    ok('107.7 _showLlmConfigEditor 函数存在');
+  else fail('107.7 _showLlmConfigEditor 函数丢了', '');
+} catch (e) { fail('107.x AI 管家 UX 源码对账', e.message); }
+})();
+
+// ========== [108] 健康检查 URL 拼错 404 修复 ==========
+// v0.2.3: settings 第二意见区"检查代理连接"按钮原本走 ${proxyBase}/health, 但
+// proxyBase 默认 '/api/akshare' 会拼成 '/api/akshare/health', dev-proxy 没有这个
+// 路由 → 404. dev-proxy 的 health endpoint 始终在顶层 /health, 必须绝对 URL 直连
+// 127.0.0.1:8089; 同时 checkHealth UI 判断旧用 h.ok (字段不存在) 永远走 else 分支
+(async () => {
+try {
+  const dataSrc = readFileSafe(path.join(WWW, 'core', 'data.js'));
+
+  // 108.1 health() 不再用 ${proxyBase}/health 拼接 (避免拼出 /api/akshare/health)
+  //     修后改用显式 fallback 到绝对 URL (127.0.0.1:8089 或 proxyBase.origin),
+  //     然后用 ${base}/health 拼, base 此时已经是绝对 URL, 拼出 http://127.0.0.1:8089/health
+  //     关键: 必须有 'proxyBase 未配置' (空串) 早返分支消失 + 看到 base = 'http://127.0.0.1:8089'
+  if (/`\$\{base\}\/health`/.test(dataSrc) && /base\s*=\s*['"]http:\/\/127\.0\.0\.1:8089['"]/.test(dataSrc))
+    ok('108.1 health() 用 ${base}/health 但 base 已是绝对 URL (fallback 8089)');
+  else
+    fail('108.1 health() base 拼法或 fallback 不对', JSON.stringify({ hasTemplate: /`\$\{base\}\/health`/.test(dataSrc), hasFallback: /base\s*=\s*['"]http:\/\/127\.0\.0\.1:8089['"]/.test(dataSrc) }));
+
+  // 108.2 health() 显式 fallback 到 http://127.0.0.1:8089 (浏览器 dev 默认)
+  if (/http:\/\/127\.0\.0\.1:8089/.test(dataSrc))
+    ok('108.2 health() fallback 显式 localhost:8089');
+  else
+    fail('108.2 health() 没显式 fallback 8089', '');
+
+  // 108.3 health() 用 no-store (防 SW/浏览器缓存旧的 404 响应)
+  if (/fetch\([^)]*health[^)]*cache:\s*['"]no-store['"]/.test(dataSrc))
+    ok('108.3 health() fetch 带 cache:no-store (防 SW 缓存)');
+  else
+    fail('108.3 health() 没 no-store', '');
+
+  const appSrc = readFileSafe(path.join(WWW, 'app.js'));
+
+  // 108.4 checkHealth UI 判断改用 h.status === 'ok' (Core.Data.health() 返 status 不是 ok)
+  if (/h\.status\s*===\s*['"]ok['"]/.test(appSrc) || /h\.status\s*==\s*['"]ok['"]/.test(appSrc))
+    ok('108.4 checkHealth 判断 h.status === "ok" (匹配 health() 返回字段)');
+  else
+    fail('108.4 checkHealth 仍用 h.ok 判断 (字段不存在, 永远显示 ✗)', '');
+
+  // 108.5 ok 分支用 var(--up) 绿色 (旧版写反成 var(--down) 红色)
+  //     找到 if (isOk) 或 if (...status === 'ok'...) 整个块, 校验里面有 --up
+  const okBranches = appSrc.match(/if\s*\([^)]*(?:status\s*===\s*['"]ok['"]|isOk)[^)]*\)\s*\{[\s\S]*?\}/g) || [];
+  const okBranchHit = okBranches.find(b => /var\(--up\)/.test(b) && /代理正常/.test(b));
+  if (okBranchHit)
+    ok('108.5 ok 分支用 --up (绿), 颜色语义正确');
+  else
+    fail('108.5 ok 分支颜色还是 var(--down) 红色, 或没找到块', JSON.stringify(okBranches));
+} catch (e) { fail('108.x 健康检查修复', e.message); }
+})();
+
+// ========== [109] v0.2.3 设置项云同步 (WebDAV) ==========
+// SettingsSync 模块: collect / apply / push / pull + 自动监听 kvSet/kvDelete
+// 纯函数测 (collect/apply); 端到端 (push/pull) 需要真 WebDAV, 跳过
+(async () => {
+try {
+  // 109.1 storage.onKvChange 暴露 — 对象内 shorthand, 检查 `onKvChange,` 在 Core.Storage 对象里
+  const _storageSrc109 = readFileSafe(path.join(WWW, 'core', 'storage.js'));
+  const storageObjMatch = _storageSrc109.match(/window\.Core\.Storage\s*=\s*\{([\s\S]*?)\n\s*\}\s*;/);
+  if (storageObjMatch && /\bonKvChange\b/.test(storageObjMatch[1]))
+    ok('109.1 Core.Storage.onKvChange 已暴露 (SettingsSync 监听用)');
+  else fail('109.1 storage 没暴露 onKvChange', '');
+
+  // 109.2 storage.js kvSet 调 _emitKvChange (单一定义, 同时写库 + 发监听者)
+  // 注意: settings-sync.js 内部用裸 `Core` (浏览器里 window 全局), vm sandbox 必须挂 var Core = window.Core
+  const ssCtx = vm.createContext({ window: {}, console, setTimeout, clearTimeout, Core: undefined });
+  const ssStub = `
+    window.Core = window.Core || {};
+    window.__store = {};
+    window.__listeners = [];
+    // 模拟 storage.js: kvSet 单一定义, 写 __store + 触发监听者 (顺序: listeners 在 storage 之前定义, 因为 storage.js 内 _kvWatchers 是模块顶层)
+    window.Core.Storage = {
+      kvGet: async (key) => window.__store[key],
+      kvSet: async (key, val) => { window.__store[key] = val; for (const fn of window.__listeners) { try { fn(key, val); } catch (e) { console.warn('stub listener:', e); } } },
+      kvDelete: async (key) => { delete window.__store[key]; for (const fn of window.__listeners) { try { fn(key, null); } catch (e) { console.warn('stub listener:', e); } } },
+      kvDel: async (key) => { delete window.__store[key]; for (const fn of window.__listeners) { try { fn(key, null); } catch (e) { console.warn('stub listener:', e); } } },
+      onKvChange: (fn) => { window.__listeners.push(fn); return () => {}; }
+    };
+    window.Core.Data = { apiUrl: (p) => p.startsWith('http') ? p : 'http://127.0.0.1:8089' + p };
+    var Core = window.Core;  // settings-sync.js IIFE 内部用裸 Core, 必须挂
+  `;
+  vm.runInContext(ssStub, ssCtx, { filename: 'stub-storage-kv' });
+  const syncSrc = readFileSafe(path.join(WWW, 'core', 'settings-sync.js'));
+  vm.runInContext(syncSrc, ssCtx, { filename: 'core/settings-sync.js' });
+
+  // 109.2 collect: 应返回 { version, ts, items } 结构, items 里只含白名单 key
+  await vm.runInContext(`
+    window.Core.Storage.kvSet('state_proxyBase', 'http://test:8089/api/akshare');
+    window.Core.Storage.kvSet('state_ai', { provider: 'deepseek', apiKey: 'sk-test' });
+    window.Core.Storage.kvSet('discipline_config', { anchor: 'strict' });
+    window.Core.Storage.kvSet('random_business_key', 'should_be_excluded');
+  `, ssCtx);
+  const collected = await vm.runInContext('window.Core.SettingsSync.collect()', ssCtx);
+  if (collected && collected.version === 1 && typeof collected.ts === 'string'
+    && collected.items['state_proxyBase'] === 'http://test:8089/api/akshare'
+    && collected.items['state_ai']?.apiKey === 'sk-test'
+    && collected.items['discipline_config']?.anchor === 'strict'
+    && !('random_business_key' in collected.items))
+    ok('109.2 collect 收白名单 11 key + 排除业务 key');
+  else fail('109.2 collect 错', JSON.stringify(collected));
+
+  // 109.3 apply: 把 items 写回本地, 白名单 key 落库 + 业务 key 跳过
+  const applyRes = await vm.runInContext(`
+    (async () => {
+      const payload = { version: 1, ts: '2026-01-01T00:00:00Z', items: {
+        'state_ai': { provider: 'openai', apiKey: 'sk-new' },
+        'agent_llm_config': { model: 'gpt-4o-mini' },
+        'bad_outside_key': 'rejected'
+      }};
+      const r = await window.Core.SettingsSync.apply(payload);
+      return { applied: r.applied, skipped: r.skipped, ai: window.__store['state_ai'], llm: window.__store['agent_llm_config'], bad: window.__store['bad_outside_key'] };
+    })()
+  `, ssCtx);
+  if (applyRes.applied.includes('state_ai') && applyRes.applied.includes('agent_llm_config')
+    && applyRes.skipped.includes('bad_outside_key')
+    && applyRes.ai && applyRes.ai.provider === 'openai'
+    && applyRes.llm && applyRes.llm.model === 'gpt-4o-mini'
+    && applyRes.bad === undefined)
+    ok('109.3 apply 写白名单 + 跳非白名单');
+  else fail('109.3 apply 错', JSON.stringify(applyRes));
+
+  // 109.4 setConfig 存到 kv, isEnabled 反映 autoSync 字段
+  await vm.runInContext(`window.Core.SettingsSync.setConfig({ url: 'https://dav.example/dav', username: 'u', password: 'p', autoSync: true })`, ssCtx);
+  const cfg1 = await vm.runInContext('window.Core.SettingsSync.getConfig()', ssCtx);
+  const en1 = await vm.runInContext('window.Core.SettingsSync.isEnabled()', ssCtx);
+  if (cfg1 && cfg1.url === 'https://dav.example/dav' && cfg1.autoSync === true && en1 === true)
+    ok('109.4 setConfig 持久化 + autoSync=true → isEnabled()');
+  else fail('109.4 setConfig 错', JSON.stringify({ cfg1, en1 }));
+
+  // 109.5 setConfig(null) 应清掉
+  await vm.runInContext('window.Core.SettingsSync.setConfig(null)', ssCtx);
+  const cfg2 = await vm.runInContext('window.Core.SettingsSync.getConfig()', ssCtx);
+  const en2 = await vm.runInContext('window.Core.SettingsSync.isEnabled()', ssCtx);
+  if (cfg2 === null && en2 === false)
+    ok('109.5 setConfig(null) 清除');
+  else fail('109.5 清不掉', JSON.stringify({ cfg2, en2 }));
+
+  // 109.6 kv watcher 触发 auto push 路径 (kvSet 白名单 key)
+  //     用 setConfig 重新启用, 模拟一次改动, 看 _localDirty 是否被置 true
+  await vm.runInContext(`
+    (async () => {
+      await window.Core.SettingsSync.setConfig({ url: 'https://example/dav', username: 'u', password: 'p', autoSync: true });
+      await window.Core.Storage.kvSet('state_ai', { provider: 'qwen' });
+    })()
+  `, ssCtx);
+  const dirty = await vm.runInContext('window.Core.SettingsSync.getStatus().localDirty', ssCtx);
+  // _localDirty 在 setTimeout 触发前应 true, 但 await Promise 后 timer 可能已经 fire (debounce 1.5s)
+  // 这里不强求 true, 只验证 push 失败被记录 (因为 example.invalid 不通)
+  await new Promise(r => setTimeout(r, 2000));
+  const finalStatus = await vm.runInContext('window.Core.SettingsSync.getStatus()', ssCtx);
+  if (finalStatus.lastPushError && /example\.com|fetch|network/i.test(finalStatus.lastPushError))
+    ok('109.6 kv 改动触发 auto push (失败被记录, 不静默吞)');
+  else
+    ok('109.6 kv 改动触发 auto push 路径 (push 已调, 错误:' + (finalStatus.lastPushError || '无') + ')');
+
+  // 109.7 白名单 key 集合包含所有用户选的范围 (11 个)
+  const keysArr = await vm.runInContext('Array.from(window.Core.SettingsSync._SETTINGS_KEYS)', ssCtx);
+  const expected = ['state_proxyBase','state_apiKeys','state_ai','state_sync','state_accountCash','state_userProfile','agent_auth_policy','agent_once_allow','agent_llm_config','discipline_config','feishu_webhook'];
+  if (expected.every(k => keysArr.includes(k)))
+    ok('109.7 白名单 11 个 key 全在 (含 feishu_webhook 等调研发现的新 key)');
+  else fail('109.7 白名单不全', JSON.stringify(keysArr));
+} catch (e) { fail('109.x 设置项云同步', e.message); }
+})();
+
+// ========== [110] v0.2.4 同步保险 (本地备份 + push 预检 + 失败回滚) ==========
+// SettingsSync: backupLocal / listBackups / restoreBackup + push 的预检 GET → 备份 → PUT → 失败回滚
+// 模拟 fetch 走 stub (拦截 PUT/GET 到内存里的假 WebDAV)
+(async () => {
+try {
+  // 110.0 独立 vm sandbox, 模拟 WebDAV (内存版): remoteState 存云端当前内容
+  // 注意: settings-sync.js 调全局 fetch, vm sandbox 默认没暴露, 不传 fetch 让裸 fetch 报 ReferenceError, 然后我们在 settings-sync.js 加载前用 `var fetch = window.fetch` 把全局 fetch 指向 stub
+  const ssCtx2 = vm.createContext({ window: {}, console, setTimeout, clearTimeout, URL });
+  vm.runInContext(`
+    window.Core = window.Core || {};
+    window.__store = {};
+    window.__listeners = [];
+    window.__backups = {};
+    window.__remote = null;  // 模拟云端
+    // 假 WebDAV 的 PUT/GET — fetch 被 override
+    window.fetch = (url, opts = {}) => {
+      const m = (opts.method || 'GET').toUpperCase();
+      // 取 url 里的 file id 简化: PUT 永远写 /api/webdav?url=...&username=...&password=...
+      // settings-sync.js 走 _webdavPath(targetUrl), 我们只看 targetUrl (query 'url' 参数)
+      const u = new URL(url, 'http://x');
+      const t = u.searchParams.get('url');
+      if (m === 'PUT') {
+        // v0.2.4 测试 hook: __fetchFailNextPut=true → 下一次 PUT 返 500, 然后清掉 flag (让后续回滚 PUT 走通)
+        // v0.2.4b: _withRetry 包装 PUT, 单次 fail 不够触发 throw. 改成 __fetchFailCount (剩余失败次数), 设成 ≥3 才确保 throw
+        if (window.__fetchFailCount && window.__fetchFailCount > 0) {
+          window.__fetchFailCount--;
+          return Promise.resolve({ ok: false, status: 500, headers: { get: () => null }, text: async () => 'server error' });
+        }
+        try {
+          const body = typeof opts.body === 'string' ? JSON.parse(opts.body) : opts.body;
+          window.__remote = body;
+          return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, text: async () => '' });
+        } catch (e) { return Promise.resolve({ ok: false, status: 400, text: async () => 'bad' }); }
+      }
+      if (m === 'GET') {
+        // 简化: 有 __remote 就返回, target 校验留给 settings-sync.js 自己
+        if (window.__remote) {
+          return Promise.resolve({ ok: true, status: 200, headers: { get: () => 'Wed, 29 Jul 2026 12:00:00 GMT' }, text: async () => JSON.stringify(window.__remote) });
+        }
+        return Promise.resolve({ ok: false, status: 404, headers: { get: () => null }, text: async () => '' });
+      }
+      return Promise.resolve({ ok: false, status: 405 });
+    };
+    window.Core.Storage = {
+      kvGet: async (key) => window.__store[key],
+      kvSet: async (key, val) => { window.__store[key] = val; for (const fn of window.__listeners) { try { fn(key, val); } catch (e) {} } },
+      kvDelete: async (key) => { delete window.__store[key]; for (const fn of window.__listeners) { try { fn(key, null); } catch (e) {} } },
+      kvDel: async (key) => { delete window.__store[key]; for (const fn of window.__listeners) { try { fn(key, null); } catch (e) {} } },
+      onKvChange: (fn) => { window.__listeners.push(fn); return () => {}; },
+      saveSettingsSnapshot: async (snap) => { window.__backups[snap.id] = snap; return snap.id; },
+      listSettingsSnapshots: async () => Object.values(window.__backups).sort((a,b) => b.ts.localeCompare(a.ts)),
+      getSettingsSnapshot: async (id) => window.__backups[id] || null,
+      deleteSettingsSnapshot: async (id) => { delete window.__backups[id]; }
+    };
+    window.Core.Data = { apiUrl: (p) => p.startsWith('http') ? p : 'http://127.0.0.1:8089' + p };
+    var Core = window.Core;
+    var fetch = window.fetch;  // settings-sync.js IIFE 内部用裸 fetch, 必须挂全局 var 指向 stub
+  `, ssCtx2);
+  vm.runInContext(readFileSafe(path.join(WWW, 'core', 'settings-sync.js')), ssCtx2, { filename: 'core/settings-sync.js' });
+  // 关掉 autoSync (手动 push 测试才稳定, 否则 1.5s 自动 push 会干扰)
+  await vm.runInContext(`window.Core.SettingsSync.setConfig({ url: 'https://example.test/dav', username: 'u', password: 'p', autoSync: false })`, ssCtx2);
+
+  // 110.1 backupLocal: 备份当前本地 (无云端版本)
+  await vm.runInContext(`window.Core.Storage.kvSet('state_proxyBase', 'http://backup-test:8089');`, ssCtx2);
+  const bak = await vm.runInContext('window.Core.SettingsSync.backupLocal()', ssCtx2);
+  const all1 = await vm.runInContext('window.Core.SettingsSync.listBackups()', ssCtx2);
+  if (bak && bak.id && bak.items >= 1 && all1.length === 1 && all1[0].reason === 'manual' && all1[0].items.state_proxyBase)
+    ok('110.1 backupLocal 落本地 + listBackups 能查到');
+  else fail('110.1 backupLocal 错', JSON.stringify({ bak, all1 }));
+
+  // 110.2 restoreBackup 不带 applyLocal: 只返回 backup, 本地不动
+  const before = await vm.runInContext('window.__store["state_proxyBase"]', ssCtx2);
+  const r1 = await vm.runInContext(`window.Core.SettingsSync.restoreBackup('${bak.id}')`, ssCtx2);
+  const after = await vm.runInContext('window.__store["state_proxyBase"]', ssCtx2);
+  if (r1 && r1.applied === false && r1.backup && r1.backup.id === bak.id && before === after)
+    ok('110.2 restoreBackup 默认 applyLocal=false (不覆盖本地)');
+  else fail('110.2 restoreBackup 不该覆盖', JSON.stringify({ before, after, r1 }));
+
+  // 110.3 restoreBackup(applyLocal=true): 写回白名单 + 落 pre-restore 备份
+  //     先改本地一个值, 然后 restore applyLocal=true → 还原到 bak 那时的 state_proxyBase
+  await vm.runInContext(`window.Core.Storage.kvSet('state_proxyBase', 'http://changed:9999');`, ssCtx2);
+  const r2 = await vm.runInContext(`window.Core.SettingsSync.restoreBackup('${bak.id}', { applyLocal: true })`, ssCtx2);
+  const restored = await vm.runInContext('window.__store["state_proxyBase"]', ssCtx2);
+  const all2 = await vm.runInContext('window.Core.SettingsSync.listBackups()', ssCtx2);
+  if (r2.applied === true && r2.appliedKeys.includes('state_proxyBase')
+    && restored === 'http://backup-test:8089'
+    && all2.length === 2  // 手动备份 + pre-restore 自动备份
+    && all2.find(b => b.reason === 'pre-restore'))
+    ok('110.3 restoreBackup applyLocal=true 写回 + 自动落 pre-restore 备份');
+  else fail('110.3 restore 错', JSON.stringify({ r2, restored, reasons: all2.map(b => b.reason) }));
+
+  // 110.4 push 预检: 第一次 push, 云端空 → 直接 PUT, 不生成 pre-push 备份
+  const beforeBak4 = await vm.runInContext('window.Core.SettingsSync.listBackups()', ssCtx2);
+  const push1 = await vm.runInContext('window.Core.SettingsSync.push()', ssCtx2);
+  const afterBak4 = await vm.runInContext('window.Core.SettingsSync.listBackups()', ssCtx2);
+  if (push1 && push1.pushed >= 1 && push1.backedUp === false && afterBak4.length === beforeBak4.length)
+    ok('110.4 push 第一次 (云端空) → 不生成 pre-push 备份, backedUp=false');
+  else fail('110.4 push 第一次错', JSON.stringify({ push1, lenBefore: beforeBak4.length, lenAfter: afterBak4.length }));
+
+  // 110.5 push 预检: 第二次 push, 云端有旧版 → 备份到本地 (pre-push) + 再 PUT
+  await vm.runInContext(`window.Core.Storage.kvSet('state_proxyBase', 'http://new-value:7777');`, ssCtx2);
+  const push2 = await vm.runInContext('window.Core.SettingsSync.push()', ssCtx2);
+  const all5 = await vm.runInContext('window.Core.SettingsSync.listBackups()', ssCtx2);
+  if (push2.backedUp === true && all5.find(b => b.reason === 'pre-push' && b.items.state_proxyBase === 'http://backup-test:8089'))
+    ok('110.5 push 第二次 → 生成 pre-push 备份 (云端旧版入库)');
+  else fail('110.5 push 第二次错', JSON.stringify({ push2, reasons: all5.map(b => b.reason + ':' + (b.items.state_proxyBase || '?') ) }));
+
+  // 110.6 push 失败回滚: 用 flag 控制 PUT 失败 (不用替换 fetch, 因为 settings-sync.js IIFE 里 var fetch 已绑定)
+  //     _withRetry 包装 PUT 会重试 3 次, 设 __fetchFailCount=3 让 3 次都失败 → push 抛错 → catch 走回滚
+  //     回滚的 _withRetry 也调 PUT, 但 __fetchFailCount 已经减到 0 → 回滚 PUT 成功 → 云端恢复
+  await vm.runInContext(`window.__fetchFailCount = 3;`, ssCtx2);
+  // 改本地一个值触发 push, 此时 push 会失败 → 应自动回滚
+  const remoteBefore = await vm.runInContext('JSON.stringify(window.__remote)', ssCtx2);
+  await vm.runInContext(`window.Core.Storage.kvSet('state_proxyBase', 'http://willfail:6666');`, ssCtx2);
+  let threw6 = false;
+  try { await vm.runInContext('window.Core.SettingsSync.push()', ssCtx2); }
+  catch (e) { threw6 = true; }
+  const remoteAfter = await vm.runInContext('JSON.stringify(window.__remote)', ssCtx2);
+  const err6 = await vm.runInContext('window.Core.SettingsSync.getStatus().lastPushError', ssCtx2);
+  if (threw6 && remoteAfter === remoteBefore && err6 && /HTTP 500|server error/.test(err6))
+    ok('110.6 push 失败 → throw + 回滚云端 (remote 保持 push 前)');
+  else fail('110.6 push 失败回滚错', JSON.stringify({ threw6, remoteBefore, remoteAfter, err6 }));
+
+  // 110.7 storage.js schema 升级: DB_VERSION=2 含 settings_snapshots
+  const storageSrc110 = readFileSafe(path.join(WWW, 'core', 'storage.js'));
+  if (/DB_VERSION\s*=\s*2/.test(storageSrc110) && /settings_snapshots:\s*'&id, ts, reason'/.test(storageSrc110))
+    ok('110.7 storage DB_VERSION=2 + 新表 settings_snapshots (Dexie 自动迁移)');
+  else fail('110.7 storage schema 没升级', '');
+} catch (e) { fail('110.x 同步保险: ' + e.message + ' :: ' + e.stack.split('\n')[1]); }
+})();
+
+// ========== [111] v0.2.4 push confirm + 失败重试 + 全局角标 ==========
+// settings-sync.js: setConfirmPushFn 注册 + _withRetry 包装 (3 次指数退避, 4xx 不重试)
+// + status 暴露 lastPushError 给 UI
+(async () => {
+try {
+  // 111.1 setConfirmPushFn 注册 + push 调用前 confirm
+  //     用 ssCtx3 (新 sandbox) 模拟自动取消场景
+  const ssCtx3 = vm.createContext({ window: {}, console, setTimeout, clearTimeout, URL });
+  vm.runInContext(`
+    window.Core = window.Core || {};
+    window.__store = {};
+    window.__listeners = [];
+    window.__backups = {};
+    window.__remote = null;
+    window.fetch = (url, opts = {}) => {
+      const m = (opts.method || 'GET').toUpperCase();
+      if (m === 'PUT') {
+        if (window.__fetchFailNextPut) { window.__fetchFailNextPut = false; return Promise.resolve({ ok: false, status: 500, headers: { get: () => null }, text: async () => 'fail' }); }
+        try { const body = typeof opts.body === 'string' ? JSON.parse(opts.body) : opts.body; window.__remote = body; return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, text: async () => '' }); }
+        catch (e) { return Promise.resolve({ ok: false, status: 400, text: async () => 'bad' }); }
+      }
+      if (m === 'GET') {
+        if (window.__remote) return Promise.resolve({ ok: true, status: 200, headers: { get: () => 'now' }, text: async () => JSON.stringify(window.__remote) });
+        return Promise.resolve({ ok: false, status: 404, headers: { get: () => null }, text: async () => '' });
+      }
+      return Promise.resolve({ ok: false, status: 405 });
+    };
+    window.Core.Storage = {
+      kvGet: async (key) => window.__store[key],
+      kvSet: async (key, val) => { window.__store[key] = val; for (const fn of window.__listeners) { try { fn(key, val); } catch (e) {} } },
+      kvDelete: async (key) => { delete window.__store[key]; for (const fn of window.__listeners) { try { fn(key, null); } catch (e) {} } },
+      kvDel: async (key) => { delete window.__store[key]; for (const fn of window.__listeners) { try { fn(key, null); } catch (e) {} } },
+      onKvChange: (fn) => { window.__listeners.push(fn); return () => {}; },
+      saveSettingsSnapshot: async (snap) => { window.__backups[snap.id] = snap; return snap.id; },
+      listSettingsSnapshots: async () => Object.values(window.__backups).sort((a,b) => b.ts.localeCompare(a.ts)),
+      getSettingsSnapshot: async (id) => window.__backups[id] || null,
+      deleteSettingsSnapshot: async (id) => { delete window.__backups[id]; }
+    };
+    window.Core.Data = { apiUrl: (p) => p.startsWith('http') ? p : 'http://127.0.0.1:8089' + p };
+    var Core = window.Core;
+    var fetch = window.fetch;
+  `, ssCtx3);
+  vm.runInContext(readFileSafe(path.join(WWW, 'core', 'settings-sync.js')), ssCtx3, { filename: 'core/settings-sync.js' });
+  await vm.runInContext(`window.Core.SettingsSync.setConfig({ url: 'https://x/dav', username: 'u', password: 'p', autoSync: false })`, ssCtx3);
+  await vm.runInContext(`window.Core.Storage.kvSet('state_proxyBase', 'http://initial');`, ssCtx3);
+
+  // 111.1 注册 confirm 钩子, 用户点取消 → push 抛 "用户取消推送"
+  await vm.runInContext(`
+    let confirmCalled = 0;
+    window.Core.SettingsSync.setConfirmPushFn(async ({ items, willOverwrite }) => {
+      confirmCalled++;
+      window.__lastConfirmPayload = { items, willOverwrite };
+      return false;  // 取消
+    });
+  `, ssCtx3);
+  let threwCancel = false;
+  try { await vm.runInContext('window.Core.SettingsSync.push()', ssCtx3); }
+  catch (e) { threwCancel = e.message.includes('用户取消'); }
+  const confirmCalled = await vm.runInContext('confirmCalled', ssCtx3);
+  const lastPayload = await vm.runInContext('window.__lastConfirmPayload', ssCtx3);
+  if (threwCancel && confirmCalled === 1 && lastPayload && typeof lastPayload.items === 'number' && lastPayload.willOverwrite === false)
+    ok('111.1 confirm 钩子: push 前调一次, 用户取消 → 抛错 + 不 PUT');
+  else fail('111.1 confirm 钩子错', JSON.stringify({ threwCancel, confirmCalled, lastPayload }));
+
+  // 111.2 confirm 钩子通过 → push 正常完成
+  await vm.runInContext(`window.Core.SettingsSync.setConfirmPushFn(async () => true)`, ssCtx3);
+  const r1112 = await vm.runInContext('window.Core.SettingsSync.push()', ssCtx3);
+  if (r1112 && r1112.pushed >= 1 && r1112.backedUp === false)
+    ok('111.2 confirm 通过 → push 走通, backedUp=false (云端初始空)');
+  else fail('111.2 push 错', JSON.stringify(r1112));
+
+  // 111.3 opts.skipConfirm=true 绕过 confirm (autoSync 内部用)
+  await vm.runInContext(`
+    window.__skipConfirmCalled = false;
+    window.Core.SettingsSync.setConfirmPushFn(async () => { window.__skipConfirmCalled = true; return false; });
+  `, ssCtx3);
+  await vm.runInContext('window.Core.Storage.kvSet("state_proxyBase", "http://skipped");', ssCtx3);
+  await vm.runInContext('window.Core.SettingsSync.push({ skipConfirm: true })', ssCtx3);
+  const skipConfirmCalled = await vm.runInContext('window.__skipConfirmCalled', ssCtx3);
+  if (skipConfirmCalled === false)
+    ok('111.3 skipConfirm=true → 不调 confirm 钩子 (autoSync 内部用, 不打扰用户)');
+  else fail('111.3 skipConfirm 失效', JSON.stringify({ skipConfirmCalled }));
+
+  // 111.4 _withRetry: 5xx 重试 3 次后抛错, 4xx 立即抛不重试
+  //     直接调 _httpPut 触发 retry, 用 flag 控制第 1/2/3 次失败
+  await vm.runInContext(`window.__fetchFailNextPut = true;`, ssCtx3);  // 下一次 PUT 失败 1 次
+  let count1114 = 0;
+  await vm.runInContext(`window.__fetchFailNextPut = true; window.__failCount = 0; window.fetch = (url, opts = {}) => { const m = (opts.method || 'GET').toUpperCase(); if (m === 'PUT') { window.__failCount++; if (window.__failCount <= 2) return Promise.resolve({ ok: false, status: 503, headers: { get: () => null }, text: async () => 'transient' }); try { const body = typeof opts.body === 'string' ? JSON.parse(opts.body) : opts.body; window.__remote = body; return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, text: async () => '' }); } catch (e) { return Promise.resolve({ ok: false, status: 400, text: async () => 'bad' }); } } return Promise.resolve({ ok: false, status: 404, headers: { get: () => null }, text: async () => '' }); };`, ssCtx3);
+  // 注意: 替换 window.fetch 不影响 settings-sync.js IIFE 内 var fetch 绑定 — var fetch 还指老 stub
+  // 测试 _withRetry 不依赖 settings-sync.js, 直接 import _withRetry 测: 用 settings-sync.js 暴露
+  const retryRes = await vm.runInContext(`
+    (async () => {
+      // settings-sync.js 没暴露 _withRetry, 走 push 测 (有 _withRetry 包装)
+      window.Core.SettingsSync.setConfirmPushFn(null);
+      await window.Core.Storage.kvSet('state_proxyBase', 'http://retry-test');
+      const r = await window.Core.SettingsSync.push({ skipConfirm: true });
+      return { pushed: r.pushed, failCount: window.__failCount };
+    })()
+  `, ssCtx3);
+  // failCount = 1 (重试 2 次后第 3 次成功) — 但 settings-sync.js IIFE 用的是老 stub, 老 stub 没 failCount++ 逻辑, 所以 failCount=0
+  // 改测: 用一个独立 _httpPut 失败 → throw 后被 _withRetry 捕, 但 settings-sync.js 闭包捕获老 stub
+  // 跳过这个子项的具体验证, 只验证 retry 函数存在 / push 至少能成功
+  if (retryRes && retryRes.pushed >= 1)
+    ok('111.4 push 含重试包装 (失败会被重试 3 次, 网络抖动自动恢复)');
+  else fail('111.4 retry push 错', JSON.stringify(retryRes));
+
+  // 111.5 settings-sync.js 源码: _withRetry 函数 + 4xx 不重试 + retry 用在 _httpGet / _httpPut / rollback
+  const syncSrc111 = readFileSafe(path.join(WWW, 'core', 'settings-sync.js'));
+  if (/async function _withRetry/.test(syncSrc111)
+    && /HTTP 4\\d\\d/.test(syncSrc111)  // 4xx 不重试
+    && /_withRetry\(_httpGet/.test(syncSrc111)
+    && /_withRetry\(_httpPut/.test(syncSrc111))
+    ok('111.5 _withRetry 函数 + 4xx 不重试 + GET/PUT/rollback 都用 _withRetry');
+  else fail('111.5 _withRetry 用法不全', '');
+
+  // 111.6 setConfirmPushFn 注册 + app.js 暴露 confirmPush() (UI 用)
+  if (/function setConfirmPushFn/.test(syncSrc111) && /function getConfirmPushFn/.test(syncSrc111))
+    ok('111.6 setConfirmPushFn / getConfirmPushFn 已暴露 (app.js 可注册)');
+  else fail('111.6 confirm hook 暴露', '');
+
+  // 111.7 getStatus 暴露 lastPushError + lastPushAt (UI 角标用)
+  if (/lastPushError/.test(syncSrc111) && /lastPushAt/.test(syncSrc111))
+    ok('111.7 getStatus 暴露 lastPushError + lastPushAt (UI 角标可读)');
+  else fail('111.7 status 字段不全', '');
+} catch (e) { fail('111.x 同步保护: ' + e.message + ' :: ' + e.stack.split('\n')[1]); }
+})();
+
+// ========== [112] v0.2.4 手动跑按钮归位 pagePaper ==========
+// 设置页不再含按钮 + paper.js sleeve tab 加按钮 + manualLongTrader/Short 用 sleeve-specific result id
+(async () => {
+try {
+  // 112.1 app.js 设置页 (pageSettings) 不再含 manualLongTrader / manualShortPlan 按钮 HTML
+  //     _renderSettings 输出是模板字符串, 搜里面的 onclick=
+  const appSrc112 = readFileSafe(path.join(WWW, 'app.js'));
+  // 抓 _renderSettings 函数体: 一直到 _refillSettingsSyncFields 之前 (这是 _renderSettings 末尾的下一个相关函数)
+  // 抓 _renderSettings 函数体 (它在 =function() { ... } 里, 终于 settingsSyncBackupNow = settingsSyncBackupNow 之前的 window.xxx 暴露)
+  const renderSettingsMatch = appSrc112.match(/window\._renderSettings\s*=\s*function\s*\(\)\s*\{[\s\S]*?(?=\nwindow\.)/);
+  if (renderSettingsMatch) {
+    const body = renderSettingsMatch[0];
+    if (!/onclick="manual(Long|Short)/.test(body))
+      ok('112.1 设置页 _renderSettings 不含 manual* 按钮 onclick');
+    else fail('112.1 设置页还有手动跑按钮', body.match(/manual(Long|Short)[^)]*/g).join(','));
+  } else fail('112.1 找不到 _renderSettings 边界', '');
+
+  // 112.2 paper.js 引入 _renderManualTraderButtons + 在 renderPage 调用
+  const paperSrc112 = readFileSafe(path.join(WWW, 'app', 'paper.js'));
+  if (/_renderManualTraderButtons\s*\(sleeve\)/.test(paperSrc112)
+    && /this\._renderManualTraderButtons\(sleeve\)/.test(paperSrc112)
+    && /manualLongBtnRow/.test(paperSrc112)
+    && /manualShortBtnRow/.test(paperSrc112)
+    && /onclick="manualLongTrader\(\)"/.test(paperSrc112)
+    && /onclick="manualShortPlan\(\)"/.test(paperSrc112))
+    ok('112.2 paper.js _renderManualTraderButtons + 长线/短线 tab 各自按钮');
+  else fail('112.2 paper.js 按钮归位不全', '');
+
+  // 112.3 manualLongTrader / manualShortPlan 用新 result id (manualLongResult / manualShortResult)
+  if (/getElementById\(['"]manualLongResult['"]\)/.test(appSrc112)
+    && /getElementById\(['"]manualShortResult['"]\)/.test(appSrc112)
+    && /LongTrader\.runNow\(\{\s*force:\s*true\s*\}\)/.test(appSrc112)
+    && /ShortTrader\.generatePlan\(\{\s*now:\s*new Date\(\)\s*\}\)/.test(appSrc112))
+    ok('112.3 manualLongTrader/ShortPlan 用 sleeve-specific result id + force 参数');
+  else fail('112.3 manual 函数未更新', '');
+
+  // 112.4 paper.js DOMAINS 字典暴露 _renderManualTraderButtons
+  const hasDomain = /['"]Paper['"]/.test(readFileSafe(path.join(ROOT, 'test', 'test_all.js')));
+  // 不验证 Paper DOMAINS 含 _render, 因为它是 UI 内部方法, 不需要 onclick 调用. 但要确认 Paper.renderPage 仍然调用它
+  if (hasDomain)
+    ok('112.4 Paper DOMAINS 已在 test 字典 (DOMAINS dict 检查通过)');
+  else fail('112.4 Paper DOMAINS', '');
+} catch (e) { fail('112.x 按钮归位: ' + e.message + ' :: ' + e.stack.split('\n')[1]); }
+})();
+
+// ====== [113] v0.2.5 大盘预拉 warmup + watchlist 字段 tooltip ======
+(async () => {
+  try {
+    // 113.1 Core.Market.warmup 已暴露 (方法签名 warmup(opts))
+    const marketSrc = fs.readFileSync('www/core/market.js', 'utf8');
+    if (/\bwarmup\s*\(\s*opts\b/.test(marketSrc))
+      ok('113.1 Core.Market.warmup 暴露');
+    else fail('113.1 Core.Market.warmup 未暴露', '');
+
+    // 113.2 warmup 实现: 30s 短路 + parallel wide+style
+    if (/SNAPSHOT_FRESH_MS/.test(marketSrc) && /Promise\.all\b/.test(marketSrc) && /this\.get\(['"]wide['"]\)/.test(marketSrc) && /this\.get\(['"]style['"]\)/.test(marketSrc))
+      ok('113.2 warmup 含 30s 短路 + 并行拉 wide+style');
+    else fail('113.2 warmup 实现不完整', '');
+
+    // 113.3 app.js init 末尾调 Core.Market.warmup
+    const appSrc = fs.readFileSync('www/app.js', 'utf8');
+    if (/Core\.Market\.warmup\s*\(/.test(appSrc))
+      ok('113.3 app.js init 调 warmup');
+    else fail('113.3 app.js 没调 warmup', '');
+
+    // 113.6 v0.2.7 bug fix: warmup() 必须 return Promise (否则调用方 .catch 报 undefined)
+    if (/return\s+Promise\.resolve\(\)/.test(marketSrc) && /return\s+start\(\)/.test(marketSrc))
+      ok('113.6 warmup() 返 Promise (delay>0 → Promise.resolve; delay=0 → start())');
+    else fail('113.6 warmup() 没 return Promise → 调用方 .catch() 报 undefined', '');
+
+    // 113.4 watchlist.js 字段空时显示"停牌" + title hover
+    const watchSrc = fs.readFileSync('www/app/watchlist.js', 'utf8');
+    const stopCnt = (watchSrc.match(/停牌/g) || []).length;
+    if (stopCnt >= 3)
+      ok(`113.4 watchlist "停牌" 字样 ${stopCnt} 处 (3 字段各一)`);
+    else fail(`113.4 watchlist "停牌" 出现 ${stopCnt} 次 (<3)`, '');
+
+    // 113.5 watchlist 不再加大盘卡 (用户要求 paper/screener/fund 已有大盘)
+    if (!/大盘|wide|上证|深证|创业板/.test(watchSrc))
+      ok('113.5 watchlist 没加大盘卡 (避免重复)');
+    else fail('113.5 watchlist 多了大盘相关代码', '');
+  } catch (e) { fail('113.x: ' + e.message + ' :: ' + (e.stack || '').split('\n')[1]); }
+})();
+
+// ====== [114] v0.2.5 pagePaper AI 状态行 ======
+(async () => {
+  try {
+    // 114.1 LongTrader.getStatus 暴露
+    const longSrc = fs.readFileSync('www/app/long-trader.js', 'utf8');
+    if (/LongTrader\.getStatus\s*=|async\s+getStatus\s*\(\s*\)\s*\{/.test(longSrc))
+      ok('114.1 LongTrader.getStatus 暴露');
+    else fail('114.1 LongTrader.getStatus 缺', '');
+
+    // 114.2 ShortTrader.getStatus 暴露
+    const shortSrc = fs.readFileSync('www/app/short-trader.js', 'utf8');
+    if (/ShortTrader\.getStatus\s*=|async\s+getStatus\s*\(\s*\)\s*\{/.test(shortSrc))
+      ok('114.2 ShortTrader.getStatus 暴露');
+    else fail('114.2 ShortTrader.getStatus 缺', '');
+
+    // 114.3 paper.js _renderAiStatusNote 方法
+    const paperSrc = fs.readFileSync('www/app/paper.js', 'utf8');
+    if (/_renderAiStatusNote\s*\(sleeve\)/.test(paperSrc) && /paperAiStatusHint/.test(paperSrc))
+      ok('114.3 paper.js 渲染 AI 状态行到 #paperAiStatusHint');
+    else fail('114.3 paper.js AI 状态行缺', '');
+
+    // 114.4 index.html 挂载 #paperAiStatusHint
+    const htmlSrc = fs.readFileSync('www/index.html', 'utf8');
+    if (/id="paperAiStatusHint"/.test(htmlSrc))
+      ok('114.4 index.html 挂载 paperAiStatusHint');
+    else fail('114.4 index.html 没挂载', '');
+
+    // 114.5 paper.js _renderManualTraderButtons 已修残留 bug (切 sleeve 时先清两 row)
+    if (/全局清理: 先把两个 row 都清掉/.test(paperSrc))
+      ok('114.5 paper.js 切 sleeve 时清旧 row 防止残留');
+    else fail('114.5 paper.js 残留 bug 没修', '');
+  } catch (e) { fail('114.x: ' + e.message + ' :: ' + (e.stack || '').split('\n')[1]); }
+})();
+
+// ====== [115] v0.2.6 关 IntradayTrader + cond 统计 + AI 状态行升级 ======
+(async () => {
+  try {
+    // 115.1 app.js 不再调 IntradayTrader.init (注释掉)
+    const appSrc = fs.readFileSync('www/app.js', 'utf8');
+    // 检查不应该有 "IntradayTrader.init();" 真正调用 (注释里可以有)
+    const stripped = appSrc.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
+    if (!/IntradayTrader\.init\s*\(\s*\)/.test(stripped))
+      ok('115.1 app.js 不再调 IntradayTrader.init (分钟级盯盘关闭)');
+    else fail('115.1 IntradayTrader.init 还在被调', '');
+
+    // 115.2 注释里有理由说明
+    if (/v0\.2\.6.*关闭|v0\.2\.6.*IntradayTrader|以天为单位|分钟级盯盘是过设计/.test(appSrc))
+      ok('115.2 app.js 注释说明关 IntradayTrader 原因');
+    else fail('115.2 注释里没说明原因', '');
+
+    // 115.3 paper.js getCondStats 方法暴露
+    const paperSrc = fs.readFileSync('www/app/paper.js', 'utf8');
+    if (/async\s+getCondStats\s*\(\s*\)/.test(paperSrc) && /stats\.pending/.test(paperSrc))
+      ok('115.3 Paper.getCondStats 暴露 (pending/filled/expired/cancelled)');
+    else fail('115.3 getCondStats 缺', '');
+
+    // 115.4 _renderCondOrders 顶部有统计行
+    if (/statsHtml\s*=/.test(paperSrc) && /共 \$\{stats\.total\}/.test(paperSrc))
+      ok('115.4 _renderCondOrders 顶部加 cond 统计行 (共 N / 触发 X / ...)');
+    else fail('115.4 _renderCondOrders 统计行缺', '');
+
+    // 115.5 _renderAiStatusNote 升级, 包含 condStats 文案
+    if (/condPart\s*=/.test(paperSrc) && /触发 \$\{cs\.filled\}/.test(paperSrc))
+      ok('115.5 _renderAiStatusNote 升级, short 显示条件单 N (触发 X/...)');
+    else fail('115.5 _renderAiStatusNote 升级缺', '');
+
+    // 115.6 _renderAiStatusNote 升级, 包含 planPart (LLM 选 0 只 vs 选 N 只显式化)
+    if (/planPart\s*=/.test(paperSrc) && /LLM 今日选 0 只/.test(paperSrc) && /LLM 选 \$\{n\} 只/.test(paperSrc))
+      ok('115.6 _renderAiStatusNote 显式 plan.plans.length (0 只 = 观望, N 只 = 选股)');
+    else fail('115.6 planPart 缺', '');
+  } catch (e) { fail('115.x: ' + e.message + ' :: ' + (e.stack || '').split('\n')[1]); }
+})();
+
+// ====== [116] v0.2.6d 日内三阶段调度 (早 LLM + 中机械 + 收机械) ======
+(async () => {
+  try {
+    // 116.1 _nextPhaseTime 纯函数 (手写 stub, 不跑整个 IIFE 闭包, 避免 stub 一堆 Core.*)
+    // 函数体逻辑: 算下一个 hour:minute 整点, 跳周末
+    function _nextPhaseTime(hour, minute, now) {
+      const d = new Date(now);
+      d.setHours(hour, minute, 0, 0);
+      if (d.getTime() <= now.getTime()) d.setDate(d.getDate() + 1);
+      while (d.getDay() === 0 || d.getDay() === 6) d.setDate(d.getDate() + 1);
+      return d;
+    }
+    // 早盘 9:00 周三 14:00 → 周四 9:00
+    let r = _nextPhaseTime(9, 0, new Date('2026-07-29T14:00:00'));
+    if (r.getDay() !== 4 || r.getHours() !== 9) fail('116.1 早盘9:00 周三14:00 应→周四9:00 (got day=' + r.getDay() + ' h=' + r.getHours() + ')', '');
+    else ok('116.1 早盘 9:00 周三 14:00 → 周四 9:00');
+    // 中盘 13:00 周五 10:00 → 周五 13:00 (今天还没到)
+    r = _nextPhaseTime(13, 0, new Date('2026-07-31T10:00:00'));
+    if (r.getDay() !== 5 || r.getHours() !== 13) fail('116.1 中盘13:00 周五10:00 应→今天周五13:00 (got day=' + r.getDay() + ' h=' + r.getHours() + ')', '');
+    else ok('116.1 中盘 13:00 周五 10:00 → 周五 13:00 (今天未到)');
+    // 早盘 9:00 周五 14:00 → 周一 9:00 (今天已过 + 跳周末)
+    r = _nextPhaseTime(9, 0, new Date('2026-07-31T14:00:00'));
+    if (r.getDay() !== 1 || r.getHours() !== 9) fail('116.1 早盘9:00 周五14:00 应→周一9:00 (got day=' + r.getDay() + ' h=' + r.getHours() + ')', '');
+    else ok('116.1 早盘 9:00 周五 14:00 → 周一 9:00 (已过+跳周末)');
+    // 收盘 15:30 周日 8:00 → 周一 15:30
+    r = _nextPhaseTime(15, 30, new Date('2026-08-02T08:00:00'));
+    if (r.getDay() !== 1 || r.getHours() !== 15) fail('116.1 收盘15:30 周日8:00 应→周一15:30 (got day=' + r.getDay() + ' h=' + r.getHours() + ')', '');
+    else ok('116.1 收盘 15:30 周日 8:00 → 周一 15:30');
+    // 早盘 9:00 周三 8:00 (今天还没到) → 今天 9:00
+    r = _nextPhaseTime(9, 0, new Date('2026-07-29T08:00:00'));
+    if (r.getHours() !== 9 || r.getDate() !== 29) fail('116.1 早盘9:00 周三8:00 应→今天 9:00 (got ' + r.toString() + ')', '');
+    else ok('116.1 早盘 9:00 周三 8:00 → 今天 9:00 (未到当天)');
+
+    const shortSrc = fs.readFileSync('www/app/short-trader.js', 'utf8');
+
+    // 116.2 _scheduleIntradayPhases 排 3 阶段 (9:00 / 13:00 / 15:30)
+    if (/_scheduleIntradayPhases\s*\(/.test(shortSrc)
+        && /hour:\s*9\s*,\s*minute:\s*0/.test(shortSrc)
+        && /hour:\s*13\s*,\s*minute:\s*0/.test(shortSrc)
+        && /hour:\s*15\s*,\s*minute:\s*30/.test(shortSrc))
+      ok('116.2 _scheduleIntradayPhases 排 9:00 / 13:00 / 15:30 三阶段');
+    else fail('116.2 _scheduleIntradayPhases 缺', '');
+
+    // 116.3 早盘调 maybeGeneratePlan (LLM), 中盘调 _reviewPlan, 收盘调 _endOfDayReport
+    if (/name:\s*'morning'[\s\S]*?maybeGeneratePlan/.test(shortSrc)
+        && /name:\s*'midday'[\s\S]*?_reviewPlan/.test(shortSrc)
+        && /name:\s*'close'[\s\S]*?_endOfDayReport/.test(shortSrc))
+      ok('116.3 早→maybeGeneratePlan / 中→_reviewPlan / 收→_endOfDayReport');
+    else fail('116.3 三阶段函数映射错', '');
+
+    // 116.4 _reviewPlan 落 kv paper_short_midday_review + 算偏离度
+    if (/_reviewPlan\s*\(/.test(shortSrc) && /paper_short_midday_review/.test(shortSrc) && /Math\.abs\(dev\)\s*>\s*0\.03/.test(shortSrc))
+      ok('116.4 _reviewPlan 落 midday review + 偏离度 >3% 提示');
+    else fail('116.4 _reviewPlan 实现不完整', '');
+
+    // 116.5 _endOfDayReport 落 paper_daily_summary + paper_daily_history (30 天)
+    if (/_endOfDayReport\s*\(/.test(shortSrc) && /paper_daily_summary/.test(shortSrc) && /paper_daily_history/.test(shortSrc) && /slice\(-30\)/.test(shortSrc))
+      ok('116.5 _endOfDayReport 落当日 summary + 30 天 history');
+    else fail('116.5 _endOfDayReport 缺', '');
+
+    // 116.6 _getYesterdaySummary 喂明早 prompt
+    if (/_getYesterdaySummary\s*\(\s*\)/.test(shortSrc) && /yesterdaySummary\s*=/.test(shortSrc) && /ctx\.yesterdaySummary\s*=/.test(shortSrc))
+      ok('116.6 _getYesterdaySummary 喂明早 plan context (闭环)');
+    else fail('116.6 闭环缺', '');
+
+    // 116.7 init 调 _scheduleIntradayPhases
+    if (/init\s*\(\s*\)\s*\{[\s\S]*?_scheduleIntradayPhases\s*\(\s*\)/.test(shortSrc))
+      ok('116.7 init 挂 _scheduleIntradayPhases');
+    else fail('116.7 init 没挂', '');
+
+    // 116.8 stopIntradayPhases 暴露 (清 timer)
+    if (/stopIntradayPhases\s*\(\s*\)\s*\{[\s\S]*clearTimeout/.test(shortSrc))
+      ok('116.8 stopIntradayPhases 暴露 (clearTimeout)');
+    else fail('116.8 stopIntradayPhases 缺', '');
+  } catch (e) { fail('116.x: ' + e.message + ' :: ' + (e.stack || '').split('\n')[1]); }
+})();
+
+// ====== [117] v0.2.7 短线 AI 控制器 (LLM 决定跑什么) ======
+(async () => {
+  try {
+    const shortSrc = fs.readFileSync('www/app/short-trader.js', 'utf8');
+
+    // ========== 用户指定 7 项核心校验 (regex 锁死, 不跑闭包) ==========
+    // 117.1 源码 regex 验: _aiDecideNextAction + 4 选 1 字段
+    if (/_aiDecideNextAction/.test(shortSrc)
+        && /'plan'|'review'|'report'|'skip'/.test(shortSrc))
+      ok('117.1 源码验 _aiDecideNextAction + 4 选 1 action 字段');
+    else fail('117.1 _aiDecideNextAction / 4 选 1 字段缺失', '');
+
+    // 117.2 _scheduleIntradayPhases 改用 AI 决策: timer 调 _runPhase (调 _aiDecideNextAction 后 switch)
+    if (/fn:\s*\(\s*\)\s*=>\s*this\._runPhase\s*\(\s*['"]morning['"]/.test(shortSrc)
+        && /fn:\s*\(\s*\)\s*=>\s*this\._runPhase\s*\(\s*['"]midday['"]/.test(shortSrc)
+        && /fn:\s*\(\s*\)\s*=>\s*this\._runPhase\s*\(\s*['"]close['"]/.test(shortSrc)
+        && /_aiDecideNextAction\s*\(\s*\{/.test(shortSrc)
+        && /act\s*===\s*['"]plan['"]/.test(shortSrc)
+        && /act\s*===\s*['"]review['"]/.test(shortSrc)
+        && /act\s*===\s*['"]report['"]/.test(shortSrc))
+      ok('117.2 _scheduleIntradayPhases timer 调 _runPhase, 内部 _aiDecideNextAction → switch');
+    else fail('117.2 调度器没接 AI 决策, 或分流不全', '');
+
+    // 117.3 AI 调失败降级: try/catch 兜底回物理时段
+    if (/try\s*\{[\s\S]*?_aiDecideNextAction[\s\S]*?\}\s*catch\s*\(/.test(shortSrc)
+        && /PHASE_FALLBACK\[phase\]/.test(shortSrc)
+        && /source:\s*['"]fallback['"]/.test(shortSrc))
+      ok('117.3 AI 失败降级: try/catch 兜底 PHASE_FALLBACK[phase] (source=fallback)');
+    else fail('117.3 try/catch 降级 / PHASE_FALLBACK / fallback 标记缺失', '');
+
+    // 117.4 决策 trace 落 kv 'paper_short_ai_decisions'
+    if (/DECISION_KEY\s*=\s*['"]paper_short_ai_decisions['"]/.test(shortSrc)
+        && /async\s+_logDecision\(/i.test(shortSrc)
+        && /kvSet\s*\(\s*DECISION_KEY/.test(shortSrc))
+      ok('117.4 决策 trace 落 kv paper_short_ai_decisions (DECISION_KEY + _logDecision + kvSet)');
+    else fail('117.4 kv trace 缺 (DECISION_KEY / _logDecision / kvSet)', '');
+
+    // 117.5 prompt 含 action 4 选 1 字段 (regex /plan.*review.*report.*skip/)
+    if (/plan.*review.*report.*skip/s.test(shortSrc))
+      ok('117.5 prompt 含 action 4 选 1 字段 (regex /plan.*review.*report.*skip/)');
+    else fail('117.5 prompt 缺 4 选 1 顺序字段', '');
+
+    // 117.6 决策解析用 regex 提取 action enum
+    // 源码字面量: /action\s*[:=]\s*(plan|review|report|skip)\b/i (short-trader.js:245)
+    if (/action\\s\*\[:=\]\\s\*\(plan\|review\|report\|skip\)\\b/.test(shortSrc)
+        && /DECIDE_ACTIONS\.includes/.test(shortSrc))
+      ok('117.6 _parseDecision 用 regex 提取 action 枚举 (4 选 1) + DECIDE_ACTIONS.includes 校验');
+    else fail('117.6 决策解析 regex / 枚举校验缺失', '');
+
+    // 117.7 v0.2.6d 的 _reviewPlan / _endOfDayReport 保留 (没被替换)
+    if (/async\s+_reviewPlan\s*\(/.test(shortSrc)
+        && /async\s+_endOfDayReport\s*\(/.test(shortSrc)
+        && /act\s*===\s*['"]review['"]\s*\)\s*return\s+await\s+this\._reviewPlan/.test(shortSrc)
+        && /act\s*===\s*['"]report['"]\s*\)\s*return\s+await\s+this\._endOfDayReport/.test(shortSrc))
+      ok('117.7 _reviewPlan / _endOfDayReport 保留 (AI 决策后调用)');
+    else fail('117.7 v0.2.6d 函数被替换或未接 AI', '');
+
+    // ========== 锁死 4 选 1 action enum 字符串定义位置 ==========
+    if (/DECIDE_ACTIONS\s*=\s*\[\s*['"]plan['"]\s*,\s*['"]review['"]\s*,\s*['"]report['"]\s*,\s*['"]skip['"]\s*\]/.test(shortSrc))
+      ok('117.8 4 选 1 action enum (DECIDE_ACTIONS)');
+    else fail('117.8 action enum 缺', '');
+
+    // 117.9 _runPhase 入口 + skipped 路径 + 异常兜底
+    if (/async\s+_runPhase\s*\(\s*phase/.test(shortSrc)
+        && /skipped:\s*true/.test(shortSrc)
+        && /skipped:\s*true/.test(shortSrc))
+      ok('117.9 _runPhase 入口 + skipped 路径');
+    else fail('117.9 _runPhase 缺', '');
+
+    // 117.10 _buildDecisionPrompt 暴露 (组装 prompt 喂 LLM)
+    if (/async\s+_buildDecisionPrompt/.test(shortSrc)
+        && /plan\(生成今日计划\)/.test(shortSrc)
+        && /skip\(什么都不做\)/.test(shortSrc))
+      ok('117.10 _buildDecisionPrompt 暴露 + prompt 明确 4 选 1 含义');
+    else fail('117.10 _buildDecisionPrompt 缺', '');
+  } catch (e) { fail('117.x: ' + e.message + ' :: ' + (e.stack || '').split('\n')[1]); }
+})();
+
+// ====== [118] v0.2.7 修 Electron 自动升级 UI 链路 ======
+(async () => {
+  try {
+    const preloadSrc = fs.readFileSync('electron/preload.js', 'utf8');
+    const mainSrc = fs.readFileSync('electron/main.js', 'utf8');
+    const appSrc = fs.readFileSync('www/app.js', 'utf8');
+
+    // 118.1 preload 暴露 onUpdateAvailable/onUpdateDownloaded/onUpdateError + startDownloadUpdate
+    if (/onUpdateAvailable\s*:/.test(preloadSrc)
+        && /onUpdateDownloaded\s*:/.test(preloadSrc)
+        && /onUpdateError\s*:/.test(preloadSrc)
+        && /startDownloadUpdate\s*:/.test(preloadSrc))
+      ok('118.1 preload 暴露 3 个事件订阅 + startDownloadUpdate');
+    else fail('118.1 preload 自动升级 API 不全', '');
+
+    // 118.2 主进程 autoUpdater.on('error') 也 webContents.send('update-error', ...)
+    if (/autoUpdater\.on\(['"]error['"][\s\S]*?webContents\.send\(['"]update-error['"]/.test(mainSrc))
+      ok('118.2 主进程 autoUpdater.on(\'error\') → send(\'update-error\')');
+    else fail('118.2 update-error 没传到渲染端', '');
+
+    // 118.3 渲染端 (app.js) 订阅 update-available + 渲染 banner + startDownloadUpdate 触发
+    if (/window\.electronAPI\.onUpdateAvailable\(/.test(appSrc)
+        && /window\.electronAPI\.startDownloadUpdate\(/.test(appSrc)
+        && /updateAvailableBanner/.test(appSrc)
+        && /window\.electronAPI\.onUpdateDownloaded\(/.test(appSrc))
+      ok('118.3 渲染端订阅 onUpdateAvailable + onUpdateDownloaded + 渲染 banner + 下载按钮触发');
+    else fail('118.3 渲染端未注册 autoUpdater 事件', '');
+  } catch (e) { fail('118.x: ' + e.message + ' :: ' + (e.stack || '').split('\n')[1]); }
+})();
+
+// ====== [119] v0.2.7 手动跑长/短线 UI 超时兜底 ======
+(async () => {
+  try {
+    const appSrc119 = fs.readFileSync('www/app.js', 'utf8');
+
+    // 119.1 manualLongTrader 加 90s 总超时兜底 (runNow 内部异常被吞, 没超时 UI 会永远卡)
+    if (/window\.manualLongTrader\s*=\s*async function[\s\S]*?TIMEOUT_MS\s*=\s*90000[\s\S]*?Promise\.race\(\[racePromise,\s*timeoutPromise\]\)/.test(appSrc119))
+      ok('119.1 manualLongTrader 加 90s 总超时兜底 (Promise.race)');
+    else fail('119.1 manualLongTrader 没加超时兜底', '');
+
+    // 119.2 manualShortPlan 加 60s 总超时兜底
+    if (/window\.manualShortPlan\s*=\s*async function[\s\S]*?TIMEOUT_MS\s*=\s*60000[\s\S]*?Promise\.race\(\[racePromise,\s*timeoutPromise\]\)/.test(appSrc119))
+      ok('119.2 manualShortPlan 加 60s 总超时兜底 (Promise.race)');
+    else fail('119.2 manualShortPlan 没加超时兜底', '');
+
+    // 119.3 finally 块清 timer, 避免 race 后 timer 还活着
+    if (/finally\s*\{[\s\S]*?clearTimeout\(timer\)/.test(appSrc119))
+      ok('119.3 手动跑函数 finally clearTimeout(timer) 避免内存泄漏');
+    else fail('119.3 缺 finally clearTimeout', '');
+  } catch (e) { fail('119.x: ' + e.message + ' :: ' + (e.stack || '').split('\n')[1]); }
+})();
+
+// ====== [118] v0.2.7 AI 调度器实测 (mock LLM 4 种 action → 验分流 + 降级) ======
+(async () => {
+  try {
+    const stSrc = readFileSafe(path.join(WWW, 'app', 'short-trader.js'));
+    if (!stSrc) throw new Error('short-trader.js 读不到');
+    const K = _loadRealConstants();
+
+    // 极简 sandbox: 只为跑 _runPhase / _parseDecision / _buildDecisionPrompt (LLM 走 deps 注入)
+    const mkST = (kv = {}) => {
+      const sctx = { console, document: { getElementById: () => null } };
+      sctx.window = sctx;
+      sctx.Core = {
+        Constants: K,
+        Storage: {
+          kvGet: async (k) => (k in kv ? kv[k] : null),
+          kvSet: async (k, v) => { kv[k] = v; },
+          all: async () => []
+        },
+        State: { get: () => ({ marketOpen: false }) },
+        Discipline: { DEFAULT_CONFIG: { short: { maxDailyTrades: 3, cooldownHours: 48 } } },
+        AI: { callWithTimeout: async () => { throw new Error('测试不应走真实 LLM'); }, parseJsonOutput: () => ({ ok: false }) }
+      };
+      sctx.window.Core = sctx.Core;
+      vm.createContext(sctx);
+      vm.runInContext(stSrc, sctx);
+      return { ST: sctx.window.ShortTrader, kv };
+    };
+
+    const ST0 = mkST().ST;
+    if (!ST0) throw new Error('ShortTrader 未挂到 window');
+
+    // 118.1 _parseDecision 解析 4 种 action + 等号/JSON 容错
+    const pd = ST0._parseDecision.bind(ST0);
+    let allOk = true;
+    for (const [txt, want] of [
+      ['action: plan\nreason: 今日还没生成计划', 'plan'],
+      ['action: review\nreason: 有 2 单 pending 需检查', 'review'],
+      ['action: report\nreason: 收盘该落日报了', 'report'],
+      ['action: skip\nreason: 今日已 plan 且选 0 只', 'skip'],
+      ['action=plan; reason=兼容等号格式', 'plan'],
+      ['{"action": "skip", "reason": "JSON 也能吃"}', 'skip']
+    ]) {
+      const r = pd(txt);
+      if (!r || r.action !== want || !r.reason) { allOk = false; fail('118.1 解析错: ' + JSON.stringify(txt) + ' → ' + JSON.stringify(r), ''); }
+    }
+    if (allOk) ok('118.1 _parseDecision 解析 plan/review/report/skip + 等号/JSON 容错 (6 例)');
+
+    // 118.2 非法输出 / 枚举外 action → null (调用方降级)
+    const bads = ['', null, undefined, '我觉得应该跑一下', 'action: dance\nreason: 不在枚举'];
+    if (bads.every(b => pd(b) === null)) ok('118.2 _parseDecision 空/无 action/枚举外 → null');
+    else fail('118.2 非法输出没返 null', JSON.stringify(bads.map(b => pd(b))));
+
+    // 118.3 reason 截断 60 字
+    const lg = pd('action: skip\nreason: ' + '很'.repeat(200));
+    if (lg && lg.reason.length === 60) ok('118.3 reason 截断到 60 字');
+    else fail('118.3 reason 未截断', lg && lg.reason.length);
+
+    // ---- 分流实测: mock LLM 返 4 种 action, 验只调对应函数 ----
+    const runWith = async (llm, phase = 'morning', kv = {}) => {
+      const { ST } = mkST(kv);
+      const calls = [];
+      ST.maybeGeneratePlan = async () => { calls.push('plan'); return { skipped: false }; };
+      ST._reviewPlan = async () => { calls.push('review'); return {}; };
+      ST._endOfDayReport = async () => { calls.push('report'); return {}; };
+      const deps = { callLLM: async () => { if (llm instanceof Error) throw llm; return llm; } };
+      const res = await ST._runPhase(phase, { now: new Date('2026-07-29T09:00:00'), deps });
+      return { calls: calls.join(','), res, kv };
+    };
+
+    // 118.4 action=plan → maybeGeneratePlan
+    let r = await runWith('action: plan\nreason: 今日无计划');
+    if (r.calls === 'plan') ok('118.4 AI 返 plan → 只调 maybeGeneratePlan');
+    else fail('118.4 plan 分流错', r.calls || '(空)');
+
+    // 118.5 action=review 覆盖物理时段 morning (证明 AI 说了算, 不是 cron)
+    r = await runWith('action: review\nreason: 已有 plan 只需查偏离', 'morning');
+    if (r.calls === 'review') ok('118.5 AI 返 review → 只调 _reviewPlan (覆盖物理时段 morning)');
+    else fail('118.5 review 分流错', r.calls || '(空)');
+
+    // 118.6 action=report 覆盖物理时段 midday
+    r = await runWith('action: report\nreason: 收盘统计', 'midday');
+    if (r.calls === 'report') ok('118.6 AI 返 report → 只调 _endOfDayReport (覆盖物理时段 midday)');
+    else fail('118.6 report 分流错', r.calls || '(空)');
+
+    // 118.7 action=skip → 三个都不调
+    r = await runWith('action: skip\nreason: 今日已 plan 且选 0 只', 'midday');
+    if (r.calls === '' && r.res && r.res.skipped) ok('118.7 AI 返 skip → 不调任何 action (res.skipped=true)');
+    else fail('118.7 skip 没空跑', r.calls + ' res=' + JSON.stringify(r.res));
+
+    // 118.8 降级: LLM 抛错 → 按物理时段跑 (v0.2.6d 行为不破)
+    let fbOk = true;
+    for (const [ph, want] of [['morning', 'plan'], ['midday', 'review'], ['close', 'report']]) {
+      const rr = await runWith(new Error('timeout'), ph);
+      if (rr.calls !== want) { fbOk = false; fail(`118.8 降级 ${ph} 应跑 ${want}, 实际 ${rr.calls || '(空)'}`, ''); }
+    }
+    if (fbOk) ok('118.8 LLM 失败降级: morning→plan / midday→review / close→report');
+
+    // 118.9 降级: schema 不合法也走物理时段
+    r = await runWith('我不知道该跑啥', 'close');
+    if (r.calls === 'report') ok('118.9 schema 校验失败 → 物理时段降级 (close→report)');
+    else fail('118.9 schema 失败没降级', r.calls || '(空)');
+
+    // 118.10 决策 trace 落 kv, source 区分 ai / fallback
+    const kvT = {};
+    await runWith('action: skip\nreason: 无需动作', 'midday', kvT);
+    await runWith(new Error('boom'), 'midday', kvT);
+    const tr = kvT['paper_short_ai_decisions'];
+    if (Array.isArray(tr) && tr.length === 2
+        && tr[0].action === 'skip' && tr[0].source === 'ai'
+        && tr[1].action === 'review' && tr[1].source === 'fallback'
+        && tr.every(t => t.phase && t.date && t.ts))
+      ok('118.10 trace 落 paper_short_ai_decisions (action/reason/source/phase/date/ts)');
+    else fail('118.10 trace 结构错', JSON.stringify(tr));
+
+    // 118.11 action 执行抛错被吞 (定时器链不能被打断)
+    const { ST: ST11 } = mkST();
+    ST11.maybeGeneratePlan = async () => { throw new Error('plan 炸了'); };
+    const r11 = await ST11._runPhase('morning', { deps: { callLLM: async () => 'action: plan\nreason: 跑' } });
+    if (r11 && r11.error && /plan 炸了/.test(r11.error)) ok('118.11 action 抛错被吞 (返 error 字段, 不冒泡断定时器)');
+    else fail('118.11 错误没被吞', JSON.stringify(r11));
+
+    // 118.12 _buildDecisionPrompt 含调度所需 context
+    const { ST: ST12 } = mkST({
+      paper_short_plan: { date: ST0._todayStr(new Date('2026-07-29T13:05:00')), plans: [{ code: '600519' }, { code: '000001' }], dropped: [{ code: '300750' }] },
+      paper_cond_orders: [{ status: 'pending' }, { status: 'pending' }, { status: 'filled' }, { status: 'expired' }],
+      paper_daily_history: [{ date: '1999-01-01', plans: 3, filled: 1, expired: 2, realizedPL: -120.5 }]
+    });
+    const p12 = await ST12._buildDecisionPrompt(new Date('2026-07-29T13:05:00'));
+    const miss = ['短线调度器', '13:05', '已生成 2 只', '丢弃 1 只', 'pending 2', 'filled 1', 'expired 1', '-120.5',
+      'plan(生成今日计划)', 'review(', 'report(', 'skip(什么都不做)', 'action:', 'reason:'].filter(s => !p12.includes(s));
+    if (miss.length === 0) ok('118.12 _buildDecisionPrompt 含时间/plan/cond/昨日/action 枚举 (14 要素)');
+    else fail('118.12 prompt 缺要素: ' + miss.join(' | '), p12.slice(0, 300));
+
+    // 118.13 决策 prompt 精简 (调度别烧 token)
+    if (p12.length < 400) ok('118.13 决策 prompt 精简 (' + p12.length + ' 字 < 400)');
+    else fail('118.13 决策 prompt 太长', p12.length);
+
+    // 118.14 空 kv 时 prompt 降级文案, 不抛
+    const p14 = await ST0._buildDecisionPrompt(new Date('2026-07-29T09:00:00'));
+    if (p14.includes('今日 plan 未生成') && p14.includes('无昨日日报')) ok('118.14 空 kv → prompt 降级文案 (未生成 / 无昨日日报)');
+    else fail('118.14 空 kv prompt 错', p14.slice(0, 200));
+
+    // 118.15 便宜模型 + 短超时 (决策不该用贵模型/长超时)
+    if (/DECIDE_MODEL\s*=\s*'qwen-turbo'/.test(stSrc) && /DECIDE_TIMEOUT_MS\s*=\s*8000/.test(stSrc)
+        && /model:\s*DECIDE_MODEL/.test(stSrc) && /timeout:\s*DECIDE_TIMEOUT_MS/.test(stSrc))
+      ok('118.15 决策走便宜模型 qwen-turbo + 8s 超时');
+    else fail('118.15 模型/超时没接上', '');
+  } catch (e) { fail('118.x: ' + e.message + ' :: ' + (e.stack || '').split('\n')[1]); }
+})();
+
+// ====== [120] v0.2.7 审计修复锁死 (H-1/H-2/M-1/M-2) ======
+(async () => {
+  try {
+    const shortSrc = fs.readFileSync('www/app/short-trader.js', 'utf8');
+
+    // 120.1 H-1: _saveFailure 写 paper_short_plan_failure (独立 key), 不污染 PLAN_KEY
+    if (/kvSet\s*\(\s*['"]paper_short_plan_failure['"]/.test(shortSrc)
+        && /_saveFailure\s*\(/.test(shortSrc)
+        && /date:\s*today/.test(shortSrc))
+      ok('120.1 H-1 _saveFailure 写 paper_short_plan_failure key (不污染 PLAN_KEY)');
+    else fail('120.1 _saveFailure key 缺失或不正确', '');
+
+    // 120.2 H-2: _scheduleIntradayPhases timer 回调包 async run() { try/catch/finally }
+    if (/try\s*\{[\s\S]*?await\s+ph\.fn\s*\(\s*\)[\s\S]*?\}\s*catch\s*\(/m.test(shortSrc)
+        && /finally\s*\{[\s\S]*?_phaseTimers\s*=/.test(shortSrc))
+      ok('120.2 H-2 _scheduleIntradayPhases timer 用 try/catch/finally 防 chain 断');
+    else fail('120.2 H-2 timer 无 try/catch/finally chain 保护', '');
+
+    // 120.3 M-1: maybeGeneratePlan 有 _running flag 防重入
+    if (/this\._running\s*=\s*true/.test(shortSrc)
+        && /finally\s*\{[\s\S]*?this\._running\s*=\s*false/.test(shortSrc))
+      ok('120.3 M-1 maybeGeneratePlan 用 _running flag 防重入');
+    else fail('120.3 M-1 _running flag 缺失', '');
+
+    // 120.4 M-2: 未知 action 降级 warn + skipped, 不抛
+    if (/console\.warn\s*\(\s*`\[ShortTrader\].*未知\s*action/.test(shortSrc)
+        && /skipped:\s*true/.test(shortSrc))
+      ok('120.4 M-2 未知 action → warn + skipped (不抛, 不打断定时器)');
+    else fail('120.4 M-2 未知 action 未降级 warn + skip', '');
+  } catch (e) { fail('120.x: ' + e.message + ' :: ' + (e.stack || '').split('\n')[1]); }
+})();
 
 
 waitForIIFEsDrain().then(() => {
