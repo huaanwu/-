@@ -60,9 +60,11 @@
       this._running = true;
       try {
         const now = opts.now || new Date();
-        // 1. 触发条件: 周一 + 距上次 ≥ RERUN_DAYS 天
-        const lastRun = (await Core.Storage.kvGet(LAST_RUN_KEY)) || null;
-        if (!this._shouldRun(now, lastRun && lastRun.ts)) return;
+        // 1. 触发条件: 周一 + 距上次 ≥ RERUN_DAYS 天 (opts.force 跳过限制, 用于手动测试)
+        if (!opts.force) {
+          const lastRun = (await Core.Storage.kvGet(LAST_RUN_KEY)) || null;
+          if (!this._shouldRun(now, lastRun && lastRun.ts)) return;
+        }
         // 2. long sleeve 现金下限
         const acc = await Paper._getAccountRaw('long');
         if ((acc.cash || 0) < MIN_CASH) {

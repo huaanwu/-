@@ -47,11 +47,39 @@
       }
     ],
     "win": {
-      "target": "portable",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
       "icon": "www/icons/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "installerIcon": "www/icons/icon.ico",
+      "uninstallerIcon": "www/icons/icon.ico",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "StockMaster"
     },
     "portable": {
       "artifactName": "StockMaster-${version}-portable.exe"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "huaanwu",
+      "repo": "-",
+      "releaseType": "release"
     },
     "asar": false
   },
@@ -65,6 +93,7 @@
     "@capacitor/share": "^8.0.1",
     "dexie": "^4.4.4",
     "echarts": "^5.6.0",
+    "electron-updater": "^6.8.9",
     "marked": "^15.0.12"
   },
   "devDependencies": {

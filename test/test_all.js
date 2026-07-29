@@ -7336,10 +7336,10 @@ section('[40] ShortTrader T4 学习环: _judgeClosedTrade 全分支 / verify 扫
       if (url.includes('/api/discover/dev-proxy')) {
         return { ok: true, status: 200, json: async () => ({ port: 8089, serverIPs: ['192.168.1.10', '10.0.0.5'], host: '192.168.1.10', healthPath: '/health', proxyPath: '/api/akshare', timestamp: '2026-07-28T00:00:00Z' }) };
       }
-      if (url.startsWith('http://192.168.1.10:8089/health')) {
-        return { ok: true, status: 200, json: async () => ({ status: 'ok', akshare_target: 'http://127.0.0.1:8088' }) };
+      if (url.startsWith('http://192.168.1.10:8089/ping')) {
+        return { ok: true, status: 200, json: async () => ({ status: 'ok', ping: true, timestamp: '2026-07-28T00:00:00Z' }) };
       }
-      if (url.startsWith('http://10.0.0.5:8089/health')) {
+      if (url.startsWith('http://10.0.0.5:8089/ping')) {
         return { ok: false, status: 500, json: async () => ({}) };
       }
       return { ok: false, status: 500, json: async () => ({}) };
@@ -7388,8 +7388,8 @@ section('[40] ShortTrader T4 学习环: _judgeClosedTrade 全分支 / verify 扫
     if (typeof ctx42.window.discoverDevProxy !== 'function') { fail('42.g 函数未挂载', ''); return; }
     await ctx42.window.discoverDevProxy();
     const callInfo = fetchCalls42.some(u => u.includes('/api/discover/dev-proxy'));
-    const callHealth = fetchCalls42.some(u => u.includes('192.168.1.10:8089/health'));
-    if (callInfo && callHealth) ok('42.g discoverDevProxy 运行时: 拿到 serverIPs + 触发 /health 探测');
+    const callHealth = fetchCalls42.some(u => u.includes('192.168.1.10:8089/ping'));
+    if (callInfo && callHealth) ok('42.g discoverDevProxy 运行时: 拿到 serverIPs + 触发 /ping 探测');
     else fail('42.g runtime', 'fetch 调用不完整: ' + fetchCalls42.join(' | '));
   } catch (e) {
     fail('42 自动发现 dev-proxy', e.message + ' / ' + (e.stack || ''));

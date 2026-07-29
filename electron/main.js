@@ -12,10 +12,70 @@
  *
  * 退出: 关窗口 → 杀子进程 → 退出主进程
  */
-const { app, BrowserWindow, shell, dialog, Menu } = require('electron');
+const { app, BrowserWindow, shell, dialog, Menu, ipcMain } = require('electron');
+const { autoUpdater } = require('electron-updater');
 const path = require('path');
 const { spawn } = require('child_process');
 const fs = require('fs');
+
+// ===== 自动更新 (electron-updater) =====
+function setupAutoUpdater() {
+  if (!app.isPackaged) return;
+
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = true;
+  // 仓库实际名为 "-"，electron-updater 默认读 package.json build.publish,
+  // 但读不到时可显式指定 feed URL 作 fallback
+  autoUpdater.setFeedURL({
+    provider: 'github',
+    owner: 'huaanwu',
+    repo: '-'
+  });
+
+  autoUpdater.on('checking-for-update', () => {
+    process.stdout.write('[autoUpdater] 检查更新中...\n');
+  });
+
+  autoUpdater.on('update-available', (info) => {
+    process.stdout.write('[autoUpdater] 发现新版本: ' + info.version + '\n');
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('update-available', info);
+    }
+  });
+
+  autoUpdater.on('update-not-available', () => {
+    process.stdout.write('[autoUpdater] 当前已是最新版本\n');
+  });
+
+  autoUpdater.on('download-progress', (p) => {
+    process.stdout.write('[autoUpdater] 下载进度: ' + Math.round(p.percent) + '%\n');
+  });
+
+  autoUpdater.on('update-downloaded', (info) => {
+    process.stdout.write('[autoUpdater] 下载完成: ' + info.version + '\n');
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('update-downloaded', info);
+    }
+  });
+
+  autoUpdater.on('error', (err) => {
+    process.stderr.write('[autoUpdater] 错误: ' + err.message + '\n');
+  });
+
+  ipcMain.on('start-download-update', () => {
+    autoUpdater.downloadUpdate();
+  });
+  ipcMain.on('install-update', () => {
+    autoUpdater.quitAndInstall(false, true);
+  });
+
+  // 启动 3 秒后静默检查更新
+  setTimeout(() => {
+    autoUpdater.checkForUpdates().catch((err) => {
+      process.stderr.write('[autoUpdater] 检查失败: ' + err.message + '\n');
+    });
+  }, 3000);
+}
 
 const IS_DEV = !app.isPackaged;
 // 生产: __dirname/.. 是 app.asar 根, www 在 app 内; dev-proxy 在 resources/dev-proxy.mjs
@@ -29,10 +89,10 @@ const children = [];
 function spawnChild(name, cmd, args, cwd, color) {
   const child = spawn(cmd, args, { cwd, shell: true, env: { ...process.env, FORCE_COLOR: color || '1' } });
   children.push(child);
-  const tag = `[${name}]`;
-  child.stdout.on('data', (d) => process.stdout.write(`${tag} ${d}`));
-  child.stderr.on('data', (d) => process.stderr.write(`${tag} ${d}`));
-  child.on('exit', (code) => process.stdout.write(`${tag} exit ${code}\n`));
+  const tag = '[' + name + ']';
+  child.stdout.on('data', (d) => process.stdout.write(tag + ' ' + d));
+  child.stderr.on('data', (d) => process.stderr.write(tag + ' ' + d));
+  child.on('exit', (code) => process.stdout.write(tag + ' exit ' + code + '\n'));
   return child;
 }
 
@@ -52,37 +112,34 @@ async function _ensureAktools() {
   const http = require('http');
   const aktoolsTarget = process.env.AKSHARE_TARGET || 'http://127.0.0.1:8088';
   const url = new URL(aktoolsTarget);
-  // 先探一下, 通就跳过
   const alreadyUp = await new Promise((resolve) => {
-    const req = http.get(`${aktoolsTarget}/api/public/macro_china_lpr`, { timeout: 3000 }, (res) => {
+    const req = http.get(aktoolsTarget + '/api/public/macro_china_lpr', { timeout: 3000 }, (res) => {
       resolve(res.statusCode === 200 || res.statusCode === 422);
     });
     req.on('error', () => resolve(false));
     req.on('timeout', () => { req.destroy(); resolve(false); });
   });
   if (alreadyUp) {
-    process.stdout.write(`[aktools] 已有外部进程在 ${aktoolsTarget}, 不自动拉起\n`);
+    process.stdout.write('[aktools] 已有外部进程在 ' + aktoolsTarget + ', 不自动拉起\n');
     return;
   }
   const py = _pickPython();
   if (!py) {
-    process.stdout.write(`[aktools] ${aktoolsTarget} 不通, 且没找到 python/python3, 跳过自动拉起\n`);
+    process.stdout.write('[aktools] ' + aktoolsTarget + ' 不通, 且没找到 python/python3, 跳过\n');
     return;
   }
-  // 确认 aktools 模块已装
   const cp = require('child_process');
   try { cp.execFileSync(py, ['-c', 'import aktools'], { timeout: 5000 }); }
   catch (_) {
-    process.stdout.write(`[aktools] ${py} 在但 aktools 没装, 跳过自动拉起 (手动: ${py} -m pip install aktools)\n`);
+    process.stdout.write('[aktools] ' + py + ' 在但 aktools 没装, 跳过\n');
     return;
   }
-  process.stdout.write(`[aktools] ${aktoolsTarget} 不通, 自动拉起: ${py} -m aktools --host ${url.hostname} --port ${url.port}\n`);
+  process.stdout.write('[aktools] 自动拉起: ' + py + ' -m aktools --host ' + url.hostname + ' --port ' + url.port + '\n');
   spawnChild('aktools', py, ['-m', 'aktools', '--host', url.hostname, '--port', url.port], ROOT, '3');
-  // 等端口起来 (最多 20s)
   const deadline = Date.now() + 20000;
   while (Date.now() < deadline) {
     const ok = await new Promise(resolve => {
-      const req = http.get(`${aktoolsTarget}/api/public/macro_china_lpr`, { timeout: 2000 }, (res) => {
+      const req = http.get(aktoolsTarget + '/api/public/macro_china_lpr', { timeout: 2000 }, (res) => {
         resolve(res.statusCode === 200 || res.statusCode === 422);
       });
       req.on('error', () => resolve(false));
@@ -96,22 +153,18 @@ async function _ensureAktools() {
 /** V14: 启动内置静态 HTTP 服务器 (避免 file:// fetch CORS 问题) */
 function _startStaticServer(port) {
   const http = require('http');
-  const expressDir = path.join(RESOURCES, 'node_modules', 'express');
   let staticDir;
   if (IS_DEV) {
     staticDir = path.join(ROOT, 'www');
   } else {
-    staticDir = path.join(RESOURCES, 'www');
+    staticDir = path.join(RESOURCES, 'app', 'www');
   }
   if (!fs.existsSync(staticDir)) {
-    process.stderr.write(`[static] www 目录不存在: ${staticDir}\n`);
+    process.stderr.write('[static] www 目录不存在: ' + staticDir + '\n');
     return;
   }
-  // 用 Node 内置 http + fs 做极简静态文件服务器 (不依赖 express, 打包体积小)
-  // 所有 /api/* 请求转发到 dev-proxy (localhost:8089)
   const DEVO_PROXY_TARGET = 'http://127.0.0.1:8089';
   const server = http.createServer((req, res) => {
-    // API 代理 (同源解决 CORS)
     if (req.url.startsWith('/api/') || req.url === '/health') {
       const options = {
         hostname: '127.0.0.1',
@@ -128,47 +181,41 @@ function _startStaticServer(port) {
       req.pipe(proxyReq);
       return;
     }
-    // 静态文件
     let filePath = path.join(staticDir, req.url === '/' ? 'index.html' : req.url);
-    if (!fs.existsSync(filePath)) filePath = path.join(staticDir, 'index.html');  // SPA fallback
+    if (!fs.existsSync(filePath)) filePath = path.join(staticDir, 'index.html');
     const ext = path.extname(filePath).toLowerCase();
     const mime = { '.html': 'text/html', '.js': 'application/javascript', '.css': 'text/css', '.json': 'application/json', '.png': 'image/png', '.ico': 'image/x-icon', '.svg': 'image/svg+xml', '.webmanifest': 'application/manifest+json' };
     res.writeHead(200, { 'Content-Type': mime[ext] || 'application/octet-stream' });
     res.end(fs.readFileSync(filePath));
   });
-  server.listen(port, '127.0.0.1', () => process.stdout.write(`[static] 静态文件服务器 → http://127.0.0.1:${port}/\n`));
-  server.on('error', (e) => process.stderr.write(`[static] 启动失败: ${e.message}\n`));
+  server.listen(port, '127.0.0.1', () => process.stdout.write('[static] 静态文件服务器 -> http://127.0.0.1:' + port + '/\n'));
+  server.on('error', (e) => process.stderr.write('[static] 启动失败: ' + e.message + '\n'));
   const cleanup = () => { try { server.close(); } catch (_) {} };
   children.push({ kill: cleanup });
   process.on('exit', cleanup);
 }
 
 async function startBackend() {
-  // 0) 自动拉起 aktools (生产/开发 都一样)
   await _ensureAktools();
 
   if (IS_DEV) {
-    // dev mode: 启动 dev-proxy + vite (跟 npm run dev 一致)
     const proxyScript = path.join(ROOT, 'scripts', 'dev-proxy.mjs');
     if (fs.existsSync(proxyScript)) {
       spawnChild('proxy', 'node', [proxyScript], ROOT, '1');
     }
     spawnChild('vite', 'npx', ['vite'], ROOT, '2');
-    // 等 vite 起来
     await waitForUrl('http://127.0.0.1:3003', 15000);
     await waitForUrl('http://127.0.0.1:8089/health', 5000).catch(() => null);
   } else {
-    // 生产模式: 启动 dev-proxy (端口 8089, 已由 extraResources 打包进 exe)
     const proxyScript = path.join(RESOURCES, 'dev-proxy.mjs');
     if (fs.existsSync(proxyScript)) {
       spawnChild('proxy', 'node', [proxyScript], RESOURCES, '1');
       await waitForUrl('http://127.0.0.1:8089/health', 8000).catch(() => null);
     }
-    // V14: 启动内置静态文件服务器 (serve www/index.html), 避免 file:// fetch CORS
-    //     file:// 协议下 fetch(http://127.0.0.1:8089/api/...) 被同源策略阻止 (opaque origin)
-    //     改用 http://localhost:29037 加载页面, api 请求变成同源可代理
     _startStaticServer(29037);
-    await waitForUrl('http://127.0.0.1:29037', 3000);
+    await waitForUrl('http://127.0.0.1:29037', 3000).catch(() => {
+      process.stderr.write('[startBackend] 静态服务器未在 3s 内就绪, 继续尝试加载窗口\n');
+    });
   }
 }
 
@@ -208,19 +255,17 @@ function createWindow() {
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
-      // 不允许跨域, 配合 dev-proxy 处理
+      preload: path.join(__dirname, 'preload.js')
     }
   });
 
-  const indexPath = path.join(ROOT, 'www', 'index.html');
   if (IS_DEV) {
     mainWindow.loadURL('http://127.0.0.1:3003');
     mainWindow.webContents.openDevTools({ mode: 'detach' });
   } else {
-    mainWindow.loadURL('http://127.0.0.1:29037');  // V14: 走内置 HTTP 服务器, 避 CORS
+    mainWindow.loadURL('http://127.0.0.1:29037');
   }
 
-  // 外链走系统默认浏览器
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url);
     return { action: 'deny' };
@@ -229,7 +274,7 @@ function createWindow() {
   mainWindow.on('closed', () => { mainWindow = null; });
 }
 
-// ===== 菜单 (极简, 隐藏 MenuBar) =====
+// ===== 菜单 =====
 function buildMenu() {
   const template = [
     {
@@ -262,6 +307,7 @@ app.whenReady().then(async () => {
   buildMenu();
   await startBackend();
   createWindow();
+  setupAutoUpdater();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });

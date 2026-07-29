@@ -536,8 +536,13 @@
   // 不在顶部检查限流 (留给 fetchWithCache 决定: 缓存命中不限流, 没缓存才限流)
   // 限流按 path 独立: 同一时间 stock_zh_a_hist 限流不影响 stock_zh_a_spot
   async function _fetch(path, params = {}, opts = {}) {
-    const { retries = 2, baseDelay = 1500 } = opts;  // 第一次失败等 1.5s, 第二次 3s
-    const base = (window.Core && Core.State && Core.State.get('proxyBase')) || DEFAULT_PROXY;
+    const { retries = 2, baseDelay = 1500 } = opts;
+    // APK 首次启动 proxyBase 为空, 静默失败不抛错 (等自动发现或手动配)
+    const pb = (window.Core && Core.State && Core.State.get('proxyBase'));
+    const base = (pb == null) ? DEFAULT_PROXY : pb;
+    if (base === '') {
+      return { success: false, msg: 'proxyBase 未配置' };
+    }
     const qs = new URLSearchParams(params).toString();
     // base 已是绝对 URL (APK) 直接用; 是相对路径 (浏览器 dev) 也直接用, 走 vite proxy
     const url = qs ? `${base}/${path}?${qs}` : `${base}/${path}`;
@@ -1597,7 +1602,9 @@
    * 健康检查(代理是否通)
    */
   async function health() {
-    const base = (window.Core && Core.State && Core.State.get('proxyBase')) || DEFAULT_PROXY;
+    const pb = (window.Core && Core.State && Core.State.get('proxyBase'));
+    const base = (pb == null) ? DEFAULT_PROXY : pb;
+    if (base === '') return { ok: false, error: 'proxyBase 未配置' };
     try {
       const resp = await fetch(`${base}/health`);
       if (!resp.ok) return { ok: false, error: `HTTP ${resp.status}` };

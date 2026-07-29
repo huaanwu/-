@@ -234,20 +234,38 @@ const app = express();
 function _addCorsHeaders(proxyRes, req, res) {
   proxyRes.headers['access-control-allow-origin'] = '*';
   proxyRes.headers['access-control-allow-methods'] = 'GET, POST, OPTIONS';
-  proxyRes.headers['access-control-allow-headers'] = 'Content-Type';
+  proxyRes.headers['access-control-allow-headers'] = 'Content-Type, Authorization';
 }
 const _proxyOpts = { onProxyRes: _addCorsHeaders };
 
-app.options('/api/*', (req, res) => {
+// V15: CORS preflight — 用 middleware 避 path-to-regexp 5.x 的 * 通配符废弃
+app.use((req, res, next) => {
+  // 对所有路由加 ACAO:* (包括非 /api/*, 因 /api/sina 等经 proxy 后 ACAO 丢失)
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') {
+    res.status(204).end();
+    return;
+  }
+  next();
+});
+// V15: 纯快速存活探测 (不做任何 aktools 检查), 给 APK 自动发现用
+app.options('/ping', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.status(204).end();
 });
+app.get('/ping', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.json({ status: 'ok', ping: true, timestamp: new Date().toISOString() });
+});
+
 app.options('/health', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.status(204).end();
 });
 app.get('/health', async (req, res) => {

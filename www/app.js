@@ -197,7 +197,34 @@ function hideRegimeAlertBanner() {
       } else {
         console.log('[App] AKShare proxy ok');
       }
-    });
+    })
+    // 4c. Electron 自动更新通知
+    if (window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.App) {
+      window.Capacitor.Plugins.App.addListener('update-downloaded', (info) => {
+        if (document.getElementById('updateBanner')) return;
+        var el = document.createElement('div');
+        el.id = 'updateBanner';
+        el.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:99999;background:#1a7f37;color:#fff;padding:16px 20px;border-radius:8px;max-width:360px;font-size:14px;box-shadow:0 4px 12px rgba(0,0,0,0.3);';
+        var btn = document.createElement('button');
+        btn.textContent = '立即重启安装 (v' + info.version + ')';
+        btn.style.cssText = 'background:#fff;color:#1a7f37;border:none;padding:8px 16px;border-radius:4px;cursor:pointer;font-weight:600;margin-top:8px;';
+        btn.onclick = function() {
+          if (window.electronAPI && window.electronAPI.installUpdate) {
+            window.electronAPI.installUpdate();
+          }
+          el.remove();
+        };
+        var dismiss = document.createElement('button');
+        dismiss.textContent = '稍后';
+        dismiss.style.cssText = 'background:transparent;color:#aaa;border:1px solid #555;padding:8px 14px;border-radius:4px;cursor:pointer;margin-top:8px;margin-left:6px;';
+        dismiss.onclick = function() { el.remove(); };
+        el.innerHTML = '<div style="font-weight:600;margin-bottom:6px;">发现新版本</div><div style="margin-bottom:4px;">已下载完成,点击重启自动安装</div>';
+        el.appendChild(btn);
+        el.appendChild(dismiss);
+        document.body.appendChild(el);
+      });
+    }
+;
 
     // 4b. 大盘状态机每日重算 (Z1 Phase A, 接管 Kimi 活; H3 多指数 + 失灵熔断)
     // 异步, 失败不阻塞 UI; 每日 1 次 by kv lastDate 去重
@@ -321,41 +348,74 @@ function hideRegimeAlertBanner() {
  */
 async function _autoDiscoverDevProxy() {
   const port = 8089;
+  // V15.3: Race 模式 — 只要一个命中立即返回, 不等所有 IP 超时
   // 常见家用子网 + 部分商用 (OpenWrt / 软路由常见)
   const subnets = ['192.168.1', '192.168.0', '192.168.31', '10.0.0', '172.20', '172.24'];
   const candidates = [];
   for (const sn of subnets) {
-    // 扫 .1 (网关/Possible PC) + .2-.10 (常见 PC 地址)
     for (let i = 1; i <= 10; i++) candidates.push(`${sn}.${i}`);
   }
-  // 并发扫: 单个 2.5s 超时 (WebView fetch 没 abort, 用 AbortController), 整批 8s 总预算
-  const tasks = candidates.map(async (ip) => {
-    const c = new AbortController();
-    const timer = setTimeout(() => c.abort(), 2500);
-    try {
-      const r = await fetch(`http://${ip}:${port}/health`, { cache: 'no-store', signal: c.signal });
-      clearTimeout(timer);
-      if (!r.ok) return null;
-      const j = await r.json().catch(() => null);
-      if (j && j.status === 'ok') return { ip, j };
-      return null;
-    } catch (e) {
-      clearTimeout(timer);
-      return null;
+  // 用 Promise.race: 第一个命中的 IP 立即胜出
+  // 兜底: 最多 concurrent 10 (Android WebView 连接池有限)
+  const result = await new Promise((resolve) => {
+    let done = false;
+    let pending = 0;
+    function check(ip) {
+      pending++;
+      const c = new AbortController();
+      const timer = setTimeout(() => c.abort(), 3000);
+      fetch(`http://${ip}:${port}/ping`, { cache: 'no-store', signal: c.signal })
+        .then(r => { clearTimeout(timer); return r.ok ? r.json() : null; })
+        .then(j => { if (!done && j && j.status === 'ok' && j.ping) { done = true; resolve({ ip, j }); } })
+        .catch(() => { clearTimeout(timer); })
+        .finally(() => { pending--; if (!done && pending === 0) resolve(null); });
     }
+    // 分批: 一次并发 10, 每批 3s
+    const BATCH = 10;
+    (function nextBatch(idx) {
+      if (done) return;
+      const batch = candidates.slice(idx, idx + BATCH);
+      if (batch.length === 0) { setTimeout(() => { if (!done) resolve(null); }, 3000); return; }
+      batch.forEach(check);
+      setTimeout(() => nextBatch(idx + BATCH), 200);
+    })(0);
   });
-  const settled = await Promise.allSettled(tasks);
-  const hits = settled.map(s => s.value).filter(Boolean);
-  if (hits.length === 0) {
+  if (!result) {
     if (window.Core && Core.Toast) Core.Toast.show('📡 APK 自动发现失败 — 打开设置页手动填代理地址', 6000);
     return;
   }
-  // 取第一个命中 (理论上都很快, 任意一个都行)
-  const picked = hits[0];
-  const url = `http://${picked.ip}:${port}/api/akshare`;
-  window.Core.State.set('proxyBase', url);
-  if (window.Core && Core.Toast) Core.Toast.show(`📡 自动发现 dev-proxy @ ${picked.ip}:${port} (设置页可改)`, 5000);
-  console.log('[App] V11 auto-discover 命中:', url, '其他候选:', hits.slice(1).map(h => h.ip).join(','));
+  const picked = result;
+  const proxyUrl = `http://${picked.ip}:${port}/api/akshare`;
+  window.Core.State.set('proxyBase', proxyUrl);
+  if (window.Core && Core.Toast) Core.Toast.show(`📡 自动发现 dev-proxy @ ${picked.ip}:${port}`, 5000);
+  console.log('[App] V15.3 auto-discover 命中:', proxyUrl);
+  // V15.3: 通过 dev-proxy 服务端扫本地大模型（不走手机直连，无 CORS 问题）
+  _discoverLLMviaProxy();
+  // V15.3: 自动发现成功后刷新当前页面数据
+  const curPage = window.Core.State.get('currentPage');
+  if (curPage && window.Core && Core.Router) {
+    Core.Router.switchPage(curPage);
+  }
+}
+
+/** V15.3: 通过 dev-proxy 的服务端扫描找本地大模型（不走手机直连，无 CORS 问题） */
+async function _discoverLLMviaProxy() {
+  try {
+    const _apiUrl = (window.Core && Core.Data && Core.Data.apiUrl) ? Core.Data.apiUrl : (p) => p;
+    const resp = await fetch(_apiUrl('/api/discover/local-llm'), { method: 'GET', cache: 'no-store' });
+    if (!resp.ok) return;
+    const j = await resp.json();
+    if (!j || !j.found || !j.found.length) return;
+    const best = j.found[0];
+    const model = (best.models && best.models[0]) || '';
+    if (!model) return;
+    const ai = window.Core.State.get('ai') || {};
+    ai.localEndpoint = { baseURL: best.baseURL, apiKey: '', model };
+    ai.preferLocal = true;
+    window.Core.State.set('ai', ai);
+    if (window.Core && Core.Toast) Core.Toast.show(`🤖 自动发现本地 LLM @ ${best.baseURL} / ${model}`, 6000);
+    console.log('[App] V15.3 auto-discover LLM via proxy:', best.baseURL, model);
+  } catch (_) { /* 静默失败，手动扫不影响 */ }
 }
 
 // ========== 设置页渲染 ==========
@@ -407,6 +467,15 @@ window._renderSettings = function() {
       <span id="devProxyDiscoverResult" style="font-size:12px;color:var(--text-muted);margin-left:8px;"></span>
     </div>
     <div id="devProxyDiscoverList" style="margin-top:8px;"></div>
+
+    <div class="form-row">
+      <label>🤖 AI 手动测试 (绕过周一限制 / 交易日限制)</label>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px;">
+        <button class="btn" onclick="manualLongTrader()">🔍 手动跑长线 AI 选股</button>
+        <button class="btn" onclick="manualShortPlan()">📋 手动跑短线盘前计划</button>
+      </div>
+      <div id="manualTraderResult" style="font-size:12px;color:var(--text-muted);margin-top:6px;"></div>
+    </div>
 
     <div class="form-row">
       <label>AKShare 代理地址</label>
@@ -837,7 +906,7 @@ window.testLocalAI = async function() {
 
 // 局域网自动发现 dev-proxy (给 APK 用) —
 // 步骤: 浏览器 fetch dev-proxy 的 /api/discover/dev-proxy → 拿 serverIPs 列表
-//       → 浏览器挨个 fetch {ip}:8089/health (dev-proxy 已加 CORS: *)
+//       → 浏览器挨个 fetch {ip}:8089/ping (纯内存, 不探测 aktools, 快)
 //       → 命中即填入 settingProxyBase, 一键保存
 window.discoverDevProxy = async function() {
   const status = document.getElementById('devProxyDiscoverResult');
@@ -867,11 +936,11 @@ window.discoverDevProxy = async function() {
     if (status) { status.textContent = '❌ dev-proxy 没拿到任何 LAN IP (虚拟网卡? 防火墙?)'; status.style.color = 'var(--down)'; }
     return;
   }
-  // 探测每个候选: fetch {ip}:{port}/health (3s timeout)
+  // V15: 探测每个候选: fetch {ip}:{port}/ping (纯内存, 不探测 aktools, 快)
   const port = info.port || 8089;
   const tasks = [...candidates].map(async (ip) => {
     const start = Date.now();
-    const url = `http://${ip}:${port}/health`;
+    const url = `http://${ip}:${port}/ping`;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 3000);
     try {
@@ -1088,6 +1157,36 @@ window.discoverLLM = async function() {
       status.style.color = 'var(--down)';
     }
     console.warn('[discoverLLM] 错误:', e);
+  }
+};
+
+// 手动测试长线 AI 选股（强制跳过周一/7天限制，直接跑完整管线）
+window.manualLongTrader = async function() {
+  const el = document.getElementById('manualTraderResult');
+  if (el) { el.textContent = '⏳ 正在拉行情+评分+LLM 选股（可能需要 30-60 秒）...'; el.style.color = 'var(--text-muted)'; }
+  try {
+    if (!window.LongTrader) { throw new Error('LongTrader 未加载'); }
+    await LongTrader.runNow({ force: true });
+    if (el) { el.textContent = '✅ 长线选股完成，请去模拟盘页面查看结果'; el.style.color = 'var(--up)'; }
+  } catch (e) {
+    if (el) { el.textContent = '❌ 失败: ' + e.message; el.style.color = 'var(--down)'; }
+  }
+};
+
+// 手动测试短线盘前计划（强制重新生成，忽略今日已生成记录）
+window.manualShortPlan = async function() {
+  const el = document.getElementById('manualTraderResult');
+  if (el) { el.textContent = '⏳ 正在生成短线盘前计划（可能需要 30-60 秒）...'; el.style.color = 'var(--text-muted)'; }
+  try {
+    if (!window.ShortTrader) { throw new Error('ShortTrader 未加载'); }
+    const r = await ShortTrader.generatePlan({ now: new Date() });
+    if (el) {
+      const n = r && r.plans ? r.plans.length : 0;
+      el.textContent = n > 0 ? `✅ 短线计划生成完成 (${n} 条)，请去模拟盘-短线页面查看` : '✅ 已运行，请查看结果';
+      el.style.color = 'var(--up)';
+    }
+  } catch (e) {
+    if (el) { el.textContent = '❌ 失败: ' + e.message; el.style.color = 'var(--down)'; }
   }
 };
 

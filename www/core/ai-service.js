@@ -101,14 +101,18 @@
     // 优先用 ai.localEndpoint, 否则回退到主配置
     const local = ai.localEndpoint || {};
     // 7) 自动发现模式: baseURL 形如 http://<ip>:8082/v1 → 强制走 /api/local/v1 绕浏览器 CORS
-    // APK / 真机场景保留直连
+    // APK / 真机场景: 本地 LLM 直连会被 CORS 拦截, 通过 dev-proxy /api/local 转发
     let localBaseURL = local.baseURL || '';
-    if (localBaseURL && !localBaseURL.startsWith('/') && (location.hostname === 'localhost' || location.hostname === '127.0.0.1' || /^\[.*\]$/.test(location.hostname) || /^::1$/.test(location.hostname))) {
-      // dev / 本机访问场景: 重写为 /api/local/v1
-      try {
-        const u = new URL(localBaseURL);
-        localBaseURL = _apiUrl(`/api/local${u.pathname}`.replace(/\/v1\/v1$/, '/v1'));
-      } catch (e) { console.warn('[AI] 本地 LLM baseURL 解析失败, 保留原值:', e.message); }
+    if (localBaseURL && !localBaseURL.startsWith('/')) {
+      const _isNative = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+      const isSameHost = (location.hostname === 'localhost' || location.hostname === '127.0.0.1' || /^\[.*\]$/.test(location.hostname) || /^::1$/.test(location.hostname));
+      if (isSameHost || _isNative) {
+        // 本机场景 / APK 场景: 走 dev-proxy /api/local 绕 CORS
+        try {
+          const u = new URL(localBaseURL);
+          localBaseURL = _apiUrl(`/api/local${u.pathname}`.replace(/\/v1\/v1$/, '/v1'));
+        } catch (e) { console.warn('[AI] 本地 LLM baseURL 解析失败, 保留原值:', e.message); }
+      }
     }
     const localConfig = {
       baseURL: localBaseURL,
