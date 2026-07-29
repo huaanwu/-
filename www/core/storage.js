@@ -19,7 +19,7 @@
   // 这里直接 new Dexie()
 
   const DB_NAME = 'stockmaster';
-  const DB_VERSION = 1;
+  const DB_VERSION = 2;  // v0.2.4: 加 settings_snapshots 表 (WebDAV 同步保险, push 前存云端上一版)
 
   let db = null;
 
@@ -42,7 +42,11 @@
       funds: '&code, name, type, addedAt',
       cashflow: '&id, date, type, createdAt',  // 资金流水 (存入/取出/分红/费用)
       cache: '&key, expiresAt',
-      kv: '&key'
+      kv: '&key',
+      // v0.2.4: WebDAV 同步备份 — 每次 push 前 GET 云端上一版, 落到这里.
+      //   reason: 'pre-push' / 'manual' / 'pre-restore'
+      //   items 是压缩的 settings 字典 (跟 settings-sync.js collect() 一致)
+      settings_snapshots: '&id, ts, reason'
     });
 
     return db;
@@ -137,16 +141,77 @@
     return item ? item.value : null;
   }
 
+  /**
+   * V0.2.3 设置项同步钩子: kvSet/kvDelete 触发监听
+   * 监听者 (Core.SettingsSync) 收到 (key, value | null) 事件
+   * 业务逻辑 / 临时缓存 (cache 表) 不需要这个钩子, 但 kvSet 是单点所以一视同仁发出去,
+   * SettingsSync 自己按白名单过滤, 避免 hook 调用方做白名单筛选导致新增设置项漏同步
+   */
+  const _kvWatchers = new Set();
+  function onKvChange(fn) {
+    if (typeof fn === 'function') _kvWatchers.add(fn);
+    return () => _kvWatchers.delete(fn);
+  }
+  function _emitKvChange(key, value) {
+    for (const fn of _kvWatchers) {
+      try { fn(key, value); } catch (e) { console.warn('[Storage] kv watcher error:', e); }
+    }
+  }
+
   async function kvSet(key, value) {
     const d = init();
     if (!d) return;
     await d.kv.put({ key, value });
+    _emitKvChange(key, value);
   }
 
   async function kvDelete(key) {
     const d = init();
     if (!d) return;
     await d.kv.delete(key);
+    _emitKvChange(key, null);
+  }
+
+  /**
+   * v0.2.4: WebDAV 同步保险 — settings_snapshots 表专用 helper
+   * 写一份 snapshot, 按 ts 排序保留最近 N 份, 超出删最老 (默认 5, 走 kv 'settings_sync_backup_keep')
+   */
+  async function saveSettingsSnapshot(snap) {
+    const d = init();
+    if (!d) throw new Error('DB not ready');
+    await d.settings_snapshots.put(snap);
+    const keepRaw = await kvGet('settings_sync_backup_keep');
+    const keep = Math.max(1, Math.min(50, parseInt(keepRaw, 10) || 5));
+    const all = await d.settings_snapshots.orderBy('ts').reverse().toArray();
+    if (all.length > keep) {
+      const toDel = all.slice(keep).map(s => s.id);
+      await d.settings_snapshots.bulkDelete(toDel);
+    }
+    return snap.id;
+  }
+
+  async function listSettingsSnapshots() {
+    const d = init();
+    if (!d) return [];
+    return await d.settings_snapshots.orderBy('ts').reverse().toArray();
+  }
+
+  async function getSettingsSnapshot(id) {
+    const d = init();
+    if (!d) return null;
+    return await d.settings_snapshots.get(id);
+  }
+
+  async function deleteSettingsSnapshot(id) {
+    const d = init();
+    if (!d) return;
+    await d.settings_snapshots.delete(id);
+  }
+
+  async function clearSettingsSnapshots() {
+    const d = init();
+    if (!d) return;
+    await d.settings_snapshots.clear();
   }
 
   /**
@@ -173,7 +238,9 @@
     add, put, get, all, where, remove, clear,
     cacheGet, cacheSet, cacheClear,
     kvGet, kvSet, kvDelete,
+    onKvChange,
     clearAll,
+    saveSettingsSnapshot, listSettingsSnapshots, getSettingsSnapshot, deleteSettingsSnapshot, clearSettingsSnapshots,
     DB_NAME, DB_VERSION
   };
 })();

@@ -529,6 +529,57 @@ app.use('/api/local', createProxyMiddleware({
   }
 }));
 
+// ===== WebDAV 透传 (v0.2.3 设置项云同步) =====
+// 浏览器 → /api/webdav?url={完整目标 URL}&username=&password= → 透传到任意 WebDAV
+// 用 query 而不是 header 传 url/credentials 是为了避免自定义 header 触发 CORS 预检
+//   (WebDAV 服务器 (坚果云/Nextcloud/自建) 端支持 basic auth, 我们在 proxy 层注入 Authorization header)
+function _decodeCred(value) {
+  if (!value) return '';
+  try { return decodeURIComponent(value); } catch (_) { return value; }
+}
+function _webdavProxy(req, res, next) {
+  const target = req.query.url;
+  if (!target) {
+    return res.status(400).json({ error: 'MISSING_URL', message: '需要 ?url= 参数指定 WebDAV 目标' });
+  }
+  // 安全: 仅允许 http/https
+  let parsed;
+  try { parsed = new URL(target); } catch (e) {
+    return res.status(400).json({ error: 'BAD_URL', message: 'URL 解析失败: ' + e.message });
+  }
+  if (!/^https?:$/.test(parsed.protocol)) {
+    return res.status(400).json({ error: 'BAD_SCHEME', message: '仅允许 http/https, 不支持 ' + parsed.protocol });
+  }
+  const username = _decodeCred(req.query.username);
+  const password = _decodeCred(req.query.password);
+  const proxyOpts = {
+    target: target,
+    changeOrigin: true,
+    followRedirects: true,
+    pathRewrite: () => parsed.pathname + parsed.search,
+    onProxyReq: (proxyReq, pReq) => {
+      // 透传 Authorization: 用前端传的 username/password 拼 basic
+      if (username || password) {
+        const auth = Buffer.from(username + ':' + password).toString('base64');
+        proxyReq.setHeader('Authorization', 'Basic ' + auth);
+      }
+    },
+    onProxyRes: (proxyRes) => {
+      // dev-proxy 头要保留 Last-Modified / ETag 给前端 (判断 mtime)
+      proxyRes.headers['access-control-expose-headers'] = 'Last-Modified, ETag, Content-Length';
+    },
+    onError: (err, pReq, pRes) => {
+      console.error(`[webdav] ${pReq.method} ${pReq.url} → ${err.message}`);
+      if (!pRes.headersSent) {
+        pRes.status(502).json({ error: 'WEBDAV_UNREACHABLE', message: err.message });
+      }
+    }
+  };
+  // 创建子 proxy, 调用它作为当前请求的 handler
+  createProxyMiddleware(proxyOpts)(req, res, next);
+}
+app.use('/api/webdav', _webdavProxy);
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 StockMaster dev-proxy listening on http://0.0.0.0:${PORT}`);
   console.log('   /api/akshare/* → ' + AKSHARE_TARGET);
@@ -538,6 +589,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   /api/discover/local-llm → scan ${DISCOVER_PORTS.length} ports × N hosts (server-side)`);
   console.log(`   /api/discover/dev-proxy → 暴露 serverIPs (给 APK 局域网自动发现用)`);
   console.log(`   /api/local/* → ${LOCAL_LLM_TARGET} (本地大模型透传, 绕浏览器 CORS)`);
+  console.log(`   /api/webdav → 透传 ?url= 任意 WebDAV (设置项云同步, 鉴权走 query)`);
   console.log(`   /api/tencent/* → qt.gtimg.cn (腾讯行情备用通道, 主用 data.js 直连)`);
   console.log(`   Health: http://127.0.0.1:${PORT}/health`);
   console.log('');

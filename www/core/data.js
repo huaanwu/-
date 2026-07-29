@@ -324,9 +324,9 @@
     'https://push2delay.eastmoney.com/api/qt/clist/get'    // 延迟 15min, 限制 100/页但稳
   ];
   const EM_FS = 'm:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23';  // 沪主+科创+深主+创业
-  const EM_FIELDS = 'f12,f14,f2,f3,f4,f5,f6,f8,f9,f10,f20,f23';
+  const EM_FIELDS = 'f12,f14,f2,f3,f4,f5,f6,f8,f9,f10,f20,f21,f23';
   const EM_PAGE_SIZE = 100;  // push2delay 限 100/页, push2 5000
-  const EM_MAX_PAGES = 5;     // 最多 5 页 = 500 只 (避免被 ban)
+  const EM_MAX_PAGES = 50;     // push2delay 50 页 × 100 = 5000 只, 覆盖全市场
 
   async function _efinanceFetch() {
     // 限流检查 (跟 _fetch 一致: 限流期内不发起请求)
@@ -360,7 +360,7 @@
     const isDelay = baseUrl.includes('push2delay');
     const pageSize = isDelay ? Math.min(EM_PAGE_SIZE, 100) : 5000;
     // 延迟端点限 100/页, 必须分页; 实时端点 pz=5000 一次就行
-    const pages = isDelay ? Math.min(maxPages, 5) : 1;
+    const pages = isDelay ? Math.min(maxPages, 50) : 1;
     const all = [];
     for (let pn = 1; pn <= pages; pn++) {
       const url = `${baseUrl}?pn=${pn}&pz=${pageSize}&po=1&fs=${EM_FS}&fields=${EM_FIELDS}`;
@@ -409,6 +409,7 @@
           '市盈率': _num(r.f9) / 100,
           '量比': _num(r.f10) / 100,
           '流通市值': _num(r.f20),
+          '总市值': _num(r.f21),
           '市净率': _num(r.f23) / 100
         });
       }
@@ -651,8 +652,11 @@
       );
       return all.filter(s => codes.includes(s.代码) || codes.includes(s.code));
     }
-    // 不传 codes: 优先 aktools stock_zh_a_spot (5532 条全市场, 浏览器可直连 dev-proxy)
-    // efinance 直连 push2.eastmoney.com 当前对裸请求 ECONNRESET, 仅作为 fallback
+    // 不传 codes: 优先 efinance (含 PE/PB/换手率/总市值), fallback stock_zh_a_spot (14 基础字段)
+    try {
+      const em = await getStockSpotEfinanceCached();
+      if (em && em.length > 0) return em;
+    } catch (_) { /* 降级 */ }
     try {
       return await fetchWithCache(
         'stock_spot_all',
@@ -1599,18 +1603,35 @@
   // ==================== 自检 ====================
 
   /**
-   * 健康检查(代理是否通)
+   * 健康检查 (dev-proxy :8089 是否通)
+   * V0.2.3 修: 之前走 `${proxyBase}/health`, 但 proxyBase 默认 '/api/akshare' 会拼成
+   * '/api/akshare/health' → dev-proxy 没这个路由 → 404. health endpoint 始终在 dev-proxy
+   * 顶层 /health, 必须绕过 /api/akshare/ 这层, 用显式 localhost:8089 fallback.
    */
   async function health() {
+    // 优先读 proxyBase; 没设或走 /api/akshare 相对路径 → 显式 fallback 127.0.0.1:8089
     const pb = (window.Core && Core.State && Core.State.get('proxyBase'));
-    const base = (pb == null) ? DEFAULT_PROXY : pb;
-    if (base === '') return { ok: false, error: 'proxyBase 未配置' };
+    let base;
+    if (!pb || /^https?:\/\//i.test(pb) === false) {
+      // pb 为 null/空 或 相对路径 → 浏览器 dev 期望直连 dev-proxy
+      // 注: Vite 代理不能转发顶层 /health (只能 /api/*), 所以这里必须是绝对 URL
+      base = 'http://127.0.0.1:8089';
+    } else {
+      try {
+        const u = new URL(pb);
+        // pb 形如 'http://192.168.x.x:8089' 或 'http://127.0.0.1:8089/api/akshare'
+        // → 抽 origin 拼 /health
+        base = u.origin;
+      } catch (e) {
+        base = 'http://127.0.0.1:8089';
+      }
+    }
     try {
-      const resp = await fetch(`${base}/health`);
-      if (!resp.ok) return { ok: false, error: `HTTP ${resp.status}` };
+      const resp = await fetch(`${base}/health`, { cache: 'no-store' });
+      if (!resp.ok) return { ok: false, error: `HTTP ${resp.status} (${base}/health)` };
       return await resp.json();
     } catch (e) {
-      return { ok: false, error: e.message };
+      return { ok: false, error: e.message + ` (尝试 ${base}/health)` };
     }
   }
 
@@ -2437,6 +2458,7 @@
     _sinaFetch, _sinaParse,  // Z13: 新浪 fetcher + 解析 (腾讯失败兜底, 测试用)
     _tencentKLine,          // Y12: 腾讯 K 线 fetcher (内部)
     getStockSpotEfinance,  // C: 东方财富 fetcher (全市场, screener 用)
+    getStockSpotEfinanceCached,  // 带 60s 缓存的东方财富 fetcher
     getStockFinancialHistory,  // Phase R: 近 N 期财报对比
     getFinancialCalendar, getStockNextDisclosure,  // Phase U: 财报披露日历
     // 排雷 (Phase Y.1)

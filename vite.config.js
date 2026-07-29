@@ -63,7 +63,9 @@ export default defineConfig({
         '/core/weight-advisor.js',  // Tier 6: LLM 周度动态权重
         '/core/user-profile.js',  // Commit 1: 用户画像 (7 字段 schema)
         '/core/agent.js',         // AI 管家: 工具调用循环 + 分级授权
-        '/app/agent-ui.js'        // AI 管家: 侧边栏对话窗
+        '/core/agent-tools.js',   // AI 管家: renderer-direct 工具集 (v0.2.0 全盘接管)
+        '/app/agent-ui.js',       // AI 管家: 侧边栏对话窗
+        '/core/settings-sync.js'  // v0.2.3: 设置项云同步 (WebDAV)
       ]
     }
   },
@@ -124,6 +126,12 @@ export default defineConfig({
       // 天天基金历史净值 (aktools 端点 500 时 fallback; dev-proxy 透传到 fund.eastmoney.com)
       // 浏览器 → /api/fund/eastmoney/pingzhongdata/007194.js → dev-proxy → fund.eastmoney.com
       '/api/fund': {
+        target: 'http://127.0.0.1:8089',
+        changeOrigin: true
+      },
+      // v0.2.3 设置项云同步 (WebDAV 透传) — 浏览器 → vite proxy → dev-proxy → 用户指定 WebDAV
+      // dev-proxy /api/webdav 解析 ?url= 参数透传到任意 WebDAV (坚果云/Nextcloud)
+      '/api/webdav': {
         target: 'http://127.0.0.1:8089',
         changeOrigin: true
       }
