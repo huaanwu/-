@@ -21,46 +21,63 @@ const agentRegistry = require('./agent-registry');
 
 // ===== 自动更新 (electron-updater) =====
 function setupAutoUpdater() {
-  if (!app.isPackaged) return;
+  // v0.2.11 修: dev 模式 (npm run dev:electron) 也跑升级检查, 方便本地端到端测试升级流程
+  //   - 走 env override (STOCKMASTER_FEED_URL) 或 package.json build.publish
+  //   - 检查失败不阻塞应用, 只 console.log 排查信息
+  if (!app.isPackaged && !process.env.STOCKMASTER_DEV_UPDATE) {
+    console.log('[autoUpdater] dev 模式未开 STOCKMASTER_DEV_UPDATE, 跳过升级检查');
+    return;
+  }
 
   autoUpdater.autoDownload = false;
   autoUpdater.autoInstallOnAppQuit = true;
-  // 仓库实际名为 "-"，electron-updater 默认读 package.json build.publish,
-  // 但读不到时可显式指定 feed URL 作 fallback
-  autoUpdater.setFeedURL({
-    provider: 'github',
-    owner: 'huaanwu',
-    repo: '-'
-  });
+
+  // v0.2.11 修: 支持自定义 feed URL (env override), 用于自建 nginx/局域网共享/私服
+  //   格式: STOCKMASTER_FEED_URL=https://update.example.com/stockmaster
+  //   不设时走 package.json build.publish (github provider, owner=huaanwu, repo=-)
+  const customFeed = process.env.STOCKMASTER_FEED_URL;
+  if (customFeed) {
+    console.log('[autoUpdater] 使用自定义 feed URL: ' + customFeed);
+    autoUpdater.setFeedURL(customFeed);
+  } else {
+    // v0.2.11 修: 删 setFeedURL 显式调用 (跟 package.json publish 重复)
+    //   electron-updater 默认读 package.json build.publish 段, 无需重复
+    const pub = require('../package.json').build && require('../package.json').build.publish;
+    if (pub) {
+      console.log('[autoUpdater] feed: ' + pub.provider + ' ' + pub.owner + '/' + pub.repo);
+    } else {
+      console.warn('[autoUpdater] package.json build.publish 未配置, 升级功能不可用');
+    }
+  }
 
   autoUpdater.on('checking-for-update', () => {
-    process.stdout.write('[autoUpdater] 检查更新中...\n');
+    console.log('[autoUpdater] 检查更新中...');
   });
 
   autoUpdater.on('update-available', (info) => {
-    process.stdout.write('[autoUpdater] 发现新版本: ' + info.version + '\n');
+    console.log('[autoUpdater] 发现新版本: ' + info.version);
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('update-available', info);
     }
   });
 
   autoUpdater.on('update-not-available', () => {
-    process.stdout.write('[autoUpdater] 当前已是最新版本\n');
+    console.log('[autoUpdater] 当前已是最新版本');
   });
 
   autoUpdater.on('download-progress', (p) => {
-    process.stdout.write('[autoUpdater] 下载进度: ' + Math.round(p.percent) + '%\n');
+    console.log('[autoUpdater] 下载进度: ' + Math.round(p.percent) + '%');
   });
 
   autoUpdater.on('update-downloaded', (info) => {
-    process.stdout.write('[autoUpdater] 下载完成: ' + info.version + '\n');
+    console.log('[autoUpdater] 下载完成: ' + info.version);
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('update-downloaded', info);
     }
   });
 
   autoUpdater.on('error', (err) => {
-    process.stderr.write('[autoUpdater] 错误: ' + err.message + '\n');
+    console.error('[autoUpdater] 错误: ' + err.message);
     // B5 修复: 错误也推到渲染端, 让用户看到红色 toast (不只写 stderr)
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('update-error', { message: err.message });
@@ -77,7 +94,7 @@ function setupAutoUpdater() {
   // 启动 3 秒后静默检查更新
   setTimeout(() => {
     autoUpdater.checkForUpdates().catch((err) => {
-      process.stderr.write('[autoUpdater] 检查失败: ' + err.message + '\n');
+      console.error('[autoUpdater] 检查失败: ' + err.message);
     });
   }, 3000);
 }
