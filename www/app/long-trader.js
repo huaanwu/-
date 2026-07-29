@@ -55,6 +55,35 @@
      * 流程: 检查触发 → 拉行情 → 硬筛 top 30 → LLM 挑 TOP_N → 调 Paper.autoTradeFromPick
      * 整轮异常吞, 失败不影响下次
      */
+    /**
+     * v0.2.5: 暴露状态给 pagePaper note 渲染
+     * @returns {Promise<{running: boolean, lastRunTs: number|null, lastRunDate: string|null, lastError: string|null, nextRunAt: number|null}>}
+     */
+    async getStatus() {
+      const lastRun = await Core.Storage.kvGet(LAST_RUN_KEY).catch(() => null);
+      const lastRunTs = lastRun && lastRun.ts ? lastRun.ts : null;
+      let nextRunAt = null;
+      if (lastRunTs) {
+        nextRunAt = lastRunTs + RERUN_DAYS * 24 * 60 * 60 * 1000;
+      } else {
+        // 从未跑过 → 下一个周一 09:30
+        const now = new Date();
+        const day = now.getDay();
+        const offset = (1 - day + 7) % 7 || 7;
+        const next = new Date(now);
+        next.setDate(now.getDate() + offset);
+        next.setHours(9, 30, 0, 0);
+        nextRunAt = next.getTime();
+      }
+      return {
+        running: !!this._running,
+        lastRunTs,
+        lastRunDate: lastRun && lastRun.date ? lastRun.date : null,
+        lastError: null,  // 错误只 warn, 不存, 想要可加 key
+        nextRunAt
+      };
+    },
+
     async runNow(opts = {}) {
       if (this._running) return;
       this._running = true;

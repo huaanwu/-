@@ -291,6 +291,61 @@
     },
 
     /**
+     * 预热: 后台并行拉宽基 + 风格快照, fire-and-forget
+     * - opts.force: 默认 false — 30s 内已有快照则跳过网络
+     * - opts.delay: 默认 0 — 延迟 ms 后再触发 (用于 idle 调用)
+     * 失败仅 console.warn, 不抛
+     */
+    warmup(opts) {
+      opts = opts || {};
+      const force = !!opts.force;
+      const delay = Number(opts.delay) || 0;
+      const SNAPSHOT_FRESH_MS = 30 * 1000;
+
+      const start = async () => {
+        try {
+          // 30s 短路: 缓存新鲜则跳过网络
+          if (!force && window.Core && Core.Storage && Core.Storage.cacheGet) {
+            try {
+              const cached = await Core.Storage.cacheGet('market_warmup');
+              if (cached && (Date.now() - (cached.ts || 0)) < SNAPSHOT_FRESH_MS) {
+                return cached;
+              }
+            } catch (e) { /* 缓存读失败不算错 */ }
+          }
+
+          // 并行拉 wide + style
+          const [wideR, styleR] = await Promise.all([
+            Promise.resolve().then(() => this.get('wide')).catch(e => { throw new Error('wide: ' + e.message); }),
+            Promise.resolve().then(() => this.get('style')).catch(e => { throw new Error('style: ' + e.message); })
+          ]);
+
+          const snap = {
+            wide: (wideR && Array.isArray(wideR.items)) ? wideR.items : [],
+            style: (styleR && Array.isArray(styleR.items)) ? styleR.items : [],
+            ts: Date.now()
+          };
+
+          if (window.Core && Core.Storage && Core.Storage.cacheSet) {
+            try { await Core.Storage.cacheSet('market_warmup', snap, TTL_WIDE); } catch (e) { /* ignore */ }
+          }
+          return snap;
+        } catch (e) {
+          console.warn('[Market] warmup 失败:', e.message || e);
+          return null;
+        }
+      };
+
+      if (delay > 0) {
+        setTimeout(start, delay);
+        // 立即返一个占位 Promise, 让调用方 .catch() 不炸; 等到 setTimeout 真正触发时跑 start()
+        // 注意: 调用方拿到的 Promise 与延迟执行的 start() 不是同一个 Promise — 这里只是兼容 .catch 句法
+        return Promise.resolve();
+      }
+      return start();
+    },
+
+    /**
      * 工具: 简单格式化(纯函数,可在 vm 测)
      */
     formatItem(it) {

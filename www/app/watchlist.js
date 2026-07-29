@@ -85,9 +85,9 @@
           <td>${escapeHtml(item.name || s.名称)}</td>
           <td>${fmtNum(price, 2)}</td>
           <td class="${pctClass(changePct)}">${fmtPct(changePct)}</td>
-          <td class="${pctClass(changePct)}">${s.涨跌额 ? fmtNum(parseFloat(s.涨跌额), 2) : '-'}</td>
-          <td>${s.成交量 || '-'}</td>
-          <td>${s.换手率 ? parseFloat(s.换手率).toFixed(2) + '%' : '-'}</td>
+          <td class="${pctClass(changePct)}">${s.涨跌额 ? fmtNum(parseFloat(s.涨跌额), 2) : '<span style="color:var(--text-muted);" title="' + escapeHtml('该股今日停牌/无成交, 涨跌额/成交量/换手率无数据') + '">停牌</span>'}</td>
+          <td>${s.成交量 || '<span style="color:var(--text-muted);" title="' + escapeHtml('该股今日停牌/无成交, 涨跌额/成交量/换手率无数据') + '">停牌</span>'}</td>
+          <td>${s.换手率 ? parseFloat(s.换手率).toFixed(2) + '%' : '<span style="color:var(--text-muted);" title="' + escapeHtml('该股今日停牌/无成交, 涨跌额/成交量/换手率无数据') + '">停牌</span>'}</td>
           <td><button class="btn btn-sm" title="AI 简评" onclick="event.stopPropagation();StockAdvisor.show('${escapeHtml(item.code)}','${escapeHtml(item.name || s.名称 || '')}')">💡</button> <button class="btn btn-sm" onclick="event.stopPropagation();Watchlist.remove('${escapeHtml(item.code)}')">✕</button></td>
         </tr>`;
       }).join('');
