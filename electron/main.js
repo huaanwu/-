@@ -88,7 +88,26 @@ function setupAutoUpdater() {
     autoUpdater.downloadUpdate();
   });
   ipcMain.on('install-update', () => {
-    autoUpdater.quitAndInstall(false, true);
+    // v0.2.14 修: 升级前主动 taskkill 旧 StockMaster.exe 进程树 (/T), 避免 NSIS 替换 .exe 时被 Windows 文件锁拒
+    //   流程: 等 200ms IPC flush → taskkill (主进程 + 子进程 + 工具进程) → 等 500ms 让 OS 释放锁 → quitAndInstall
+    setImmediate(() => {
+      setTimeout(() => {
+        try {
+          require('child_process').execSync('taskkill /F /IM StockMaster.exe /T 2>nul', { stdio: 'ignore', timeout: 5000 });
+          console.log('[autoUpdater] 已杀旧 StockMaster.exe 进程树');
+        } catch (_) { /* taskkill 在没进程时 exit 1, 静默吞 */ }
+        setTimeout(() => {
+          try {
+            autoUpdater.quitAndInstall(false, true, true);
+          } catch (e) {
+            console.error('[autoUpdater] quitAndInstall 失败:', e.message);
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('update-error', { message: '升级安装失败: ' + e.message });
+            }
+          }
+        }, 500);
+      }, 200);
+    });
   });
 
   // 启动 3 秒后静默检查更新
