@@ -227,6 +227,7 @@
     const topN = opts.topN || 30;
     const includeFiltered = opts.includeFiltered || false;
     const skipPrefilter = opts.skipPrefilter || false;
+    const onProgress = opts.onProgress;  // v0.2.13: 透传进度回调 (done, total, code) 给 getStockFinancialBatch
     _lastDegraded = [];  // V6: 重置, 重新记录本轮的 fetch 失败
 
     // 1. 拉全市场行情
@@ -255,7 +256,7 @@
     const codes = prefilted.map(s => s.代码);
     let finMap = new Map(), industryMap = new Map(), northMap = new Map();
     try {
-      finMap = await Core.Data.getStockFinancialBatch(codes);
+      finMap = await Core.Data.getStockFinancialBatch(codes, onProgress ? { onProgress } : {});
     } catch (e) { _lastDegraded.push('finMap'); console.warn('[Scoring] finMap 失败:', e); }
     try {
       industryMap = await Core.Data.getStockIndustryBatch(codes);

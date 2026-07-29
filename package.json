@@ -72,7 +72,8 @@
       "uninstallerIcon": "www/icons/icon.ico",
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "StockMaster"
+      "shortcutName": "StockMaster",
+      "artifactName": "StockMaster-Setup-${version}.${ext}"
     },
     "portable": {
       "artifactName": "StockMaster-${version}-portable.exe"

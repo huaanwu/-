@@ -198,10 +198,33 @@
         if (scoreEligible && window.Core && Core.Scoring && Core.Scoring.rank && filtered.length > 0) {
           try {
             const codes = filtered.map(s => s.代码);
-            const [finMap, industryMap] = await Promise.all([
-              Core.Data.getStockFinancialBatch(codes).catch(e => { scoreError = 'financial:' + e.message; return new Map(); }),
-              Core.Data.getStockIndustryBatch(codes).catch(e => { scoreError = (scoreError || 'industry:' + e.message); return new Map(); })
-            ]);
+            // v0.2.13: 进度条 + 取消 (用户不再"点完不知道是不是卡了")
+            let _cancelReq = false;
+            const _renderProgress = (done, total) => {
+              const pct = Math.round(done * 100 / total);
+              resultEl.innerHTML = `<div class="loading">
+                📊 正在拉 ${total} 只基本面 (已 ${done}/${total}, ${pct}%)...<br>
+                <div style="margin-top:8px;background:var(--bg-base);border-radius:4px;height:6px;overflow:hidden;">
+                  <div style="width:${pct}%;height:100%;background:linear-gradient(90deg,var(--up),#4ade80);transition:width 0.2s;"></div>
+                </div>
+                <div style="font-size:11px;color:var(--text-muted);margin-top:6px;">💡 首次跑约 20-40s, 缓存命中后秒开</div>
+                <button class="btn btn-sm btn-ghost" style="margin-top:10px;" onclick="Screener._cancelRun = true">✋ 取消</button>
+              </div>`;
+            };
+            Screener._cancelRun = false;
+            const _onProgress = (done, total) => {
+              if (Screener._cancelRun) { _cancelReq = true; return; }
+              _renderProgress(done, total);
+            };
+            const finMapP = Core.Data.getStockFinancialBatch(codes, { onProgress: _onProgress })
+              .catch(e => { scoreError = 'financial:' + e.message; return new Map(); });
+            const industryMapP = Core.Data.getStockIndustryBatch(codes)
+              .catch(e => { scoreError = (scoreError || 'industry:' + e.message); return new Map(); });
+            const [finMap, industryMap] = await Promise.all([finMapP, industryMapP]);
+            if (_cancelReq) {
+              resultEl.innerHTML = '<div class="empty">已取消</div>';
+              return;
+            }
             const beforeRank = scoreError;
             ranked = Core.Scoring.rank(
               filtered, finMap, industryMap,

@@ -801,13 +801,16 @@
 
   /**
    * 批量财务摘要 (Phase 5 long-trader)
-   * 并发 5 逐批拉, 返回 Map<code, rawData>
+   * v0.2.13 提速: chunk 5 → 20 并发 (单点 aktools 不会被 4x 并发打挂, 但提速 4 倍)
+   *   2000 只财务 batch: 80s → 20s
    * Bug #8 修复: 加 7 天 in-memory 缓存, 跨 runNow / reviewHoldings 调用复用
    * (财报季度才更新, 同 code 短期重复请求走 cache)
+   * @param {Array<string>} codes
+   * @param {Object} [opts] { chunkSize=20, onProgress?: (done, total, code) => void }
    */
   const _finBatchCache = new Map();   // code -> { value, ts }
   const _FIN_BATCH_TTL = 7 * 24 * 60 * 60 * 1000;
-  async function getStockFinancialBatch(codes) {
+  async function getStockFinancialBatch(codes, opts = {}) {
     const results = new Map();
     const toFetch = [];
     for (const c of codes) {
@@ -819,8 +822,11 @@
       }
     }
     if (toFetch.length === 0) return results;
+    const CHUNK_SIZE = opts.chunkSize || 20;  // v0.2.13: 5 → 20 (aktools 单点 4x 并发安全)
+    const onProgress = opts.onProgress;       // (done, total, code) 实时进度回调
     const chunked = [];
-    for (let i = 0; i < toFetch.length; i += 5) chunked.push(toFetch.slice(i, i + 5));
+    for (let i = 0; i < toFetch.length; i += CHUNK_SIZE) chunked.push(toFetch.slice(i, i + CHUNK_SIZE));
+    let done = 0;
     for (const chunk of chunked) {
       const batch = await Promise.allSettled(
         chunk.map(c => getStockFinancial(c).catch(() => null))
@@ -829,6 +835,10 @@
         if (batch[i]?.status === 'fulfilled' && batch[i].value) {
           results.set(c, batch[i].value);
           _finBatchCache.set(c, { value: batch[i].value, ts: Date.now() });
+        }
+        done++;
+        if (onProgress) {
+          try { onProgress(done, toFetch.length, c); } catch (_) { /* 进度回调容错 */ }
         }
       });
     }
