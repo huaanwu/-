@@ -30,12 +30,17 @@
   /** 工具名级别的"曾经允许过"覆盖 (用户点了"总是允许"后记这里, 重启也保留) */
   let _onceAllow = new Set();
 
+  /** AI 管家独立的 LLM 配置 (覆盖主 AI 配置). 任意字段为空 → fallback 主配置 */
+  let _llmConfig = null; // { provider?: string, model?: string, baseURL?: string, apiKey?: string, localEndpoint?: {...} }
+
   async function _loadPolicy() {
     try {
       const saved = await Core.Storage.kvGet('agent_auth_policy');
       if (saved && typeof saved === 'object') _policy = Object.assign(_policy, saved);
       const once = await Core.Storage.kvGet('agent_once_allow');
       if (Array.isArray(once)) _onceAllow = new Set(once);
+      const llm = await Core.Storage.kvGet('agent_llm_config');
+      if (llm && typeof llm === 'object') _llmConfig = llm;
     } catch (_) { /* ignore */ }
   }
 
@@ -44,6 +49,42 @@
       await Core.Storage.kvSet('agent_auth_policy', _policy);
       await Core.Storage.kvSet('agent_once_allow', Array.from(_onceAllow));
     } catch (_) {}
+  }
+
+  /** 管家独立 LLM 配置读写 */
+  function getLlmConfig() {
+    return _llmConfig ? Object.assign({}, _llmConfig) : null;
+  }
+
+  async function setLlmConfig(cfg) {
+    _llmConfig = cfg && typeof cfg === 'object' && Object.keys(cfg).length > 0 ? cfg : null;
+    try {
+      if (_llmConfig) {
+        await Core.Storage.kvSet('agent_llm_config', _llmConfig);
+      } else {
+        await Core.Storage.kvDel('agent_llm_config');
+      }
+    } catch (_) {}
+    return _llmConfig;
+  }
+
+  /**
+   * 解析 AI 管家实际用的 LLM 配置: 独立配置覆盖主配置, 字段级合并
+   * @returns { provider, model, baseURL, apiKey, local/localEndpoint, _isCustom }
+   */
+  function _resolveLlmConfig() {
+    const mainCfg = (Core.AI && Core.AI.getConfig && Core.AI.getConfig()) || {};
+    if (!_llmConfig) return mainCfg;
+    const merged = Object.assign({}, mainCfg, _llmConfig);
+    // local / localEndpoint 字段级合并 (避免主 baseURL/apiKey 残留)
+    // Core.AI.getConfig 返回 local; 早期版本可能用 localEndpoint — 兼容两者
+    const localKey = mainCfg.local ? 'local' : (mainCfg.localEndpoint ? 'localEndpoint' : 'local');
+    if (_llmConfig[localKey] && mainCfg[localKey]) {
+      merged[localKey] = Object.assign({}, mainCfg[localKey], _llmConfig[localKey]);
+    } else if (_llmConfig[localKey]) {
+      merged[localKey] = _llmConfig[localKey];
+    }
+    return merged;
   }
 
   function setPolicyLevel(risk, mode) {
@@ -105,8 +146,14 @@
       const ok = await Core.Agent.confirmUI(tool, toolUse.input);
       if (!ok) return _mkToolResult(toolUse.id, { ok: false, error: '用户拒绝执行' });
     }
+    // 分发: renderer 工具 (Core.AgentTools 注册) 优先, 走 in-process 调用
+    // 主进程工具 (Electron 文件/重启/健康) 走 IPC
+    if (Core.AgentTools && Core.AgentTools.get && Core.AgentTools.get(toolUse.name)) {
+      const out = await Core.AgentTools.invoke(toolUse.name, toolUse.input, ctx || {});
+      return _mkToolResult(toolUse.id, out);
+    }
     if (!window.electronAPI || !window.electronAPI.invokeAgent) {
-      return _mkToolResult(toolUse.id, { ok: false, error: 'Electron IPC 桥未就绪 (浏览器模式不支持工具调用)' });
+      return _mkToolResult(toolUse.id, { ok: false, error: 'Electron IPC 桥未就绪 (浏览器模式不支持该工具)' });
     }
     // 把当前 Core.State.ai 配置透传给主进程, 主进程用它探测 LLM endpoint 而非写死 11434
     let aiCtx = {};
@@ -151,7 +198,10 @@
         stream: false
       });
       const assistantMsg = _normalizeAssistant(resp);
-      messages.push(assistantMsg);
+      // 推回 messages 时必须用 OAI 字段 (content / tool_calls), 不能用内部表示 (text / tool_uses)
+      // 否则 qwen36 等兼容 provider 在下一轮会拒绝:
+      //   'Assistant message must contain either content or tool_calls'
+      messages.push(_toOaiAssistant(assistantMsg));
       if (opts.onText && assistantMsg.text) {
         lastText = assistantMsg.text;
         opts.onText(assistantMsg.text);
@@ -176,22 +226,84 @@
     return lastText || '(已达到最大工具调用轮次)';
   }
 
+  /** 把内部 assistant 表示 {role, text, tool_uses} 转成 OAI 协议消息 {role, content, tool_calls} */
+  function _toOaiAssistant(internal) {
+    const out = { role: 'assistant' };
+    if (internal.tool_uses && internal.tool_uses.length > 0) {
+      // OAI 协议: tool_calls 是数组, 每项 { id, type:'function', function:{ name, arguments } }
+      out.tool_calls = internal.tool_uses.map(tu => ({
+        id: tu.id,
+        type: 'function',
+        function: {
+          name: tu.name,
+          arguments: typeof tu.input === 'string' ? tu.input : JSON.stringify(tu.input || {})
+        }
+      }));
+      // 工具调用轮 assistant 消息 content 通常为 null (qwen36 接受)
+      out.content = internal.text && internal.text.length > 0 ? internal.text : null;
+    } else {
+      // 纯文本轮: content 是 text; 若 text 为空给个占位空格避免部分 provider 拒绝
+      out.content = (internal.text && internal.text.length > 0) ? internal.text : ' ';
+    }
+    return out;
+  }
+
   /** 把 callRaw 响应标准化成 { role, text, tool_uses } */
   function _normalizeAssistant(resp) {
-    if (!resp) return { role: 'assistant', text: '(LLM 返回空)' };
+    if (!resp) return { role: 'assistant', text: '(LLM 返回空)', tool_uses: [] };
     const text = resp.text || '';
     const tool_uses = (resp.tool_calls || []).map(tc => ({
       id: tc.id,
       name: tc.function && tc.function.name,
       input: _safeParse(tc.function && tc.function.arguments)
     })).filter(tu => tu.name);
-    return { role: 'assistant', text, tool_uses };
+    // OpenAI 协议要求 assistant 消息必须有 content 或 tool_calls 之一
+    // text 空 + tool_calls 空 会让 provider 在下一轮拒绝 ('Assistant message must contain either content or tool_calls')
+    const finalText = (text && text.length > 0) ? text : (tool_uses.length > 0 ? '' : ' ');
+    return { role: 'assistant', text: finalText, tool_uses };
   }
 
   function _safeParse(s) {
     if (!s) return {};
     try { return JSON.parse(s); } catch (_) { return { _raw: s }; }
   }
+
+  /** 默认 fallback: UI 未接管时全 deny */
+  const confirmUI = async function (tool, input) {
+    console.warn('[Agent] confirmUI 未实现, 默认拒绝', tool.name);
+    return false;
+  };
+
+  /** 异步初始化: 加载授权偏好 + 同步主进程工具表 */
+  const init = async function () {
+    await _loadPolicy();
+    // 1) 加载主进程工具 (Electron IPC 端 — 文件/重启/健康)
+    if (window.electronAPI && window.electronAPI.listAgentTools) {
+      try {
+        const tools = await window.electronAPI.listAgentTools();
+        for (const t of tools) {
+          Core.Agent._toolsIndex.set(t.name, t);
+        }
+        console.log('[Agent] 已加载主进程 ' + tools.length + ' 个工具');
+      } catch (e) {
+        console.warn('[Agent] 工具表同步失败:', e);
+      }
+    }
+    // 2) 加载 renderer 工具 (Core.AgentTools — UI 操作类: 页面切换/自选股/提醒/模拟盘等)
+    if (Core.AgentTools && Core.AgentTools.list) {
+      try {
+        const rTools = Core.AgentTools.list();
+        for (const t of rTools) {
+          Core.Agent._toolsIndex.set(t.name, t);
+        }
+        console.log('[Agent] 已加载 renderer ' + rTools.length + ' 个工具');
+      } catch (e) {
+        console.warn('[Agent] renderer 工具表同步失败:', e);
+      }
+    }
+  };
+
+  const _testExports = { _normalizeAssistant, _toOaiAssistant, _mkToolResult, _safeParse, _resolveLlmConfig, _loadPolicy };
 
   Core.Agent = {
     chat,
@@ -203,29 +315,15 @@
     listOnceAllow,
     _resolveAuthPolicy,
     _toolsIndex: new Map(),
+    /** 管家独立 LLM 配置: 留空 fallback 主配置, 字段级合并 */
+    getLlmConfig,
+    setLlmConfig,
+    getEffectiveLlmConfig: _resolveLlmConfig,
     /** 测试钩子 (test_only): 暴露内部纯函数让 test/test_all.js 单测 */
-    _test: { _normalizeAssistant, _mkToolResult, _safeParse },
+    _test: _testExports,
     /** UI 钩子: 侧边栏注册 confirm 实现后覆盖此函数 */
-    confirmUI: async function (tool, input) {
-      // 默认 fallback: 全 deny, 强制 UI 层接管
-      console.warn('[Agent] confirmUI 未实现, 默认拒绝', tool.name);
-      return false;
-    },
-    init: async function () {
-      await _loadPolicy();
-      // 同步主进程工具注册表到 _toolsIndex
-      if (window.electronAPI && window.electronAPI.listAgentTools) {
-        try {
-          const tools = await window.electronAPI.listAgentTools();
-          for (const t of tools) {
-            Core.Agent._toolsIndex.set(t.name, t);
-          }
-          console.log('[Agent] 已加载 ' + tools.length + ' 个工具');
-        } catch (e) {
-          console.warn('[Agent] 工具表同步失败:', e);
-        }
-      }
-    }
+    confirmUI,
+    init
   };
   window.Core.Agent = {
     chat,
@@ -237,8 +335,11 @@
     listOnceAllow,
     _resolveAuthPolicy,
     _toolsIndex: Core.Agent._toolsIndex,
-    _test: Core.Agent._test,
-    confirmUI: Core.Agent.confirmUI,
-    init: Core.Agent.init
+    getLlmConfig,
+    setLlmConfig,
+    getEffectiveLlmConfig: _resolveLlmConfig,
+    _test: _testExports,
+    confirmUI,
+    init
   };
 })();

@@ -207,9 +207,17 @@
     root.appendChild(userBubble);
     root.scrollTop = root.scrollHeight;
 
-    const cfg = (Core.AI && Core.AI.getConfig) ? Core.AI.getConfig() : null;
+    const cfg = Core.Agent && typeof Core.Agent.getEffectiveLlmConfig === 'function'
+      ? Core.Agent.getEffectiveLlmConfig()
+      : ((Core.AI && Core.AI.getConfig) ? Core.AI.getConfig() : null);
     if (!cfg) {
       _appendAssistant(root, '⚠️ AI 未配置。请先在设置页填 Provider / API Key / Model。');
+      _messages.push({ role: 'assistant', content: 'AI 未配置' });
+      _saveSession();
+      return;
+    }
+    if (!cfg.apiKey && cfg.provider !== 'custom' && !(cfg.local && cfg.local.enabled)) {
+      _appendAssistant(root, '⚠️ AI 未配置 API Key。请先在 ⚙ 管家 → 🧠 模型 或主设置里填入。');
       _messages.push({ role: 'assistant', content: 'AI 未配置' });
       _saveSession();
       return;
@@ -294,6 +302,7 @@
       '<div style="padding:14px 16px;border-bottom:1px solid #30363d;display:flex;align-items:center;justify-content:space-between;">',
       '  <div style="font-weight:600;font-size:15px;">🤖 AI 管家</div>',
       '  <div style="display:flex;gap:8px;">',
+      '    <button id="aiBtnModel" title="为 AI 管家单独配置大模型 (留空则用主 AI 配置)" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;">🧠 模型</button>',
       '    <button id="aiBtnPolicy" title="调整分级授权策略" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;">⚙ 授权</button>',
       '    <button id="aiBtnClear" title="清空对话" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;">🗑 清空</button>',
       '    <button id="aiBtnClose" title="关闭" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;">✕</button>',
@@ -307,14 +316,20 @@
     ].join('');
     document.body.appendChild(root);
 
-    // 头部触发按钮
+    // 头部触发按钮 — 优先挂到 .app-header, 找不到则挂到 body 右上角 (兜底防静默丢失)
     const trigger = document.createElement('button');
     trigger.id = 'aiTriggerBtn';
     trigger.innerHTML = '🤖 AI';
     trigger.title = '打开 AI 管家';
-    trigger.style.cssText = 'background:#1f6feb;color:#fff;border:none;border-radius:6px;padding:6px 14px;font-size:13px;cursor:pointer;font-weight:600;margin-left:8px;';
     const header = document.querySelector('.app-header');
-    if (header) header.appendChild(trigger);
+    if (header) {
+      trigger.style.cssText = 'background:#1f6feb;color:#fff;border:none;border-radius:6px;padding:6px 14px;font-size:13px;cursor:pointer;font-weight:600;margin-left:8px;';
+      header.appendChild(trigger);
+    } else {
+      trigger.style.cssText = 'position:fixed;top:12px;right:80px;z-index:8500;background:#1f6feb;color:#fff;border:none;border-radius:6px;padding:6px 14px;font-size:13px;cursor:pointer;font-weight:600;box-shadow:0 2px 8px rgba(0,0,0,.3);';
+      document.body.appendChild(trigger);
+      console.warn('[AgentUI] .app-header 未找到, 触发按钮已挂到 body 右上角');
+    }
     trigger.addEventListener('click', () => _toggle(true));
 
     // 关闭
@@ -325,6 +340,7 @@
       if (stream) stream.innerHTML = '';
     });
     document.getElementById('aiBtnPolicy').addEventListener('click', _showPolicyEditor);
+    document.getElementById('aiBtnModel').addEventListener('click', _showLlmConfigEditor);
 
     // 发送
     const input = document.getElementById('aiInput');
@@ -333,12 +349,16 @@
       input.value = '';
       _send(text);
     });
+    // Enter 直接发送, Shift+Enter 换行; 中文 IME 合成时 (composition) 不发
     input.addEventListener('keydown', e => {
-      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-        const text = input.value;
-        input.value = '';
-        _send(text);
-      }
+      if (e.key !== 'Enter') return;
+      if (e.shiftKey) return;                  // Shift+Enter 显式换行
+      if (e.isComposing || e.keyCode === 229) return;   // 中文/日文输入法未确认
+      e.preventDefault();
+      const text = input.value;
+      if (!text.trim()) return;
+      input.value = '';
+      _send(text);
     });
   }
 
@@ -435,6 +455,238 @@
       if (e.target === modal) modal.remove();
     });
     document.body.appendChild(modal);
+  }
+
+  /**
+   * 🧠 AI 管家独立 LLM 配置编辑器
+   *
+   * 数据源: Core.Agent.getLlmConfig() / setLlmConfig(cfg)
+   * 留空 = fallback 主 AI 配置 (Core.AI.getConfig())
+   * 字段级合并: 独立配置的非空字段覆盖主配置, 未填字段保持主配置
+   */
+  function _showLlmConfigEditor() {
+    const mainCfg = (Core.AI && Core.AI.getConfig) ? Core.AI.getConfig() : {};
+    const agentCfg = (Core.Agent && Core.Agent.getLlmConfig) ? (Core.Agent.getLlmConfig() || {}) : {};
+    const Providers = (Core.AI && Core.AI.PROVIDERS) ? Core.AI.PROVIDERS : {};
+    const providerKeys = Object.keys(Providers);
+
+    const modal = document.createElement('div');
+    modal.className = 'modal-backdrop';
+    modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:99998;display:flex;align-items:center;justify-content:center;';
+    const card = document.createElement('div');
+    card.style.cssText = 'background:var(--card,#1e2128);color:var(--fg,#e6edf3);padding:24px;border-radius:12px;max-width:520px;width:90%;max-height:85vh;overflow-y:auto;';
+
+    const h3 = document.createElement('h3');
+    h3.style.cssText = 'margin:0 0 6px;font-size:16px;';
+    h3.textContent = '🧠 AI 管家 - 独立大模型';
+    card.appendChild(h3);
+
+    const hint = document.createElement('div');
+    hint.style.cssText = 'font-size:12px;opacity:.7;margin-bottom:14px;line-height:1.5;';
+    hint.textContent = '选 Provider + 填 Key 即可, baseURL/模型会按 Provider 默认填上, 留空 = 沿用主 AI 配置.';
+    card.appendChild(hint);
+
+    // 主配置当前状态
+    const cur = document.createElement('div');
+    cur.style.cssText = 'font-size:12px;padding:8px 10px;background:#161b22;border-radius:6px;margin-bottom:14px;line-height:1.6;';
+    cur.textContent = '主配置当前: ' + (mainCfg.provider || '(无)') + ' / ' + (mainCfg.model || '(无)');
+    card.appendChild(cur);
+
+    // 现有独立配置 → 推断初始 provider (兼容老版本 kv 仅有 baseURL/apiKey/model 没 provider 字段的情况)
+    let initialProvider = agentCfg.provider;
+    if (!initialProvider) {
+      // 兜底: baseURL 形如包含 deepseek/openai/moonshot/dashscope/bigmodel/minimax → 推断
+      const u = (agentCfg.baseURL || '').toLowerCase();
+      if (u.includes('deepseek')) initialProvider = 'deepseek';
+      else if (u.includes('moonshot')) initialProvider = 'moonshot';
+      else if (u.includes('dashscope')) initialProvider = 'qwen';
+      else if (u.includes('bigmodel')) initialProvider = 'zhipu';
+      else if (u.includes('openai.com')) initialProvider = 'openai';
+      else if (u.includes('minimax')) initialProvider = 'minimax';
+      else if (u) initialProvider = 'custom';
+      else if (mainCfg.provider) initialProvider = mainCfg.provider;
+    }
+    if (!Providers[initialProvider]) initialProvider = providerKeys[0] || 'deepseek';
+    const curPcfg = Providers[initialProvider] || {};
+
+    // ---- Provider 下拉 ----
+    const provRow = document.createElement('div');
+    provRow.style.cssText = 'margin-bottom:12px;';
+    const provLbl = document.createElement('div');
+    provLbl.style.cssText = 'font-size:12px;font-weight:600;margin-bottom:4px;';
+    provLbl.textContent = 'Provider';
+    provRow.appendChild(provLbl);
+    const provSel = document.createElement('select');
+    provSel.style.cssText = 'width:100%;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:4px;padding:6px 8px;font-size:13px;box-sizing:border-box;';
+    for (const k of providerKeys) {
+      const opt = document.createElement('option');
+      opt.value = k;
+      opt.textContent = Providers[k].name || k;
+      if (k === initialProvider) opt.selected = true;
+      provSel.appendChild(opt);
+    }
+    provRow.appendChild(provSel);
+    card.appendChild(provRow);
+
+    // ---- API Key ----
+    const keyRow = document.createElement('div');
+    keyRow.style.cssText = 'margin-bottom:12px;';
+    const keyLbl = document.createElement('div');
+    keyLbl.style.cssText = 'font-size:12px;font-weight:600;margin-bottom:4px;';
+    keyLbl.textContent = 'API Key';
+    keyRow.appendChild(keyLbl);
+    const keyInp = document.createElement('input');
+    keyInp.type = 'password';
+    keyInp.placeholder = agentCfg.apiKey ? '••••(已设置, 不改留空)' : (mainCfg.apiKey ? '主配置已设, 不改留空' : '填入 Provider 的 API Key');
+    keyInp.value = '';
+    keyInp.style.cssText = 'width:100%;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:4px;padding:6px 8px;font-size:13px;box-sizing:border-box;';
+    keyRow.appendChild(keyInp);
+    // Key 状态行
+    const keyHint = document.createElement('div');
+    keyHint.style.cssText = 'font-size:11px;opacity:.6;margin-top:3px;';
+    keyHint.textContent = agentCfg.apiKey
+      ? '✓ 已保存 (显示留空, 填新值覆盖, 不填 = 保留旧)'
+      : (mainCfg.apiKey ? '主配置已有 key, 留空沿用' : '必填 (除非走主配置)');
+    keyRow.appendChild(keyHint);
+    card.appendChild(keyRow);
+
+    // ---- 模型 (下拉 + 自由输入) ----
+    const modelRow = document.createElement('div');
+    modelRow.style.cssText = 'margin-bottom:12px;';
+    const modelLbl = document.createElement('div');
+    modelLbl.style.cssText = 'font-size:12px;font-weight:600;margin-bottom:4px;';
+    modelLbl.textContent = '模型';
+    modelRow.appendChild(modelLbl);
+    const modelWrap = document.createElement('div');
+    modelWrap.style.cssText = 'display:flex;gap:6px;';
+    const modelSel = document.createElement('select');
+    modelSel.style.cssText = 'flex:0 0 auto;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:4px;padding:6px 8px;font-size:13px;';
+    const modelInp = document.createElement('input');
+    modelInp.type = 'text';
+    modelInp.placeholder = curPcfg.defaultModel || '默认模型';
+    modelInp.style.cssText = 'flex:1;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:4px;padding:6px 8px;font-size:13px;box-sizing:border-box;';
+    modelWrap.appendChild(modelSel);
+    modelWrap.appendChild(modelInp);
+    modelRow.appendChild(modelWrap);
+    card.appendChild(modelRow);
+
+    // ---- baseURL (仅 custom 显示, 其他 Provider 隐藏) ----
+    const urlRow = document.createElement('div');
+    urlRow.style.cssText = 'margin-bottom:12px;display:none;';
+    const urlLbl = document.createElement('div');
+    urlLbl.style.cssText = 'font-size:12px;font-weight:600;margin-bottom:4px;';
+    urlLbl.textContent = 'Base URL (custom 必填)';
+    urlRow.appendChild(urlLbl);
+    const urlInp = document.createElement('input');
+    urlInp.type = 'text';
+    urlInp.placeholder = 'https://your-openai-compatible/v1';
+    urlInp.style.cssText = 'width:100%;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:4px;padding:6px 8px;font-size:13px;box-sizing:border-box;';
+    urlRow.appendChild(urlInp);
+    card.appendChild(urlRow);
+
+    // 当前模型的回填函数 (按 provider 切 + 现有 agentCfg.model 优先)
+    function _refreshModelUI(provKey) {
+      const pcfg = Providers[provKey] || {};
+      const models = Array.isArray(pcfg.models) ? pcfg.models : [];
+      modelSel.innerHTML = '';
+      const placeholderOpt = document.createElement('option');
+      placeholderOpt.value = '__custom__';
+      placeholderOpt.textContent = (models.length === 0 ? '(填模型名)' : '自定义...');
+      modelSel.appendChild(placeholderOpt);
+      for (const m of models) {
+        const opt = document.createElement('option');
+        opt.value = m;
+        opt.textContent = m;
+        modelSel.appendChild(opt);
+      }
+      // 决定 input 显示什么: agentCfg.model > 选下拉首项 > Provider 默认
+      const targetModel = (initialProvider === provKey && agentCfg.model) ? agentCfg.model
+        : (models[0] || pcfg.defaultModel || '');
+      const exact = models.includes(targetModel);
+      if (exact) {
+        modelSel.value = targetModel;
+        modelInp.value = '';
+      } else {
+        modelSel.value = '__custom__';
+        modelInp.value = targetModel || '';
+      }
+      // custom 时显示 baseURL, 否则隐藏
+      urlRow.style.display = (provKey === 'custom') ? 'block' : 'none';
+      urlInp.value = (provKey === 'custom' && initialProvider === 'custom') ? (agentCfg.baseURL || '') : (pcfg.baseURL || '');
+      // baseURL placeholder 跟着 provider 走
+      if (provKey === 'custom') {
+        urlInp.placeholder = pcfg.baseURL ? '(默认: ' + pcfg.baseURL + ')' : 'https://your-openai-compatible/v1';
+      }
+    }
+    _refreshModelUI(initialProvider);
+    provSel.addEventListener('change', () => _refreshModelUI(provSel.value));
+    modelSel.addEventListener('change', () => {
+      if (modelSel.value !== '__custom__') modelInp.value = '';
+    });
+
+    // ---- 操作按钮 ----
+    const actions = document.createElement('div');
+    actions.style.cssText = 'margin-top:18px;display:flex;gap:8px;justify-content:space-between;';
+    const left = document.createElement('div');
+    left.style.cssText = 'display:flex;gap:8px;';
+    const resetBtn = document.createElement('button');
+    resetBtn.style.cssText = 'padding:6px 12px;border-radius:6px;border:1px solid #555;background:transparent;color:inherit;cursor:pointer;font-size:12px;';
+    resetBtn.textContent = '清空 (回到主配置)';
+    resetBtn.addEventListener('click', async () => {
+      if (Core.Agent && Core.Agent.setLlmConfig) {
+        await Core.Agent.setLlmConfig(null);
+        _appendAssistant(_ensureStreamRoot(), '✓ AI 管家已切回主 AI 配置');
+        modal.remove();
+      }
+    });
+    left.appendChild(resetBtn);
+    actions.appendChild(left);
+
+    const right = document.createElement('div');
+    right.style.cssText = 'display:flex;gap:8px;';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.style.cssText = 'padding:6px 14px;border-radius:6px;border:1px solid #555;background:transparent;color:inherit;cursor:pointer;';
+    cancelBtn.textContent = '取消';
+    cancelBtn.addEventListener('click', () => modal.remove());
+    const saveBtn = document.createElement('button');
+    saveBtn.style.cssText = 'padding:6px 14px;border-radius:6px;border:none;background:#1f6feb;color:#fff;cursor:pointer;font-weight:600;';
+    saveBtn.textContent = '保存';
+    saveBtn.addEventListener('click', async () => {
+      const newCfg = {};
+      const prov = provSel.value;
+      if (prov && prov !== mainCfg.provider) newCfg.provider = prov;
+      const key = keyInp.value.trim();
+      if (key) newCfg.apiKey = key;
+      const finalModel = (modelSel.value === '__custom__') ? modelInp.value.trim() : modelSel.value;
+      if (finalModel && finalModel !== mainCfg.model) newCfg.model = finalModel;
+      if (prov === 'custom') {
+        const url = urlInp.value.trim();
+        if (url) newCfg.baseURL = url;
+      }
+      try {
+        if (Core.Agent && Core.Agent.setLlmConfig) {
+          await Core.Agent.setLlmConfig(Object.keys(newCfg).length > 0 ? newCfg : null);
+          const keys = Object.keys(newCfg);
+          _appendAssistant(_ensureStreamRoot(),
+            '✓ AI 管家模型已保存' + (keys.length > 0 ? ' (覆盖 ' + keys.join('/') + ')' : ' (走主配置)'));
+        }
+        modal.remove();
+      } catch (e) {
+        console.warn('[AgentUI] setLlmConfig 失败:', e);
+        alert('保存失败: ' + e.message);
+      }
+    });
+    right.appendChild(cancelBtn);
+    right.appendChild(saveBtn);
+    actions.appendChild(right);
+    card.appendChild(actions);
+
+    modal.appendChild(card);
+    modal.addEventListener('click', e => {
+      if (e.target === modal) modal.remove();
+    });
+    document.body.appendChild(modal);
+    provSel.focus();
   }
 
   Core.AgentUI = {
