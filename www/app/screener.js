@@ -6,6 +6,8 @@
   'use strict';
 
   const Screener = {
+    _roundHistory: [],    // 多轮交互历史 [{round, feedback, picks}]
+    _roundCount: 0,       // 当前 AI 解读轮次
 
     async init() {
       this._renderForm();
@@ -75,7 +77,8 @@
 - 中长线持有, 不看短线"></textarea>
           <div style="font-size:11px;color:var(--text-muted);">
             跑完硬筛后, 点 [🤖 AI 解读结果] 会把这些偏好 + 宏观环境 + top 候选股 一起喂给 LLM。<br>
-            💡 <b>留空</b>走 ⚙️ 设置页"用户画像"里的<b>个人偏好</b> (选股/选基共用同一来源)。
+            💡 <b>留空</b>走 ⚙️ 设置页"用户画像"里的<b>个人偏好</b> (选股/选基共用同一来源)。<br>
+            💡 多轮交互：AI 解读后可以继续给反馈，无需重新拉数据。
           </div>
         </div>
         <fieldset style="border:1px solid var(--bg-base);border-radius:6px;padding:8px 12px;margin:8px 0;">
@@ -127,74 +130,83 @@
         const changeRange = document.getElementById('scChange').value.trim();
         const limit = parseInt(document.getElementById('scLimit').value) || 50;
 
-        // 涨跌幅区间 "2~7" → [2, 7]
         let changeMin = null, changeMax = null;
         if (changeRange) {
           const m = changeRange.match(/^(-?\d+(?:\.\d+)?)\s*~\s*(-?\d+(?:\.\d+)?)$/);
-          if (m) {
-            changeMin = parseFloat(m[1]);
-            changeMax = parseFloat(m[2]);
-          }
+          if (m) { changeMin = parseFloat(m[1]); changeMax = parseFloat(m[2]); }
         }
 
-        // 3) 筛选
-        const filtered = all.filter(s => {
+        // 3) 第1层 初筛: 自动排 ST/*ST/退市/新股<5日/一字板 (复用 Scoring 硬过滤)
+        let filtered = all;
+        if (window.Core && Core.Scoring && Core.Scoring.applyHardFilters) {
+          try {
+            filtered = Core.Scoring.applyHardFilters(all, { filters: { newStock: true, st: true, oneWordLimitUp: true } });
+          } catch (_) { /* 初筛失败不阻塞 */ }
+        }
+
+        // 4) 第1.5层: 用户条件过滤 (PE/PB/市值/换手率/涨跌幅)
+        filtered = filtered.filter(s => {
           const code = s.代码;
-          // 市场
           if (market === 'sh' && !/^(60|68)/.test(code)) return false;
           if (market === 'sz' && !/^(00|30)/.test(code)) return false;
           if (market === 'bj' && !/^(8|43)/.test(code)) return false;
-
-          // PE
-          if (!isNaN(peMax)) {
-            const pe = parseFloat(s.市盈率);
-            if (isNaN(pe) || pe <= 0 || pe > peMax) return false;
-          }
-          // PB
-          if (!isNaN(pbMax)) {
-            const pb = parseFloat(s.市净率);
-            if (isNaN(pb) || pb <= 0 || pb > pbMax) return false;
-          }
-          // 总市值(亿)
-          if (!isNaN(mktCapMin)) {
-            const mc = parseFloat(s.总市值);
-            if (isNaN(mc) || mc < mktCapMin * 1e8) return false;
-          }
-          // 换手率
-          if (!isNaN(turnoverMin)) {
-            const to = parseFloat(s.换手率);
-            if (isNaN(to) || to < turnoverMin) return false;
-          }
-          // 涨跌幅区间
-          if (changeMin !== null) {
-            const ch = parseFloat(s.涨跌幅);
-            if (isNaN(ch) || ch < changeMin) return false;
-          }
-          if (changeMax !== null) {
-            const ch = parseFloat(s.涨跌幅);
-            if (isNaN(ch) || ch > changeMax) return false;
-          }
+          if (!isNaN(peMax)) { const pe = parseFloat(s.市盈率); if (isNaN(pe) || pe <= 0 || pe > peMax) return false; }
+          if (!isNaN(pbMax)) { const pb = parseFloat(s.市净率); if (isNaN(pb) || pb <= 0 || pb > pbMax) return false; }
+          if (!isNaN(mktCapMin)) { const mc = parseFloat(s.总市值); if (isNaN(mc) || mc < mktCapMin * 1e8) return false; }
+          if (!isNaN(turnoverMin)) { const to = parseFloat(s.换手率); if (isNaN(to) || to < turnoverMin) return false; }
+          if (changeMin !== null) { const ch = parseFloat(s.涨跌幅); if (isNaN(ch) || ch < changeMin) return false; }
+          if (changeMax !== null) { const ch = parseFloat(s.涨跌幅); if (isNaN(ch) || ch > changeMax) return false; }
           return true;
         });
 
-        // 按涨跌幅降序
-        filtered.sort((a, b) => parseFloat(b.涨跌幅) - parseFloat(a.涨跌幅));
+        // 5) 第2层: 因子评分排名 (8 因子加权打分, 替代涨跌幅降序)
+        let scored = false;
+        let ranked = [];
+        if (window.Core && Core.Scoring && Core.Scoring.rank && filtered.length > 0) {
+          // 候选 > 500 时跳过因子评分 (财务数据逐批请求太慢)
+          if (filtered.length > 500) {
+            console.log(`[screener] 候选 ${filtered.length} 只, 跳过因子评分 (降级涨跌幅排序)`);
+          } else {
+            try {
+              const codes = filtered.map(s => s.代码);
+              const [finMap, industryMap] = await Promise.all([
+                Core.Data.getStockFinancialBatch(codes).catch(() => new Map()),
+                Core.Data.getStockIndustryBatch(codes).catch(() => new Map())
+              ]);
+              ranked = Core.Scoring.rank(
+                filtered, finMap, industryMap,
+                new Map(), {}, null, new Map(), [], [],
+                new Map(), new Map()
+              );
+              scored = true;
+            } catch (e) {
+              console.warn('[screener] 因子评分失败, 降级涨跌幅排序:', e.message);
+            }
+          }
+        }
+
+        if (scored && ranked.length > 0) {
+          ranked.sort((a, b) => b._score - a._score);
+          filtered = ranked;
+        } else {
+          filtered.sort((a, b) => parseFloat(b.涨跌幅) - parseFloat(a.涨跌幅));
+        }
         const top = filtered.slice(0, limit);
 
-        // Y.2 排雷 (位置 B: 硬筛后, top 截取后, 不隐藏被排雷股票)
+        // 6) 排雷
         const riskResult = await this._runRiskFilter(all, filtered);
         const riskMap = riskResult.map;
         const riskErrors = riskResult.errors;
 
-        // 保存结果供 AI 解读
+        // 保存结果供 AI 解读 + 多轮交互
         this._lastResults = {
-          all, filtered, top, conditions: { market, peMax, pbMax, mktCapMin, turnoverMin, changeMin, changeMax },
-          _riskMap: riskMap,
-          _riskErrors: riskErrors,
-          _riskEnabled: riskResult.enabled
+          all, filtered, top,
+          conditions: { market, peMax, pbMax, mktCapMin, turnoverMin, changeMin, changeMax, limit, scored },
+          _riskMap: riskMap, _riskErrors: riskErrors, _riskEnabled: riskResult.enabled
         };
+        this._roundHistory = [];  // 新筛选重置多轮历史
 
-        // 4) 渲染
+        // 7) 渲染
         if (top.length === 0) {
           resultEl.innerHTML = '<div class="empty">没有符合条件的股票</div>';
           return;
@@ -202,17 +214,17 @@
 
         const aiCfg = Core.AI.getConfig();
         const hasAiKey = !!aiCfg.apiKey || aiCfg.provider === 'custom';
-
         const flaggedCount = top.filter(s => riskMap && riskMap.has(s.代码)).length;
         const riskHint = riskResult.enabled
           ? (flaggedCount > 0
               ? `,排雷命中 <strong style="color:var(--down);">${flaggedCount}</strong> 只 (已标 ⚠,仅供参考)`
               : `,排雷全清 ✓`)
           : `,排雷未启用`;
+        const scoreHint = scored ? `,因子评分 ✓` : `,涨跌幅排序`;
 
         resultEl.innerHTML = `
           <div style="padding:12px 16px;color:var(--text-muted);font-size:12px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
-            <span>命中 ${filtered.length} 只,展示前 ${top.length} 只(按涨跌幅降序)${riskHint}</span>
+            <span>命中 ${filtered.length} 只,展示前 ${top.length} 只${scoreHint}${riskHint}</span>
             <button class="btn btn-sm btn-primary" onclick="Screener.aiInterpret()" ${hasAiKey ? '' : 'disabled title="请先到 ⚙️ 设置页配置 AI API Key"'}>
               🤖 AI 解读结果
             </button>
@@ -221,41 +233,39 @@
           <table>
             <thead>
               <tr>
-                <th>代码</th><th>名称</th><th>现价</th><th>涨跌幅</th>
+                <th>代码</th><th>名称</th><th>行业</th><th>现价</th><th>涨跌幅</th>
                 <th>PE</th><th>PB</th><th>换手率</th><th>总市值</th><th>⚠ 排雷</th>
               </tr>
             </thead>
             <tbody>
               ${top.map(s => {
                 const reasons = riskMap && riskMap.has(s.代码) ? Array.from(riskMap.get(s.代码)) : [];
-                const reasonsHtml = reasons.map(r => `<span style="display:inline-block;background:var(--bg-base);color:var(--down);border-radius:3px;padding:1px 4px;margin:1px;font-size:11px;">${escapeHtml(r)}</span>`).join('');
-                return `
-                <tr style="cursor:pointer;" onclick="Watchlist.showKLine('${escapeHtml(s.代码)}','${escapeHtml(s.名称)}')">
-                  <td><span class="code">${escapeHtml(s.代码)}</span></td>
-                  <td>${escapeHtml(s.名称)}</td>
-                  <td>${fmtNum(parseFloat(s.最新价), 2)}</td>
-                  <td class="${pctClass(parseFloat(s.涨跌幅) / 100)}">${fmtPct(parseFloat(s.涨跌幅) / 100)}</td>
-                  <td>${s.市盈率 !== '-' && s.市盈率 != null ? parseFloat(s.市盈率).toFixed(1) : '-'}</td>
-                  <td>${s.市净率 !== '-' && s.市净率 != null ? parseFloat(s.市净率).toFixed(2) : '-'}</td>
-                  <td>${s.换手率 ? parseFloat(s.换手率).toFixed(2) + '%' : '-'}</td>
-                  <td>${s.总市值 ? fmtMoney(parseFloat(s.总市值)) : '-'}</td>
-                  <td>${reasonsHtml}</td>
-                </tr>
-              `;
+                const reasonsHtml = reasons.map(r => '<span style="display:inline-block;background:var(--bg-base);color:var(--down);border-radius:3px;padding:1px 4px;margin:1px;font-size:11px;">' + escapeHtml(r) + '</span>').join('');
+                const industry = s._industry || '';
+                return '<tr style="cursor:pointer;" onclick="Watchlist.showKLine(\'' + escapeHtml(s.代码) + '\',\'' + escapeHtml(s.名称) + '\')">' +
+                  '<td><span class="code">' + escapeHtml(s.代码) + '</span></td>' +
+                  '<td>' + escapeHtml(s.名称) + '</td>' +
+                  '<td style="font-size:11px;color:var(--text-muted);">' + escapeHtml(industry) + '</td>' +
+                  '<td>' + fmtNum(parseFloat(s.最新价), 2) + '</td>' +
+                  '<td class="' + pctClass(parseFloat(s.涨跌幅) / 100) + '">' + fmtPct(parseFloat(s.涨跌幅) / 100) + '</td>' +
+                  '<td>' + (s.市盈率 !== '-' && s.市盈率 != null ? parseFloat(s.市盈率).toFixed(1) : '-') + '</td>' +
+                  '<td>' + (s.市净率 !== '-' && s.市净率 != null ? parseFloat(s.市净率).toFixed(2) : '-') + '</td>' +
+                  '<td>' + (s.换手率 ? parseFloat(s.换手率).toFixed(2) + '%' : '-') + '</td>' +
+                  '<td>' + (s.总市值 ? fmtMoney(parseFloat(s.总市值)) : '-') + '</td>' +
+                  '<td>' + reasonsHtml + '</td>' +
+                '</tr>';
               }).join('')}
             </tbody>
           </table>
         `;
       } catch (e) {
-        resultEl.innerHTML = `<div class="empty">筛选失败: ${escapeHtml(e.message)}</div>`;
+        resultEl.innerHTML = '<div class="empty">筛选失败: ' + escapeHtml(e.message) + '</div>';
       }
-    },
-
-    /**
-     * AI 解读硬筛结果 — 从命中股票里挑 5-10 只, 多维分析
-     */
-    async aiInterpret() {
+    },async aiInterpret(round) {
       if (!this._lastResults) { toastWarning('请先跑一次硬筛'); return; }
+      if (round == null) { this._roundCount = (this._roundCount || 0) + 1; round = this._roundCount; }
+      else { this._roundCount = round; }
+      if (round > 5) { toastWarning('已达最大轮次 (5 轮)'); return; }
       const aiCfg = Core.AI.getConfig();
       if (!aiCfg.apiKey && aiCfg.provider !== 'custom') {
         toastError('请先到 ⚙️ 设置页配置 AI API Key');
@@ -286,7 +296,7 @@
         }
       } catch (e) { console.warn('[screener] 拉持仓失败:', e); }
 
-      // 喂 LLM: 命中股票 top 30 (限制 token)
+      // 喂 LLM: 命中股票 top 15 (本地 128k 模型限制 token)
       const candidates = top.slice(0, 30).map((s, i) => {
         const pe = parseFloat(s.市盈率);
         const pb = parseFloat(s.市净率);
@@ -535,6 +545,13 @@ ${momentumLine}
 【候选池 (按涨跌幅降序, 最多 30 只, 字段: 代码 名称 PE PB 换手率 量比 市值 涨跌幅)】
 ${candidates}
 
+${(() => {
+  const hist = this._roundHistory || [];
+  if (hist.length === 0) return '';
+  const lines = hist.map((h, i) => `第${i+1}轮反馈: "${h.feedback || '(无)'}" → 选了 ${(h.picks || []).map(p => p.code).join(', ')}`);
+  return '\n\n【多轮交互历史】\n' + lines.join('\n');
+})()}
+
 请从候选池中挑出 5-10 只最适合用户偏好的股票, 严格使用候选项, JSON 输出 (按 systemPrompt 格式)。每条 reason 引用具体数据, 信心等级和 KB 引用必填。`;
 
       try {
@@ -571,6 +588,11 @@ ${candidates}
           let picks = obj.picks || [];
           // 5.1.3: 把 AI 选股结果 (含 reasons/risks) 暂存, 给"加自选"按钮写入 journal 用
           this._lastAiPicks = picks;
+          // 记录多轮历史
+          const fb = document.getElementById('scRoundFeedback');
+          const feedback = fb ? fb.value.trim() : '';
+          this._roundHistory = this._roundHistory || [];
+          this._roundHistory.push({ round: this._roundCount, feedback, picks: picks.map(p => ({ code: p.code, name: p.name })) });
           this._lastAiContext = { marketView: obj.marketView || '', policyView: obj.policyView || '', risks: obj.risks || [], conditions };
           // Bug H 修复 (选股 picks ⊆ top30): AI 可能编出候选池外代码 (类似 Bug G),
           // 渲染前用 _lastResults.top 前 30 提 Set, 给每个 pick 标 outOfTop, UI 灰按钮禁入库
@@ -654,6 +676,17 @@ ${candidates}
               }
             });
           }
+          // 多轮交互: 成功后追加反馈输入框 + 再选一轮按钮
+          if (this._roundCount < 5) {
+            const rd = document.createElement('div');
+            rd.style.cssText = 'margin-top:12px;padding:10px;background:var(--bg-base);border-radius:6px;';
+            rd.innerHTML = '<div style="font-size:12px;color:var(--text-muted);margin-bottom:6px;">💡 第 ' + this._roundCount + ' 轮完成，可以继续提要求：</div>' +
+              '<div style="display:flex;gap:6px;">' +
+              '<input type="text" id="scRoundFeedback" placeholder="例如: 再严格点 / 多看看新能源 / 减少银行股" style="flex:1;padding:6px;font-size:13px;border:1px solid var(--bg-base);border-radius:4px;background:var(--bg-card);color:var(--text);">' +
+              '<button class="btn btn-sm btn-primary" id="scRoundBtn" onclick="Screener.nextRound()">🔄 再选一轮(' + (this._roundCount + 1) + '/5)</button>' +
+              '</div>';
+            if (streamEl) streamEl.appendChild(rd);
+          }
         } else {
           // Phase T: schema 校验失败, 显示原始 + 错误明细
           if (streamEl) {
@@ -722,7 +755,10 @@ ${candidates}
       const errors = [];
       const safeFetch = async (name, fn) => {
         try {
-          const r = await fn();
+          const r = await Promise.race([
+            fn(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('超时')), 15000))
+          ]);
           if (!Array.isArray(r) || r.length === 0) {
             errors.push(`${name}=空`);
             return [];
@@ -939,6 +975,16 @@ ${candidates}
         console.error('[Screener] _addWatchlistFromPick 失败:', e);
         toastError('加自选失败: ' + e.message);
       }
+    },
+
+    /**
+     * 多轮交互: 用户点 [🔄 再选一轮] 时调用
+     * 读 scRoundFeedback 输入框的内容, 调用 aiInterpret(round+1)
+     */
+    nextRound() {
+      const feedback = document.getElementById('scRoundFeedback');
+      if (feedback) feedback.value = feedback.value.trim();  // 让 input 保持
+      this.aiInterpret(this._roundCount + 1);
     },
 
   /**
