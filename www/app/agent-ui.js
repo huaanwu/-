@@ -692,10 +692,22 @@
   Core.AgentUI = {
     init: function () {
       _loadSession();
-      // 把 confirmUI 实现注入 Core.Agent (必须在 Core.Agent.init 之后调用)
-      Core.Agent.confirmUI = confirmUI;
-      inject();
-      console.log('[AgentUI] 初始化完成, 历史消息 ' + _messages.length + ' 条');
+      // confirmUI 注入必须 try/catch — 若 Core.Agent 未就绪 / DOM 异常, 不阻塞后续 inject()
+      try {
+        if (window.Core && Core.Agent && typeof confirmUI === 'function') {
+          Core.Agent.confirmUI = confirmUI;
+        } else {
+          console.warn('[AgentUI] Core.Agent 未就绪, confirmUI 注入跳过 (executeTool 时 confirm 弹窗会回到默认 deny)');
+        }
+      } catch (e) {
+        console.warn('[AgentUI] confirmUI 注入失败:', e.message);
+      }
+      try {
+        inject();
+        console.log('[AgentUI] 初始化完成, 历史消息 ' + _messages.length + ' 条');
+      } catch (e) {
+        console.error('[AgentUI] inject() 失败:', e);
+      }
     },
     send: _send,
     toggle: _toggle

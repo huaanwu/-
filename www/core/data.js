@@ -549,15 +549,20 @@
     const url = qs ? `${base}/${path}?${qs}` : `${base}/${path}`;
 
     let lastErr = null;
+    // 单次请求超时 (默认 25s) — aktools 后端偶发 hang 不挂死 UI
+    const FETCH_TIMEOUT_MS = opts.timeout ?? 25000;
     for (let attempt = 0; attempt <= retries; attempt++) {
       let resp;
       try {
-        resp = await fetch(url, {
-          method: 'GET',
-          headers: { 'Accept': 'application/json' }
-        });
+        resp = await Promise.race([
+          fetch(url, {
+            method: 'GET',
+            headers: { 'Accept': 'application/json' }
+          }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error(`请求超时 (${FETCH_TIMEOUT_MS / 1000}s)`)), FETCH_TIMEOUT_MS))
+        ]);
       } catch (e) {
-        lastErr = new Error(`网络错误: ${e.message}。检查 AKShare 代理是否运行`);
+        lastErr = new Error(`${path}: ${e.message}`);
         if (attempt < retries) {
           await new Promise(r => setTimeout(r, baseDelay * (attempt + 1)));
           continue;

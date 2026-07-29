@@ -305,7 +305,10 @@
 
   const _testExports = { _normalizeAssistant, _toOaiAssistant, _mkToolResult, _safeParse, _resolveLlmConfig, _loadPolicy };
 
-  Core.Agent = {
+  // 质量债修复: 之前 Core.Agent = {...} 和 window.Core.Agent = {...} 两段重复挂载,
+  //   第二段直接覆盖第一段 (Core === window.Core, 都是同一引用), 第一段白写.
+  //   init() / executeTool() 走 window.Core.Agent._toolsIndex, 只此一处入口.
+  window.Core.Agent = {
     chat,
     executeTool,
     setPolicyLevel,
@@ -322,23 +325,6 @@
     /** 测试钩子 (test_only): 暴露内部纯函数让 test/test_all.js 单测 */
     _test: _testExports,
     /** UI 钩子: 侧边栏注册 confirm 实现后覆盖此函数 */
-    confirmUI,
-    init
-  };
-  window.Core.Agent = {
-    chat,
-    executeTool,
-    setPolicyLevel,
-    getPolicy,
-    rememberAllow,
-    forgetAllow,
-    listOnceAllow,
-    _resolveAuthPolicy,
-    _toolsIndex: Core.Agent._toolsIndex,
-    getLlmConfig,
-    setLlmConfig,
-    getEffectiveLlmConfig: _resolveLlmConfig,
-    _test: _testExports,
     confirmUI,
     init
   };

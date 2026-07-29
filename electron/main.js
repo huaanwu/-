@@ -61,6 +61,10 @@ function setupAutoUpdater() {
 
   autoUpdater.on('error', (err) => {
     process.stderr.write('[autoUpdater] 错误: ' + err.message + '\n');
+    // B5 修复: 错误也推到渲染端, 让用户看到红色 toast (不只写 stderr)
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('update-error', { message: err.message });
+    }
   });
 
   ipcMain.on('start-download-update', () => {

@@ -114,10 +114,20 @@
       resultEl.innerHTML = '<div class="loading">加载全市场行情(可能需要 10-30 秒)...</div>';
 
       try {
-        // 1) 拉全市场行情
-        const all = await Core.Data.getStockSpot();
+        // 1) 拉全市场行情 — 整体 30s 兜底, aktools 后端偶发 hang 不阻塞 UI
+        let all;
+        try {
+          all = await Promise.race([
+            Core.Data.getStockSpot(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('拉取全市场行情超时 (30s)')), 30000))
+          ]);
+        } catch (e) {
+          console.warn('[screener] getStockSpot 整体超时/失败:', e.message);
+          resultEl.innerHTML = '<div class="empty">拉取行情失败: ' + escapeHtml(e.message) + '<br><br>数据源全挂:<br>• 东方财富 (push2.eastmoney.com) — ERR_EMPTY_RESPONSE<br>• 东财 spot_em (aktools) — HTTP 500<br>• 新浪 spot (aktools) — 当前似乎 hang<br><br>建议: 等数据源恢复或换网络 (APN 切换) 后重试</div>';
+          return;
+        }
         if (!Array.isArray(all) || all.length === 0) {
-          resultEl.innerHTML = '<div class="empty">未获取到行情数据</div>';
+          resultEl.innerHTML = '<div class="empty">未获取到行情数据 (数据源全挂)</div>';
           return;
         }
 
@@ -160,33 +170,54 @@
         });
 
         // 5) 第2层: 因子评分排名 (8 因子加权打分, 替代涨跌幅降序)
+        // threshold 5000: 仅在极端全集 (~全A 5400) 时跳过评分 (财务 fetcher 单次 60s 上限)。
+        // 多数场景 (硬过滤后 <5000) 都跑评分 — 没数据时安全降级到涨跌幅。
         let scored = false;
         let ranked = [];
-        if (window.Core && Core.Scoring && Core.Scoring.rank && filtered.length > 0) {
-          // 候选 > 500 时跳过因子评分 (财务数据逐批请求太慢)
-          if (filtered.length > 500) {
-            console.log(`[screener] 候选 ${filtered.length} 只, 跳过因子评分 (降级涨跌幅排序)`);
-          } else {
-            try {
-              const codes = filtered.map(s => s.代码);
-              const [finMap, industryMap] = await Promise.all([
-                Core.Data.getStockFinancialBatch(codes).catch(() => new Map()),
-                Core.Data.getStockIndustryBatch(codes).catch(() => new Map())
-              ]);
-              ranked = Core.Scoring.rank(
-                filtered, finMap, industryMap,
-                new Map(), {}, null, new Map(), [], [],
-                new Map(), new Map()
-              );
-              scored = true;
-            } catch (e) {
-              console.warn('[screener] 因子评分失败, 降级涨跌幅排序:', e.message);
+        let scoreError = null;
+        let scoreEligible = true;  // 跟踪评分是否"有资格跑"
+        if (filtered.length > 5000) {
+          scoreEligible = false;
+          scoreError = '候选 > 5000, 跳评分';
+          console.log(`[screener] 候选 ${filtered.length} 只, ${scoreError} (降级涨跌幅排序)`);
+        }
+        // 5.0.5) 初选硬筛 0 IO (中庸阈值: 砍小市值/低换手/资不抵债, 给下游重 IO batch 减压)
+        //    在评分前再砍一遍, 跟 Scoring.applyHardFilters 互补 (后者砍 ST/一字板/新股)
+        if (scoreEligible && window.Core && Core.Scoring && Core.Scoring.prefilter && filtered.length > 0) {
+          try {
+            const pf = Core.Scoring.prefilter(filtered);
+            if (pf && Array.isArray(pf.passed)) {
+              const beforeCount = filtered.length;
+              filtered = pf.passed;
+              if (beforeCount !== filtered.length) {
+                console.log(`[screener] prefilter: ${beforeCount} → ${filtered.length} (砍 ${pf.dropped.length}, 0 IO)`);
+              }
             }
+          } catch (_) { /* prefilter 失败不阻塞 */ }
+        }
+        if (scoreEligible && window.Core && Core.Scoring && Core.Scoring.rank && filtered.length > 0) {
+          try {
+            const codes = filtered.map(s => s.代码);
+            const [finMap, industryMap] = await Promise.all([
+              Core.Data.getStockFinancialBatch(codes).catch(e => { scoreError = 'financial:' + e.message; return new Map(); }),
+              Core.Data.getStockIndustryBatch(codes).catch(e => { scoreError = (scoreError || 'industry:' + e.message); return new Map(); })
+            ]);
+            const beforeRank = scoreError;
+            ranked = Core.Scoring.rank(
+              filtered, finMap, industryMap,
+              new Map(), {}, null, new Map(), [], [],
+              new Map(), new Map()
+            );
+            scored = true;
+            if (beforeRank) console.warn(`[screener] 因子评分部分数据缺失 (${beforeRank}), 仍出结果`);
+          } catch (e) {
+            scoreError = e.message;
+            console.warn('[screener] 因子评分失败, 降级涨跌幅排序:', e.message);
           }
         }
 
         if (scored && ranked.length > 0) {
-          ranked.sort((a, b) => b._score - a._score);
+          ranked.sort((a, b) => (b._score || 0) - (a._score || 0));
           filtered = ranked;
         } else {
           filtered.sort((a, b) => parseFloat(b.涨跌幅) - parseFloat(a.涨跌幅));
@@ -216,11 +247,15 @@
         const hasAiKey = !!aiCfg.apiKey || aiCfg.provider === 'custom';
         const flaggedCount = top.filter(s => riskMap && riskMap.has(s.代码)).length;
         const riskHint = riskResult.enabled
-          ? (flaggedCount > 0
-              ? `,排雷命中 <strong style="color:var(--down);">${flaggedCount}</strong> 只 (已标 ⚠,仅供参考)`
-              : `,排雷全清 ✓`)
+          ? (riskResult._allFailed
+              ? `,<strong style="color:var(--warn);">⚠ 排雷数据不可用 (4 fetcher 全失败)</strong>`
+              : (flaggedCount > 0
+                  ? `,排雷命中 <strong style="color:var(--down);">${flaggedCount}</strong> 只 (已标 ⚠,仅供参考)`
+                  : `,排雷全清 ✓`))
           : `,排雷未启用`;
-        const scoreHint = scored ? `,因子评分 ✓` : `,涨跌幅排序`;
+        const scoreHint = scored
+          ? `,因子评分 ✓`
+          : (scoreError ? `,降级涨跌幅排序 (评分不可用: ${scoreError})` : `,涨跌幅排序`);
 
         resultEl.innerHTML = `
           <div style="padding:12px 16px;color:var(--text-muted);font-size:12px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
@@ -233,7 +268,9 @@
           <table>
             <thead>
               <tr>
-                <th>代码</th><th>名称</th><th>行业</th><th>现价</th><th>涨跌幅</th>
+                <th>代码</th><th>名称</th><th>行业</th>
+                ${scored ? '<th title="8 因子加权综合评分,满分 100">⭐ 评分</th>' : ''}
+                <th>现价</th><th>涨跌幅</th>
                 <th>PE</th><th>PB</th><th>换手率</th><th>总市值</th><th>⚠ 排雷</th>
               </tr>
             </thead>
@@ -242,10 +279,12 @@
                 const reasons = riskMap && riskMap.has(s.代码) ? Array.from(riskMap.get(s.代码)) : [];
                 const reasonsHtml = reasons.map(r => '<span style="display:inline-block;background:var(--bg-base);color:var(--down);border-radius:3px;padding:1px 4px;margin:1px;font-size:11px;">' + escapeHtml(r) + '</span>').join('');
                 const industry = s._industry || '';
+                const scoreCell = scored ? `<td style="font-weight:600;color:${(s._score ?? 0) >= 60 ? 'var(--up)' : 'var(--text)'};">${typeof s._score === 'number' ? s._score.toFixed(1) : '-'}</td>` : '';
                 return '<tr style="cursor:pointer;" onclick="Watchlist.showKLine(\'' + escapeHtml(s.代码) + '\',\'' + escapeHtml(s.名称) + '\')">' +
                   '<td><span class="code">' + escapeHtml(s.代码) + '</span></td>' +
                   '<td>' + escapeHtml(s.名称) + '</td>' +
                   '<td style="font-size:11px;color:var(--text-muted);">' + escapeHtml(industry) + '</td>' +
+                  scoreCell +
                   '<td>' + fmtNum(parseFloat(s.最新价), 2) + '</td>' +
                   '<td class="' + pctClass(parseFloat(s.涨跌幅) / 100) + '">' + fmtPct(parseFloat(s.涨跌幅) / 100) + '</td>' +
                   '<td>' + (s.市盈率 !== '-' && s.市盈率 != null ? parseFloat(s.市盈率).toFixed(1) : '-') + '</td>' +
@@ -750,7 +789,7 @@ ${(() => {
     async _runRiskFilter(allStocks, _hardFiltered) {
       const enabled = this._isAnyRiskFlagOn();
       if (!enabled) {
-        return { enabled: false, map: null, errors: [] };
+        return { enabled: false, map: null, errors: [], _allFailed: false };
       }
       const errors = [];
       const safeFetch = async (name, fn) => {
@@ -776,6 +815,9 @@ ${(() => {
         safeFetch('业绩', () => Core.Data.getStockEarningsForecastFresh()),
         safeFetch('主力', () => Core.Data.getStockCapitalFlight())
       ]);
+      // 勾选了排雷 flag 但 4 个 fetcher 全部失败 (errors=4) → 数据不可用
+      // 半失败 (1~3 失败) 用 map 但带警告; 全成功 errors.length === 0
+      const allFetchFailed = errors.length >= 4;
       // 仅在前端确实勾选时计入对应类 (避免无关数据污染 map)
       const ck = id => !!document.getElementById(id) && document.getElementById(id).checked;
       const bl = await this._readBlacklist();
@@ -800,7 +842,7 @@ ${(() => {
           }
         }
       }
-      return { enabled: true, map, errors };
+      return { enabled: true, map, errors, _allFailed: allFetchFailed };
     },
 
     /**

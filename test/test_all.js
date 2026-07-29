@@ -141,14 +141,7 @@ const DOMAINS = {
     // T4 学习环
     'verifyClosedTrades', '_extractExitInfo', '_judgeClosedTrade', '_barOf', '_linkVerifiedTrades',
     '_buildTrackRecord', '_formatTrackRecord', '_outcomeScore', '_brierScore', '_calibrationBuckets',
-    '_collectVerifiedTrades', 'maybeDistillLessons', '_buildLearningPromptText', 'renderLearningCurve',
-    // v0.2.6d 日内三阶段 + v0.2.7 AI 调度器
-    '_scheduleIntradayPhases', '_nextPhaseTime', 'stopIntradayPhases', '_reviewPlan', '_endOfDayReport',
-    '_getYesterdaySummary', '_runPhase', '_aiDecideNextAction', '_buildDecisionPrompt', '_parseDecision', '_logDecision'],
-  // 盘中操盘手 (Intraday Trader): 文件名 intraday-trader.js, key 用 'Intraday-Trader' (toLowerCase 对得上)
-  'Intraday-Trader': ['init', 'runNow', 'stopPolling', 'listLog',
-    '_processPosition', '_decideWithLlm', '_executeAction', '_appendLog',
-    '_isTradingTime', '_isCooldownOver', '_isUnderDailyLimit', '_mechanicalExit', '_isMinHoldPassed', '_parseDecision'],
+    '_collectVerifiedTrades', 'maybeDistillLessons', '_buildLearningPromptText', 'renderLearningCurve'],
   // 长线操盘手 (Long Trader): 文件名 long-trader.js, key 用 'Long-Trader' (toLowerCase 对得上)
   'Long-Trader': ['init', 'runNow', 'stopPolling', 'listLog', '_shouldRun', '_llmPickTop', '_appendLog'],
   // AI 管家侧边栏 UI (文件名 agent-ui.js, key 用 'Agent-Ui')
@@ -269,7 +262,7 @@ for (const m of LP_METHODS) {
 // 检查 5 调用方注入 Core.LearningPool.format()
 const callerFiles = [
   'short-trader.js', 'long-trader.js', 'screener.js',
-  'intraday-trader.js', 'fund/ai-advisor.js'
+  'fund/ai-advisor.js'
 ];
 for (const cf of callerFiles) {
   const src = readFileSafe(path.join(WWW, 'app', cf));
@@ -9073,8 +9066,10 @@ section('[59.H2] H2: short-trader._buildLearningPromptText 拼入校准段');
 })();
 
 // ========== [59] IntradayTrader 盘中操盘手 (T5: 1 分钟轮询 + 本地 LLM 实时调仓) ==========
-section('[59] IntradayTrader: 纯函数 (交易时段/冷却/日限/机械止盈止损/最短持有/解析)');
+// B2 收口: v0.2.6 关闭盘中盯盘层, 文件已删. 整段 IIFE 直接 return, 跳过所有测试用例.
+section('[59] IntradayTrader: SKIP (v0.2.6 关闭, 文件已删)');
 (async () => {
+  return;
   try {
     const itSrc = readFileSafe(path.join(WWW, 'app', 'intraday-trader.js'));
     if (!itSrc) throw new Error('intraday-trader.js 读不到');
@@ -9298,8 +9293,10 @@ section('[59.b] Core.Util.fmtDate: 本地时区对齐 ShortTrader._todayStr (避
 })();
 
 // ========== [60] IntradayTrader 集成: 持仓 → 拉价 → 机械止盈止损 → LLM 决策 → 调仓落地 ==========
-section('[60] IntradayTrader 集成: 整轮 runNow + 机械止盈/止损优先 + LLM 调仓 + 日志');
+// B2 收口: 同 [59], 整段 IIFE 直接 return.
+section('[60] IntradayTrader 集成: SKIP (v0.2.6 关闭)');
 (async () => {
+  return;
   try {
     const itSrc = readFileSafe(path.join(WWW, 'app', 'intraday-trader.js'));
     if (!itSrc) throw new Error('intraday-trader.js 读不到');
@@ -10457,10 +10454,9 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
       ok('67.7 regime.js stale 段含"指数数据源失灵"');
     } else fail('67.7 stale line', '缺');
 
-    // 67.8-67.12 5 调用方 prompt 注入
+    // 67.8-67.11 4 调用方 prompt 注入 (v0.2.6 关闭盘中盯盘, intraday-trader.js 删除)
     const callers = [
       ['short-trader.js', /Core\.Regime\._formatRegimeBlock/],
-      ['intraday-trader.js', /Core\.Regime[\s\S]{0,40}_formatRegimeBlock/],
       ['long-trader.js', /Core\.Regime[\s\S]{0,40}gateMultipliers/],
       ['screener.js', /Core\.Regime[\s\S]{0,40}_formatRegimeBlock/],
       ['fund/ai-advisor.js', /Core\.Regime[\s\S]{0,40}_formatRegimeBlock/]
@@ -11106,11 +11102,8 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
       ok('75.2 short-trader.js 注入 ctx.northByCode + ctx.lhbMap + formatForPrompt');
     else fail('75.2 short-trader.js 注入缺失', '');
     // 75.3 intraday-trader.js 仅注北向 (不注龙虎 — T+1 盘中无意义)
-    const itSrc = readFileSafe(path.join(WWW, 'app/intraday-trader.js'));
-    if (/Core\.Data\.getNorthboundFlow/.test(itSrc) && !/Core\.Data\.getLhbSnapshotMap/.test(itSrc)
-        && !/Core\.Data\.getLhbActivity/.test(itSrc) && /【北向资金 T\+1】/.test(itSrc))
-      ok('75.3 intraday-trader.js 仅注北向(不注龙虎) + 单行标签【北向资金 T+1】');
-    else fail('75.3 intraday 注入规则不对', '');
+    // B2 收口: v0.2.6 关闭盘中盯盘, 文件已删, 此检查 skip
+    ok('75.3 intraday-trader.js SKIP (v0.2.6 关闭)');
   } catch (e) {
     fail('75 调用方注入', e.message);
   }
@@ -11580,10 +11573,11 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
       ok('95.5 scoring rank 加 forecast 7 因子打分');
     else fail('95.5 forecast 因子未入打分', '');
 
-    // 95.6: scoring.js applyHardFilters 加首亏/续亏剔除 (用 indexOf)
+    // 95.6: scoring.js applyHardFilters 加首亏/续亏剔除
+    //   v0.2.10: rankCandidates 改用 prefilted (预筛后), 兼容正则匹配 applyHardFilters(<ident>, opts, forecastMap)
     if (sc95.indexOf('首亏') !== -1 && sc95.indexOf('续亏') !== -1 &&
-        sc95.indexOf('applyHardFilters(all, opts, forecastMap)') !== -1)
-      ok('95.6 applyHardFilters 硬剔首亏/续亏');
+        /applyHardFilters\(\s*\w+\s*,\s*opts\s*,\s*forecastMap\s*\)/.test(sc95))
+      ok('95.6 applyHardFilters 硬剔首亏/续亏 (兼容预筛后变量名)');
     else fail('95.6 硬过滤未加首亏剔除', '');
 
     // 95.7: DEFAULT_WEIGHTS 含 forecast = 0.10
@@ -11642,13 +11636,18 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
     if (fnStart === -1) {
       fail('96.7 _summarizeZygc 函数未找到', '');
     } else {
-      // 函数体: 找末尾 (CR LF + 2 空格 + }) 作为函数体结束标记
+      // 函数体: 找末尾 (行尾 + 2 空格 + }) 作为函数体结束标记
       // 用字面字符串拼装 (不要在 JS literal 里写换行, 否则会被解析为真换行截断 string)
-      // 函数体结束: data.js 是 CRLF, 函数结尾是 CRLF + 2空格 + }
+      // B6 修复: 兼容 LF 和 CRLF 两种行尾 (data.js 当前是 LF, 早期是 CRLF)
       const CR = String.fromCharCode(13);
       const NL = String.fromCharCode(10);
-      const endMarker = CR + NL + '  }' + CR + NL;
-      const fnEnd = dataJs96.indexOf(endMarker, fnStart);
+      const endMarkers = [CR + NL + '  }' + CR + NL, NL + '  }' + NL];
+      let fnEnd = -1;
+      let endMarker = '';
+      for (const m of endMarkers) {
+        const i = dataJs96.indexOf(m, fnStart);
+        if (i !== -1) { fnEnd = i; endMarker = m; break; }
+      }
       if (fnEnd === -1) {
         fail('96.7 _summarizeZygc 函数体结束符未找到', '');
       } else {
@@ -11721,6 +11720,137 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
       ok('97.7 weight-advisor 引用 Core.Scoring.FACTOR_KEYS (含 rps)');
     else fail('97.7 weight-advisor 未引用 scoring FACTOR_KEYS', '');
   } catch (e) { fail('97.x RPS', e.message); }
+
+  // ===== 120.x: 初选硬筛 prefilter + 后台预热 warmup (v0.2.10 性能修复) =====
+  // 解决 5000 只全市场评分卡 5-10 分钟问题:
+  //   - prefilter: 0 IO 纯函数, 5000 → ~2000 (中庸阈值)
+  //   - warmupFinMap: app init 后台预热基本面 7d 缓存
+  //   - ensureFinMap: 评分前等 0-3s warmup
+  try {
+    // 120.1 prefilter 函数已挂 Core.Scoring
+    const scoringSrc = readFileSafe(path.join(WWW, 'core', 'scoring.js'));
+    if (scoringSrc && /prefilter:\s*function|function prefilter/.test(scoringSrc) && /window\.Core\.Scoring[\s\S]{0,200}prefilter/.test(scoringSrc)) {
+      ok('120.1 prefilter 纯函数已挂 Core.Scoring');
+    } else {
+      fail('120.1 prefilter 未挂', '');
+    }
+
+    // 120.2 PREFILTER_DEFAULTS 常量在 Constants
+    const constantsSrc = readFileSafe(path.join(WWW, 'core', 'constants.js'));
+    if (constantsSrc && /PREFILTER_DEFAULTS\s*=\s*\{/.test(constantsSrc) && /minMktCap:\s*20e8/.test(constantsSrc) && /PREFILTER_DEFAULTS/.test(constantsSrc.split('window.Core.Constants =')[1] || '')) {
+      ok('120.2 PREFILTER_DEFAULTS 常量 (20 亿/0.5%/ST/一字板) 收口到 Constants');
+    } else {
+      fail('120.2 PREFILTER_DEFAULTS 缺/没导出', '');
+    }
+
+    // 120.3 prefilter 纯函数 vm 沙箱实测
+    try {
+      const scoringForVm = scoringSrc.replace(/window\.Core\s*=\s*window\.Core\s*\|\|\s*\{\};?/, '')
+                                     .replace(/window\.Core\.Scoring\s*=\s*\{[\s\S]*?\};\s*$/m, '');
+      // 找 prefilter 函数体 (到下一个 ^  function 或 ^} 结束)
+      const fnStart = scoringForVm.indexOf('function prefilter(all, opts = {})');
+      if (fnStart === -1) throw new Error('prefilter 函数未找到');
+      // 用行号定位: prefilter 后第一个 "^  }" 表示函数结束
+      const endMarkerLF = '\n  }\n';
+      let fnEnd = scoringForVm.indexOf(endMarkerLF, fnStart);
+      if (fnEnd === -1) {
+        // fallback: 找下一个 ^  }
+        fnEnd = scoringForVm.indexOf('\n  }\n', fnStart + 100);
+      }
+      if (fnEnd === -1) throw new Error('prefilter 函数体结束符未找到');
+      const fnSrc = scoringForVm.substr(fnStart, fnEnd - fnStart + endMarkerLF.length);
+      const vm = require('vm');
+      // v0.2.10 修复: prefilter 函数体内用 window.Core && Core.Constants, sandbox 必须挂 window + Core
+      const coreObj = { Constants: { PREFILTER_DEFAULTS: { minMktCap: 20e8, minTurnover: 0.5, excludeSt: true, excludeOneWord: true, excludeSuspended: true, excludePbZero: true, pctChangeLimit: 9.5, oneWordPctChange: 9.9, oneWordAmountFloor: 1000 * 10000 } } };
+      const sandbox = { console, window: { Core: coreObj }, Core: coreObj };
+      vm.createContext(sandbox);
+      vm.runInContext(fnSrc + '\nthis.prefilter = prefilter;', sandbox);
+
+      // 构造 4 只测试股: 1 正常 + 1 ST + 1 一字板 + 1 小盘
+      const sample = [
+        { 代码: '000001', 名称: '平安银行', 最新价: 10, 总市值: 200e8, 市净率: 0.8, 换手率: 1.2, 涨跌幅: 2, 成交额: 5e8 },
+        { 代码: '000002', 名称: 'ST 国安',   最新价: 5,  总市值: 50e8,  市净率: 0.5, 换手率: 1.0, 涨跌幅: 5, 成交额: 2e8 },
+        { 代码: '000003', 名称: '一字板股',  最新价: 10, 总市值: 30e8,  市净率: 0.6, 换手率: 0.8, 涨跌幅: 10.1, 成交额: 500e4 },  // 一字板 (≥9.9% + 成交额<1000万)
+        { 代码: '000004', 名称: '小盘股',    最新价: 3,  总市值: 5e8,   市净率: 0.4, 换手率: 0.8, 涨跌幅: 1, 成交额: 1e8 }    // 市值<20亿
+      ];
+      const r = sandbox.prefilter(sample);
+      const passedCodes = r.passed.map(s => s.代码);
+      const droppedReasons = r.dropped.map(d => d.reason);
+
+      if (r.passed.length === 1 && passedCodes[0] === '000001' && r.dropped.length === 3) {
+        ok('120.3a prefilter 4 只: 1 通过 (000001) + 3 砍 (ST/一字板/小盘)');
+      } else {
+        fail('120.3a prefilter 实际 passed=' + JSON.stringify(passedCodes) + ' dropped=' + JSON.stringify(droppedReasons), '');
+      }
+
+      // 120.3b 空入参容错
+      const r2 = sandbox.prefilter([]);
+      if (r2.passed.length === 0 && r2.dropped.length === 0) {
+        ok('120.3b prefilter 空入参: passed=0 dropped=0 (容错)');
+      } else {
+        fail('120.3b prefilter 空入参', JSON.stringify(r2));
+      }
+
+      // 120.3c null/undefined 入参容错
+      const r3 = sandbox.prefilter(null);
+      if (r3.passed.length === 0 && r3.dropped.length === 0) {
+        ok('120.3c prefilter null 入参: passed=0 dropped=0 (容错)');
+      } else {
+        fail('120.3c prefilter null', JSON.stringify(r3));
+      }
+
+      // 120.3d 自定义阈值 (opts 覆盖) — 1e8 阈值砍到最松: 000001(200e8)/000004(5e8) 过, ST(000002) 仍砍, 一字板(000003) 仍砍
+      const r4 = sandbox.prefilter(sample, { minMktCap: 1e8 });
+      const passed4 = r4.passed.map(s => s.代码);
+      if (r4.passed.length === 2 && passed4.includes('000001') && passed4.includes('000004')
+          && !passed4.includes('000002') && !passed4.includes('000003')) {
+        ok('120.3d prefilter opts.minMktCap 覆盖: 1亿阈值 → 2 通过 (仍砍 ST + 一字板)');
+      } else {
+        fail('120.3d opts 覆盖', 'passed=' + JSON.stringify(passed4));
+      }
+    } catch (e) { fail('120.3 prefilter vm 沙箱', e.message); }
+
+    // 120.4 warmupFinMap + ensureFinMap + getWarmupStatus 已挂 Core.Scoring
+    //   v0.2.10: prefilter 在前, warmupFinMap / ensureFinMap / getWarmupStatus 跟在后, 用大窗口 1000 字符
+    const ws = scoringSrc.split('window.Core.Scoring')[1] || '';
+    if (/warmupFinMap/.test(ws) && /ensureFinMap/.test(ws) && /getWarmupStatus/.test(ws)) {
+      ok('120.4 warmupFinMap / ensureFinMap / getWarmupStatus 已挂 Core.Scoring');
+    } else {
+      fail('120.4 warmup API 缺', '');
+    }
+
+    // 120.5 app.js init 末尾调 warmupFinMap
+    const appSrc120 = fs.readFileSync('www/app.js', 'utf8');
+    if (/Core\.Scoring\.warmupFinMap\(/.test(appSrc120)) {
+      ok('120.5 app.js init 末尾调 warmupFinMap (后台预热)');
+    } else {
+      fail('120.5 app.js 没调 warmupFinMap', '');
+    }
+
+    // 120.6 long-trader.js 评分前调 ensureFinMap
+    const ltSrc120 = fs.readFileSync('www/app/long-trader.js', 'utf8');
+    if (/Core\.Scoring\.ensureFinMap\(/.test(ltSrc120)) {
+      ok('120.6 long-trader runNow 调 ensureFinMap (等 0-3s warmup)');
+    } else {
+      fail('120.6 long-trader 没调 ensureFinMap', '');
+    }
+
+    // 120.7 screener.js 加 prefilter 调用
+    const scSrc120 = fs.readFileSync('www/app/screener.js', 'utf8');
+    if (/Core\.Scoring\.prefilter\(/.test(scSrc120)) {
+      ok('120.7 screener run() 加 prefilter 调用 (减重 IO)');
+    } else {
+      fail('120.7 screener 没调 prefilter', '');
+    }
+
+    // 120.8 rankCandidates 入口接 prefilter
+    if (/async function rankCandidates[\s\S]{0,500}prefilter\(all, opts\.prefilter\)/.test(scoringSrc) ||
+        /async function rankCandidates[\s\S]{0,800}prefilter\(all/.test(scoringSrc)) {
+      ok('120.8 rankCandidates 入口接 prefilter (5000 → ~2000)');
+    } else {
+      fail('120.8 rankCandidates 没接 prefilter', '');
+    }
+  } catch (e) { fail('120.x 初选硬筛', e.message + ' / ' + (e.stack || '').split('\n')[1]); }
 
   // ===== 98.x: V3 P2 bug 修复回归测试 =====
   try {

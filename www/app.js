@@ -191,22 +191,78 @@ function hideRegimeAlertBanner() {
 
     // 4. 健康检查(异步,不阻塞 UI)
     Core.Data.health().then(h => {
-      if (!h.ok) {
-        console.warn('[App] AKShare 代理不通:', h.error);
+      if (!h || h.status !== 'ok') {
+        console.warn('[App] AKShare 代理不通:', h && h.error);
         // 不弹 toast,启动时太吵
       } else {
         console.log('[App] AKShare proxy ok');
       }
     })
-    // 4c. Electron 自动更新通知
+    // 4c. Electron 自动更新通知 (B5 修复: 完整链路接通)
+    if (window.electronAPI && window.electronAPI.onUpdateAvailable) {
+      // 用户确认下载: 显示 banner 含"立即下载"按钮
+      window.electronAPI.onUpdateAvailable(function(info) {
+        if (document.getElementById('updateAvailableBanner')) return;
+        var el = document.createElement('div');
+        el.id = 'updateAvailableBanner';
+        el.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:99999;background:#0969da;color:#fff;padding:16px 20px;border-radius:8px;max-width:360px;font-size:14px;box-shadow:0 4px 12px rgba(0,0,0,0.3);';
+        el.innerHTML = '<div style="font-weight:600;margin-bottom:6px;">发现新版本 v' + (info && info.version ? info.version : '') + '</div><div style="margin-bottom:8px;font-size:12px;opacity:0.9;">是否立即下载?</div>';
+        var btn = document.createElement('button');
+        btn.textContent = '立即下载';
+        btn.style.cssText = 'background:#fff;color:#0969da;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-weight:600;margin-right:6px;';
+        btn.onclick = function() {
+          if (window.electronAPI.startDownloadUpdate) window.electronAPI.startDownloadUpdate();
+          el.remove();
+        };
+        var dismiss = document.createElement('button');
+        dismiss.textContent = '稍后';
+        dismiss.style.cssText = 'background:transparent;color:#fff;border:1px solid rgba(255,255,255,0.4);padding:6px 12px;border-radius:4px;cursor:pointer;';
+        dismiss.onclick = function() { el.remove(); };
+        el.appendChild(btn);
+        el.appendChild(dismiss);
+        document.body.appendChild(el);
+      });
+      // 下载完成: 显示 banner 含"立即重启安装"按钮
+      window.electronAPI.onUpdateDownloaded(function(info) {
+        if (document.getElementById('updateDownloadedBanner')) return;
+        var el = document.createElement('div');
+        el.id = 'updateDownloadedBanner';
+        el.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:99999;background:#1a7f37;color:#fff;padding:16px 20px;border-radius:8px;max-width:360px;font-size:14px;box-shadow:0 4px 12px rgba(0,0,0,0.3);';
+        var btn = document.createElement('button');
+        btn.textContent = '立即重启安装 (v' + (info && info.version ? info.version : '') + ')';
+        btn.style.cssText = 'background:#fff;color:#1a7f37;border:none;padding:8px 16px;border-radius:4px;cursor:pointer;font-weight:600;margin-top:8px;';
+        btn.onclick = function() {
+          if (window.electronAPI.installUpdate) window.electronAPI.installUpdate();
+          el.remove();
+        };
+        var dismiss = document.createElement('button');
+        dismiss.textContent = '稍后';
+        dismiss.style.cssText = 'background:transparent;color:#aaa;border:1px solid #555;padding:8px 14px;border-radius:4px;cursor:pointer;margin-top:8px;margin-left:6px;';
+        dismiss.onclick = function() { el.remove(); };
+        el.innerHTML = '<div style="font-weight:600;margin-bottom:6px;">已下载完成</div><div style="margin-bottom:4px;">点击重启自动安装</div>';
+        el.appendChild(btn);
+        el.appendChild(dismiss);
+        document.body.appendChild(el);
+      });
+      // 升级出错: 红色 toast 提示
+      window.electronAPI.onUpdateError(function(err) {
+        var msg = (err && err.message) ? err.message : '未知错误';
+        if (window.Core && Core.Toast && Core.Toast.show) {
+          Core.Toast.show('更新失败: ' + msg, 'error');
+        } else {
+          console.warn('[App] 自动更新失败:', msg);
+        }
+      });
+    }
+    // 4c.b Capacitor (Android APK) 自动更新通知 (旧版保留)
     if (window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.App) {
-      window.Capacitor.Plugins.App.addListener('update-downloaded', (info) => {
+      window.Capacitor.Plugins.App.addListener('update-downloaded', function(info) {
         if (document.getElementById('updateBanner')) return;
         var el = document.createElement('div');
         el.id = 'updateBanner';
         el.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:99999;background:#1a7f37;color:#fff;padding:16px 20px;border-radius:8px;max-width:360px;font-size:14px;box-shadow:0 4px 12px rgba(0,0,0,0.3);';
         var btn = document.createElement('button');
-        btn.textContent = '立即重启安装 (v' + info.version + ')';
+        btn.textContent = '立即重启安装 (v' + (info && info.version ? info.version : '') + ')';
         btn.style.cssText = 'background:#fff;color:#1a7f37;border:none;padding:8px 16px;border-radius:4px;cursor:pointer;font-weight:600;margin-top:8px;';
         btn.onclick = function() {
           if (window.electronAPI && window.electronAPI.installUpdate) {
@@ -290,9 +346,18 @@ function hideRegimeAlertBanner() {
     if (window.ShortTrader && ShortTrader.maybeDistillLessons) {
       ShortTrader.maybeDistillLessons().catch(e => console.warn('[App] 短线教训提炼失败:', e));
     }
-    // IntradayTrader: 盘中盯盘层 — 1 分钟轮询, 交易时段守卫, 本地 LLM 实时调仓
-    if (window.IntradayTrader && IntradayTrader.init) {
-      IntradayTrader.init();
+    // IntradayTrader: 盘中盯盘层 — v0.2.6 关闭
+    // 1 分钟轮询 + LLM 实时决策 = 过度设计, T2 盘前条件单 + T3 日线结算 + T4 学习环已覆盖短线场景
+    // 完整删除 www/app/intraday-trader.js (B2 收口)
+    // 如需复用, 见 git history commit 365fe9d 之前的版本
+    // B4 修复: 启动期预热大盘宽度/风格 (30s 内完成, 让长线/选股页面打开时不再 cold start)
+    if (window.Core && Core.Market && typeof Core.Market.warmup === 'function') {
+      Core.Market.warmup().catch(e => console.warn('[App] Market.warmup 失败:', e));
+    }
+    // 初选硬筛后台预热: app 启动后异步拉 2000 只基本面 (7d 缓存), 用户主动跑评分时秒开
+    // 失败不阻塞, 跑失败时用户主动跑评分会自然降级 (Scoring 失败时 long-trader 有兜底排序)
+    if (window.Core && Core.Scoring && typeof Core.Scoring.warmupFinMap === 'function') {
+      Core.Scoring.warmupFinMap().catch(e => console.warn('[App] Scoring.warmupFinMap 失败:', e));
     }
     // LongTrader: 长线 sleeve 自动选股 — 30 分钟检查, 周一距上次 ≥7 天自动跑 AI 选股 → 成交到 long sleeve
     if (window.LongTrader && LongTrader.init) {
@@ -476,15 +541,6 @@ window._renderSettings = function() {
       <span id="devProxyDiscoverResult" style="font-size:12px;color:var(--text-muted);margin-left:8px;"></span>
     </div>
     <div id="devProxyDiscoverList" style="margin-top:8px;"></div>
-
-    <div class="form-row">
-      <label>🤖 AI 手动测试 (绕过周一限制 / 交易日限制)</label>
-      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px;">
-        <button class="btn" onclick="manualLongTrader()">🔍 手动跑长线 AI 选股</button>
-        <button class="btn" onclick="manualShortPlan()">📋 手动跑短线盘前计划</button>
-      </div>
-      <div id="manualTraderResult" style="font-size:12px;color:var(--text-muted);margin-top:6px;"></div>
-    </div>
 
     <div class="form-row">
       <label>AKShare 代理地址</label>
@@ -1170,32 +1226,52 @@ window.discoverLLM = async function() {
 };
 
 // 手动测试长线 AI 选股（强制跳过周一/7天限制，直接跑完整管线）
+// B3 修复: 按钮已归位到 paper.js 长线 tab (manualLongResult), 设置页不再有按钮
+// B7 修复: 90s 总超时兜底 (LongTrader.runNow 内部异常被吞, 不超时 UI 永远卡)
 window.manualLongTrader = async function() {
-  const el = document.getElementById('manualTraderResult');
-  if (el) { el.textContent = '⏳ 正在拉行情+评分+LLM 选股（可能需要 30-60 秒）...'; el.style.color = 'var(--text-muted)'; }
+  const el = document.getElementById('manualLongResult');
+  if (el) { el.textContent = '⏳ 正在拉行情+评分+LLM 选股（可能需要 30-90 秒）...'; el.style.color = 'var(--text-muted)'; }
+  if (!window.LongTrader) { if (el) { el.textContent = '❌ LongTrader 未加载'; el.style.color = 'var(--down)'; } return; }
+  const TIMEOUT_MS = 90000;
+  let timer = null;
   try {
-    if (!window.LongTrader) { throw new Error('LongTrader 未加载'); }
-    await LongTrader.runNow({ force: true });
-    if (el) { el.textContent = '✅ 长线选股完成，请去模拟盘页面查看结果'; el.style.color = 'var(--up)'; }
+    const racePromise = LongTrader.runNow({ force: true });
+    const timeoutPromise = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('LongTrader.runNow 超时 (' + (TIMEOUT_MS / 1000) + 's)')), TIMEOUT_MS);
+    });
+    await Promise.race([racePromise, timeoutPromise]);
+    if (el) { el.textContent = '✅ 长线选股完成，请查看上方结果'; el.style.color = 'var(--up)'; }
   } catch (e) {
     if (el) { el.textContent = '❌ 失败: ' + e.message; el.style.color = 'var(--down)'; }
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 };
 
 // 手动测试短线盘前计划（强制重新生成，忽略今日已生成记录）
+// B3 修复: 按钮已归位到 paper.js 短线 tab (manualShortResult), 设置页不再有按钮
+// B7 修复: 60s 总超时兜底 (同 manualLongTrader, 短线 LLM 决策更快给 60s)
 window.manualShortPlan = async function() {
-  const el = document.getElementById('manualTraderResult');
+  const el = document.getElementById('manualShortResult');
   if (el) { el.textContent = '⏳ 正在生成短线盘前计划（可能需要 30-60 秒）...'; el.style.color = 'var(--text-muted)'; }
+  if (!window.ShortTrader) { if (el) { el.textContent = '❌ ShortTrader 未加载'; el.style.color = 'var(--down)'; } return; }
+  const TIMEOUT_MS = 60000;
+  let timer = null;
   try {
-    if (!window.ShortTrader) { throw new Error('ShortTrader 未加载'); }
-    const r = await ShortTrader.generatePlan({ now: new Date() });
+    const racePromise = ShortTrader.generatePlan({ now: new Date() });
+    const timeoutPromise = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('ShortTrader.generatePlan 超时 (' + (TIMEOUT_MS / 1000) + 's)')), TIMEOUT_MS);
+    });
+    const r = await Promise.race([racePromise, timeoutPromise]);
     if (el) {
       const n = r && r.plans ? r.plans.length : 0;
-      el.textContent = n > 0 ? `✅ 短线计划生成完成 (${n} 条)，请去模拟盘-短线页面查看` : '✅ 已运行，请查看结果';
+      el.textContent = n > 0 ? `✅ 短线计划生成完成 (${n} 条)，查看上方结果` : '✅ 已运行，请查看结果';
       el.style.color = 'var(--up)';
     }
   } catch (e) {
     if (el) { el.textContent = '❌ 失败: ' + e.message; el.style.color = 'var(--down)'; }
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 };
 
@@ -1267,12 +1343,13 @@ window.checkHealth = async function() {
   el.textContent = '检查中...';
   el.style.color = 'var(--text-muted)';
   const h = await Core.Data.health();
-  if (h.ok) {
+  // B1 修复: Core.Data.health() 返 { status, error }, 不是 { ok }
+  if (h && h.status === 'ok') {
     el.textContent = '✓ 代理正常';
-    el.style.color = 'var(--down)';
-  } else {
-    el.textContent = '✗ ' + h.error;
     el.style.color = 'var(--up)';
+  } else {
+    el.textContent = '✗ ' + (h && h.error ? h.error : '未知错误');
+    el.style.color = 'var(--down)';
   }
 };
 

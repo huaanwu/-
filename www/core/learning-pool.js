@@ -58,7 +58,8 @@
       }
     } catch (e) { console.warn('[LearningPool] LongTrader 收集失败:', e); }
 
-    // 3) IntradayTrader: intraday log verified=true
+    // 3) IntradayTrader: v0.2.6 关闭, 文件已删. 保留这段读旧 paper_intraday_log 兼容数据
+    //    (用户可能 B2 之前跑过有日志, 升 v0.2.6 后新数据不会再写入, 但历史仍参与学习池)
     try {
       const log = (await Core.Storage.kvGet('paper_intraday_log')) || [];
       for (const e of log) {

@@ -138,6 +138,10 @@
         //    硬过滤 (新股 < 5 日 / ST / 一字板) 已内置在 Scoring.applyHardFilters
         //    换手率 ≥ 1% 也通过 Scoring 的 turn-over 因子隐式表达
         let sorted;
+        // 等 warmup (0-3s) — app init 后已经 fire-and-forget 预热基本面, 用户主动跑时大概率已 ready
+        if (Core.Scoring && typeof Core.Scoring.ensureFinMap === 'function') {
+          await Core.Scoring.ensureFinMap().catch(() => {});
+        }
         try {
           sorted = await Core.Scoring.rankCandidates({ topN: HARD_TOP });
           // 排除已持仓 (跟 Bear 之前一样)

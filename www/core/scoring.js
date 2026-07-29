@@ -219,12 +219,14 @@
 
   /**
    * 完整流程: 拉数据 + 过滤 + 打分 + 截断
-   * @param {{ topN?: number, includeFiltered?: boolean }} opts
+   * @param {{ topN?: number, includeFiltered?: boolean, skipPrefilter?: boolean }} opts
+   *   - skipPrefilter: 测试/调用方确认数据已预筛过, 跳过第一层
    * @returns {Promise<Array>} topN 个候选 (按 _score desc)
    */
   async function rankCandidates(opts = {}) {
     const topN = opts.topN || 30;
     const includeFiltered = opts.includeFiltered || false;
+    const skipPrefilter = opts.skipPrefilter || false;
     _lastDegraded = [];  // V6: 重置, 重新记录本轮的 fetch 失败
 
     // 1. 拉全市场行情
@@ -237,8 +239,20 @@
     }
     if (!Array.isArray(all) || all.length === 0) return [];
 
-    // 2. 拉财务 + 行业 (并发)
-    const codes = all.map(s => s.代码);
+    // 1.5 第一层硬筛: 5000 → ~2000 (中庸阈值, 0 IO)
+    //    避免对烂股拉基本面/行业/北向这些重 IO batch (单只 batch 200ms × 5000 = 1000s)
+    let prefilted;
+    if (skipPrefilter) {
+      prefilted = all;
+    } else {
+      const r = prefilter(all, opts.prefilter);
+      prefilted = r.passed;
+      console.log(`[Scoring] rankCandidates 预筛: ${all.length} → ${prefilted.length} (砍 ${r.dropped.length})`);
+    }
+    if (prefilted.length === 0) return [];
+
+    // 2. 拉财务 + 行业 (并发) — 只对预筛后的 ~2000 只拉
+    const codes = prefilted.map(s => s.代码);
     let finMap = new Map(), industryMap = new Map(), northMap = new Map();
     try {
       finMap = await Core.Data.getStockFinancialBatch(codes);
@@ -299,7 +313,7 @@
     }
 
     // 5. 硬过滤 + 打分
-    const filtered = applyHardFilters(all, opts, forecastMap);
+    const filtered = applyHardFilters(prefilted, opts, forecastMap);
     const ranked = rank(filtered, finMap, industryMap, northMap, heldByInd, weights, conceptMap, conceptPerf, sectorPerf, forecastMap, rpsMap);
 
     // V2 P3 / V2+concept: chokepoint + 概念板块只对 top 候选调, 避免全市场 IO
@@ -355,6 +369,217 @@
     }
 
     return includeFiltered ? finalRanked : finalRanked.slice(0, topN);
+  }
+
+  // ============ 后台预热: app init 时异步拉基本面 + 业绩预告, 用户点 AI 选股时秒开 ============
+  /**
+   * warmupFinMap: 启动期后台预热, 让"基本面 batch"在用户主动跑评分时已经准备好 (7d 缓存命中)
+   *
+   * 流程:
+   *   1) getStockSpot 拿全市场 (60s 缓存, 已有就直接读)
+   *   2) prefilter 砍到 ~2000 只
+   *   3) 后台异步拉 getStockFinancialBatch(2000) — 第一次 ~60s, 之后 0s
+   *   4) 并行拉 getStockEarningForecastBatch(2000) — 单端点批量
+   *
+   * 设计原则:
+   *   - 不阻塞 init (Promise 不 await, 只 fire-and-forget)
+   *   - 失败不抛, 只 console.warn, 跑不出来用户用评分时自然降级
+   *   - 多次调用幂等: in-flight Promise 复用, 不会并发拉 N 次
+   *   - ensureFinMap(opts) 公开给 long-trader, 让评分前等 0-3s (用户感知不到) 拿到更好的数据
+   */
+  let _warmupPromise = null;       // in-flight 复用
+  let _warmupStatus = 'idle';      // 'idle' | 'running' | 'done' | 'failed'
+  let _warmupAt = 0;               // 上次完成时间戳
+  const _WARMUP_TTL_MS = 30 * 60 * 1000;  // 30 分钟内不重复预热
+  let _warmupPrefilteredCodes = null;       // 最近一次预热后保留下来的 codes (ensureFinMap 用)
+
+  function getWarmupStatus() {
+    return {
+      status: _warmupStatus,
+      at: _warmupAt,
+      codeCount: _warmupPrefilteredCodes ? _warmupPrefilteredCodes.length : 0
+    };
+  }
+
+  async function warmupFinMap(opts = {}) {
+    // 1) 幂等: 30 分钟内已成功完成过 → 直接返
+    if (_warmupStatus === 'done' && Date.now() - _warmupAt < _WARMUP_TTL_MS) {
+      return { skipped: true, reason: 'recently_warmed', at: _warmupAt };
+    }
+    // 2) 幂等: in-flight → 复用同一个 Promise
+    if (_warmupPromise) return _warmupPromise;
+
+    _warmupStatus = 'running';
+    _warmupPromise = (async () => {
+      try {
+        // 1. 拉全市场 (60s cache, 已有秒回)
+        const all = await Core.Data.getStockSpot();
+        if (!Array.isArray(all) || all.length === 0) {
+          throw new Error('getStockSpot 返回空');
+        }
+        // 2. 硬筛 5000 → 2000
+        const { passed, dropped } = prefilter(all, opts);
+        const codes = passed.map(s => s.代码).filter(Boolean);
+        _warmupPrefilteredCodes = codes;
+        console.log(`[Scoring] warmup 预筛: ${all.length} → ${codes.length} (砍 ${dropped.length}, 占比 ${(dropped.length / all.length * 100).toFixed(1)}%)`);
+        if (codes.length === 0) {
+          throw new Error('预筛后 0 只, 不拉基本面');
+        }
+        // 3. 后台拉基本面 + 业绩预告 (fire-and-forget, 不 await 阻断 init)
+        //    这两个 batch 内部本身有 cache, 第一次跑耗时, 之后秒开
+        const t0 = Date.now();
+        try {
+          await Core.Data.getStockFinancialBatch(codes);
+          console.log(`[Scoring] warmup finMap ${codes.length} 只, 耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+        } catch (e) {
+          console.warn('[Scoring] warmup finMap 失败 (不致命, 用户跑时降级):', e.message);
+        }
+        try {
+          if (Core.Data.getStockEarningForecastBatch) {
+            await Core.Data.getStockEarningForecastBatch(codes);
+          }
+        } catch (e) {
+          console.warn('[Scoring] warmup forecast 失败 (不致命):', e.message);
+        }
+        _warmupStatus = 'done';
+        _warmupAt = Date.now();
+        return { skipped: false, prefiltedCount: codes.length, ms: Date.now() - t0 };
+      } catch (e) {
+        _warmupStatus = 'failed';
+        console.warn('[Scoring] warmup 整体失败 (不致命, 用户跑时自然降级):', e.message);
+        throw e;
+      } finally {
+        _warmupPromise = null;  // 释放 in-flight, 允许重试
+      }
+    })();
+    return _warmupPromise;
+  }
+
+  /**
+   * ensureFinMap: 给 long-trader / screener 在评分前用
+   *   - 如果 warmup 在跑 → 等它完成 (最多 3s, 超时不等)
+   *   - 如果 warmup 30 分钟内已完成 → 直接返 (秒开)
+   *   - 如果 warmup 失败/没跑过 → 启动一次 + 立刻返 (不等)
+   * @returns {Promise<{ready: boolean, source: 'warmed'|'fresh'|'timeout'|'failed'}>}
+   */
+  async function ensureFinMap(opts = {}) {
+    const WAIT_MS = 3000;
+    // 1) 已完成且新鲜
+    if (_warmupStatus === 'done' && Date.now() - _warmupAt < _WARMUP_TTL_MS) {
+      return { ready: true, source: 'warmed' };
+    }
+    // 2) in-flight → 等最多 3s
+    if (_warmupPromise) {
+      const t0 = Date.now();
+      try {
+        await Promise.race([
+          _warmupPromise,
+          new Promise(resolve => setTimeout(resolve, WAIT_MS))
+        ]);
+        if (_warmupStatus === 'done') {
+          return { ready: true, source: 'warmed', waitedMs: Date.now() - t0 };
+        }
+        return { ready: false, source: 'timeout', waitedMs: Date.now() - t0 };
+      } catch (_) {
+        return { ready: false, source: 'failed' };
+      }
+    }
+    // 3) 没启动过 → fire and don't wait
+    warmupFinMap(opts).catch(() => {});  // 失败不抛
+    return { ready: false, source: 'fresh' };
+  }
+
+  /**
+   * 初选硬筛: 5000 全市场 → ~2000 (中庸阈值, 0 网络 IO, < 10ms)
+   *
+   * 用行情基础字段 (现价/总市值/换手率/涨跌幅/成交额/名称/市净率) 砍掉明显的烂股,
+   * 把下游 Scoring 精细评分 + long-trader / screener LLM 解读 的输入缩小到可控规模。
+   *
+   * 跟 applyHardFilters 的区别:
+   *   - applyHardFilters: 在已富化的 stocks 上做"硬过滤", 依赖 _fe / forecastMap,
+   *     跑在 Scoring.rank 之后, 用于"低质但过了硬筛的再砍一次"
+   *   - prefilter: 跑在 getStockSpot 之后立刻做, 0 依赖, 5000 → 2000 立刻砍掉,
+   *     避免对烂股拉基本面/行业/北向这些重 IO fetcher
+   *
+   * 阈值从 Constants.PREFILTER_DEFAULTS 拿, 调用方可覆盖 opts
+   *
+   * @param {Array} all - getStockSpot() 返回的 stocks
+   * @param {Object} [opts] - 覆盖默认阈值 { minMktCap?, minTurnover?, ... }
+   * @returns {{ passed: Array, dropped: Array }}
+   *   - passed: 通过硬筛的 (~2000)
+   *   - dropped: 被砍的 + 原因 [{ code, name, reason }]
+   */
+  function prefilter(all, opts = {}) {
+    if (!Array.isArray(all) || all.length === 0) {
+      return { passed: [], dropped: [] };
+    }
+    // 合并默认阈值 + 调用方覆盖
+    const defaults = (window.Core && Core.Constants && Core.Constants.PREFILTER_DEFAULTS) || {
+      minMktCap: 20e8, minTurnover: 0.5, excludeSt: true, excludeOneWord: true,
+      excludeSuspended: true, excludePbZero: true, pctChangeLimit: 9.5,
+      oneWordPctChange: 9.9, oneWordAmountFloor: 1000 * 10000
+    };
+    const cfg = Object.assign({}, defaults, opts || {});
+
+    const passed = [];
+    const dropped = [];
+    for (const s of all) {
+      if (!s || !s.代码) { dropped.push({ code: '?', name: '', reason: '无代码' }); continue; }
+      const code = s.代码;
+      const name = s.名称 || '';
+
+      // 1. ST / *ST / 退市
+      if (cfg.excludeSt && /ST|退|暂停/.test(name)) {
+        dropped.push({ code, name, reason: 'ST/退市' }); continue;
+      }
+
+      // 2. 停牌 (成交额 = 0 / 缺失)
+      if (cfg.excludeSuspended) {
+        const amt = parseFloat(s.成交额 || s.成交额 || 0);
+        if (isNaN(amt) || amt <= 0) {
+          dropped.push({ code, name, reason: '停牌(成交额=0)' }); continue;
+        }
+      }
+
+      // 3. 一字板 (涨幅 ≥ 9.9% 且 成交额 < 1000 万 — 流动性枯竭)
+      if (cfg.excludeOneWord) {
+        const pct = parseFloat(s.涨跌幅);
+        const amt = parseFloat(s.成交额 || 0);
+        if (!isNaN(pct) && !isNaN(amt) && pct >= cfg.oneWordPctChange && amt < cfg.oneWordAmountFloor) {
+          dropped.push({ code, name, reason: '一字板' }); continue;
+        }
+      }
+
+      // 4. 总市值 ≥ 20 亿 (小盘流动性差)
+      const mc = parseFloat(s.总市值);
+      if (isNaN(mc) || mc < cfg.minMktCap) {
+        dropped.push({ code, name, reason: '小市值<' + (cfg.minMktCap / 1e8) + '亿' }); continue;
+      }
+
+      // 5. 市净率 > 0 (资不抵债)
+      if (cfg.excludePbZero) {
+        const pb = parseFloat(s.市净率);
+        if (!isNaN(pb) && pb <= 0) {
+          dropped.push({ code, name, reason: '市净率≤0' }); continue;
+        }
+      }
+
+      // 6. 换手率 ≥ 0.5% (无交易量 = 僵尸股)
+      const to = parseFloat(s.换手率);
+      if (isNaN(to) || to < cfg.minTurnover) {
+        dropped.push({ code, name, reason: '低换手<' + cfg.minTurnover + '%' }); continue;
+      }
+
+      // 7. 涨跌幅 ±9.5% 异常 (一字板/跌停板流动性枯竭, 即便不是一字板判定)
+      const ch = parseFloat(s.涨跌幅);
+      if (!isNaN(ch) && Math.abs(ch) >= cfg.pctChangeLimit) {
+        dropped.push({ code, name, reason: '涨跌±' + cfg.pctChangeLimit + '%+' }); continue;
+      }
+
+      // 全部通过
+      passed.push(s);
+    }
+    return { passed, dropped };
   }
 
   /**
@@ -467,6 +692,10 @@
     rankCandidates,
     rank,             // 暴露纯函数便于测试
     applyHardFilters,
+    prefilter,        // 初选硬筛 (0 IO, 5000 → ~2000)
+    warmupFinMap,     // 后台预热基本面
+    ensureFinMap,     // long-trader / screener 评分前等 0-3s
+    getWarmupStatus,  // UI 读 warmup 状态
     DEFAULT_WEIGHTS,
     FACTOR_KEYS,      // 单点 source-of-truth, 供 weight-advisor / test 引用
     NEW_STOCK_RULE_DAYS,

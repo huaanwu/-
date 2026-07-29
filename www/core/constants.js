@@ -202,6 +202,25 @@
   /** 业绩预告/估值的新鲜度窗口: 公告日期超过半年视为陈旧回填数据, 丢弃 (与 data.js Y1 防御一致) */
   const EARNINGS_WARNING_FRESH_MS = 180 * 24 * 60 * 60 * 1000;
 
+  /**
+   * 选股初选硬筛阈值 (中庸档, 5000 → ~2000)
+   * - 0 网络 IO 纯函数, 跑全市场 < 10ms
+   * - 用行情基础字段 (现价/总市值/换手率/涨跌幅/成交额/名称/市净率) 硬砍
+   * - 不依赖基本面/行业, 留给下游精细评分
+   * - 改阈值前先在 _loadRealConstants().PREFILTER_DEFAULTS 单点改, 调用方不感知
+   */
+  const PREFILTER_DEFAULTS = {
+    minMktCap: 20e8,         // 总市值 ≥ 20 亿 (小盘流动性差/操纵多)
+    minTurnover: 0.5,        // 换手率 ≥ 0.5% (无交易量 = 僵尸股)
+    excludeSt: true,         // 排除 ST / *ST / 退市
+    excludeOneWord: true,    // 排除一字板 (涨幅 ≥ 9.9% 且 成交额 < 1000 万)
+    excludeSuspended: true,  // 排除停牌 (成交额 = 0 或 空)
+    excludePbZero: true,     // 排除市净率 ≤ 0 (资不抵债)
+    pctChangeLimit: 9.5,     // 排除涨跌幅 ±9.5% 以上 (一字板/跌停板流动性枯竭)
+    oneWordPctChange: 9.9,   // 一字板判定涨幅阈值
+    oneWordAmountFloor: 1000 * 10000,  // 一字板判定成交额上限 (1000 万)
+  };
+
   /** 估值偏离: 单只指数当前 PE 在近 N 个月历史序列里的分位 ≥ 此值视为"偏贵", 与低估值买入逻辑相悖 */
   const VALUATION_PERCENTILE_WARN = 80;
 
@@ -351,6 +370,7 @@
     ALERT_LONG_CACHE_TTL_MS,
     EARNINGS_WARNING_NEGATIVE_TYPES,
     EARNINGS_WARNING_FRESH_MS,
+    PREFILTER_DEFAULTS,
     VALUATION_PERCENTILE_WARN,
     VALUATION_INDEX_NAMES,
     VALUATION_PE_LOOKBACK_MO,
