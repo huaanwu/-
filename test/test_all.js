@@ -147,7 +147,9 @@ const DOMAINS = {
     '_processPosition', '_decideWithLlm', '_executeAction', '_appendLog',
     '_isTradingTime', '_isCooldownOver', '_isUnderDailyLimit', '_mechanicalExit', '_isMinHoldPassed', '_parseDecision'],
   // 长线操盘手 (Long Trader): 文件名 long-trader.js, key 用 'Long-Trader' (toLowerCase 对得上)
-  'Long-Trader': ['init', 'runNow', 'stopPolling', 'listLog', '_shouldRun', '_llmPickTop', '_appendLog']
+  'Long-Trader': ['init', 'runNow', 'stopPolling', 'listLog', '_shouldRun', '_llmPickTop', '_appendLog'],
+  // AI 管家侧边栏 UI (文件名 agent-ui.js, key 用 'Agent-Ui')
+  'Agent-UI': ['init', 'send', 'toggle']
 };
 for (const [name, methods] of Object.entries(DOMAINS)) {
   const file = path.join(WWW, 'app', name.toLowerCase() + '.js');
@@ -180,7 +182,8 @@ const CORE_MODULES = {
   'core/prebacktest.js': 'Core.PreBacktest',
   'core/crosscheck.js': 'Core.CrossCheck',
   'core/user-profile.js': 'Core.UserProfile',
-  'core/learning-pool.js': 'Core.LearningPool'
+  'core/learning-pool.js': 'Core.LearningPool',
+  'core/agent.js': 'Core.Agent'
 };
 for (const [file, ns] of Object.entries(CORE_MODULES)) {
   const content = readFileSafe(path.join(WWW, file));
@@ -11947,6 +11950,168 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
 
 
 
+
+
+
+// ========== [103] AI 管家 - 工具调用循环 + 分级授权 (核心纯函数) ==========
+section('103] AI 管家 - 工具调用循环 + 分级授权');
+try {
+  const agentCtx = vm.createContext({
+    window: {},
+    console: { log() {}, warn() {}, error() {} },
+    setTimeout, clearTimeout
+  });
+  // 加载 util (空 stub) + storage (空 stub) + agent
+  const utilStub = 'window.Core = window.Core || {}; window.Core.Util = { escapeHtml: s => String(s||"") }; window.Core.Storage = { kvGet: async() => null, kvSet: async() => {} };';
+  vm.runInContext(utilStub, agentCtx, { filename: 'stub-util-storage' });
+  const agentSrc = readFileSafe(path.join(WWW, 'core', 'agent.js'));
+  if (!agentSrc) throw new Error('agent.js 读不到');
+  vm.runInContext(agentSrc, agentCtx, { filename: 'core/agent.js' });
+  const Agent = agentCtx.window.Core.Agent;
+  if (!Agent) throw new Error('Core.Agent 未挂载');
+
+  // 103.1 _normalizeAssistant: 纯文本分支
+  const r1 = Agent._test._normalizeAssistant({ text: 'hello', tool_calls: [] });
+  if (r1.role === 'assistant' && r1.text === 'hello' && r1.tool_uses.length === 0)
+    ok('103.1 _normalizeAssistant 纯文本响应');
+  else fail('103.1 _normalizeAssistant 纯文本', JSON.stringify(r1));
+
+  // 103.2 _normalizeAssistant: tool_calls 分支
+  const r2 = Agent._test._normalizeAssistant({
+    text: '',
+    tool_calls: [{ id: 'call_1', function: { name: 'fs.readUserFile', arguments: '{"a":1}' } }]
+  });
+  if (r2.tool_uses.length === 1 && r2.tool_uses[0].name === 'fs.readUserFile' && r2.tool_uses[0].input.a === 1)
+    ok('103.2 _normalizeAssistant 解析 tool_calls');
+  else fail('103.2 tool_calls', JSON.stringify(r2));
+
+  // 103.3 _normalizeAssistant: 空响应兜底
+  const r3 = Agent._test._normalizeAssistant(null);
+  if (r3.role === 'assistant' && typeof r3.text === 'string')
+    ok('103.3 _normalizeAssistant 空响应兜底');
+  else fail('103.3 空响应', JSON.stringify(r3));
+
+  // 103.4 _normalizeAssistant: arguments 非法 JSON 不崩
+  const r4 = Agent._test._normalizeAssistant({
+    text: '',
+    tool_calls: [{ id: 'c2', function: { name: 't', arguments: 'not json{' } }]
+  });
+  if (r4.tool_uses[0].input && r4.tool_uses[0].input._raw)
+    ok('103.4 _normalizeAssistant arguments 非法 JSON 兜底 (_raw)');
+  else fail('103.4 _raw', JSON.stringify(r4));
+
+  // 103.5 _mkToolResult: 标准格式
+  const r5 = Agent._test._mkToolResult('call_xyz', { ok: true, data: 42 });
+  if (r5.role === 'tool' && r5.tool_call_id === 'call_xyz' && JSON.parse(r5.content).data === 42)
+    ok('103.5 _mkToolResult 标准 OpenAI tool result');
+  else fail('103.5 _mkToolResult', JSON.stringify(r5));
+
+  // 103.6 _safeParse: 成功 + 失败双路径
+  if (Agent._test._safeParse('{"a":1}').a === 1) ok('103.6 _safeParse JSON OK');
+  else fail('103.6 _safeParse OK', '');
+  const sp = Agent._test._safeParse('garbage');
+  if (sp && sp._raw === 'garbage') ok('103.6b _safeParse JSON 错回 _raw');
+  else fail('103.6 _safeParse bad', '');
+
+  // 103.7 policy 默认值
+  const defaultPolicy = Agent.getPolicy();
+  if (defaultPolicy.L === 'auto' && defaultPolicy.M === 'auto' && defaultPolicy.H === 'ask')
+    ok('103.7 默认策略: L=auto M=auto H=ask (顺手)');
+  else fail('103.7 默认策略', JSON.stringify(defaultPolicy));
+
+  // 103.8 _resolveAuthPolicy: deny 优先
+  const t1 = { name: 'any', risk: 'H' };
+  Agent.setPolicyLevel('H', 'deny');
+  if (Agent._resolveAuthPolicy(t1) === 'deny')
+    ok('103.8a _resolveAuthPolicy deny 模式');
+  else fail('103.8a deny', '');
+  Agent.setPolicyLevel('H', 'ask');
+  if (Agent._resolveAuthPolicy(t1) === 'confirm')
+    ok('103.8b _resolveAuthPolicy ask 模式');
+  else fail('103.8b ask', '');
+  Agent.setPolicyLevel('H', 'auto');
+  if (Agent._resolveAuthPolicy(t1) === 'confirm') // 第一次未记住 → confirm
+    ok('103.8c _resolveAuthPolicy auto 未记住 → confirm');
+  else fail('103.8c auto no once', '');
+  Agent.rememberAllow('any');
+  if (Agent._resolveAuthPolicy(t1) === 'allow')
+    ok('103.8d _resolveAuthPolicy auto 记住后 → allow');
+  else fail('103.8d auto once', '');
+  Agent.forgetAllow('any');
+  // 复原策略, 不污染其它测试
+  Agent.setPolicyLevel('L', 'auto');
+  Agent.setPolicyLevel('M', 'auto');
+  Agent.setPolicyLevel('H', 'ask');
+
+  // 103.9 setPolicyLevel 校验
+  let threw = false;
+  try { Agent.setPolicyLevel('Z', 'auto'); } catch (_) { threw = true; }
+  if (threw) ok('103.9 setPolicyLevel 拒绝非法 risk');
+  else fail('103.9 setPolicyLevel 校验', '');
+
+} catch (e) { fail('103.x AI 管家', e.message); }
+
+// ========== [104] AI 管家 - electron/agent-registry 风险等级校验 (纯 Node) ==========
+section('104] AI 管家 - 工具注册表');
+try {
+  // 把 agent-registry.js 当 Node 模块跑 (它在 CommonJS 环境可加载)
+  const regSrc = readFileSafe(path.join(ROOT, 'electron', 'agent-registry.js'));
+  if (!regSrc) throw new Error('agent-registry.js 读不到');
+
+  // 静态查每个 register 调用都不缺字段
+  // 用括号配对找 register({...}) 块
+  function _extractRegisterBlocks(src) {
+    // 找 'register({' 起始, 然后括号配对 (跳过字符串字面量里的括号)
+    const blocks = [];
+    const re = /register\(\{/g;
+    let m;
+    while ((m = re.exec(src)) !== null) {
+      let depth = 1, i = m.index + 10, inStr = false, q = '';
+      while (i < src.length && depth > 0) {
+        const c = src[i];
+        if (inStr) {
+          if (c === '\\') { i += 2; continue; }
+          if (c === q) inStr = false;
+        } else {
+          if (c === "'" || c === '"') { inStr = true; q = c; }
+          else if (c === '{') depth++;
+          else if (c === '}') depth--;
+        }
+        i++;
+      }
+      if (depth === 0) blocks.push(src.slice(m.index + 9, i));
+    }
+    return blocks;
+  }
+  const registerBlocks = _extractRegisterBlocks(regSrc);
+  const tools = [];
+  for (const block of registerBlocks) {
+    const body = block;
+    const name = (block.match(/name:\s*'([^']+)'/) || [])[1];
+    const risk = (block.match(/risk:\s*'([LMH])'/) || [])[1];
+    const desc = (block.match(/description:\s*'([^']+)'/) || [])[1];
+    const inputSchema = /input_schema/.test(block);
+    const handler = /handler:/.test(block);
+    tools.push({ name, risk, desc, inputSchema, handler });
+  }
+  if (tools.length >= 5) ok('104.1 注册了 ' + tools.length + ' 个工具 (≥5)');
+  else fail('104.1 工具数', String(tools.length));
+
+  // 每个工具 name/risk/description 必须存在
+  const missing = tools.filter(t => !t.name || !t.risk || !t.desc);
+  if (missing.length === 0) ok('104.2 所有工具都有 name/risk/description');
+  else fail('104.2 缺字段', JSON.stringify(missing));
+
+  // 每个 risk 必须是 L/M/H
+  const badRisk = tools.filter(t => !['L','M','H'].includes(t.risk));
+  if (badRisk.length === 0) ok('104.3 所有 risk 都是 L/M/H');
+  else fail('104.3 bad risk', JSON.stringify(badRisk));
+
+  // 至少存在一个 L 和一个 H
+  if (tools.some(t => t.risk === 'L') && tools.some(t => t.risk === 'H'))
+    ok('104.4 同时覆盖 L/H 风险等级');
+  else fail('104.4 风险覆盖不全', '');
+} catch (e) { fail('104.x 工具注册表', e.message); }
 
 
 waitForIIFEsDrain().then(() => {

@@ -17,6 +17,7 @@ const { autoUpdater } = require('electron-updater');
 const path = require('path');
 const { spawn } = require('child_process');
 const fs = require('fs');
+const agentRegistry = require('./agent-registry');
 
 // ===== 自动更新 (electron-updater) =====
 function setupAutoUpdater() {
@@ -320,3 +321,31 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', killChildren);
 process.on('exit', killChildren);
+
+// ===== AI Agent 工具调用 (IPC) =====
+// 渲染进程通过 electronAPI.invokeAgent(name, args) 调用,
+// 主进程路由到 agent-registry 的对应 handler
+ipcMain.handle('agent:list', () => agentRegistry.list());
+
+ipcMain.handle('agent:invoke', async (event, name, args) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  // args.llmBaseUrl 可选, 渲染进程把 Core.State.ai 配置透传过来
+  // 这样 data.health 能真实探测用户当前用的 LLM endpoint 而不是写死的 11434
+  const ctx = {
+    webContents: event.sender,
+    llmBaseUrl: (args && args.__llmBaseUrl) || process.env.LLM_BASE_URL || 'http://127.0.0.1:11434'
+  };
+  // 把 __llmBaseUrl 从 args 删掉, 不让它传到工具 handler 里污染实际输入
+  if (args && args.__llmBaseUrl) {
+    const { __llmBaseUrl, ...rest } = args;
+    args = rest;
+  }
+  const result = await agentRegistry.invoke(name, args, ctx);
+  return result;
+});
+
+ipcMain.handle('agent:openExternal', async (event, url) => {
+  if (!/^https?:\/\//.test(url)) return { ok: false, error: '非 http(s) URL' };
+  await shell.openExternal(url);
+  return { ok: true };
+});

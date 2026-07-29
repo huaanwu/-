@@ -309,6 +309,15 @@ function hideRegimeAlertBanner() {
     if (window.Fund && Fund.init) Fund.init();
     if (window.Backtest && Backtest.init) Backtest.init();
     if (window.Alerts && Alerts.init) Alerts.init();
+
+    // AI 管家 - 启动顺序: Core.Agent 先 await (拉工具表 + 加载授权偏好) → AgentUI 后 (渲染侧边栏, 注册 confirmUI)
+    // 必须 await, 否则用户在 AgentUI.init 之后立刻发消息时 _toolsIndex 还没就绪
+    if (window.Core && Core.Agent && Core.Agent.init) {
+      await Core.Agent.init().catch(e => console.warn('[App] Agent.init 失败:', e));
+    }
+    if (window.Core && Core.AgentUI && Core.AgentUI.init) {
+      Core.AgentUI.init();
+    }
     // Phase W-P1: 中长线盯盘改事件驱动 — 启动时先跑一轮 (异步不阻塞, 参照上面 Data.health 的写法;
     // 规则自带 nextCheck 门控, 频繁触发无副作用)
     if (window.Alerts && Alerts.runLongChecks) {

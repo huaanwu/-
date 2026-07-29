@@ -61,7 +61,9 @@ export default defineConfig({
         '/core/risk-mine.js',  // Phase Y.1.2: 排雷数据聚合
         '/core/scoring.js',     // Tier 6: 多因子打分
         '/core/weight-advisor.js',  // Tier 6: LLM 周度动态权重
-        '/core/user-profile.js'  // Commit 1: 用户画像 (7 字段 schema)
+        '/core/user-profile.js',  // Commit 1: 用户画像 (7 字段 schema)
+        '/core/agent.js',         // AI 管家: 工具调用循环 + 分级授权
+        '/app/agent-ui.js'        // AI 管家: 侧边栏对话窗
       ]
     }
   },

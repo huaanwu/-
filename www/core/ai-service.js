@@ -513,6 +513,179 @@
   }
 
   /**
+   * callRaw (Phase: AI 管家) - 透传完整 messages + tools, 返回原始结构化响应
+   *
+   * 与 call() 区别:
+   *   - call() 重写成 system + single user, 适合 LongTrader/Screener 一次性输出 JSON
+   *   - callRaw() 接受 opts.messages (OpenAI Chat Completions 协议格式),
+   *     可选 opts.tools (OpenAI tools schema), 返回 { text, tool_calls, raw }
+   *     而不仅是纯文本
+   *
+   * opts: { provider, model, messages: [{role, content, tool_calls?, tool_call_id?}],
+   *         tools?: [{type:'function', function:{name, description, parameters}}],
+   *         tool_choice?: 'auto' | 'required' | 'none' | { type:'function', function:{name}},
+   *         temperature, maxTokens, signal, stream, onChunk }
+   *
+   * @returns { text, tool_calls, raw, usage }
+   */
+  async function callRaw(opts) {
+    const cfg = await resolveEndpoint(opts);
+    const { baseURL, apiKey, model } = cfg;
+    const temperature = opts.temperature ?? 0.7;
+    const maxTokens = opts.maxTokens ?? 2048;
+
+    const body = {
+      model,
+      messages: opts.messages || [],
+      temperature,
+      max_tokens: maxTokens,
+      stream: !!opts.stream
+    };
+    if (Array.isArray(opts.tools) && opts.tools.length > 0) {
+      body.tools = opts.tools;
+      if (opts.tool_choice) body.tool_choice = opts.tool_choice;
+      else body.tool_choice = 'auto';
+    }
+
+    const url = baseURL + '/chat/completions';
+    let resp;
+    try {
+      resp = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + apiKey
+        },
+        body: JSON.stringify(body),
+        signal: opts.signal
+      });
+    } catch (e) {
+      if (e.name === 'AbortError') throw e;
+      throw new Error('网络请求失败 (CORS/断网): ' + e.message);
+    }
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => '');
+      let errMsg = 'HTTP ' + resp.status;
+      try {
+        const j = JSON.parse(errText);
+        if (j.error && j.error.message) errMsg = j.error.message;
+      } catch (_) {}
+      if (resp.status === 401) errMsg = 'API Key 无效或过期';
+      if (resp.status === 429) errMsg = '请求太频繁 / 余额不足';
+      if (resp.status === 402) errMsg = '余额不足';
+      throw new Error(errMsg);
+    }
+
+    if (opts.stream) {
+      const out = await readSSEWithTools(resp.body, opts.onChunk);
+      return out; // { text, tool_calls }
+    } else {
+      const j = await resp.json();
+      const choice = j.choices && j.choices[0];
+      const msg = choice && choice.message || {};
+      const text = msg.content || '';
+      const tool_calls = msg.tool_calls || [];
+      return {
+        text,
+        tool_calls,
+        raw: j,
+        usage: j.usage || null
+      };
+    }
+  }
+
+  /**
+   * callRawWithTimeout - 给 callRaw 加 AbortController 超时
+   */
+  async function callRawWithTimeout(opts) {
+    const timeout = (opts && opts.timeout) ?? 120000;
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort('timeout'), timeout);
+    try {
+      return await callRaw({ ...opts, signal: ac.signal });
+    } catch (e) {
+      if (e && (e.name === 'AbortError' || String(e.message || e).includes('abort'))) {
+        throw new Error('AI 调用超时 (' + Math.round(timeout / 1000) + 's)');
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * readSSEWithTools - 流式读 SSE 同时累积 tool_calls (OpenAI 协议)
+   * onChunk(delta) 每次推一段文本增量
+   * 返回 { text, tool_calls } - tool_calls 数组含 { id, type, function: { name, arguments } }
+   */
+  async function readSSEWithTools(body, onChunk) {
+    const reader = body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buf = '';
+    let full = '';
+    const toolCallsAccum = new Map(); // index -> tool_call
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop() || '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const payload = trimmed.slice(5).trim();
+          if (payload === '[DONE]') continue;
+          try {
+            const obj = JSON.parse(payload);
+            const choice = obj.choices && obj.choices[0];
+            if (!choice) continue;
+            const delta = choice.delta || {};
+            if (delta.content) {
+              full += delta.content;
+              if (onChunk) {
+                try { onChunk(delta.content, full); } catch (e) { console.warn('[AI] onChunk 抛错:', e && e.message); }
+              }
+            }
+            if (delta.tool_calls) {
+              for (const tcDelta of delta.tool_calls) {
+                const idx = tcDelta.index;
+                if (!toolCallsAccum.has(idx)) {
+                  toolCallsAccum.set(idx, {
+                    id: tcDelta.id || null,
+                    type: tcDelta.type || 'function',
+                    function: { name: '', arguments: '' }
+                  });
+                }
+                const tc = toolCallsAccum.get(idx);
+                if (tcDelta.id) tc.id = tcDelta.id;
+                if (tcDelta.function) {
+                  if (tcDelta.function.name) tc.function.name += tcDelta.function.name;
+                  if (tcDelta.function.arguments) tc.function.arguments += tcDelta.function.arguments;
+                }
+              }
+            }
+          } catch (e) { console.warn('[AI] SSE 单行 parse 失败:', e && e.message); }
+        }
+      }
+    } catch (e) { console.warn('[AI] readSSEWithTools 外层异常:', e && e.message); }
+    const tool_calls = [];
+    for (const tc of toolCallsAccum.values()) {
+      if (!tc.id) {
+        // id 是 OAI 协议强约束, 缺失要让上层知道而不是 fabricating
+        console.warn('[AI] tool_call 缺 id, 丢弃: name=' + (tc.function.name || '?'));
+        continue;
+      }
+      tool_calls.push({
+        id: tc.id,
+        type: tc.type,
+        function: { name: tc.function.name, arguments: tc.function.arguments }
+      });
+    }
+    return { text: full, tool_calls };
+  }
+
+  /**
    * parseJsonOutput (Phase T) - 从 AI 输出里抽 JSON 并按 schema 校验
    * 抽取: 用 match 找第一个 { 到最后一个 }, 容错 markdown ```json 围栏
    * 校验: schema = { required: ['picks', ...], types: { picks: 'array', ...}, arrayItemTypes: { picks: 'object' } }
@@ -655,6 +828,8 @@
     call,
     cachedCall,
     callWithTimeout,
+    callRaw,
+    callRawWithTimeout,
     jsonCall,
     parseJsonOutput,
     testConnection,
