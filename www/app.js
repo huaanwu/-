@@ -545,7 +545,7 @@ window._renderSettings = function() {
     <div class="form-row">
       <label>AKShare 代理地址</label>
       <input type="text" id="settingProxyBase" value="${escapeHtml(state.proxyBase)}"
-             placeholder="http://192.168.1.3:8089/api/akshare">
+             placeholder="http://127.0.0.1:8089/api/akshare (本机默认) 或 http://192.168.x.x:8089/api/akshare (APK 局域网)">
       <div style="font-size:11px;color:var(--text-muted);margin-top:4px;line-height:1.5;">
         💡 浏览器 dev 用 <code>/api/akshare</code> (走 vite proxy);<br>
         📱 APK/手机 用 <code>http://192.168.1.3:8089/api/akshare</code> (你的 PC 局域网 IP)
@@ -1354,7 +1354,11 @@ window.checkHealth = async function() {
 };
 
 window.saveSettings = function(silent) {
-  const proxyBase = document.getElementById('settingProxyBase').value.trim() || '/api/akshare';
+  // v0.2.12 修: 安装版 (file://) 默认 proxyBase = http://127.0.0.1:8089/api/akshare (相对路径在 file:// 协议下 fetch 失败)
+  //            dev 模式 (http://localhost:3003) 默认 '/api/akshare' (走 vite proxy)
+  const isFileProtocol = window.location && window.location.protocol === 'file:';
+  const defaultProxy = isFileProtocol ? 'http://127.0.0.1:8089/api/akshare' : '/api/akshare';
+  const proxyBase = document.getElementById('settingProxyBase').value.trim() || defaultProxy;
   const tushareToken = document.getElementById('settingTushareToken').value.trim();
   // Phase D2: 第二意见的 per-provider key (map), 只更新当前选中的那个 provider, 其余保留
   const llmKeys = { ...(Core.State.get('apiKeys').llm || {}) };

@@ -1,6 +1,6 @@
 {
   "name": "stock-master",
-  "version": "0.2.11",
+  "version": "0.2.12",
   "description": "自用 A股/基金投资工具 - 行情/持仓/复盘/选股/回测/提醒",
   "main": "electron/main.js",
   "scripts": {
