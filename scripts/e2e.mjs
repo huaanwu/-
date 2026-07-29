@@ -218,7 +218,16 @@ const modalResult = await eval_(`(async () => {
 results.aiColleagueModal = modalResult;
 
 // ===== 7. 截图 =====
+// v0.2.11 修: 截图前关掉 AI 同事弹窗, 否则所有页面被挡
+async function closeModal() {
+  await eval_(`(function(){
+    const root = document.getElementById('modalRoot');
+    if (root) root.innerHTML = '';
+  })()`);
+  await wait(200);
+}
 async function shot(name) {
+  await closeModal();
   const r = await send('Page.captureScreenshot', { format: 'png' });
   if (r?.data) {
     const fp = path.join(SCREENSHOT_DIR, name);
@@ -239,6 +248,12 @@ await shot('04-fund.png');
 await eval_(`switchPage('pageAlerts')`);
 await wait(500);
 await shot('05-alerts.png');
+await eval_(`switchPage('pagePaper')`);
+await wait(500);
+await shot('06-paper.png');
+await eval_(`switchPage('pageSettings')`);
+await wait(500);
+await shot('07-settings.png');
 
 // ===== 8. 收尾 =====
 log('===== e2e 结果 =====');
