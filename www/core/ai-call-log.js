@@ -38,7 +38,8 @@
         model: entry.model || '',
         baseURL: entry.baseURL || '',
         injected: entry.injected || {},
-        error: entry.error || null
+        error: entry.error || null,
+        runId: entry.runId || null
       };
       await Core.Storage.add('ai_call_log', e);
       // 滚动截断: 超 MAX_LOGS 就删最旧的 (先快照 ids, 避免迭代中 splice 跳过)

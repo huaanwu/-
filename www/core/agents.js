@@ -167,6 +167,10 @@
       lines.push(`## 新闻 (共 ${total} 条, 取前 ${shown}${total > shown ? `, 省略 ${total - shown} 条` : ''})`);
       ctx.news.slice(0, 5).forEach(n => lines.push(`- ${n.title || n.text || JSON.stringify(n)}`));
     }
+    // Phase 1.6: 数据来源摘要 (新注入) — 告诉 AI 数据有多新/来自哪/校验状态
+    if (typeof ctx.sourceDigest === 'string' && ctx.sourceDigest.length > 0) {
+      lines.push(`## 数据来源摘要\n${ctx.sourceDigest}`);
+    }
     return lines.length > 0 ? lines.join('\n') : '(无事实)';
   }
 

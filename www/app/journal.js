@@ -242,13 +242,30 @@
             : Promise.resolve(null)
         ]);
         // P0.1: 行情价格注入 holdings (currentPrice), 串行拉 (holdings <20 只, cache 命中后 <2s)
+        // Phase 1.6: 走 Facade.getQuote 拿标准化 envelope, 收集 sourceDigest
+        const quoteEnvelopes = [];
         for (const h of holdings) {
           try {
-            const q = await Core.Data.getStockQuote(h.code);
-            if (q) h.currentPrice = parseFloat(q.最新价 != null ? q.最新价 : q.price) || null;
+            let q;
+            if (Core.Data && Core.Data.Facade && typeof Core.Data.Facade.getQuote === 'function') {
+              q = await Core.Data.Facade.getQuote(h.code);
+              if (q) quoteEnvelopes.push(q);
+            } else {
+              // 兜底: facade 未加载时走原 Core.Data.getStockQuote
+              q = await Core.Data.getStockQuote(h.code);
+            }
+            if (q) {
+              const env = (q.payload && q.symbol) ? q : null;
+              const priceVal = env ? env.payload.price : parseFloat(q['最新价'] != null ? q['最新价'] : q.price);
+              h.currentPrice = (priceVal != null && !isNaN(priceVal)) ? priceVal : null;
+            }
           } catch (e) { /* keep null, summary 里不显示价格字段 */ }
         }
         const ctx = { holdings, alerts, recentJournals, portfolio, macro: macroText, marketWidth };
+        // Phase 1.6: 给 observer 的 ctx 注入 sourceDigest (压缩数据来源摘要)
+        if (Core.Data && Core.Data.Facade && typeof Core.Data.Facade.digest === 'function' && quoteEnvelopes.length > 0) {
+          ctx.sourceDigest = Core.Data.Facade.digest(quoteEnvelopes);
+        }
         // 跑 pipeline
         const r = await Core.Agents.runPipeline(intent, ctx);
         // 渲染 steps

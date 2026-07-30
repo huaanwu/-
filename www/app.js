@@ -3,7 +3,7 @@
  * 挂全局兼容层 + 初始化
  */
 
-var APP_VERSION = 'v0.2.16';
+var APP_VERSION = 'v0.2.17';
 var APP_BUILD_DATE = '2026-07-30';
 var APP_GIT_COMMIT = '';
 // build-web.mjs 写入 www/version.json, 启动时读它覆盖 (保证 package.json 是单一来源)
