@@ -1242,37 +1242,58 @@
   /**
    * 按 code 反查所属行业 (申万一级)
    * 数据源 stock_board_industry_cons_em 全市场一次, 24h 缓存命中, 后续调用 0 成本
+   * v0.2.21 加 in-flight 去重 + 30s 总 timeout: 之前 5 个并发都触发 fetch, dev-proxy 死了时雪崩
+   *   (用户报告: 选股卡 30min 不出结果, 根因: 400 chunks × 25s timeout × retry = 几小时)
    * @param {string} code 6 位代码
    * @returns {Promise<string|null>} 行业名称, 未匹配/失败返 null
    */
+  let _indIndexInflight = null;  // v0.2.21: in-flight promise, 5+ 个并发只触发 1 次 fetch
+  const _IND_INDEX_TOTAL_TIMEOUT_MS = 30 * 1000;
   async function getStockIndustryByCode(code) {
     const c = String(code || '').padStart(6, '0');
     if (!/^\d{6}$/.test(c)) return null;
-    const cacheKey = 'industry_by_code_index';
     try {
-      let idx = await Core.Storage.cacheGet(cacheKey);
+      // cacheKey + 行业 by-code index + 反查 stock_board_industry_cons_em
+      let idx = await Core.Storage.cacheGet('industry_by_code_index');
       if (!idx || typeof idx !== 'object') {
-        const rows = await fetchWithCache(
-          cacheKey,
-          'stock_board_industry_cons_em',
-          { symbol: '申万一级' },
-          24 * 60 * 60 * 1000
-        ).catch(() => null);
-        if (!Array.isArray(rows)) return null;
-        idx = {};
-        for (const r of rows) {
-          const ind = r['板块名称'] || r.name || '';
-          const members = r['成分股代码'] || r['成分股'] || r.members;
-          const mArr = Array.isArray(members) ? members
-            : (typeof members === 'string' ? members.split(',') : []);
-          for (const m of mArr) {
-            const cc = String(m).padStart(6, '0');
-            if (!idx[cc]) idx[cc] = ind;
-          }
+        // v0.2.21: in-flight dedup, 5+ 个并发只触发 1 次 fetch (避免 5x 25s retry 雪崩)
+        if (!_indIndexInflight) {
+          _indIndexInflight = (async () => {
+            const buildIdx = async () => {
+              const rows = await fetchWithCache('industry_by_code_index', 'stock_board_industry_cons_em', { symbol: '申万一级' }, 24 * 60 * 60 * 1000).catch(() => null);
+              if (!Array.isArray(rows)) return null;
+              const m = {};
+              for (const r of rows) {
+                const ind = r['板块名称'] || r.name || '';
+                const members = r['成分股代码'] || r['成分股'] || r.members;
+                const mArr = Array.isArray(members) ? members
+                  : (typeof members === 'string' ? members.split(',') : []);
+                for (const mm of mArr) {
+                  const cc = String(mm).padStart(6, '0');
+                  if (!m[cc]) m[cc] = ind;
+                }
+              }
+              return m;
+            };
+            const res = await Promise.race([
+              buildIdx(),
+              new Promise((resolve) => setTimeout(() => resolve('__TIMEOUT__'), _IND_INDEX_TOTAL_TIMEOUT_MS))
+            ]);
+            if (res === '__TIMEOUT__') {
+              console.warn('[Data] getStockIndustryByCode 全市场索引 30s 超时, 降级返 null (选股不卡死)');
+              return null;
+            }
+            return res;
+          })().finally(() => {
+            setTimeout(() => { _indIndexInflight = null; }, 1000);
+          });
         }
-        await Core.Storage.cacheSet(cacheKey, idx, 24 * 60 * 60 * 1000);
+        idx = await _indIndexInflight;
+        if (idx && typeof idx === 'object') {
+          try { await Core.Storage.cacheSet('industry_by_code_index', idx, 24 * 60 * 60 * 1000); } catch (_) {}
+        }
       }
-      return idx[c] || null;
+      return (idx && idx[c]) || null;
     } catch (e) {
       console.warn('[Data] getStockIndustryByCode 失败:', e.message);
       return null;
@@ -1283,9 +1304,11 @@
    * 批量行业归属查询 (Phase 5 long-trader)
    * 并发 5 逐批拉, 返回 Map<code, industryName>
    * Bug #8 修复: 行业归属基本不变, 24h 内存缓存
+   * v0.2.21: 总 30s 兜底超时, 跑够就停 (dev-proxy 死了别卡 30min)
    */
   const _indBatchCache = new Map();
   const _IND_BATCH_TTL = 24 * 60 * 60 * 1000;
+  const _IND_BATCH_TOTAL_TIMEOUT_MS = 30 * 1000;
   async function getStockIndustryBatch(codes) {
     const results = new Map();
     const toFetch = [];
@@ -1298,9 +1321,15 @@
       }
     }
     if (toFetch.length === 0) return results;
+    const start = Date.now();
     const chunked = [];
     for (let i = 0; i < toFetch.length; i += 5) chunked.push(toFetch.slice(i, i + 5));
     for (const chunk of chunked) {
+      // 30s 兜底: dev-proxy 死了别卡 30min
+      if (Date.now() - start > _IND_BATCH_TOTAL_TIMEOUT_MS) {
+        console.warn(`[Data] getStockIndustryBatch 总超时 ${_IND_BATCH_TOTAL_TIMEOUT_MS / 1000}s, 已查 ${results.size}/${codes.length}, 行业归 null 降级`);
+        break;
+      }
       const batch = await Promise.allSettled(
         chunk.map(c => getStockIndustryByCode(c).catch(() => null))
       );

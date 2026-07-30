@@ -8548,7 +8548,8 @@ section('[50] data.js 行业映射 + 公告 + 量比');
     if (!dataSrc) throw new Error('data.js 读不到');
 
     // 50.a getStockIndustryByCode: 24h cache + 反向 idx 写法
-    if (/getStockIndustryByCode[\s\S]{0,300}industry_by_code_index[\s\S]{0,200}stock_board_industry_cons_em/.test(dataSrc))
+    // v0.2.21 加 in-flight dedup (_indIndexInflight) 让 cacheKey → fetchWithCache 距离变长 (>200 chars), regex 窗口调到 500
+    if (/getStockIndustryByCode[\s\S]{0,500}industry_by_code_index[\s\S]{0,500}stock_board_industry_cons_em/.test(dataSrc))
       ok('50.a getStockIndustryByCode 24h cache + stock_board_industry_cons_em 反查');
     else fail('50.a 行业映射', '源码未匹配预期实现');
 

@@ -88,24 +88,27 @@ function setupAutoUpdater() {
     autoUpdater.downloadUpdate();
   });
   ipcMain.on('install-update', () => {
-    // v0.2.14 修: 升级前主动 taskkill 旧 StockMaster.exe 进程树 (/T), 避免 NSIS 替换 .exe 时被 Windows 文件锁拒
-    //   流程: 等 200ms IPC flush → taskkill (主进程 + 子进程 + 工具进程) → 等 500ms 让 OS 释放锁 → quitAndInstall
+    // v0.2.14 修: 升级前 taskkill 进程树, NSIS 才能替换 .exe
+    //   流程: 等 200ms IPC flush → taskkill → 等 500ms → quitAndInstall
+    // v0.2.21 修: 用户报告 "一直说有后台阻止" → 等 3s + poll
+    // v0.2.22 修 (用户报告 "下载好后点重启升级没反应"): 之前 taskkill 了 StockMaster.exe **自身**
+    //   → 进程死了 → JS 上下文销毁 → quitAndInstall 永远不执行 → NSIS 永远不跑
+    //   正确: **不要杀主进程**. quitAndInstall 内部:
+    //     - spawnLog NSIS (detached:true, p.unref()) — 父退出后 NSIS 还活着
+    //     - app.quit() → before-quit handler 杀子进程 (dev-proxy / 29037 static server)
+    //   NSIS 启动时已 detached, 父退出它不死, 文件锁 free, NSIS 能替换 .exe
     setImmediate(() => {
       setTimeout(() => {
         try {
-          require('child_process').execSync('taskkill /F /IM StockMaster.exe /T 2>nul', { stdio: 'ignore', timeout: 5000 });
-          console.log('[autoUpdater] 已杀旧 StockMaster.exe 进程树');
-        } catch (_) { /* taskkill 在没进程时 exit 1, 静默吞 */ }
-        setTimeout(() => {
-          try {
-            autoUpdater.quitAndInstall(false, true, true);
-          } catch (e) {
-            console.error('[autoUpdater] quitAndInstall 失败:', e.message);
-            if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('update-error', { message: '升级安装失败: ' + e.message });
-            }
+          console.log('[autoUpdater] 调 quitAndInstall (electron-updater spawn NSIS detached, 然后 app.quit)');
+          // quitAndInstall(isSilent, isForceRunAfter) — BaseUpdater 签名只 2 个参数, 第三个被忽略
+          autoUpdater.quitAndInstall(false, true);
+        } catch (e) {
+          console.error('[autoUpdater] quitAndInstall 失败:', e.message);
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('update-error', { message: '升级安装失败: ' + e.message });
           }
-        }, 500);
+        }
       }, 200);
     });
   });
