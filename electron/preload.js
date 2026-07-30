@@ -29,5 +29,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   invokeAgent: (name, args, ctx) => ipcRenderer.invoke('agent:invoke', name, args, ctx),
 
   // 应用层 (非工具调用, 直接暴露给 UI 用)
-  openExternal: (url) => ipcRenderer.invoke('agent:openExternal', url)
+  openExternal: (url) => ipcRenderer.invoke('agent:openExternal', url),
+
+  // v0.2.19: dev-proxy 死了后, 用户在自检页点 "🔄 重启 dev-proxy" 触发
+  restartDevProxy: () => ipcRenderer.invoke('restart-dev-proxy')
 });

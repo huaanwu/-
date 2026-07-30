@@ -133,8 +133,59 @@ function spawnChild(name, cmd, args, cwd, color) {
   const tag = '[' + name + ']';
   child.stdout.on('data', (d) => process.stdout.write(tag + ' ' + d));
   child.stderr.on('data', (d) => process.stderr.write(tag + ' ' + d));
-  child.on('exit', (code) => process.stdout.write(tag + ' exit ' + code + '\n'));
+  child.on('exit', (code) => {
+    process.stdout.write(tag + ' exit ' + code + '\n');
+    // v0.2.19: dev-proxy 死了自动重启 (auto-restart watchdog)
+    // 背景: prod 模式 dev-proxy 是 child process, 任何原因 (aktools hang / 端口冲突 / OOM) 死掉都会让
+    //       renderer selfCheck 全 ×, 用户得重启 StockMaster 才能恢复. 改成自动重启.
+    if (name === 'proxy' && !app.isQuitting) {
+      process.stdout.write('[proxy] 3s 后自动重启...\n');
+      setTimeout(() => {
+        if (app.isQuitting) return;
+        // 找到 children[] 里这个已死的 child, 替换成新的
+        const deadIdx = children.indexOf(child);
+        const newProxy = _spawnDevProxy();
+        if (deadIdx >= 0 && newProxy) children[deadIdx] = newProxy;
+      }, 3000);
+    }
+  });
   return child;
+}
+
+// v0.2.19: 单独启 dev-proxy (auto-restart + IPC "重启 dev-proxy" 按钮都用)
+function _spawnDevProxy() {
+  try {
+    const proxyScript = IS_DEV
+      ? path.join(ROOT, 'scripts', 'dev-proxy.mjs')
+      : path.join(RESOURCES, 'dev-proxy.mjs');
+    if (!fs.existsSync(proxyScript)) {
+      process.stderr.write('[proxy] script 不存在: ' + proxyScript + '\n');
+      return null;
+    }
+    const c = spawn('node', [proxyScript], {
+      cwd: IS_DEV ? ROOT : RESOURCES,
+      env: { ...process.env, FORCE_COLOR: '1' }
+    });
+    c.stdout.on('data', (d) => process.stdout.write('[proxy] ' + d));
+    c.stderr.on('data', (d) => process.stderr.write('[proxy] ' + d));
+    c.on('exit', (code) => {
+      process.stdout.write('[proxy] exit ' + code + '\n');
+      if (!app.isQuitting) {
+        process.stdout.write('[proxy] 3s 后自动重启...\n');
+        setTimeout(() => {
+          if (app.isQuitting) return;
+          const deadIdx = children.indexOf(c);
+          const newProxy = _spawnDevProxy();
+          if (deadIdx >= 0 && newProxy) children[deadIdx] = newProxy;
+        }, 3000);
+      }
+    });
+    process.stdout.write('[proxy] 启动 (pid ' + c.pid + ')\n');
+    return c;
+  } catch (e) {
+    process.stderr.write('[proxy] 启动失败: ' + e.message + '\n');
+    return null;
+  }
 }
 
 /** 找一个可用的 Python 可执行文件, 优先 python3 / python, 被 pip 隔离时 fallback sys.executable */
@@ -246,12 +297,18 @@ async function startBackend() {
     }
     spawnChild('vite', 'npx', ['vite'], ROOT, '2');
     await waitForUrl('http://127.0.0.1:3003', 15000);
-    await waitForUrl('http://127.0.0.1:8089/health', 5000).catch(() => null);
+    await waitForUrl('http://127.0.0.1:8089/health', 5000).catch(() => {
+      process.stderr.write('[startBackend] ⚠️ dev-proxy 启动 5s 内未就绪, selfCheck 会显示 ×\n');
+    });
   } else {
+    // v0.2.19: 用 _spawnDevProxy 走统一启停, 死了自动重启, IPC 也能手动重启
     const proxyScript = path.join(RESOURCES, 'dev-proxy.mjs');
     if (fs.existsSync(proxyScript)) {
-      spawnChild('proxy', 'node', [proxyScript], RESOURCES, '1');
-      await waitForUrl('http://127.0.0.1:8089/health', 8000).catch(() => null);
+      const c = _spawnDevProxy();
+      if (c) children.push(c);
+      // 8s 等就绪, fail 也不阻塞 (auto-restart watchdog 会救活)
+      const ready = await waitForUrl('http://127.0.0.1:8089/health', 8000).then(() => true).catch(() => false);
+      if (!ready) process.stderr.write('[startBackend] ⚠️ dev-proxy 启动 8s 内未就绪, 看 selfCheck 状态 (可手动点 🔄 重启 dev-proxy)\n');
     }
     _startStaticServer(29037);
     await waitForUrl('http://127.0.0.1:29037', 3000).catch(() => {
@@ -359,8 +416,38 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
-app.on('before-quit', killChildren);
+app.on('before-quit', () => { app.isQuitting = true; killChildren(); });
 process.on('exit', killChildren);
+
+// ===== v0.2.19: dev-proxy 重启 IPC (renderer 调这个手动重启 dev-proxy) =====
+ipcMain.handle('restart-dev-proxy', async () => {
+  process.stdout.write('[main] 收到 renderer 重启 dev-proxy 请求\n');
+  // 找到 children[] 里名为 proxy 的, kill, 然后 spawn 新的
+  for (let i = 0; i < children.length; i++) {
+    const c = children[i];
+    // 老的 spawnChild 启动的 child 没有 ._isProxy 标记, 简单按 pid 对比 proxy script 路径难, 用启发式
+    // _spawnDevProxy 启动的 child stdout 写了 [proxy] tag, 但 runtime 不能直接判断
+    // 直接遍历 kill 全部 ._v0219Spawned (新) 或 .exitCode===null (老)
+    if (c.exitCode === null && c.signalCode === null) {
+      // 还活着, 但只 kill 我们认为的 proxy (启发式: spawn args 含 'dev-proxy.mjs')
+      const args = c.spawnargs ? c.spawnargs.join(' ') : '';
+      if (args.includes('dev-proxy.mjs')) {
+        try { c.kill('SIGTERM'); } catch (_) {}
+        // 替换为新的
+        const newProxy = _spawnDevProxy();
+        if (newProxy) children[i] = newProxy;
+        // 等 2s 拿 health
+        const ready = await waitForUrl('http://127.0.0.1:8089/health', 4000).then(() => true).catch(() => false);
+        return { ok: ready, message: ready ? 'dev-proxy 已重启' : '重启了但 4s 内未就绪' };
+      }
+    }
+  }
+  // 没找到活的, 直接启
+  const newProxy = _spawnDevProxy();
+  if (newProxy) children.push(newProxy);
+  const ready = await waitForUrl('http://127.0.0.1:8089/health', 4000).then(() => true).catch(() => false);
+  return { ok: ready, message: ready ? 'dev-proxy 已启动' : '启动了但 4s 内未就绪' };
+});
 
 // ===== AI Agent 工具调用 (IPC) =====
 // 渲染进程通过 electronAPI.invokeAgent(name, args) 调用,

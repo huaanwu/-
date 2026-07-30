@@ -3,7 +3,7 @@
  * 挂全局兼容层 + 初始化
  */
 
-var APP_VERSION = 'v0.2.18';
+var APP_VERSION = 'v0.2.19';
 var APP_BUILD_DATE = '2026-07-30';
 var APP_GIT_COMMIT = '';
 // build-web.mjs 写入 www/version.json, 启动时读它覆盖 (保证 package.json 是单一来源)
@@ -536,6 +536,7 @@ window._renderSettings = function() {
     <div class="form-row">
       <label>🔧 服务自检 (APK 在外网/连不上后端时点这个)</label>
       <button class="btn" onclick="selfCheckServices()">▶ 一键自检 dev-proxy / aktools / LLM</button>
+      <button class="btn" id="btnRestartDevProxy" style="display:none;" onclick="restartDevProxyIPC()">🔄 重启 dev-proxy</button>
       <span id="selfCheckResult" style="font-size:12px;color:var(--text-muted);margin-left:8px;"></span>
     </div>
     <div id="selfCheckList" style="margin-top:8px;"></div>
@@ -981,6 +982,18 @@ window.testLocalAI = async function() {
 window.discoverDevProxy = async function() {
   const status = document.getElementById('devProxyDiscoverResult');
   const list = document.getElementById('devProxyDiscoverList');
+  // v0.2.19: PC 浏览器 (localhost / 127.0.0.1) 不需要扫, dev-proxy 跟浏览器同台 PC.
+  //   这个按钮原本是给 APK 在手机上用, 浏览器误点会浪费时间. 给个明确提示.
+  const isPCBrowser = /^https?:$/.test(location.protocol)
+    && (location.hostname === 'localhost' || location.hostname === '127.0.0.1' || location.hostname === '');
+  if (isPCBrowser) {
+    if (status) {
+      status.innerHTML = '💡 PC 浏览器 (本机) 不需要扫: dev-proxy 跟浏览器在同一台 PC, 直接用 <code>http://127.0.0.1:8089/api/akshare</code> 即可. 这个按钮是给 APK / 手机浏览器用的. PC 浏览器如果 selfCheck 都×, 改用上方 🔄 重启 dev-proxy (Electron) 或重启 StockMaster.';
+      status.style.color = 'var(--text-muted)';
+    }
+    if (list) list.innerHTML = '';
+    return;
+  }
   if (status) { status.textContent = '⏳ 探测中...'; status.style.color = 'var(--text-muted)'; }
   if (list) list.innerHTML = '';
   window._discoveredDevProxies = [];
@@ -1160,6 +1173,17 @@ window.selfCheckServices = async function() {
       : (someOk ? '⚠️ 部分服务异常' : '❌ 全部服务不可用 (手机端请检查 dev-proxy 是否在 PC 跑)');
     status.style.color = allOk ? 'var(--up)' : (someOk ? 'var(--accent)' : 'var(--down)');
   }
+  // v0.2.19: dev-proxy 挂了 → 显示重启按钮 (PC 浏览器 / Electron 才有意义)
+  const devProxyResult = results.find(r => r.name === 'dev-proxy');
+  const restartBtn = document.getElementById('btnRestartDevProxy');
+  if (restartBtn) {
+    if (devProxyResult && !devProxyResult.ok && window.electronAPI && window.electronAPI.restartDevProxy) {
+      restartBtn.style.display = '';
+      restartBtn.textContent = '🔄 重启 dev-proxy (Electron)';
+    } else {
+      restartBtn.style.display = 'none';
+    }
+  }
   if (list) {
     list.innerHTML = results.map((r, i) => {
       const tag = r.ok
@@ -1187,6 +1211,26 @@ window.selfCheckServices = async function() {
           ④ 在 AKShare 代理地址 输入 <code>http://PC的IP:8089/api/akshare</code>
         </div>`;
     }
+  }
+};
+
+// v0.2.19: 手动重启 dev-proxy (Electron IPC)
+window.restartDevProxyIPC = async function() {
+  if (!window.electronAPI || !window.electronAPI.restartDevProxy) {
+    if (window.Core && Core.Toast) Core.Toast.show('重启 dev-proxy 只能在 Electron 里用 (浏览器 dev 模式请手动重启 gst-dev)', 5000);
+    return;
+  }
+  const btn = document.getElementById('btnRestartDevProxy');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ 重启中...'; }
+  try {
+    const r = await window.electronAPI.restartDevProxy();
+    if (window.Core && Core.Toast) Core.Toast.show(r.ok ? '✅ dev-proxy 已重启' : '⚠️ ' + r.message, 4000);
+    // 自动重跑 selfCheck 看效果
+    if (r.ok) setTimeout(() => selfCheckServices(), 1500);
+  } catch (e) {
+    if (window.Core && Core.Toast) Core.Toast.show('❌ 重启失败: ' + e.message, 5000);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🔄 重启 dev-proxy (Electron)'; }
   }
 };
 

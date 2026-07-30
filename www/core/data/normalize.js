@@ -112,6 +112,134 @@
     return payload;
   }
 
+  /**
+   * 新浪原始对象 -> quote.v3 payload
+   *
+   * 输入 (core/data.js _sinaParse 返回结构):
+   *   {
+   *     代码: '600519', 名称: '贵州茅台',
+   *     最新价: 1730.00, 昨收: 1720.00,    // 数字, 已 parseFloat
+   *     今开: 1725.00, 最高: 1735.00, 最低: 1718.00,
+   *     成交量: 1234500,                    // **股** (新浪直给, 不是手)
+   *     成交额: 456789000,                  // **元** (新浪直给, 不是万)
+   *     涨跌额: 10.00,                      // 已算
+   *     涨跌幅: 0.58,                       // **已是百分数** (新浪客户端算的, 与腾讯字符串不同)
+   *     时间: '2026-07-30 10:30:00',
+   *     换手率: null, 市盈率: null,         // 新浪免费接口不返
+   *     流通市值: null, 总市值: null
+   *   }
+   *
+   * 输出: 与 normalizeTengxun 同形 (quote.v3 payload, 全部为标准 JS 类型)
+   */
+  function normalizeSina(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const symbol = raw['代码'] || raw.code || '';
+    const name = raw['名称'] || raw.name || '';
+    const price = _num(raw['最新价']);
+    const prevClose = _num(raw['昨收']);
+    const change = (() => {
+      const c = _num(raw['涨跌额']);
+      if (c != null) return c;
+      return (price != null && prevClose != null) ? price - prevClose : null;
+    })();
+    const volume = _num(raw['成交量']);     // 股 — 直给, 不 ×100
+    const amount = _num(raw['成交额']);     // 元 — 直给, 不 ×10000
+    return {
+      symbol, name,
+      market: _marketOf(symbol),
+      price, prevClose,
+      open: _num(raw['今开']),
+      high: _num(raw['最高']),
+      low: _num(raw['最低']),
+      change,
+      changePercent: _pctFromSina(raw['涨跌幅']),    // 数字 → 小数
+      volume, amount,
+      turnoverRate: _num(raw['换手率']),
+      pe: _num(raw['市盈率']),
+      circMarketCap: _num(raw['流通市值']),
+      totalMarketCap: _num(raw['总市值']),
+      timestamp: raw['时间'] || ''
+    };
+  }
+
+  /**
+   * AKTools 原始对象 -> quote.v3 payload
+   *
+   * 输入 (aktools stock_zh_a_spot_em 接口, 返回字段名 snake_case):
+   *   {
+   *     ts_code: '600519.SH', name: '贵州茅台',
+   *     trade_date: '20260730',
+   *     open: 1725.0, high: 1735.0, low: 1718.0, close: 1730.0,
+   *     vol: 12345.0,          // **手** (aktools stock_zh_a_spot_em vol 字段, ×100 = 股)
+   *     amount: 45678.9,       // **千元** (aktools amount 字段, ×1000 = 元)  // 待核实
+   *     change: 10.0,          // 元
+   *     pct_chg: 0.58,         // **百分数** (aktools 客户端算的, 与腾讯字符串不同)
+   *     turnover_rate: 0.85,   // % 数字
+   *     pe: 28.5,              // 倍
+   *     total_mv: 21730.5,     // **亿元** (aktools total_mv, ×1e8 = 元)
+   *     circ_mv: 21730.5       // **亿元**
+   *   }
+   *
+   * 注意: aktools vol 是手(×100 股),amount 是千(×1000 元),
+   *   total_mv/circ_mv 是万元(×1e4 元)。normalize.aktools 自己消化这些差异。
+   *
+   * 输出: quote.v3 payload
+   */
+  function normalizeAktools(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const symbolRaw = raw['ts_code'] || raw.code || raw['代码'] || '';
+    // ts_code 格式 '600519.SH' → '600519'
+    const symbol = symbolRaw.includes('.') ? symbolRaw.split('.')[0] : symbolRaw;
+    const name = raw['name'] || raw['名称'] || '';
+    const price = _num(raw['close'] != null ? raw['close'] : raw['最新价']);
+    const prevClose = _num(raw['prev_close'] != null ? raw['prev_close'] : raw['昨收']);
+    // aktools 不一定返 prev_close, 但 change + pct_chg 一定有, 反推 prevClose
+    const change = (() => {
+      const c = _num(raw['change'] != null ? raw['change'] : raw['涨跌额']);
+      if (c != null) return c;
+      return (price != null && prevClose != null) ? price - prevClose : null;
+    })();
+    const volRaw = _num(raw['vol'] != null ? raw['vol'] : raw['成交量']);
+    const volume = volRaw != null ? volRaw * 100 : null;     // 手 → 股
+    const amountRaw = _num(raw['amount'] != null ? raw['amount'] : raw['成交额']);
+    const amount = amountRaw != null ? amountRaw * 1000 : null;  // 千 → 元(待核实)
+    const tmvRaw = _num(raw['total_mv'] != null ? raw['total_mv'] : raw['总市值']);
+    const cmvRaw = _num(raw['circ_mv'] != null ? raw['circ_mv'] : raw['流通市值']);
+    return {
+      symbol, name,
+      market: _marketOf(symbol),
+      price, prevClose,
+      open: _num(raw['open'] != null ? raw['open'] : raw['今开']),
+      high: _num(raw['high'] != null ? raw['high'] : raw['最高']),
+      low: _num(raw['low'] != null ? raw['low'] : raw['最低']),
+      change,
+      changePercent: _pctFromAktools(raw['pct_chg'] != null ? raw['pct_chg'] : raw['涨跌幅']),
+      volume, amount,
+      turnoverRate: _num(raw['turnover_rate'] != null ? raw['turnover_rate'] : raw['换手率']),
+      pe: _num(raw['pe'] != null ? raw['pe'] : raw['市盈率']),
+      circMarketCap: cmvRaw != null ? cmvRaw * 1e8 : null,    // 亿元 → 元
+      totalMarketCap: tmvRaw != null ? tmvRaw * 1e8 : null,
+      timestamp: raw['trade_date'] || raw['时间'] || ''
+    };
+  }
+
+  /**
+   * 解析新浪的 "涨跌幅" 字段 — 已是百分数数字(1.23 表示 +1.23%)
+   * 边界: null / null-ish / 字符串带 % 都安全处理
+   */
+  function _pctFromSina(v) {
+    if (v == null || v === '') return null;
+    const n = parseFloat(String(v).replace(/[%\s]/g, ''));
+    return isNaN(n) ? null : n / 100;   // 1.23 → 0.0123 (与 _pctFromTengxun 同语义, 都是小数)
+  }
+
+  /**
+   * 解析 aktools pct_chg — 已是百分数数字
+   */
+  function _pctFromAktools(v) {
+    return _pctFromSina(v);
+  }
+
   // 简易 _marketOf 内联实现 (避免 normalize 依赖 facade)
   function _marketOf(symbol) {
     const s = String(symbol || '');
@@ -126,8 +254,12 @@
   window.Core.Data = window.Core.Data || {};
   window.Core.Data.Normalize = Object.freeze({
     normalizeTengxun,
+    normalizeSina,
+    normalizeAktools,
     _num,
     _pctFromTengxun,
+    _pctFromSina,
+    _pctFromAktools,
     _marketOf
   });
 })();
