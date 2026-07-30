@@ -24,9 +24,13 @@
       const page = document.getElementById(pageId);
       if (!page) { console.warn('[MarketBar] 找不到 page:', pageId); return; }
 
-      // 幂等: 已挂过就只 refresh
+      // 幂等: 已挂过的 page 只重渲染当前 group 的缓存 (缓存新鲜就 0 网络)
+      // 修复: 之前调 this.refresh(pageId) 会无视 TTL 清缓存重拉, 切页每次都拉一次, 体感慢
       if (_states[pageId] && _states[pageId].mounted) {
-        await this.refresh(pageId);
+        const st = _states[pageId];
+        // 如果 defaultGroup 跟 st.group 不同 (例如用户切 tab 后切回 page), 用新 group
+        if (defaultGroup && st.group !== defaultGroup) st.group = defaultGroup;
+        await this.switchGroup(pageId, st.group);
         return;
       }
 

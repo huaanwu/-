@@ -355,70 +355,73 @@
    * 单端点拉取, 支持分页
    * @param {string} baseUrl - push2 或 push2delay
    * @param {number} maxPages - 最多拉几页
+   *
+   * v0.2.18 优化: push2delay 必须分页 (100/页限制), 但浏览器并发 50 页无封禁 (实测 5.4s 拿满 5000)
+   *   旧版串行 200ms 间隔 × 50 = 12s+, 改并发后 5.4s (再叠加 push2 实测 36-142ms/页)
+   *   单页失败时已经成功的页面保留, 不重试 (避免雪崩)
    */
   async function _efinanceFetchOne(baseUrl, maxPages = 1) {
     const isDelay = baseUrl.includes('push2delay');
     const pageSize = isDelay ? Math.min(EM_PAGE_SIZE, 100) : 5000;
     // 延迟端点限 100/页, 必须分页; 实时端点 pz=5000 一次就行
     const pages = isDelay ? Math.min(maxPages, 50) : 1;
-    const all = [];
+    const headers = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Referer': 'https://quote.eastmoney.com/'
+    };
+    // 并发拉所有页 (push2delay 实测 50 并发不被限)
+    const pagePromises = [];
     for (let pn = 1; pn <= pages; pn++) {
       const url = `${baseUrl}?pn=${pn}&pz=${pageSize}&po=1&fs=${EM_FS}&fields=${EM_FIELDS}`;
-      let resp;
-      try {
-        resp = await fetch(url, {
-          method: 'GET',
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Referer': 'https://quote.eastmoney.com/'
-          }
-        });
-      } catch (e) {
-        if (pn === 1) throw new Error(`东财网络错误: ${e.message}`);
-        // 后续页失败就 break, 已拉的够用
-        console.warn(`[Data] 东财分页 ${pn} 失败:`, e.message);
-        break;
-      }
-      if (!resp.ok) {
-        if (resp.status === 429) _setLimit('efinance_full', 60 * 1000, `HTTP ${resp.status}`);
-        if (pn === 1) throw new Error(`东财 HTTP ${resp.status}`);
-        break;
+      pagePromises.push(
+        fetch(url, { method: 'GET', headers })
+          .then(resp => ({ pn, ok: resp.ok, status: resp.status, resp }))
+          .catch(e => ({ pn, ok: false, status: 0, err: e.message }))
+      );
+    }
+    const results = await Promise.all(pagePromises);
+    const all = [];
+    let firstErr = null;
+    let blocked429 = false;
+    for (const r of results) {
+      if (!r.ok) {
+        if (r.status === 429) blocked429 = true;
+        if (r.pn === 1 && !firstErr) firstErr = new Error(`东财 HTTP ${r.status || r.err}`);
+        console.warn(`[Data] 东财分页 ${r.pn} 失败: HTTP ${r.status || r.err}`);
+        continue;
       }
       let j;
-      try { j = await resp.json(); } catch (e) {
-        if (pn === 1) throw new Error('东财返非 JSON: ' + e.message);
-        break;
+      try { j = await r.resp.json(); } catch (e) {
+        if (r.pn === 1 && !firstErr) firstErr = new Error('东财返非 JSON: ' + e.message);
+        continue;
       }
       if (!j.data || !j.data.diff || Object.keys(j.data.diff).length === 0) {
-        if (pn === 1) throw new Error(`东财返空 (rc=${j.rc}, rt=${j.rt})`);
-        // 后续页空就 break
-        break;
+        // 静默: 后续页空就跳过, 不当错误
+        continue;
       }
       // 字段映射成 aktools 风格
       for (const k of Object.keys(j.data.diff)) {
-        const r = j.data.diff[k];
+        const row = j.data.diff[k];
         all.push({
-          '代码': r.f12 || '',
-          '名称': r.f14 || '',
-          '最新价': _num(r.f2) / 100,
-          '涨跌幅': _num(r.f3) / 100,
-          '涨跌额': _num(r.f4) / 100,
-          '成交量': _num(r.f5),
-          '成交额': _num(r.f6),
-          '换手率': _num(r.f8) / 100,
-          '市盈率': _num(r.f9) / 100,
-          '量比': _num(r.f10) / 100,
-          '流通市值': _num(r.f20),
-          '总市值': _num(r.f21),
-          '市净率': _num(r.f23) / 100
+          '代码': row.f12 || '',
+          '名称': row.f14 || '',
+          '最新价': _num(row.f2) / 100,
+          '涨跌幅': _num(row.f3) / 100,
+          '涨跌额': _num(row.f4) / 100,
+          '成交量': _num(row.f5),
+          '成交额': _num(row.f6),
+          '换手率': _num(row.f8) / 100,
+          '市盈率': _num(row.f9) / 100,
+          '量比': _num(row.f10) / 100,
+          '流通市值': _num(row.f20),
+          '总市值': _num(row.f21),
+          '市净率': _num(row.f23) / 100
         });
       }
-      if (isDelay && pn < pages) {
-        // 分页间隔 200ms, 避免被 ban
-        await new Promise(r => setTimeout(r, 200));
-      }
     }
-    if (all.length === 0) throw new Error('东财解析后为空');
+    if (blocked429) _setLimit('efinance_full', 60 * 1000, 'HTTP 429');
+    // 单页 (pages=1) 全失败才抛错; 多页场景部分成功就接受
+    if (all.length === 0) throw firstErr || new Error('东财解析后为空');
     return all;
   }
 
@@ -430,14 +433,36 @@
   }
 
   /**
-   * 带缓存的东方财富 fetcher (60s TTL)
+   * 带缓存的东方财富 fetcher (v0.2.18: TTL 60s → 5min, 跟 market-width 一致; 5min 内多次访问秒开)
    */
   async function getStockSpotEfinanceCached() {
     const cached = await Core.Storage.cacheGet('stock_spot_all_efinance');
     if (cached) return cached;
     const data = await _efinanceFetch();
-    await Core.Storage.cacheSet('stock_spot_all_efinance', data, 60 * 1000);
+    await Core.Storage.cacheSet('stock_spot_all_efinance', data, 5 * 60 * 1000);
     return data;
+  }
+
+  /**
+   * v0.2.18: 启动后台预热全市场 (fire-and-forget)
+   * 选股 / 持仓页 / 估值偏离 都会拉全市场, 第一次总是慢 (5s+)
+   * 在 app init 后台跑一次, 5min 缓存, 用户切到这些页时直接读缓存 (0 网络)
+   * 失败仅 console.warn, 不抛
+   * 注意: 直接调 getStockSpotEfinanceCached, 内部 5min 缓存命中就 0 网络, 不需要再查
+   */
+  function warmupEfinance(delay = 0) {
+    const start = async () => {
+      try {
+        await getStockSpotEfinanceCached();
+      } catch (e) {
+        console.warn('[Data] warmupEfinance 失败:', e.message || e);
+      }
+    };
+    if (delay > 0) {
+      setTimeout(start, delay);
+      return Promise.resolve();
+    }
+    return start();
   }
 
   // c (aktools 限流修复): 按端点独立限流状态
@@ -2496,7 +2521,8 @@
     _sinaFetch, _sinaParse,  // Z13: 新浪 fetcher + 解析 (腾讯失败兜底, 测试用)
     _tencentKLine,          // Y12: 腾讯 K 线 fetcher (内部)
     getStockSpotEfinance,  // C: 东方财富 fetcher (全市场, screener 用)
-    getStockSpotEfinanceCached,  // 带 60s 缓存的东方财富 fetcher
+    getStockSpotEfinanceCached,  // 带 5min 缓存的东方财富 fetcher (v0.2.18: 60s → 5min)
+    warmupEfinance,         // v0.2.18: 启动后台预热 (fire-and-forget, 5min 缓存命中 0 网络)
     getStockFinancialHistory,  // Phase R: 近 N 期财报对比
     getFinancialCalendar, getStockNextDisclosure,  // Phase U: 财报披露日历
     // 排雷 (Phase Y.1)

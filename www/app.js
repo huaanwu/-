@@ -3,7 +3,7 @@
  * 挂全局兼容层 + 初始化
  */
 
-var APP_VERSION = 'v0.2.17';
+var APP_VERSION = 'v0.2.18';
 var APP_BUILD_DATE = '2026-07-30';
 var APP_GIT_COMMIT = '';
 // build-web.mjs 写入 www/version.json, 启动时读它覆盖 (保证 package.json 是单一来源)
@@ -353,6 +353,11 @@ function hideRegimeAlertBanner() {
     // B4 修复: 启动期预热大盘宽度/风格 (30s 内完成, 让长线/选股页面打开时不再 cold start)
     if (window.Core && Core.Market && typeof Core.Market.warmup === 'function') {
       Core.Market.warmup().catch(e => console.warn('[App] Market.warmup 失败:', e));
+    }
+    // v0.2.18: 启动期后台预热全市场行情 (5min 缓存, 选股页/估值偏离 第一次 5s+ 拉取延迟掉)
+    // 失败不阻塞, 5min 缓存命中时基本 0 网络
+    if (window.Core && Core.Data && typeof Core.Data.warmupEfinance === 'function') {
+      Core.Data.warmupEfinance().catch(e => console.warn('[App] Data.warmupEfinance 失败:', e));
     }
     // 初选硬筛后台预热: app 启动后异步拉 2000 只基本面 (7d 缓存), 用户主动跑评分时秒开
     // 失败不阻塞, 跑失败时用户主动跑评分会自然降级 (Scoring 失败时 long-trader 有兜底排序)
