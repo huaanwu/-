@@ -215,6 +215,18 @@
             const _onProgress = (done, total) => {
               if (Screener._cancelRun) { _cancelReq = true; return; }
               _renderProgress(done, total);
+              // v0.2.16: 基本面 100% 后立刻切到 "行业阶段" 文案, 避免 "100% 假死" 体感
+              //   industry 没 onProgress, 用户看不到进度会以为卡了
+              if (done === total) {
+                setTimeout(() => {
+                  if (!Screener._cancelRun) {
+                    resultEl.innerHTML = '<div class="loading">⏳ 行业归属加载中 (一次性全市场索引, 约 5-20s)...<br>' +
+                      '<div style="margin-top:6px;font-size:11px;color:var(--text-muted);">基本面已完成, 拉行业匹配中</div>' +
+                      '<button class="btn btn-sm btn-ghost" style="margin-top:10px;" onclick="Screener._cancelRun = true">✋ 取消</button>' +
+                      '</div>';
+                  }
+                }, 50);
+              }
             };
             const finMapP = Core.Data.getStockFinancialBatch(codes, { onProgress: _onProgress })
               .catch(e => { scoreError = 'financial:' + e.message; return new Map(); });

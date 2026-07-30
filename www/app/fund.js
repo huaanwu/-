@@ -75,13 +75,15 @@
       }
 
       let totalCost = 0, totalValue = 0;
-      const rows = [];
-      for (const f of list) {
+      // 并行拉净值: 7 只基金串行 = 7×53s = 6+ 分钟 (aktools 500 时), 并行 = 53s 一次
+      // v0.2.16 改: 串行 → Promise.all (getFundSpot 已加降级链, 失败时降级天天基金 1-2s)
+      const navResults = await Promise.all(list.map(async (f) => {
         let currentNav = null;
         let dayChange = null;
         try {
           const data = await Core.Data.getFundSpot(f.code);
           // AKShare fund_open_fund_info_em 返回结构: 不同 indicator 不同
+          // 天天基金 pingzhongdata 降级时也是 aktools 风格 [{日期, 单位净值, 日增长率, 累计净值}]
           if (Array.isArray(data) && data.length > 0) {
             const latest = data[data.length - 1];
             currentNav = parseFloat(latest.单位净值 || latest['单位净值'] || latest.value);
@@ -96,7 +98,11 @@
         } catch (e) {
           console.warn('[Fund] 拉净值失败:', f.code, e);
         }
+        return { f, currentNav, dayChange };
+      }));
 
+      const rows = [];
+      for (const { f, currentNav, dayChange } of navResults) {
         const shares = parseFloat(f.shares) || 0;
         const costNav = parseFloat(f.costNav) || 0;
         const value = currentNav ? shares * currentNav : null;
