@@ -28,7 +28,8 @@
   const DEFAULT_CONFIG = {
     maxSingleStockPct: Core.Constants.MAX_SINGLE_STOCK_PCT,  // 单票占总资产上限
     maxTotalPositionPct: 0.95,                              // 股票总仓位上限
-    chaseWarnPct: 5,                                        // 当日涨幅超过此值视为追高 (警告不拦截)
+    // Phase 2.4: chaseWarnPct 改为小数 (0.05 = 5%), 与 envelope.payload.changePercent 语义对齐
+    chaseWarnPct: 0.05,                                     // 当日涨幅超过此值视为追高 (警告不拦截)
     maxMonthlyDrawdownPct: Core.Constants.MAX_MONTHLY_DRAWDOWN_PCT,  // 月度回撤熔断线
     maxSingleIndustryPct: Core.Constants.MAX_SINGLE_INDUSTRY_PCT,   // 单行业集中度上限 (预留)
     enabled: true,
@@ -148,9 +149,10 @@
      * @returns string | null
      */
     _checkChase({ changePct, config }) {
+      // Phase 2.4: changePct 是小数 (e.g. 0.0123 表示 +1.23%), config.chaseWarnPct 也是小数 (e.g. 0.03 = 3%)
       const v = parseFloat(changePct);
       if (isNaN(v)) return null;
-      if (v > config.chaseWarnPct) return `今日已涨 ${v.toFixed(2)}%, 确认追高?`;
+      if (v > config.chaseWarnPct) return `今日已涨 ${(v * 100).toFixed(2)}%, 确认追高?`;
       return null;
     },
 
@@ -262,8 +264,9 @@
 
         // 6. 追高 (当日涨跌幅, 拉不到行情只提示不拦)
         try {
-          const q = await window.Core.Data.getStockQuote(code);
-          const changePct = q ? parseFloat(q.涨跌幅 ?? q.changePct) : NaN;
+          // Phase 2.4: 走 Facade.getQuote (envelope.payload.changePercent 已是小数)
+          const env = await window.Core.Data.Facade.getQuote(code);
+          const changePct = (env && env.payload && env.payload.changePercent != null) ? env.payload.changePercent : NaN;
           const chaseWarn = this._checkChase({ changePct, config });
           if (chaseWarn) result.warns.push(chaseWarn);
         } catch (e) {

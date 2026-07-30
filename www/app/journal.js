@@ -8,6 +8,51 @@
 (function() {
   'use strict';
 
+  // v0.2.19 兼容: ContextBuilder 不存在时手动拉 holdings/alerts/journals/portfolio/macro/marketWidth
+  //   测试 vm / 老 NSIS 没加载 data/*.js (Phase 1.6 子文件) 时降级
+  //   返回 DTO 跟 ContextBuilder.build 一致: { slices: {...}, sourceDigest, partialErrors }
+  const _legacyBuildContext = async (intent) => {
+    const partialErrors = [];
+    const slices = { holdings: [], alerts: [], recentJournals: [], portfolio: null, macro: null, marketWidth: null };
+    try {
+      if (Core.Holdings && typeof Core.Holdings.getAll === 'function') {
+        slices.holdings = (await Core.Holdings.getAll()) || [];
+      } else if (Core.Storage && typeof Core.Storage.all === 'function') {
+        const all = await Core.Storage.all('holdings').catch(() => []);
+        slices.holdings = (all || []).filter(h => !h.isPaper);
+      }
+    } catch (e) { partialErrors.push({ source: 'holdings', msg: e.message }); }
+    try {
+      if (Core.Alerts && typeof Core.Alerts.list === 'function') {
+        slices.alerts = (await Core.Alerts.list()) || [];
+      } else if (Core.Storage && typeof Core.Storage.all === 'function') {
+        slices.alerts = (await Core.Storage.all('alerts').catch(() => [])) || [];
+      }
+    } catch (e) { partialErrors.push({ source: 'alerts', msg: e.message }); }
+    try {
+      if (Core.Storage && typeof Core.Storage.all === 'function') {
+        const all = await Core.Storage.all('journals').catch(() => []);
+        slices.recentJournals = (all || []).slice(-8);
+      }
+    } catch (e) { partialErrors.push({ source: 'journals', msg: e.message }); }
+    try {
+      if (Core.Portfolio && typeof Core.Portfolio.getAssets === 'function') {
+        slices.portfolio = await Core.Portfolio.getAssets({ paper: false });
+      }
+    } catch (e) { partialErrors.push({ source: 'portfolio', msg: e.message }); }
+    try {
+      if (Core.Macro && typeof Core.Macro.getText === 'function') {
+        slices.macro = await Core.Macro.getText();
+      }
+    } catch (e) { partialErrors.push({ source: 'macro', msg: e.message }); }
+    try {
+      if (Core.MarketWidth && typeof Core.MarketWidth.getMarketWidth === 'function') {
+        slices.marketWidth = await Core.MarketWidth.getMarketWidth();
+      }
+    } catch (e) { partialErrors.push({ source: 'marketWidth', msg: e.message }); }
+    return { slices, sourceDigest: '', partialErrors };
+  };
+
   const Journal = {
 
     async init() {},
@@ -222,46 +267,23 @@
       btn.textContent = '⏳ 跑中...';
       out.innerHTML = '<span style="color:var(--text-muted);">⏳ 拉事实 → 调 LLM → 输出...</span>';
       try {
-        // 收集事实: 持仓 + 告警 + 近期复盘
-        const holdings = ((await Core.Storage.all('holdings')) || []).filter(h => !h.isPaper);  // 排除模拟盘
-        const alerts = (await Core.Storage.all('alerts')) || [];
-        const allJ = (await Core.Storage.all('journals')) || [];
-        // 近期 7 天
-        const weekAgo = Date.now() - 7 * 86400000;
-        const recentJournals = allJ.filter(j => (j.createdAt || 0) >= weekAgo).slice(-5);
-        // P1.1: 并行拉组合 / 宏观 / 市场宽度, 任一失败不影响其他
-        const [portfolio, macroText, marketWidth] = await Promise.all([
-          Core.Portfolio && Core.Portfolio.getAssets
-            ? Core.Portfolio.getAssets({ paper: false }).catch(e => { console.warn('[aiColleague] portfolio 拉取失败:', e); return null; })
-            : Promise.resolve(null),
-          Core.Macro && Core.Macro.get
-            ? Core.Macro.get().then(m => Core.Macro.formatForPrompt ? Core.Macro.formatForPrompt(m) : (m ? JSON.stringify(m).slice(0, 800) : null)).catch(e => { console.warn('[aiColleague] macro 拉取失败:', e); return null; })
-            : Promise.resolve(null),
-          Core.MarketWidth && Core.MarketWidth.getMarketWidth
-            ? Core.MarketWidth.getMarketWidth().catch(e => { console.warn('[aiColleague] marketWidth 拉取失败:', e); return null; })
-            : Promise.resolve(null)
-        ]);
-        // P0.1: 行情价格注入 holdings (currentPrice), 串行拉 (holdings <20 只, cache 命中后 <2s)
-        // Phase 1.6: 走 Facade.getQuote 拿标准化 envelope, 收集 sourceDigest
-        const quoteEnvelopes = [];
-        for (const h of holdings) {
-          try {
-            let q;
-            if (Core.Data && Core.Data.Facade && typeof Core.Data.Facade.getQuote === 'function') {
-              q = await Core.Data.Facade.getQuote(h.code);
-              if (q) quoteEnvelopes.push(q);
-            } else {
-              // 兜底: facade 未加载时走原 Core.Data.getStockQuote
-              q = await Core.Data.getStockQuote(h.code);
-            }
-            if (q) {
-              const env = (q.payload && q.symbol) ? q : null;
-              const priceVal = env ? env.payload.price : parseFloat(q['最新价'] != null ? q['最新价'] : q.price);
-              h.currentPrice = (priceVal != null && !isNaN(priceVal)) ? priceVal : null;
-            }
-          } catch (e) { /* keep null, summary 里不显示价格字段 */ }
-        }
-        const ctx = { holdings, alerts, recentJournals, portfolio, macro: macroText, marketWidth };
+        // Phase 2.3: 走 ContextBuilder.build('diagnose') 一行收口
+        //   自动按需拉 holdings/alerts/journals/portfolio/macro/marketWidth,
+        //   失败部分记 partialErrors 不污染整体, quote 走 Facade 自动降级
+        // v0.2.19 兼容: ContextBuilder 不存在时降级到手动装配 (老路径, 不破测试 vm)
+        const ctxDto = (Core.Data && Core.Data.ContextBuilder && typeof Core.Data.ContextBuilder.build === 'function')
+          ? await Core.Data.ContextBuilder.build('diagnose')
+          : await _legacyBuildContext('diagnose');
+        // DTO -> 老 ctx 结构 (向后兼容 _summarizeCtx / _aiColleague 渲染层)
+        const holdings = ctxDto.slices.holdings || [];
+        const alerts = ctxDto.slices.alerts || [];
+        const recentJournals = ctxDto.slices.recentJournals || [];
+        const portfolio = ctxDto.slices.portfolio;
+        const macroText = ctxDto.slices.macro;
+        const marketWidth = ctxDto.slices.marketWidth;
+        // 局部兜底: 部分失败时记录 (老的 warn 仍输出)
+        ctxDto.partialErrors.forEach(e => console.warn('[aiColleague]', e.source + ':', e.msg));
+        const ctx = { holdings, alerts, recentJournals, portfolio, macro: macroText, marketWidth, sourceDigest: ctxDto.sourceDigest };
         // Phase 1.6: 给 observer 的 ctx 注入 sourceDigest (压缩数据来源摘要)
         if (Core.Data && Core.Data.Facade && typeof Core.Data.Facade.digest === 'function' && quoteEnvelopes.length > 0) {
           ctx.sourceDigest = Core.Data.Facade.digest(quoteEnvelopes);
@@ -555,14 +577,29 @@
         }
         const snapshotDate = date ? new Date(date) : new Date();
         const withPL = [];
+        // Phase 2.4: 走 Facade.getQuoteMany 批量, 失败时降级单只 getStockQuote
+        let envByCode = {};
+        if (Core.Data && Core.Data.Facade && typeof Core.Data.Facade.getQuoteMany === 'function') {
+          try {
+            const envs = await Core.Data.Facade.getQuoteMany(holdings.map(h => h.code).filter(Boolean));
+            envs.forEach(e => { if (e && e.symbol) envByCode[e.symbol] = e; });
+          } catch (_) { /* fall through to single fetcher below */ }
+        }
         for (const h of holdings) {
           const shares = parseFloat(h.shares) || 0;
           if (shares <= 0) continue;
+          let price = null, changePct = null;
           try {
-            const q = await Core.Data.getStockQuote(h.code);
-            if (!q) continue;
-            const price = parseFloat(q.最新价 ?? q.price ?? 0);
-            const changePct = parseFloat(q.涨跌幅 ?? q.change_pct ?? 0);
+            const env = envByCode[h.code] || (Core.Data && Core.Data.Facade ? await Core.Data.Facade.getQuote(h.code) : null);
+            if (env && env.payload) {
+              price = env.payload.price;
+              changePct = (env.payload.changePercent != null) ? env.payload.changePercent * 100 : null;  // 转回 %
+            } else {
+              const q = await Core.Data.getStockQuote(h.code);
+              if (!q) continue;
+              price = parseFloat(q.最新价 ?? q.price ?? 0);
+              changePct = parseFloat(q.涨跌幅 ?? q.change_pct ?? 0);
+            }
             const cost = parseFloat(h.cost) || 0;
             const mkt = shares * price;
             const costTotal = shares * cost;

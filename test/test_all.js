@@ -2896,7 +2896,46 @@ section('23] Paper 模拟盘纯函数实测');
         },
         Data: {
           getStockQuote: async (code) => storageData.quotes[code] || null,
-          getIndexSpot: async () => storageData.indexSpot || []
+          getIndexSpot: async () => storageData.indexSpot || [],
+          // Phase 2.4: Facade mock - 把 storageData.quotes 的原始形态包装成 envelope
+          Facade: {
+            getQuote: async (code) => {
+              const raw = storageData.quotes[code];
+              if (!raw) return { symbol: code, payload: { price: 0 }, provider: 'mock', quality: 'ok' };
+              const price = parseFloat(raw['最新价'] != null ? raw['最新价'] : raw.price);
+              return {
+                symbol: code,
+                name: raw['名称'] || raw.name || '',
+                market: /^(60|68)/.test(code) ? 'SH' : 'SZ',
+                provider: raw.provider || 'mock',
+                fetchedAt: Date.now(),
+                freshness: 'realtime',
+                quality: 'ok',
+                schemaVersion: 'quote.v3',
+                validation: { status: 'passed', warnings: [], errors: [] },
+                provenance: { chain: ['mock'], cacheHit: false, legacyHit: false, collectedBy: 'mock' },
+                payload: { symbol: code, name: raw['名称'] || '', price: isNaN(price) ? null : price }
+              };
+            },
+            getQuoteMany: async (codes) => {
+              const out = [];
+              for (const c of codes) {
+                const raw = storageData.quotes[c];
+                const price = raw ? parseFloat(raw['最新价'] != null ? raw['最新价'] : raw.price) : 0;
+                out.push({
+                  symbol: c,
+                  name: raw ? (raw['名称'] || '') : '',
+                  market: /^(60|68)/.test(c) ? 'SH' : 'SZ',
+                  provider: 'mock',
+                  fetchedAt: Date.now(),
+                  freshness: 'realtime',
+                  quality: raw ? 'ok' : 'failed',
+                  payload: { symbol: c, price: isNaN(price) ? 0 : price }
+                });
+              }
+              return out;
+            }
+          }
         },
         Util: { stockCodePrefix: (c) => /^(60|68)/.test(c) ? 'sh' : 'sz' },
         Constants: _loadRealConstants()
@@ -3221,7 +3260,46 @@ section('23b] Paper 分账户 sleeve 实测');
         },
         Data: {
           getStockQuote: async (code) => storageData.quotes[code] || null,
-          getIndexSpot: async () => storageData.indexSpot || []
+          getIndexSpot: async () => storageData.indexSpot || [],
+          // Phase 2.4: Facade mock - 把 storageData.quotes 的原始形态包装成 envelope
+          Facade: {
+            getQuote: async (code) => {
+              const raw = storageData.quotes[code];
+              if (!raw) return { symbol: code, payload: { price: 0 }, provider: 'mock', quality: 'ok' };
+              const price = parseFloat(raw['最新价'] != null ? raw['最新价'] : raw.price);
+              return {
+                symbol: code,
+                name: raw['名称'] || raw.name || '',
+                market: /^(60|68)/.test(code) ? 'SH' : 'SZ',
+                provider: raw.provider || 'mock',
+                fetchedAt: Date.now(),
+                freshness: 'realtime',
+                quality: 'ok',
+                schemaVersion: 'quote.v3',
+                validation: { status: 'passed', warnings: [], errors: [] },
+                provenance: { chain: ['mock'], cacheHit: false, legacyHit: false, collectedBy: 'mock' },
+                payload: { symbol: code, name: raw['名称'] || '', price: isNaN(price) ? null : price }
+              };
+            },
+            getQuoteMany: async (codes) => {
+              const out = [];
+              for (const c of codes) {
+                const raw = storageData.quotes[c];
+                const price = raw ? parseFloat(raw['最新价'] != null ? raw['最新价'] : raw.price) : 0;
+                out.push({
+                  symbol: c,
+                  name: raw ? (raw['名称'] || '') : '',
+                  market: /^(60|68)/.test(c) ? 'SH' : 'SZ',
+                  provider: 'mock',
+                  fetchedAt: Date.now(),
+                  freshness: 'realtime',
+                  quality: raw ? 'ok' : 'failed',
+                  payload: { symbol: c, price: isNaN(price) ? 0 : price }
+                });
+              }
+              return out;
+            }
+          }
         },
         Util: { stockCodePrefix: (c) => /^(60|68)/.test(c) ? 'sh' : 'sz' },
         Constants: K
@@ -3461,7 +3539,39 @@ section('24] Discipline 交易纪律引擎纯函数 + 集成实测');
             if (storageData.throwOnQuote) throw new Error('quote down');
             return storageData.quotes[code] || null;
           },
-          getFundSpot: async () => []
+          getFundSpot: async () => [],
+          // Phase 2.4: Facade mock - raw → envelope
+          Facade: {
+            getQuote: async (code) => {
+              if (storageData.throwOnQuote) throw new Error('quote down');
+              const raw = storageData.quotes[code];
+              if (!raw) return { symbol: code, payload: { price: 0 }, quality: 'failed' };
+              const price = parseFloat(raw['最新价'] != null ? raw['最新价'] : raw.price);
+              return {
+                symbol: code,
+                market: /^(60|68)/.test(code) ? 'SH' : 'SZ',
+                provider: 'mock',
+                quality: 'ok',
+                schemaVersion: 'quote.v3',
+                validation: { status: 'passed', warnings: [], errors: [] },
+                provenance: { chain: ['mock'], cacheHit: false, legacyHit: false },
+                payload: { symbol: code, price: isNaN(price) ? 0 : price, changePercent: raw.涨跌幅 ? parseFloat(raw.涨跌幅) / 100 : null }
+              };
+            },
+            getQuoteMany: async (codes) => {
+              const out = [];
+              for (const c of codes) {
+                const raw = storageData.quotes[c];
+                const price = raw ? parseFloat(raw['最新价'] != null ? raw['最新价'] : raw.price) : 0;
+                out.push({
+                  symbol: c, market: /^(60|68)/.test(c) ? 'SH' : 'SZ',
+                  provider: 'mock', quality: raw ? 'ok' : 'failed',
+                  payload: { symbol: c, price: isNaN(price) ? 0 : price, changePercent: raw && raw.涨跌幅 ? parseFloat(raw.涨跌幅) / 100 : null }
+                });
+              }
+              return out;
+            }
+          }
         },
         State: { get: (k) => storageData.state[k] ?? null },
         Util: { escapeHtml: (s) => String(s == null ? '' : s).replace(/</g, '&lt;').replace(/>/g, '&gt;') },
@@ -3575,11 +3685,12 @@ section('24] Discipline 交易纪律引擎纯函数 + 集成实测');
     if (D0._checkDrawdown({ currentTotal: 1000, anchor: null, config: cfg }) === null) ok('drawdown: 无锚点 → 不拦');
     else fail('drawdown 无锚点', '');
 
-    // _checkChase: 7% > 5% → warn; 3% → null; 无行情 → null
-    const cw = D0._checkChase({ changePct: 7.23, config: cfg });
+    // _checkChase: 7.23% > 5% → warn; 3% → null; 无行情 → null
+    // Phase 2.4: changePct 改为小数 (0.0723 = +7.23%)
+    const cw = D0._checkChase({ changePct: 0.0723, config: cfg });
     if (cw && cw.includes('7.23%') && cw.includes('追高')) ok(`chase: "${cw}"`);
     else fail('chase warn', String(cw));
-    if (D0._checkChase({ changePct: 3, config: cfg }) === null) ok('chase: 3% → 不警告');
+    if (D0._checkChase({ changePct: 0.03, config: cfg }) === null) ok('chase: 3% → 不警告');
     else fail('chase 通过', '');
     if (D0._checkChase({ changePct: NaN, config: cfg }) === null) ok('chase: 无涨跌幅 → 不警告');
     else fail('chase NaN', '');
@@ -5581,15 +5692,15 @@ section('36] 中长线盯盘: horizon 打标 / 分层轮询(短线定时器+中�
     if (/## 组合/.test(agentsSrc) && /## 宏观/.test(agentsSrc) && /## 市场宽度/.test(agentsSrc)) {
       ok('36.X.d 新增段: 组合 / 宏观 / 市场宽度 (LLM 看得到组合总盘+宏观+宽度)');
     } else fail('36.X.d 新增段', '## 组合 / ## 宏观 / ## 市场宽度 任一缺失');
-    // 36.X.e journal.js 装配 portfolio / macro / marketWidth
+    // 36.X.e journal.js 装配 portfolio / macro / marketWidth (Phase 2.3 走 ContextBuilder)
     const journalSrc = fs.readFileSync('www/app/journal.js', 'utf-8');
-    if (/Core\.Portfolio\.getAssets/.test(journalSrc) && /Core\.Macro\.get/.test(journalSrc) && /Core\.MarketWidth\.getMarketWidth/.test(journalSrc)) {
-      ok('36.X.e journal._runAgentPipeline 装配 portfolio / macro / marketWidth');
-    } else fail('36.X.e journal 装配不全', 'Portfolio/Macro/MarketWidth 任一未装配');
-    // 36.X.f holding.currentPrice 注入
-    if (/h\.currentPrice\s*=/.test(journalSrc) && /getStockQuote/.test(journalSrc)) {
-      ok('36.X.f journal._runAgentPipeline 给 holdings 注入 currentPrice (via getStockQuote)');
-    } else fail('36.X.f currentPrice 注入', 'h.currentPrice = 或 getStockQuote 缺失');
+    if (/Core\.Data\.ContextBuilder\.build/.test(journalSrc) && /slices\.portfolio/.test(journalSrc) && /slices\.marketWidth/.test(journalSrc)) {
+      ok('36.X.e journal._runAgentPipeline 装配 portfolio / macro / marketWidth (via ContextBuilder.build)');
+    } else fail('36.X.e journal 装配不全', 'ContextBuilder.build 或 slices.portfolio/slices.marketWidth 缺失');
+    // 36.X.f holding.currentPrice 注入 (Phase 2.3 走 ContextBuilder, currentPrice 由 envelope.payload.price 注入)
+    if (/currentPrice/.test(journalSrc) && /Core\.Data\.Facade\.getQuoteMany/.test(journalSrc)) {
+      ok('36.X.f journal._runAgentPipeline 给 holdings 注入 currentPrice (via Facade.getQuoteMany)');
+    } else fail('36.X.f currentPrice 注入', 'currentPrice 或 Facade.getQuoteMany 缺失');
 
     // ---- 36.Y Phase Y: 排雷 + screener AI 三补丁 (静态源码 grep) ----
     const riskSrc = fs.readFileSync('www/core/risk-mine.js', 'utf-8');
@@ -7441,7 +7552,46 @@ section('[43] Bug A 前视偏差: createdAfterClose 阈值 (盘外 OR 盘外才�
         },
         Data: {
           getStockQuote: async (code) => storageData.quotes[code] || null,
-          getIndexSpot: async () => storageData.indexSpot || []
+          getIndexSpot: async () => storageData.indexSpot || [],
+          // Phase 2.4: Facade mock - 把 storageData.quotes 的原始形态包装成 envelope
+          Facade: {
+            getQuote: async (code) => {
+              const raw = storageData.quotes[code];
+              if (!raw) return { symbol: code, payload: { price: 0 }, provider: 'mock', quality: 'ok' };
+              const price = parseFloat(raw['最新价'] != null ? raw['最新价'] : raw.price);
+              return {
+                symbol: code,
+                name: raw['名称'] || raw.name || '',
+                market: /^(60|68)/.test(code) ? 'SH' : 'SZ',
+                provider: raw.provider || 'mock',
+                fetchedAt: Date.now(),
+                freshness: 'realtime',
+                quality: 'ok',
+                schemaVersion: 'quote.v3',
+                validation: { status: 'passed', warnings: [], errors: [] },
+                provenance: { chain: ['mock'], cacheHit: false, legacyHit: false, collectedBy: 'mock' },
+                payload: { symbol: code, name: raw['名称'] || '', price: isNaN(price) ? null : price }
+              };
+            },
+            getQuoteMany: async (codes) => {
+              const out = [];
+              for (const c of codes) {
+                const raw = storageData.quotes[c];
+                const price = raw ? parseFloat(raw['最新价'] != null ? raw['最新价'] : raw.price) : 0;
+                out.push({
+                  symbol: c,
+                  name: raw ? (raw['名称'] || '') : '',
+                  market: /^(60|68)/.test(c) ? 'SH' : 'SZ',
+                  provider: 'mock',
+                  fetchedAt: Date.now(),
+                  freshness: 'realtime',
+                  quality: raw ? 'ok' : 'failed',
+                  payload: { symbol: c, price: isNaN(price) ? 0 : price }
+                });
+              }
+              return out;
+            }
+          }
         },
         Util: { stockCodePrefix: (c) => /^(60|68)/.test(c) ? 'sh' : 'sz' },
         Constants: _loadRealConstants()
@@ -7561,7 +7711,46 @@ section('[44] Bug C 同代码去重: addCondOrder 拒绝同 code pending/已持�
         },
         Data: {
           getStockQuote: async (code) => storageData.quotes[code] || null,
-          getIndexSpot: async () => storageData.indexSpot || []
+          getIndexSpot: async () => storageData.indexSpot || [],
+          // Phase 2.4: Facade mock - 把 storageData.quotes 的原始形态包装成 envelope
+          Facade: {
+            getQuote: async (code) => {
+              const raw = storageData.quotes[code];
+              if (!raw) return { symbol: code, payload: { price: 0 }, provider: 'mock', quality: 'ok' };
+              const price = parseFloat(raw['最新价'] != null ? raw['最新价'] : raw.price);
+              return {
+                symbol: code,
+                name: raw['名称'] || raw.name || '',
+                market: /^(60|68)/.test(code) ? 'SH' : 'SZ',
+                provider: raw.provider || 'mock',
+                fetchedAt: Date.now(),
+                freshness: 'realtime',
+                quality: 'ok',
+                schemaVersion: 'quote.v3',
+                validation: { status: 'passed', warnings: [], errors: [] },
+                provenance: { chain: ['mock'], cacheHit: false, legacyHit: false, collectedBy: 'mock' },
+                payload: { symbol: code, name: raw['名称'] || '', price: isNaN(price) ? null : price }
+              };
+            },
+            getQuoteMany: async (codes) => {
+              const out = [];
+              for (const c of codes) {
+                const raw = storageData.quotes[c];
+                const price = raw ? parseFloat(raw['最新价'] != null ? raw['最新价'] : raw.price) : 0;
+                out.push({
+                  symbol: c,
+                  name: raw ? (raw['名称'] || '') : '',
+                  market: /^(60|68)/.test(c) ? 'SH' : 'SZ',
+                  provider: 'mock',
+                  fetchedAt: Date.now(),
+                  freshness: 'realtime',
+                  quality: raw ? 'ok' : 'failed',
+                  payload: { symbol: c, price: isNaN(price) ? 0 : price }
+                });
+              }
+              return out;
+            }
+          }
         },
         Util: { stockCodePrefix: (c) => /^(60|68)/.test(c) ? 'sh' : 'sz' },
         Constants: _loadRealConstants()

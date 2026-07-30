@@ -197,8 +197,9 @@
       // 预填成本价: 拉实时现价, 失败回退建议均价
       let price = 0;
       try {
-        const q = await Core.Data.getStockQuote(t.code);
-        price = q ? (parseFloat(q.最新价 ?? q.price) || 0) : 0;
+        // Phase 2.4: 走 Facade.getQuote
+        const env = await Core.Data.Facade.getQuote(t.code);
+        price = (env && env.payload && env.payload.price != null) ? env.payload.price : 0;
       } catch (e) { console.warn('[Holdings] 待确认交易拉行情失败:', t.code, e); }
       if (!price && t.suggestedShares > 0) price = +(t.suggestedAmount / t.suggestedShares).toFixed(2);
       const prefill = {

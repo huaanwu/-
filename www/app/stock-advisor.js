@@ -224,7 +224,8 @@
         Core.Data.getStockFinancial(code).catch(e => { console.warn('[sa] 财务失败:', e); return null; }),
         Core.Data.getAiContextSnapshot().catch(e => { console.warn('[sa] 上下文失败:', e); return null; }),
         Core.KB.pickRelevant({ holdings: [{ name: name || code }], context: window._wrCtx || {}, maxN: 4 }).catch(e => []),
-        Core.Data.getStockQuote(code).catch(e => null)
+        // Phase 2.4: 走 Facade.getQuote, envelope 注入 AI 上下文
+        Core.Data.Facade.getQuote(code).catch(e => null)
       ]);
 
       data.fundamental = _extractFundamentals(fin);

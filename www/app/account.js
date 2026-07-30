@@ -51,14 +51,16 @@
         Core.Storage.all('cashflow')
       ]);
 
-      // 拉实时价 (并行)
+      // 拉实时价 (并行, 失败降级)
+      // Phase 2.4: 走 Facade.getQuoteMany 批量
       const stockQuotes = {};
-      await Promise.all(holdings.map(async h => {
-        try {
-          const q = await Core.Data.getStockQuote(h.code);
-          if (q) stockQuotes[h.code] = parseFloat(q.最新价) || 0;
-        } catch (e) { /* 单只失败不影响整体 */ }
-      }));
+      const stockCodes = holdings.map(h => h.code).filter(Boolean);
+      const envs = await Core.Data.Facade.getQuoteMany(stockCodes).catch(() => []);
+      envs.forEach(env => {
+        if (env && env.symbol && env.payload && env.payload.price != null) {
+          stockQuotes[env.symbol] = env.payload.price;
+        }
+      });
       const fundNavs = {};
       await Promise.all(funds.map(async f => {
         if (!f.shares || f.shares <= 0) return;

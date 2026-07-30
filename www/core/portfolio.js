@@ -30,22 +30,25 @@
       // T1 分账户: 模拟盘按 sleeve 过滤; 存量行无 sleeve 字段视为 'long' (向后兼容)
       .filter(h => !paperOnly || (h.sleeve || 'long') === sleeve);
     let stockMkt = 0, quoteFail = 0;
+    // Phase 2.4: 走 Facade.getQuoteMany 批量, 节省 N 次 fetch → 1 次批量
+    // quote 失败回退 costPrice, 累加 valueByCode (被外部 portfolio 聚合使用)
     const valueByCode = {};
-    await Promise.all(holdings.map(async (h) => {
+    const codes = holdings.filter(h => (parseFloat(h.shares) || 0) > 0).map(h => h.code).filter(Boolean);
+    const envs = await window.Core.Data.Facade.getQuoteMany(codes).catch(() => []);
+    const envByCode = {};
+    envs.forEach(env => {
+      if (env && env.symbol) envByCode[env.symbol] = env;
+    });
+    holdings.forEach((h) => {
       const shares = parseFloat(h.shares) || 0;
       if (shares <= 0) return;
-      let price = null;
-      try {
-        const q = await window.Core.Data.getStockQuote(h.code);
-        price = q ? (parseFloat(q.最新价 ?? q.price) || null) : null;
-      } catch (e) {
-        console.warn('[Portfolio] 拉行情失败:', h.code, e);
-      }
-      if (!price) { quoteFail++; price = parseFloat(h.costPrice ?? h.cost) || 0; }
+      const env = envByCode[h.code];
+      let price = (env && env.payload && env.payload.price != null) ? env.payload.price : null;
+      if (price == null) { quoteFail++; price = parseFloat(h.costPrice ?? h.cost) || 0; }
       const v = shares * price;
       valueByCode[h.code] = (valueByCode[h.code] || 0) + v;
       stockMkt += v;
-    }));
+    });
     return { stockMkt, quoteFail, valueByCode };
   }
 

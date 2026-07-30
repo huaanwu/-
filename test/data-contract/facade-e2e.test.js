@@ -97,7 +97,7 @@ async function main() {
   assert(env1.quality === Schema.QUALITY.OK, 'env1.quality = ok (因为 validation.passed)');
   assert(env1.provenance && Array.isArray(env1.provenance.chain), 'env1.provenance.chain 是数组');
   assert(env1.provenance.chain[0] === 'tengxun', 'provenance.chain[0] = tengxun');
-  assert(env1.provenance.chain[1] === 'normalize.v3', 'provenance.chain[1] = normalize.v3');
+  assert(env1.provenance.chain[1] === 'normalize.tengxun', 'provenance.chain[1] = normalize.tengxun');
   assert(env1.provenance.collectedBy === 'data.quote.get', 'collectedBy = data.quote.get');
   assert(env1.payload.price === 1730, 'env1.payload.price = 1730 (normalize 生效)');
   assert(env1.payload.change === 10, 'env1.payload.change = 10 (自算)');

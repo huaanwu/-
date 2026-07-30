@@ -3,7 +3,7 @@
  * 挂全局兼容层 + 初始化
  */
 
-var APP_VERSION = 'v0.2.19';
+var APP_VERSION = 'v0.2.20';
 var APP_BUILD_DATE = '2026-07-30';
 var APP_GIT_COMMIT = '';
 // build-web.mjs 写入 www/version.json, 启动时读它覆盖 (保证 package.json 是单一来源)
@@ -1629,10 +1629,15 @@ window.exportTodaySnapshot = async function() {
   ]);
 
   // 拉实时价 (并行, 失败降级)
+  // Phase 2.4: 走 Facade.getQuoteMany 批量
   const stockQuotes = {};
-  await Promise.all(holdings.map(async h => {
-    try { const q = await Core.Data.getStockQuote(h.code); if (q) stockQuotes[h.code] = parseFloat(q.最新价 ?? q.price ?? 0); } catch (e) { console.warn('[snapshot] 拉行情失败:', h.code, e); }
-  }));
+  const stockCodes = holdings.map(h => h.code).filter(Boolean);
+  const envs = await Core.Data.Facade.getQuoteMany(stockCodes).catch(() => []);
+  envs.forEach(env => {
+    if (env && env.symbol && env.payload && env.payload.price != null) {
+      stockQuotes[env.symbol] = env.payload.price;
+    }
+  });
   const fundNavs = {};
   await Promise.all(funds.map(async f => {
     if (!f.shares || f.shares <= 0) return;

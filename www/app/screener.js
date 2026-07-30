@@ -1006,8 +1006,9 @@ ${(() => {
         // 4) Phase E: 生成实盘"待确认交易"卡片 (人确认才成交; 失败只 warn, 不影响加自选主流程)
         if (window.Core && Core.Pending && typeof Core.Pending.add === 'function') {
           try {
-            const q = await Core.Data.getStockQuote(code);
-            const price = q ? (parseFloat(q.最新价 ?? q.price ?? 0) || 0) : 0;
+            // Phase 2.4: 走 Facade.getQuote 拿标准化 envelope (含 provenance.sourceDigest)
+            const env = await Core.Data.Facade.getQuote(code);
+            const price = (env && env.payload && env.payload.price != null) ? env.payload.price : 0;
             if (price > 0) {
               // 总资产/单票已持市值复用 Core.Portfolio.getAssets (FIX-3 收口, 与纪律检查分母一致)
               const assets = await Core.Portfolio.getAssets({ paper: false });

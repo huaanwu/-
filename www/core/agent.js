@@ -156,10 +156,13 @@
       return _mkToolResult(toolUse.id, { ok: false, error: 'Electron IPC 桥未就绪 (浏览器模式不支持该工具)' });
     }
     // 把当前 Core.State.ai 配置透传给主进程, 主进程用它探测 LLM endpoint 而非写死 11434
+    // v0.2.19 修: 优先取本地端点 (cfg.localEndpoint.baseURL, 用户的 8082 llama.cpp), 不是远程 baseURL
+    //   原版取 cfg.baseURL (远程 minimax/deepseek), data.health 走远程 + 没 key → 401 → false
+    //   修后取 localEndpoint, 用户的本地 llama.cpp 8082 能被正确探测
     let aiCtx = {};
     try {
       const cfg = (Core.AI && Core.AI.getConfig && Core.AI.getConfig()) || {};
-      aiCtx.__llmBaseUrl = cfg.baseURL || (cfg.localEndpoint && cfg.localEndpoint.baseURL) || '';
+      aiCtx.__llmBaseUrl = (cfg.localEndpoint && cfg.localEndpoint.baseURL) || cfg.baseURL || '';
     } catch (_) { /* 浏览器模式 getConfig 可能失败, 不阻塞 */ }
     const out = await window.electronAPI.invokeAgent(toolUse.name, Object.assign({}, toolUse.input, aiCtx), ctx || {});
     return _mkToolResult(toolUse.id, out);

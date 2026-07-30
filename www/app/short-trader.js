@@ -815,26 +815,19 @@
         ctx.screenerTopCodes = new Set(screenerTop.map(s => s && (s['代码'] || s.code)).filter(Boolean));
         // Bug B 修复 (资料注入 - 候选池 currentPrice): 异步拉每只的现价注入 ctx.pool,
         //   并组装 ctx.priceByCode (Map) 给 _validatePlans 方向对照用.
-        //   - 数据源: Core.Data.getStockQuote (60s 缓存, 失败容错, 单只 5s 超时)
+        //   - 数据源: Core.Data.Facade.getQuoteMany 批量 (60s 缓存, 失败容错)
         //   - 失败 code: currentPrice=null → 不影响 _validatePlans (没 cp 时跳过方向对照)
         ctx.priceByCode = new Map();
         if (Array.isArray(ctx.pool) && ctx.pool.length) {
-          const quoteResults = await Promise.allSettled(
-            ctx.pool.map(c => Core.Data.getStockQuote(c.code).catch(() => null))
-          );
-          for (let i = 0; i < ctx.pool.length; i++) {
-            const r = quoteResults[i];
-            if (r && r.status === 'fulfilled' && r.value) {
-              const q = r.value;
-              const cp = parseFloat(q['最新价'] || q.price || q.last || q.close);
-              const ch = parseFloat(q['涨跌幅'] || q.changePct || q.change);
-              if (cp > 0) {
-                ctx.pool[i].currentPrice = cp;
-                ctx.pool[i].changePct = isFinite(ch) ? ch : null;
-                ctx.priceByCode.set(ctx.pool[i].code, cp);
-              }
+          const codes = ctx.pool.map(c => c.code).filter(Boolean);
+          const envs = await Core.Data.Facade.getQuoteMany(codes).catch(() => []);
+          envs.forEach((env, i) => {
+            if (env && env.payload && env.payload.price != null) {
+              ctx.pool[i].currentPrice = env.payload.price;
+              ctx.pool[i].changePct = (env.payload.changePercent != null) ? env.payload.changePercent : null;
+              ctx.priceByCode.set(env.symbol, env.payload.price);
             }
-          }
+          });
         }
         // Bug 159 修复 (两阶段选品 - 候选池 K线特征注入):
         //   每只拉近 20 根日 K (24h 缓存), 提取 4 维特征给 AI 决策 (取代"凭记忆"瞎编)

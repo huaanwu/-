@@ -54,22 +54,52 @@ async function invoke(name, args, ctx) {
 register({
   name: 'data.health',
   risk: 'L',
-  description: '检查 akshare / dev-proxy / LLM provider 是否在线,返回布尔状态',
+  description: '检查 akshare / dev-proxy / LLM provider 是否在线,返回布尔状态 + 错误详情',
   input_schema: { type: 'object', properties: {}, additionalProperties: false },
   handler: async (_args, ctx) => {
     const http = require('http');
-    const checks = {};
     const probe = (url) => new Promise(resolve => {
-      const req = http.get(url, { timeout: 2000 }, (res) => {
-        resolve(res.statusCode === 200 || res.statusCode === 422);
+      const req = http.get(url, { timeout: 5000 }, (res) => {
+        const ok = res.statusCode === 200 || res.statusCode === 422;
+        resolve({ ok, status: res.statusCode });
       });
-      req.on('error', () => resolve(false));
-      req.on('timeout', () => { req.destroy(); resolve(false); });
+      req.on('error', (e) => resolve({ ok: false, error: e.code || e.message }));
+      req.on('timeout', () => { req.destroy(); resolve({ ok: false, error: 'timeout' }); });
     });
-    checks.aktools = await probe('http://127.0.0.1:8088/api/public/macro_china_lpr');
-    checks.devProxy = await probe('http://127.0.0.1:8089/health');
-    checks.llm = ctx.llmBaseUrl ? await probe(ctx.llmBaseUrl + '/models') : false;
-    return checks;
+    // v0.2.19: dev-proxy /health 返 akshare_status, 走 dev-proxy 间接探 aktools 更鲁棒
+    //   (aktools 8088 直连可能跟 dev-proxy 不同步, dev-proxy 死了 8088 也探不到)
+    const dp = await probe('http://127.0.0.1:8089/health');
+    let aktoolsOk = false, aktoolsDetail = { url: 'http://127.0.0.1:8089/health (akshare_status)' };
+    if (dp.ok) {
+      try {
+        // 复用 dp 抓到的 body (http.get 是一次性 stream, 重新发一次)
+        const j = await new Promise((resolve) => {
+          const req = http.get('http://127.0.0.1:8089/health', { timeout: 3000 }, (res) => {
+            let body = '';
+            res.on('data', (c) => { body += c; if (body.length > 4096) body = body.slice(0, 4096); });
+            res.on('end', () => { try { resolve(JSON.parse(body)); } catch { resolve(null); } });
+          });
+          req.on('error', () => resolve(null));
+          req.on('timeout', () => { req.destroy(); resolve(null); });
+        });
+        if (j) { aktoolsOk = j.akshare_status === 'ok'; aktoolsDetail.akshare_status = j.akshare_status; aktoolsDetail.akshare_target = j.akshare_target; }
+      } catch (e) { aktoolsDetail.error = e.message; }
+    } else {
+      aktoolsDetail.error = 'dev-proxy 不可达, aktools 没法探';
+    }
+    // v0.2.19: llmBaseUrl 优先用 renderer 传的 localEndpoint (用户的 8082 llama.cpp), 不是远程 baseURL
+    const llmUrl = ctx.llmBaseUrl ? (ctx.llmBaseUrl.endsWith('/') ? ctx.llmBaseUrl : ctx.llmBaseUrl + '/') + 'models' : null;
+    const lm = llmUrl ? await probe(llmUrl) : { ok: false, error: 'no __llmBaseUrl' };
+    return {
+      aktools: aktoolsOk,
+      devProxy: dp.ok,
+      llm: lm.ok,
+      detail: {
+        aktools: aktoolsDetail,
+        devProxy: { url: 'http://127.0.0.1:8089/health', ...dp },
+        llm: { url: llmUrl || '(not configured)', ...lm }
+      }
+    };
   }
 });
 

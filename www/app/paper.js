@@ -214,14 +214,27 @@
     async getPositions(sleeve = 'long') {
       const rows = await this._getPaperHoldings(sleeve);
       const quotes = {};
-      await Promise.all(rows.map(async h => {
-        try {
-          const q = await Core.Data.getStockQuote(h.code);
-          if (q) quotes[h.code] = parseFloat(q.最新价 ?? q.price ?? 0) || null;
-        } catch (e) {
-          console.warn('[Paper] 拉行情失败:', h.code, e);
+      // Phase 2.4: 走 Facade.getQuoteMany 批量, 自动降级链 + cacheKey 双写
+      // v0.2.19 兼容: 测试 vm / 老 NSIS 没加载 facade.js 时降级到原 getStockQuote 路径
+      const codes = rows.map(h => h.code).filter(Boolean);
+      let envs = [];
+      if (Core.Data && Core.Data.Facade && typeof Core.Data.Facade.getQuoteMany === 'function') {
+        envs = await Core.Data.Facade.getQuoteMany(codes).catch(() => []);
+      } else if (codes.length > 0 && typeof Core.Data.getStockQuote === 'function') {
+        // 降级: 串行 getStockQuote (老路径, 单只)
+        for (const c of codes) {
+          const q = await Core.Data.getStockQuote(c).catch(() => null);
+          if (q) {
+            const price = parseFloat(q['最新价'] != null ? q['最新价'] : q.price);
+            if (!isNaN(price)) quotes[c] = price;
+          }
         }
-      }));
+      }
+      envs.forEach(env => {
+        if (env && env.symbol && env.payload && env.payload.price != null) {
+          quotes[env.symbol] = env.payload.price;
+        }
+      });
       return rows.map(h => {
         const shares = parseFloat(h.shares) || 0;
         const costPrice = parseFloat(h.costPrice) || 0;
@@ -260,8 +273,26 @@
         if (shares < LOT_SIZE) { toastError(`买入不足一手 (${LOT_SIZE} 股)`); return null; }
         // T3: 结算传入 K 线成交价时跳过实时行情 (拉不到价也能成交)
         const overridePrice = parseFloat(opts.price) || 0;
-        const q = overridePrice > 0 ? null : await Core.Data.getStockQuote(code);
-        const price = overridePrice > 0 ? overridePrice : (q ? (parseFloat(q.最新价 ?? q.price ?? 0) || 0) : 0);
+        let price = 0;
+        // v0.2.19: env 提到 try 块顶部, 后面 h.name 引用不能超 scope
+        let env = null;
+        if (overridePrice <= 0) {
+          // v0.2.19 兼容: Facade 不存在时降级 getStockQuote
+          if (Core.Data && Core.Data.Facade && typeof Core.Data.Facade.getQuote === 'function') {
+            env = await Core.Data.Facade.getQuote(code).catch(() => null);
+            if (env && env.payload && env.payload.price != null) price = env.payload.price;
+          } else if (Core.Data && typeof Core.Data.getStockQuote === 'function') {
+            const q = await Core.Data.getStockQuote(code).catch(() => null);
+            if (q) {
+              const p = parseFloat(q['最新价'] != null ? q['最新价'] : q.price);
+              if (!isNaN(p)) price = p;
+              // 兼容 env.name (Facade 形态) 用于 h.name
+              env = { name: q['名称'] || q.name || '' };
+            }
+          }
+        } else {
+          price = overridePrice;
+        }
         if (!price) { toastError('拉不到实时价, 无法成交'); return null; }
         const amount = shares * price;
         const fee = this._calcFee(amount, 'buy');
@@ -291,7 +322,8 @@
           h = {
             id: uuid(),
             code,
-            name: name || (q && q.名称) || '',
+            // v0.2.19 修: Phase 1.6 引用了未声明的 q, 改用上面拉到的 env (Facade envelope 或 getStockQuote 单只)
+            name: name || (env && (env.name || env['名称'])) || '',
             market: market || Core.Util.stockCodePrefix(code),
             shares,
             costPrice: price,
@@ -351,8 +383,23 @@
         if (shares > h.shares) { toastError(`卖出股数超过持仓 (持有 ${h.shares})`); return null; }
         // T3: 结算传入 K 线成交价时跳过实时行情
         const overridePrice = parseFloat(opts.price) || 0;
-        const q = overridePrice > 0 ? null : await Core.Data.getStockQuote(h.code);
-        const price = overridePrice > 0 ? overridePrice : (q ? (parseFloat(q.最新价 ?? q.price ?? 0) || 0) : 0);
+        let price = 0;
+        if (overridePrice <= 0) {
+          // v0.2.19 兼容: Facade 不存在时降级 getStockQuote
+          let env = null;
+          if (Core.Data && Core.Data.Facade && typeof Core.Data.Facade.getQuote === 'function') {
+            env = await Core.Data.Facade.getQuote(h.code).catch(() => null);
+            if (env && env.payload && env.payload.price != null) price = env.payload.price;
+          } else if (Core.Data && typeof Core.Data.getStockQuote === 'function') {
+            const q = await Core.Data.getStockQuote(h.code).catch(() => null);
+            if (q) {
+              const p = parseFloat(q['最新价'] != null ? q['最新价'] : q.price);
+              if (!isNaN(p)) price = p;
+            }
+          }
+        } else {
+          price = overridePrice;
+        }
         if (!price) { toastError('拉不到实时价, 无法成交'); return null; }
         const amount = shares * price;
         const fee = this._calcFee(amount, 'sell');
@@ -442,17 +489,15 @@
       const shortPositions = await this.getPositions('short');
       const shortTotal = shortAcc.cash + shortPositions.reduce((s, p) => s + (p.mkt || 0), 0);
 
-      // 真实持仓市值 (与 account.js 同款: 逐只 getStockQuote; 排除模拟盘行)
+      // 真实持仓市值 (与 account.js 同款: 走 Facade.getQuoteMany 批量; 排除模拟盘行)
       let realTotal = 0;
       try {
         const realHoldings = ((await Core.Storage.all('holdings')) || []).filter(h => !h.isPaper);
-        await Promise.all(realHoldings.map(async h => {
-          try {
-            const q = await Core.Data.getStockQuote(h.code);
-            const price = q ? (parseFloat(q.最新价 ?? q.price ?? 0) || 0) : 0;
-            realTotal += (parseFloat(h.shares) || 0) * price;
-          } catch (e) { /* 单只失败按 0 计 */ }
-        }));
+        const codes = realHoldings.map(h => h.code).filter(Boolean);
+        const envs = await Core.Data.Facade.getQuoteMany(codes).catch(() => []);
+        const priceByCode = {};
+        envs.forEach(env => { if (env && env.symbol && env.payload && env.payload.price != null) priceByCode[env.symbol] = env.payload.price; });
+        realHoldings.forEach(h => { realTotal += (parseFloat(h.shares) || 0) * (priceByCode[h.code] || 0); });
       } catch (e) {
         console.warn('[Paper] 真实持仓市值计算失败:', e);
       }
@@ -493,8 +538,21 @@
         if (!pick || !pick.code) return null;
         const sleeve = pick.sleeve === 'short' ? 'short' : 'long';
         const acc = await this._getAccountRaw(sleeve);
-        const q = await Core.Data.getStockQuote(pick.code);
-        const price = q ? (parseFloat(q.最新价 ?? q.price ?? 0) || 0) : 0;
+        // v0.2.19 兼容: Facade 不存在时降级
+        let env = null;
+        if (Core.Data && Core.Data.Facade && typeof Core.Data.Facade.getQuote === 'function') {
+          env = await Core.Data.Facade.getQuote(pick.code).catch(() => null);
+        } else if (Core.Data && typeof Core.Data.getStockQuote === 'function') {
+          env = await Core.Data.getStockQuote(pick.code).catch(() => null);
+        }
+        let price = 0;
+        if (env) {
+          if (env.payload && env.payload.price != null) price = env.payload.price;
+          else {
+            const p = parseFloat(env['最新价'] != null ? env['最新价'] : env.price);
+            if (!isNaN(p)) price = p;
+          }
+        }
         const shares = this._planAutoTrade(acc.cash, acc.positionPct, price);
         if (!shares) {
           console.warn(`[Paper] 自动成交跳过 ${pick.code}: 现金 ${acc.cash} 买不起一手 (价 ${price})`);
@@ -1479,8 +1537,20 @@
         // 先拉实时价供止损价/金额校验 (拉不到则 price=0, 检查内部降级为 warn)
         let price = 0;
         try {
-          const q = await Core.Data.getStockQuote(parsed.code);
-          price = q ? (parseFloat(q.最新价 ?? q.price ?? 0) || 0) : 0;
+          // v0.2.19 兼容: Facade 不存在时降级
+          let env = null;
+          if (Core.Data && Core.Data.Facade && typeof Core.Data.Facade.getQuote === 'function') {
+            env = await Core.Data.Facade.getQuote(parsed.code);
+          } else if (Core.Data && typeof Core.Data.getStockQuote === 'function') {
+            env = await Core.Data.getStockQuote(parsed.code);
+          }
+          if (env) {
+            if (env.payload && env.payload.price != null) price = env.payload.price;
+            else {
+              const p = parseFloat(env['最新价'] != null ? env['最新价'] : env.price);
+              if (!isNaN(p)) price = p;
+            }
+          }
         } catch (e) {
           console.warn('[Paper] 纪律检查前拉价失败:', e);
         }
