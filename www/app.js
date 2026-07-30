@@ -1354,10 +1354,9 @@ window.checkHealth = async function() {
 };
 
 window.saveSettings = function(silent) {
-  // v0.2.12 修: 安装版 (file://) 默认 proxyBase = http://127.0.0.1:8089/api/akshare (相对路径在 file:// 协议下 fetch 失败)
-  //            dev 模式 (http://localhost:3003) 默认 '/api/akshare' (走 vite proxy)
-  const isFileProtocol = window.location && window.location.protocol === 'file:';
-  const defaultProxy = isFileProtocol ? 'http://127.0.0.1:8089/api/akshare' : '/api/akshare';
+  // v0.2.15 修: 跟 apiUrl 一致, 按端口判断 (3003 = dev, 其他 = prod 一律 fallback 127.0.0.1:8089)
+  const isDev = window.location && window.location.port === '3003';
+  const defaultProxy = isDev ? '/api/akshare' : 'http://127.0.0.1:8089/api/akshare';
   const proxyBase = document.getElementById('settingProxyBase').value.trim() || defaultProxy;
   const tushareToken = document.getElementById('settingTushareToken').value.trim();
   // Phase D2: 第二意见的 per-provider key (map), 只更新当前选中的那个 provider, 其余保留

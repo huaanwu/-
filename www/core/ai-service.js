@@ -243,7 +243,11 @@
       stream: !!opts.stream
     };
 
-    const url = `${baseURL}/chat/completions`;
+    // v0.2.15 修: 用 Core.Data.apiUrl() 解析 baseURL, 避免 Electron 安装版 (29037 内置 http 不代理 /api/*) 下的相对路径 fetch 失败
+    //   远程绝对 URL (https://api.minimax.chat/v1) → apiUrl 透传 → 直连 (CORS 由服务器控制)
+    //   相对路径 (/api/llm/minimax-coding/v1, 自动从 dev-proxy 走) → dev 模式 vite proxy, prod 模式 fallback 127.0.0.1:8089
+    const _apiUrl = (window.Core && Core.Data && Core.Data.apiUrl) ? Core.Data.apiUrl : (p) => p;
+    const url = `${_apiUrl(baseURL)}/chat/completions`;
     let resp;
     try {
       resp = await fetch(url, {
@@ -549,7 +553,9 @@
       else body.tool_choice = 'auto';
     }
 
-    const url = baseURL + '/chat/completions';
+    // v0.2.15 修: 同上, _apiUrl 解析 baseURL (相对路径 → 8089 fallback, 绝对 URL 透传)
+    const _apiUrl2 = (window.Core && Core.Data && Core.Data.apiUrl) ? Core.Data.apiUrl : (p) => p;
+    const url = _apiUrl2(baseURL) + '/chat/completions';
     let resp;
     try {
       resp = await fetch(url, {

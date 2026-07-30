@@ -517,21 +517,22 @@
     // V11: 显式检查 proxyBase === '' (而非 '|| DEFAULT_PROXY'), 空字符串 ≠ 缺失
     //   APK 首次启动若 proxyBase 是 '' (V10 设计), 不要 fallback 到相对路径 (会解析成 localhost/* 失败)
     const pb = (window.Core && Core.State && Core.State.get('proxyBase'));
-    // v0.2.12 修: Electron 安装版 (file:// 协议) 用相对路径 fetch 会失败 (跨协议浏览器拒)
-    //   → 在 file:// 协议 + proxyBase 未配/相对路径 时, fallback 到 127.0.0.1:8089
-    //   dev 模式 (http://localhost:3003) 仍走相对路径, 让 vite proxy 转发
-    const isFileProtocol = typeof window !== 'undefined'
-      && window.location && window.location.protocol === 'file:';
+    // v0.2.15 修: 不再按 protocol 判 dev/prod, 改按端口
+    //   背景: Electron 生产模式 (main.js:307) 用 http://127.0.0.1:29037 内置 HTTP server 加载,
+    //         不是 file://. 29037 不代理 /api/* → 相对路径 fetch 必失败
+    //   dev 模式: vite 在 3003 → 相对路径走 vite proxy 转发
+    //   prod 模式 (其他端口 / file://) → 一律 fallback 127.0.0.1:8089
+    const loc = (typeof window !== 'undefined' && window.location) || {};
+    const isDev = loc.port === '3003';
     const FALLBACK_PROXY = 'http://127.0.0.1:8089/api/akshare';
-    if (isFileProtocol) {
-      // file:// 模式 → 一律走绝对 URL, 避免 file:///api/... 解析
+    if (!isDev) {
+      // prod 模式 (Electron 29037 / file://) → 一律走绝对 URL
       if (!pb || !/^https?:\/\//i.test(pb)) {
         try {
           const u = new URL(FALLBACK_PROXY);
           return `${u.origin}${path.startsWith('/') ? path : '/' + path}`;
         } catch (e) { /* 不会失败, 兜底走原逻辑 */ }
       }
-      // proxyBase 是绝对 URL → 抽 origin 拼 path
       try {
         const u = new URL(pb);
         return `${u.origin}${path.startsWith('/') ? path : '/' + path}`;
@@ -539,8 +540,8 @@
         return path;
       }
     }
-    // dev 模式 (http://) 走原逻辑
-    if (pb == null) return path;  // 没配置 → 浏览器 dev 期望相对路径
+    // dev 模式 (vite 3003) 走原逻辑
+    if (pb == null) return path;  // 没配置 → vite proxy 期望相对路径
     if (pb === '') {
       return '';  // 显式空 → 返空字符串, 调用方自己处理
     }
