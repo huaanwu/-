@@ -23,6 +23,7 @@ fund_*.json
 fund_*.txt
 mavis-deep-research/
 .chrome-e2e-tmp-*/
+.chrome-rw-tmp-*/
 e2e_screenshots/
 emu_screenshots/
 *.log.*
@@ -33,6 +34,10 @@ www/version.json
 dp.log
 dp.err
 dist/
+dist2/
+kimi/
+.tmp_*.png
+.tmp_*.js
 
 # 临时调试/绕开脚本 (bash 魔改、调试探针)
 __*.mjs
