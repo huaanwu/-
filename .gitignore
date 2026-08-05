@@ -50,3 +50,7 @@ aktools_*.json
 zygc_*.json
 zyjs_*.json
 yjyg_*.json
+
+# Python aktools patched cache
+scripts/aktools-patched/**/__pycache__/
+scripts/aktools-patched/**/__pycache__/**

@@ -31,6 +31,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import net from 'node:net';
 import { readFileSync, existsSync, watch as fsWatch } from 'fs';
 import { join, extname, resolve, dirname } from 'path';
+import path from 'node:path';
 import { fileURLToPath } from 'url';
 import { createHash } from 'node:crypto';
 
@@ -186,13 +187,59 @@ async function _waitForPort(port, host, maxMs = 15000, intervalMs = 500) {
   return -1;
 }
 
-// 找 python 命令
+// 找 python 命令 (优先 3.12, aktools 0.0.91 + Python 3.14 已知 hang)
+// 返回 { cmd, preArgs, version }
+//   cmd: spawn 第一个参数
+//   preArgs: spawn args 前缀 (例: ['run', '--python', '3.12', '--with', 'aktools'] for uv)
+//   version: 给人看的版本字符串
 function _pickPython() {
+  // 0) 显式覆盖 (dev:proxy script 注入 / 手动)
+  const override = process.env.AKSHARE_PY;
+  if (override) return { cmd: override, preArgs: [], version: `env AKSHARE_PY=${override}` };
+
+  // 1) 优先 3.12 直装版 (用户机器常见: C:\Python312\python.exe / py -3.12)
+  const preferred312 = ['python3.12', 'python312', 'py'];
+  for (const cmd of preferred312) {
+    const args = cmd === 'py' ? ['-3.12', '--version'] : ['--version'];
+    try {
+      const out = execFileSync(cmd, args, { stdio: ['ignore', 'pipe', 'ignore'] });
+      const v = (out.toString() || '').trim();
+      if (v && v.includes('3.12')) return { cmd, preArgs: [], version: v, ...(cmd === 'py' ? { pyVersionFlag: '-3.12' } : {}) };
+    } catch (e) { /* try next */ }
+  }
+
+  // 2) uv 临时 venv 跑 3.12 (用户装了 uv 走这条路最稳)
+  try {
+    const uvOut = execFileSync('uv', ['--version'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    if (uvOut.toString().trim()) {
+      return {
+        cmd: 'uv',
+        preArgs: ['run', '--python', '3.12', '--with', 'aktools', 'python'],
+        version: 'Python 3.12 (via uv)'
+      };
+    }
+  } catch (e) { /* 没 uv */ }
+
+  // 3) 兜底: 系统 python (必须 3.12+; 3.14 + aktools 0.0.91 已知 hang)
   for (const cmd of ['python', 'py', 'python3']) {
     try {
       const out = execFileSync(cmd, ['--version'], { stdio: ['ignore', 'pipe', 'ignore'] });
       const v = (out.toString() || '').trim();
-      if (v) return { cmd, version: v };
+      if (!v) continue;
+      // 解析 major.minor (例: "Python 3.14.5" → "3.14")
+      // aktools 0.0.91 兼容窗口: Python 3.7-3.13, 3.14+ 已知 hang
+      // 注意: 3.14 = 14 >= 12, 之前逻辑错把 3.14 误判为"兼容"
+      const m = /Python\s+(\d+)\.(\d+)/.exec(v);
+      const major = m ? parseInt(m[1], 10) : 0;
+      const minor = m ? parseInt(m[2], 10) : 0;
+      if (major === 3 && minor >= 12 && minor <= 13) {
+        return { cmd, preArgs: [], version: v };
+      }
+      if (major === 3 && minor >= 14) {
+        console.warn(`[aktools] ${cmd} (${v}) 是 3.14+, aktools 0.0.91 已知 hang, 跳过`);
+      } else if (m) {
+        console.warn(`[aktools] ${cmd} (${v}) 不在 3.12-3.13 兼容窗口, 跳过`);
+      }
     } catch (e) { /* try next */ }
   }
   return null;
@@ -208,7 +255,13 @@ function _spawnAktools(py) {
   // 抽离 spawn 逻辑, 让 watchdog 和 boot 都能复用
   const host = _aktoolsParsed?.host || '127.0.0.1';
   const port = _aktoolsParsed?.port || 8088;
-  _aktoolsChild = spawn(py.cmd, ['-m', 'aktools', '--host', host, '--port', String(port)], {
+  // 走 scripts/start_aktools.py 启 patched aktools
+  // py.preArgs 例: ['run', '--python', '3.12', '--with', 'aktools', 'python'] (uv 路径)
+  // 或 [] (直接 python 路径)
+  // start_aktools.py 内部把 scripts/aktools-patched 加到 sys.path, 覆盖 site-packages 0.0.91
+  const startScript = path.join(__dirname, 'start_aktools.py');
+  const args = [...(py.preArgs || []), startScript, host, String(port)];
+  _aktoolsChild = spawn(py.cmd, args, {
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true
   });
@@ -264,13 +317,13 @@ async function _ensureAktools() {
     console.log(`[aktools] ${AKSHARE_TARGET} ❌ 不通, 且没找到 python/python3, 请手动跑: pip install aktools && python -m aktools --host 127.0.0.1 --port 8088`);
     return { spawned: false, ok: false, probe: initial, noPython: true };
   }
-  // 3) 先确认 aktools 模块已装
+  // 3) 先确认 aktools 模块已装 (走 py.preArgs, 兼容 uv 包装)
   try {
-    execFileSync(py.cmd, ['-c', 'import aktools'], { stdio: ['ignore', 'ignore', 'ignore'] });
+    execFileSync(py.cmd, [...(py.preArgs || []), '-c', 'import aktools'], { stdio: ['ignore', 'ignore', 'ignore'] });
   } catch (e) {
     console.log(`[aktools] ${AKSHARE_TARGET} ❌ 不通, ${py.cmd} (${py.version}) 在但 aktools 没装`);
-    console.log(`[aktools] → 安装: ${py.cmd} -m pip install aktools`);
-    console.log(`[aktools] → 然后: ${py.cmd} -m aktools --host 127.0.0.1 --port 8088`);
+    console.log(`[aktools] → 安装: ${py.cmd} ${(py.preArgs || []).join(' ')} -m pip install aktools`.replace(/\s+/g, ' '));
+    console.log(`[aktools] → 然后: ${py.cmd} ${(py.preArgs || []).join(' ')} -m aktools --host 127.0.0.1 --port 8088`.replace(/\s+/g, ' '));
     return { spawned: false, ok: false, probe: initial, noAktoolsPkg: true };
   }
   // 4) spawn aktools (走 _spawnAktools 共享 watchdog 钩子)
@@ -452,16 +505,19 @@ app.options('/health', (req, res) => {
 app.get('/health', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   // 顺便 ping aktools (Python 后端), selfCheck 一次性拿到 dev-proxy + aktools 状态
-  // ?v=daemon7-degraded-fix: 探针改用 /version (aktools 0.0.91+ 必定存在 + 无参数必返 200)
-  // 旧 bug: 用 /api/public/macro_china_lpr 探 (0.0.91 已废弃, 接口不存在) → 永远 timeout → akshare_status=down
-  //       → 联动 daemon 报 degraded
-  // 二次修: /api/public/version 也不存在 (该 endpoint 无前缀), 改用 /version (OpenAPI 确认 0.0.91+ 存在)
+  // ?v=daemon7-degraded-fix2: 探针改用 /openapi.json (fastapi 元数据, 不依赖 akshare/PyPI)
+  // 历史:
+  //   - /api/public/macro_china_lpr (v1): 0.0.91 已废弃, 接口不存在 → 永远 timeout → 误报 down
+  //   - /version (v2): 调 get_latest_version() 走 PyPI, PyPI 不通或慢就 hang → 误报 down
+  //   - /openapi.json (v3): fastapi 自身路由表, 0.0.91+ 必定存在, 不依赖外网
+  // 注意: 即便 aktools 自身接口 500 (aktools 0.0.91 + akshare 1.18.x API 不兼容, 已知上游问题),
+  //       /openapi.json 仍能返 200; 业务降级链已走 dev-proxy 内的腾讯备用源, 不依赖 aktools
   const aktoolsCheck = await new Promise((resolve) => {
-    const req2 = http.get(AKSHARE_TARGET + '/version', { timeout: 4000 }, (r2) => {
+    const req2 = http.get(AKSHARE_TARGET + '/openapi.json', { timeout: 4000 }, (r2) => {
       let body = '';
       r2.on('data', (c) => { body += c; if (body.length > 4096) body = body.slice(0, 4096); });
       r2.on('end', () => {
-        // 200 = ok (aktools 在); 其它 = down
+        // 200 = ok (aktools 进程在 + fastapi 起来了); 其它 = down
         const ok = r2.statusCode === 200;
         resolve({ ok, status: r2.statusCode, sample: body.slice(0, 200) });
       });
@@ -613,7 +669,8 @@ app.use('/api/akshare', createProxyMiddleware({
       // ?v=daemon7-degraded-fix: req.url 是原始 URL (含 /api/akshare 前缀), 转发到 aktools 是 /api/public/<item_id>
       // 旧版 log 拼 ${req.url} 误打 /api/public/api/akshare/<item_id> (路径重复假象), 实际转发 OK
       // 这里用 path (已剥前缀) 展示真实转发的目标 URL
-      const target = require('node:url').parse(req.url).pathname;  // 已剥前缀的 path
+      // ?v=dev-proxy-esm-fix: 旧版用 require('node:url').parse() 在 ESM 下 crash (uncaughtException), 改用顶层 import 的 URL
+      const target = new URL(req.url, 'http://placeholder').pathname;
       console.log(`[proxy] ${req.method} ${req.url} → ${AKSHARE_TARGET}/api/public${target}`);
     }
   }

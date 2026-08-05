@@ -169,13 +169,18 @@ async function probeDevProxy() {
   } catch (e) { return 'down'; }
 }
 async function probeAktools() {
-  // dev-proxy 自身会 watchdog aktools, 通过 dev-proxy 间接探测
-  // ?v=daemon7-degraded-fix: 改用 stock_zh_a_spot_em?symbol=000001 (0.0.91+ 必存在, 参数合法)
-  //   旧版用 stock_sy_em?symbol=test 端点不存在 + 无效参数 → 500 → 触发 dev-proxy 报警
-  //   新版 200/422 = ok (422 = 端点存在但参数不对, 我们传 000001 合法 → 200), 500/timeout = down
+  // ?v=daemon7-degraded-fix3: 改读 dev-proxy /health 的 akshare_status 字段
+  // 历史:
+  //   - stock_sy_em?symbol=test (v0): 端点不存在 + 无效参数 → 500 → 误报
+  //   - stock_zh_a_spot_em?symbol=000001 (v1): aktools 0.0.91 + akshare 1.18.x API 不兼容
+  //       → 该端点 500 → 误报 down (但其实 aktools 进程在, dev-proxy 已降级到腾讯备用源)
+  //   - /health.akshare_status (v2): dev-proxy 自身用 /openapi.json 探活, 0.0.91+ 必存在 + 不依赖外网
+  //       → 一次 HTTP 同时拿到 dev-proxy + aktools 状态, daemon 不用再独立探测
   try {
-    const r = await fetch(`${DEV_PROXY}/api/akshare/stock_zh_a_spot_em?symbol=000001`, { signal: AbortSignal.timeout(3000) });
-    return (r.status === 200 || r.status === 422) ? 'ok' : 'down';
+    const r = await fetch(`${DEV_PROXY}/health`, { signal: AbortSignal.timeout(3000) });
+    if (!r.ok) return 'down';
+    const j = await r.json();
+    return (j && j.akshare_status === 'ok') ? 'ok' : 'down';
   } catch (e) { return 'down'; }
 }
 
