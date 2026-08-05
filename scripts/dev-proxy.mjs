@@ -452,14 +452,16 @@ app.options('/health', (req, res) => {
 app.get('/health', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   // 顺便 ping aktools (Python 后端), selfCheck 一次性拿到 dev-proxy + aktools 状态
-  // 探针用 /api/public/index (aktools 列表页, 0.0.91+ 必定存在, 不需参数)
+  // ?v=daemon7-degraded-fix: 探针改用 /api/public/version (aktools 0.0.91+ 必定存在 + 无参数必返 200)
+  // 旧 bug: 用 /api/public/macro_china_lpr 探 (0.0.91 已废弃, 接口不存在) → 永远 timeout → akshare_status=down
+  //       → 联动 daemon 报 degraded
   const aktoolsCheck = await new Promise((resolve) => {
-    const req2 = http.get(AKSHARE_TARGET + '/api/public/macro_china_lpr', { timeout: 4000 }, (r2) => {
+    const req2 = http.get(AKSHARE_TARGET + '/api/public/version', { timeout: 4000 }, (r2) => {
       let body = '';
       r2.on('data', (c) => { body += c; if (body.length > 4096) body = body.slice(0, 4096); });
       r2.on('end', () => {
-        // 200/422 = ok (422 = 端点存在但参数不对); 404/500 = down
-        const ok = r2.statusCode === 200 || r2.statusCode === 422;
+        // 200 = ok (aktools 在); 其它 = down
+        const ok = r2.statusCode === 200;
         resolve({ ok, status: r2.statusCode, sample: body.slice(0, 200) });
       });
     });
@@ -607,7 +609,11 @@ app.use('/api/akshare', createProxyMiddleware({
       });
     },
     proxyReq: (proxyReq, req) => {
-      console.log(`[proxy] ${req.method} ${req.url} → ${AKSHARE_TARGET}/api/public${req.url}`);
+      // ?v=daemon7-degraded-fix: req.url 是原始 URL (含 /api/akshare 前缀), 转发到 aktools 是 /api/public/<item_id>
+      // 旧版 log 拼 ${req.url} 误打 /api/public/api/akshare/<item_id> (路径重复假象), 实际转发 OK
+      // 这里用 path (已剥前缀) 展示真实转发的目标 URL
+      const target = require('node:url').parse(req.url).pathname;  // 已剥前缀的 path
+      console.log(`[proxy] ${req.method} ${req.url} → ${AKSHARE_TARGET}/api/public${target}`);
     }
   }
 }));

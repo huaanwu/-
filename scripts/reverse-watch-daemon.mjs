@@ -170,9 +170,12 @@ async function probeDevProxy() {
 }
 async function probeAktools() {
   // dev-proxy 自身会 watchdog aktools, 通过 dev-proxy 间接探测
+  // ?v=daemon7-degraded-fix: 改用 stock_zh_a_spot_em?symbol=000001 (0.0.91+ 必存在, 参数合法)
+  //   旧版用 stock_sy_em?symbol=test 端点不存在 + 无效参数 → 500 → 触发 dev-proxy 报警
+  //   新版 200/422 = ok (422 = 端点存在但参数不对, 我们传 000001 合法 → 200), 500/timeout = down
   try {
-    const r = await fetch(`${DEV_PROXY}/api/akshare/stock_sy_em?symbol=test`, { signal: AbortSignal.timeout(3000) });
-    return (r.status >= 200 && r.status < 600) ? 'ok' : 'down';
+    const r = await fetch(`${DEV_PROXY}/api/akshare/stock_zh_a_spot_em?symbol=000001`, { signal: AbortSignal.timeout(3000) });
+    return (r.status === 200 || r.status === 422) ? 'ok' : 'down';
   } catch (e) { return 'down'; }
 }
 
