@@ -284,6 +284,14 @@
         // 局部兜底: 部分失败时记录 (老的 warn 仍输出)
         ctxDto.partialErrors.forEach(e => console.warn('[aiColleague]', e.source + ':', e.msg));
         const ctx = { holdings, alerts, recentJournals, portfolio, macro: macroText, marketWidth, sourceDigest: ctxDto.sourceDigest };
+        // P0: 注入研究池代码白名单 — 通用管家 (coach) 必须只从池子里推 code
+        // 不在池子里的代码 LLM 推了会在后处理里被丢弃 (避免越界选股)
+        try {
+          if (Core.ResearchPool && typeof Core.ResearchPool.list === 'function') {
+            const pool = await Core.ResearchPool.list();
+            ctx.researchPoolCodes = (pool || []).map(r => r.code).filter(Boolean);
+          }
+        } catch (e) { console.warn('[aiColleague] 研究池注入失败:', e); }
         // Phase 1.6: 给 observer 的 ctx 注入 sourceDigest (压缩数据来源摘要)
         if (Core.Data && Core.Data.Facade && typeof Core.Data.Facade.digest === 'function' && quoteEnvelopes.length > 0) {
           ctx.sourceDigest = Core.Data.Facade.digest(quoteEnvelopes);
@@ -882,12 +890,13 @@ ${regimeBlock ? regimeBlock + '\n' : ''}【候选值】
 【输出 JSON】
 {"assumption":"...","emotion":"...","verify":"..."}`;
 
-        const text = await Core.AI.call({
+        const text = await Core.AI.callThrough({
           systemPrompt,
           prompt: userPrompt,
           stream: false,
-          maxTokens: 200
-        });
+          maxTokens: 200,
+          page: 'journal', purpose: 'ai-colleague-assumption'
+        }, 'journal');
         // Phase T: schema 校验 (3 个字段必填字符串)
         const parsed = Core.AI.parseJsonOutput(text, {
           required: ['assumption', 'emotion', 'verify'],
@@ -1007,9 +1016,10 @@ ${content.slice(0, 800)}
 【输出 JSON】
 {"assumption":"...","emotion":"...","verify":"..."}`;
 
-        const text = await Core.AI.call({
-          systemPrompt, prompt: userPrompt, stream: false, maxTokens: 200
-        });
+        const text = await Core.AI.callThrough({
+          systemPrompt, prompt: userPrompt, stream: false, maxTokens: 200,
+          page: 'journal', purpose: 'ai-colleague-assumption-v2'
+        }, 'journal');
         const m = text.match(/\{[\s\S]*?\}/);
         if (!m) {
           if (window.toastError) toastError('AI 返回非 JSON 格式');

@@ -146,7 +146,7 @@
     try {
       // 第 1 次调用: 第二 provider 重跑同一上下文
       // local:false 强制远程, 防止"优先本地"把 baseURL 覆盖劫持到本地 LLM
-      const textB = await Core.AI.callWithTimeout({
+      const textB = await Core.AI.callThrough({
         systemPrompt: _lastBrief.systemPrompt,
         prompt: _lastBrief.prompt,
         baseURL: second.baseURL,
@@ -154,19 +154,21 @@
         model: second.model,
         local: false,
         maxTokens: 1000,
-        timeout: 90000
-      });
+        timeout: 90000,
+        page: 'stock-advisor', purpose: 'second-opinion'
+      }, 'stock-advisor');
       if (!textB || !textB.trim()) throw new Error('第二意见返回为空');
 
       extra.innerHTML = _renderSecondOpinion(_lastBrief.text, textB, mainLabel, secondLabel, null);
 
       // 第 2 次调用: 主模型对两份输出做一致性小结 (走默认配置, 尊重优先本地)
       try {
-        const summary = await Core.AI.callWithTimeout({
+        const summary = await Core.AI.callThrough({
           prompt: Core.CrossCheck.buildComparePrompt(_lastBrief.text, textB, mainLabel, secondLabel),
           maxTokens: 300,
-          timeout: 60000
-        });
+          timeout: 60000,
+          page: 'stock-advisor', purpose: 'second-opinion-summary'
+        }, 'stock-advisor');
         extra.innerHTML = _renderSecondOpinion(_lastBrief.text, textB, mainLabel, secondLabel, summary);
       } catch (e) {
         console.warn('[sa] 一致性小结失败:', e);
@@ -332,7 +334,7 @@
         }
         finalText = cachedText;
       } else {
-        await Core.AI.call({
+        await Core.AI.callThrough({
           systemPrompt,
           prompt,
           stream: true,
@@ -340,8 +342,9 @@
           onChunk: (delta, full) => {
             if (ld) ld.remove();
             if (el) el.textContent = full;
-          }
-        });
+          },
+          page: 'stock-advisor', purpose: 'ai-brief'
+        }, 'stock-advisor');
         finalText = (el && el.textContent) || '';
         // 异步写缓存 (24h TTL, 不阻塞当前 UI)
         if (finalText) {
@@ -488,7 +491,7 @@
     const prompt = `财报深度读请求:\n${JSON.stringify(data, null, 2)}\n\n请按上面 5 段结构输出。`;
 
     try {
-      await Core.AI.call({
+      await Core.AI.callThrough({
         systemPrompt,
         prompt,
         stream: true,
@@ -496,8 +499,9 @@
         onChunk: (delta, full) => {
           if (ld) ld.remove();
           if (el) el.textContent = full;
-        }
-      });
+        },
+        page: 'stock-advisor', purpose: 'deep-read'
+      }, 'stock-advisor');
       const finalText = (el && el.textContent) || '';
       if (el) el.innerHTML = window.Core.Util.renderWithSources(finalText);
 

@@ -169,6 +169,26 @@
           return true;
         });
 
+        // Phase R: 研究池边界 — AI 选股只能在用户研究的本地池子里挑
+        //    在所有条件过滤后, LLM 喂入前再砍一遍
+        try {
+          if (window.Core && Core.ResearchPool && typeof Core.ResearchPool.filterByPool === 'function') {
+            const r = await Core.ResearchPool.filterByPool(filtered);
+            if (r.poolEmpty) {
+              resultEl.innerHTML = '<div class="empty">研究池为空 (上限 ' + r.limit + ' 只)<br>请先到 🗂 研究池 页面加入想研究的股票, AI 才能选股<br><br><button class="btn btn-primary btn-sm" onclick="Router && Router.switchPage(\'pageResearchPool\')">前往研究池</button></div>';
+              return;
+            }
+            filtered = r.kept;
+            console.log('[screener] 研究池过滤: 候选 ' + r.total + ' → ' + r.kept.length + ' (池子大小 ' + r.poolSize + ')');
+            if (filtered.length === 0) {
+              resultEl.innerHTML = '<div class="empty">当前条件过滤后没有命中研究池中的股票<br>请检查研究池是否覆盖了想筛的行业, 或放宽筛选条件</div>';
+              return;
+            }
+          }
+        } catch (e) {
+          console.warn('[screener] 研究池过滤失败, 降级放行:', e);
+        }
+
         // 5) 第2层: 因子评分排名 (8 因子加权打分, 替代涨跌幅降序)
         // threshold 5000: 仅在极端全集 (~全A 5400) 时跳过评分 (财务 fetcher 单次 60s 上限)。
         // 多数场景 (硬过滤后 <5000) 都跑评分 — 没数据时安全降级到涨跌幅。
@@ -630,7 +650,7 @@ ${(() => {
 
       try {
         const streamEl = aiResultEl.querySelector('.ai-stream');
-        const fullText = await Core.AI.call({
+        const fullText = await Core.AI.callThrough({
           systemPrompt,
           prompt: userPrompt,
           stream: true,
@@ -639,8 +659,9 @@ ${(() => {
               streamEl.textContent = full;
               streamEl.scrollTop = streamEl.scrollHeight;
             }
-          }
-        });
+          },
+          page: 'screener', purpose: 'ai-suggest'
+        }, 'screener');
 
         // Phase T: schema 校验 (picks 必填, 数组, 元素对象)
         const AI_PICK_SCHEMA = {

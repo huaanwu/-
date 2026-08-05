@@ -57,22 +57,33 @@
     if (paperOnly) return { fundMkt: 0, quoteFail: 0 };
     const funds = (await window.Core.Storage.all('funds')) || [];
     let fundMkt = 0, quoteFail = 0;
-    await Promise.all(funds.map(async (f) => {
-      const shares = parseFloat(f.shares) || 0;
-      if (shares <= 0) return;
-      let nav = null;
-      try {
-        const arr = await window.Core.Data.getFundSpot(f.code);
-        if (Array.isArray(arr) && arr.length > 0) {
-          const last = arr[arr.length - 1];
-          nav = parseFloat(last.单位净值 ?? last.value) || null;
+    // BUGFIX P1-5: 原代码 `Promise.all(funds.map(...))` 一把全打, 100 只基金 = 100 并发.
+    //   aktools 没限流, 触发 429/超时后全部失败 → fundMkt 全部回退 costNav, 估值偏宽.
+    //   修后: 分批 8 并发 + 同批内 Promise.all. 200 只基金 ≈ 25s, 仍可接受, 但服务端压力降一个数量级.
+    const CONCURRENCY = 8;
+    const NAV_TASKS = funds
+      .filter(f => (parseFloat(f && f.shares) || 0) > 0)
+      .map(f => async () => {
+        let nav = null;
+        try {
+          const arr = await window.Core.Data.getFundSpot(f.code);
+          if (Array.isArray(arr) && arr.length > 0) {
+            const last = arr[arr.length - 1];
+            nav = parseFloat(last.单位净值 ?? last.value) || null;
+          }
+        } catch (e) {
+          console.warn('[Portfolio] 拉基金净值失败:', f.code, e);
         }
-      } catch (e) {
-        console.warn('[Portfolio] 拉基金净值失败:', f.code, e);
-      }
-      if (!nav) { quoteFail++; nav = parseFloat(f.costNav) || 0; }
-      fundMkt += shares * nav;
-    }));
+        if (!nav) {
+          quoteFail++;
+          nav = parseFloat(f.costNav) || 0;
+        }
+        const shares = parseFloat(f.shares) || 0;
+        fundMkt += shares * nav;
+      });
+    for (let i = 0; i < NAV_TASKS.length; i += CONCURRENCY) {
+      await Promise.all(NAV_TASKS.slice(i, i + CONCURRENCY).map(t => t()));
+    }
     return { fundMkt, quoteFail };
   }
 

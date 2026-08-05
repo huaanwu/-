@@ -1,0 +1,14 @@
+[
+  {
+    "code": "000858",
+    "name": "五粮液",
+    "shares": 300,
+    "price": 158,
+    "cost": 165,
+    "chg5": 0.08,
+    "belowMA20": false,
+    "sectorStrength": 0.68,
+    "fishTail5d": 0.06,
+    "sector": "白酒"
+  }
+]

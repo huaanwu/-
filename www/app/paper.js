@@ -53,6 +53,11 @@
   // Bug A: 盘中下单场景 (09:30~15:00) 视为 "与同日 K 并存", 单对次日及以后 K 才生效 (createdAfterClose=true)
   // _orderEligible 判定: createdAfterClose → bar.date > cd; 否则 bar.date >= cd
   const _isOutsideTradingHours = (mins) => mins < MARKET_OPEN_MINUTES || mins >= MARKET_CLOSE_MINUTES;
+  // P2-1/P2-2 兜底: 测试用 vm + mock Storage 没 transaction 方法, 退回直接执行 fn.
+  //   生产用真 Dexie transaction, 行为正确; 测试用 fallback 跑通逻辑, 不影响一致性验证.
+  const _safeTx = (Core.Storage && typeof Core.Storage.transaction === 'function')
+    ? (mode, tables, fn) => Core.Storage.transaction(mode, tables, fn)
+    : (_mode, _tables, fn) => fn();
 
   // Tier 1 Commit C: LLM 自由文本 assumption → Discipline 枚举映射
   // Core.Discipline._checkInputs 强校验 ASSUMPTIONS.includes(assumption), 必须落到枚举
@@ -296,64 +301,78 @@
         if (!price) { toastError('拉不到实时价, 无法成交'); return null; }
         const amount = shares * price;
         const fee = this._calcFee(amount, 'buy');
-        const acc = await this._getAccountRaw(sleeve);
-        if (amount + fee.total > acc.cash) {
-          toastError(`现金不足: 需 ${fmtMoney(amount + fee.total)} (含费), 可用 ${fmtMoney(acc.cash)}`);
+
+        // BUGFIX P2-2: 原代码"读 acc → 校验 cash → 读 holdings → 写 holding → 写 transaction → 写 acc"
+        //   6 步全无事务, network blip 或任一中间 await 抛错都会留半成品 (例 holding 写了但 transaction 没写,
+        //   或 acc 扣了但 holding 没动). 修后把"DB 写阶段"包在 Dexie 跨表事务 (holdings + transactions + kv) 里,
+        //   任一抛错全回滚, 现金 / 持仓 / 流水三者永远一致. 行情 IO 在事务外 (外部 fetch 不能 rollback).
+        //   兜底: 事务抛错 → catch → toast, 返 null, 行为与之前一致.
+        let h;
+        try {
+          h = await _safeTx('rw', ['holdings', 'transactions', 'kv'], async () => {
+            const acc = await this._getAccountRaw(sleeve);
+            if (amount + fee.total > acc.cash) {
+              throw new Error(`现金不足: 需 ${fmtMoney(amount + fee.total)} (含费), 可用 ${fmtMoney(acc.cash)}`);
+            }
+            // 移动加权成本 (与真实持仓 Holdings.saveTx 一致; 费用不摊入成本, 只扣现金)
+            const now = Date.now();
+            const rows = await this._getPaperHoldings(sleeve);
+            // 同 code 不同子账户各自成行 (rows 已按 sleeve 过滤)
+            let cur = rows.find(x => x.code === code) || null;
+            if (cur) {
+              const totalShares = cur.shares + shares;
+              cur.costPrice = (cur.shares * cur.costPrice + shares * price) / totalShares;
+              cur.shares = totalShares;
+              if (name && !cur.name) cur.name = name;
+              // Phase B: 加仓时若调用方给了新的假设/止损, 一并更新 (非索引字段)
+              if (opts.assumption) cur.assumption = opts.assumption;
+              if (opts.stopLoss) cur.stopLoss = opts.stopLoss;
+              if (opts.targetPrice) cur.targetPrice = opts.targetPrice;  // T3: 止盈价
+              cur.updatedAt = now;
+              await Core.Storage.put('holdings', cur);
+            } else {
+              cur = {
+                id: uuid(),
+                code,
+                // v0.2.19 修: Phase 1.6 引用了未声明的 q, 改用上面拉到的 env (Facade envelope 或 getStockQuote 单只)
+                name: name || (env && (env.name || env['名称'])) || '',
+                market: market || Core.Util.stockCodePrefix(code),
+                shares,
+                costPrice: price,
+                isPaper: true,
+                sleeve,   // T1: 新行总是写 sleeve (非索引字段); 存量老行无此字段按 'long' 处理
+                createdAt: now,
+                updatedAt: now
+              };
+              if (opts.assumption) cur.assumption = opts.assumption;
+              if (opts.stopLoss) cur.stopLoss = opts.stopLoss;
+              if (opts.targetPrice) cur.targetPrice = opts.targetPrice;  // T3: 止盈价
+              await Core.Storage.add('holdings', cur);
+            }
+            const tx = {
+              id: uuid(), holdingId: cur.id, code,
+              type: 'buy', date: opts.tradeDate || fmtDate(new Date()),
+              price, shares, fee: fee.total,
+              isPaper: true, sleeve, createdAt: now
+            };
+            // Phase B 纪律信息 (非索引字段): 假设/止损/警告快照
+            if (opts.assumption) tx.assumption = opts.assumption;
+            if (opts.stopLoss) tx.stopLoss = opts.stopLoss;
+            if (opts.disciplineWarns && opts.disciplineWarns.length) tx.disciplineWarns = opts.disciplineWarns;
+            if (opts.auto) tx.auto = true;  // Phase C: AI 自动成交标记 (日终小结 🤖)
+            // Phase D1: pre-mortem 证伪/失效条件 (非索引字段, 事后验证对照用)
+            if (opts.falsifyCondition) tx.falsifyCondition = opts.falsifyCondition;
+            if (opts.invalidation) tx.invalidation = opts.invalidation;
+            await Core.Storage.add('transactions', tx);
+            acc.cash = +(acc.cash - amount - fee.total).toFixed(2);
+            await this._saveAccountRaw(sleeve, acc);
+            return cur;
+          });
+        } catch (txErr) {
+          console.warn('[Paper] 买入事务失败:', txErr);
+          toastError(txErr.message || '模拟买入失败');
           return null;
         }
-
-        // 移动加权成本 (与真实持仓 Holdings.saveTx 一致; 费用不摊入成本, 只扣现金)
-        const now = Date.now();
-        const rows = await this._getPaperHoldings(sleeve);
-        // 同 code 不同子账户各自成行 (rows 已按 sleeve 过滤)
-        let h = rows.find(x => x.code === code) || null;
-        if (h) {
-          const totalShares = h.shares + shares;
-          h.costPrice = (h.shares * h.costPrice + shares * price) / totalShares;
-          h.shares = totalShares;
-          if (name && !h.name) h.name = name;
-          // Phase B: 加仓时若调用方给了新的假设/止损, 一并更新 (非索引字段)
-          if (opts.assumption) h.assumption = opts.assumption;
-          if (opts.stopLoss) h.stopLoss = opts.stopLoss;
-          if (opts.targetPrice) h.targetPrice = opts.targetPrice;  // T3: 止盈价
-          h.updatedAt = now;
-          await Core.Storage.put('holdings', h);
-        } else {
-          h = {
-            id: uuid(),
-            code,
-            // v0.2.19 修: Phase 1.6 引用了未声明的 q, 改用上面拉到的 env (Facade envelope 或 getStockQuote 单只)
-            name: name || (env && (env.name || env['名称'])) || '',
-            market: market || Core.Util.stockCodePrefix(code),
-            shares,
-            costPrice: price,
-            isPaper: true,
-            sleeve,   // T1: 新行总是写 sleeve (非索引字段); 存量老行无此字段按 'long' 处理
-            createdAt: now,
-            updatedAt: now
-          };
-          if (opts.assumption) h.assumption = opts.assumption;
-          if (opts.stopLoss) h.stopLoss = opts.stopLoss;
-          if (opts.targetPrice) h.targetPrice = opts.targetPrice;  // T3: 止盈价
-          await Core.Storage.add('holdings', h);
-        }
-        const tx = {
-          id: uuid(), holdingId: h.id, code,
-          type: 'buy', date: opts.tradeDate || fmtDate(new Date()),
-          price, shares, fee: fee.total,
-          isPaper: true, sleeve, createdAt: now
-        };
-        // Phase B 纪律信息 (非索引字段): 假设/止损/警告快照
-        if (opts.assumption) tx.assumption = opts.assumption;
-        if (opts.stopLoss) tx.stopLoss = opts.stopLoss;
-        if (opts.disciplineWarns && opts.disciplineWarns.length) tx.disciplineWarns = opts.disciplineWarns;
-        if (opts.auto) tx.auto = true;  // Phase C: AI 自动成交标记 (日终小结 🤖)
-        // Phase D1: pre-mortem 证伪/失效条件 (非索引字段, 事后验证对照用)
-        if (opts.falsifyCondition) tx.falsifyCondition = opts.falsifyCondition;
-        if (opts.invalidation) tx.invalidation = opts.invalidation;
-        await Core.Storage.add('transactions', tx);
-        acc.cash = +(acc.cash - amount - fee.total).toFixed(2);
-        await this._saveAccountRaw(sleeve, acc);
         toastSuccess(`模拟买入 ${code} ${shares} 股 @ ${price} (费 ${fmtMoney(fee.total)})`);
         return h;
       } catch (e) {
@@ -448,9 +467,18 @@
         const acc = await this._getAccountRaw(sleeve);
         acc.cash = acc.initialCash;
         await this._saveAccountRaw(sleeve, acc);
-        // 快照是双账户合并口径 (含 shortTotal), 只在重置长线时清空 (保持历史行为);
-        // 短线重置不动曲线, 次日起 shortTotal 自然回到初始资金
-        if (sleeve === 'long') await Core.Storage.kvSet('paper_snapshots', []);
+        // 快照是双账户合并口径 (paperTotal + shortTotal + realTotal 共用一行).
+        // BUGFIX P1-1: 原代码长线重置时 `kvSet('paper_snapshots', [])` 把整张表清空,
+        //   短线历史曲线 + 真实持仓曲线一并归零, 用户根本没动 short/real 却被擦.
+        //   修后: 长线重置只删今天起的快照 (paperTotal 段从初始资金重新计), 短线和真实段保留.
+        //   短线重置不动快照 (paper_snapshots 里有 shortTotal, 但短线持有的 paper_cond_orders
+        //   / paper_short_positions / paper_cond_settle 已在下方清, shortTotal 明天自然回到初始)
+        if (sleeve === 'long') {
+          const today = fmtDate(new Date());
+          const snaps = (await Core.Storage.kvGet('paper_snapshots')) || [];
+          const kept = snaps.filter(s => s && s.date < today);
+          await Core.Storage.kvSet('paper_snapshots', kept);
+        }
         // T3: 短线重置连带清空条件单/在持仓位跟踪/结算记录 (与持仓同属短线账本)
         if (sleeve === 'short') {
           await Core.Storage.kvSet('paper_cond_orders', []);
@@ -478,7 +506,21 @@
     async snapshotIfNeeded() {
       const today = fmtDate(new Date());
       const snaps = (await Core.Storage.kvGet('paper_snapshots')) || [];
-      if (snaps.some(s => s.date === today)) return snaps;
+      // BUGFIX P1-3: 原代码 `snaps.some(s => s.date === today)` 直接 return, 当天快照已存在就跳过.
+      //   但 T1 升级前的快照 (无 shortTotal 字段) 永远拿不到补字段, 曲线断段.
+      //   修后: 已有当天快照但缺 shortTotal → 补字段后落库再 return, 不重算 paperTotal/realTotal.
+      const todaySnap = snaps.find(s => s && s.date === today);
+      if (todaySnap) {
+        if (todaySnap.shortTotal == null) {
+          // 当天快照缺 shortTotal, 现算补上 (沿用同日的真实行情快照时点, 不影响 paperTotal/realTotal)
+          const shortAcc = await this._getAccountRaw('short');
+          const shortPositions = await this.getPositions('short');
+          const shortTotal = shortAcc.cash + shortPositions.reduce((s, p) => s + (p.mkt || 0), 0);
+          todaySnap.shortTotal = +shortTotal.toFixed(2);
+          await Core.Storage.kvSet('paper_snapshots', snaps);
+        }
+        return snaps;
+      }
 
       const acc = await this._getAccountRaw('long');
       const positions = await this.getPositions('long');
@@ -1002,19 +1044,34 @@
         // Bug C 修复 (同代码去重): 同 code 已有 pending 单或已持 short 仓 → 拒绝
         // 防多张同代码单叠加触发导致持仓翻倍越过 positionPct=0.20 纪律线
         // (加仓应建新方向单 above 突破买入, 而非重复 below 回调买入)
+        // BUGFIX P2-1: 原代码"读 paper_cond_orders → 查 dup → 查 holdings → 写 paper_cond_orders"
+        //   三步全无事务, 两个 tab / 两个 AI 流程并发 addCondOrder({code:'600519'}) 时都过校验
+        //   都会写库, 产生两条相同 pending 单, 后续触发后翻倍越 positionPct=0.20 纪律线.
+        //   修后: 整个"校验 + 写"包在 Dexie 跨表事务 (kv + holdings) 里, 第二次调用看到已写的
+        //   pending 立即被 dupPending 拒绝. 兜底: 事务抛错 → 外层 catch 转 toast, 不写半成品.
+        const code = String(order.code || '');
         if (!errs.length) {
-          const code = String(order.code || '');
-          const list = (await Core.Storage.kvGet('paper_cond_orders')) || [];
-          const dupPending = list.find(o => o && o.code === code && o.status === 'pending');
-          if (dupPending) {
-            errs.push(`同代码 ${code} 已有未触发的条件单 (方向 ${dupPending.triggerDirection} / 触发价 ${dupPending.triggerPrice}). 加仓请建新方向单`);
-          } else {
-            const holdings = (await Core.Storage.all('paper_holdings')) || [];
-            const sameShort = holdings.find(h => h && h.code === code && (h.sleeve === 'short' || !h.sleeve));
-            if (sameShort && sameShort.shares > 0) {
+          await _safeTx('rw', ['kv', 'holdings'], async () => {
+            const list = (await Core.Storage.kvGet('paper_cond_orders')) || [];
+            const dupPending = list.find(o => o && o.code === code && o.status === 'pending');
+            if (dupPending) {
+              errs.push(`同代码 ${code} 已有未触发的条件单 (方向 ${dupPending.triggerDirection} / 触发价 ${dupPending.triggerPrice}). 加仓请建新方向单`);
+              return;
+            }
+            // BUGFIX P0-1: 原代码查 'paper_holdings' 表, 但 schema 里只有 'holdings' (用 isPaper=true 标记模拟盘).
+            //   生产中 d.paper_holdings.toArray() 抛 TypeError → 外层 try/catch 转 "条件单创建失败",
+            //   首张单永远建不上去. 修后查 holdings + isPaper + sleeve 过滤 (与 _getPaperHoldings 一致).
+            //   存量行无 sleeve 字段按 'long' 处理, 短线判定要严防 long 仓位误命中.
+            const holdings = (await Core.Storage.all('holdings')) || [];
+            const sameShort = holdings.find(h =>
+              h && h.isPaper && h.shares > 0
+              && h.code === code
+              && (h.sleeve || 'long') === 'short'
+            );
+            if (sameShort) {
               errs.push(`已持有 ${code} 短线仓位 (${sameShort.shares} 股 @ ${sameShort.costPrice}). 加仓请建新方向单`);
             }
-          }
+          });
         }
 
         if (errs.length) {
@@ -1054,9 +1111,29 @@
           expireAt: now + COND_ORDER_EXPIRE_DAYS * 24 * 60 * 60 * 1000,
           filledAt: null, fillPrice: null, holdingId: null
         };
-        const list = (await Core.Storage.kvGet('paper_cond_orders')) || [];
-        list.push(rec);
-        await Core.Storage.kvSet('paper_cond_orders', list.slice(-COND_ORDER_LIMIT));
+        // 写也在同一事务里, 防校验通过后被并发 addCondOrder 抢写
+        let writeResult = null;
+        try {
+          writeResult = await _safeTx('rw', ['kv'], async () => {
+            const list = (await Core.Storage.kvGet('paper_cond_orders')) || [];
+            // 二次 dup 检查 (在事务内, 看到的是同一事务开始时的快照 + 自己的写)
+            // 事务间隔离由 Dexie 处理: 并发第二个事务读到的就是这里写完的 list
+            const dup = list.find(o => o && o.code === rec.code && o.status === 'pending');
+            if (dup) return { ok: false, dupId: dup.id };
+            list.push(rec);
+            await Core.Storage.kvSet('paper_cond_orders', list.slice(-COND_ORDER_LIMIT));
+            return { ok: true };
+          });
+        } catch (e) {
+          // 事务整体抛错 → toast, 返错
+          console.warn('[Paper] addCondOrder 写入事务失败:', e);
+          toastError('条件单创建失败: ' + e.message);
+          return { ok: false, errors: [e.message] };
+        }
+        if (writeResult && !writeResult.ok) {
+          toastError(`条件单校验失败: 同代码 ${rec.code} 已有未触发的条件单 (并发抢写)`);
+          return { ok: false, errors: [`同代码 ${rec.code} 已有未触发的条件单 (并发抢写)`] };
+        }
         toastSuccess(`条件单已创建: ${rec.code} ${rec.triggerDirection === 'below' ? '回调到' : '突破'} ${rec.triggerPrice} 买入 ${shares} 股`);
         return { ok: true, order: rec };
       } catch (e) {
@@ -1328,6 +1405,9 @@
       o.filledAt = Date.now();
       o.fillPrice = fillPrice;
       o.holdingId = h.id;
+      // BUGFIX P1-2: amount 原本用 triggerPrice 算, 实际成交价可能是 bar.open (跳空)
+      //   或 triggerPrice (盘中触及), 用成交价重算, 跟 buy 内 transactions 行 amount 口径对齐
+      o.amount = +(fillPrice * o.shares).toFixed(2);
       summary.filled++;
       // 在持仓位跟踪: 止损/止盈/持有天数锚点 (lastSettleBarDate=成交 K, 当日不再重复结算)
       const positions = (await Core.Storage.kvGet('paper_short_positions')) || [];
@@ -1358,11 +1438,25 @@
     async _settleExit(p, bar, act, summary) {
       const h = await Core.Storage.get('holdings', p.holdingId);
       if (!h || !h.isPaper) {
-        // 持仓已被手动卖掉/重置 → 跟踪行直接关闭, 不再卖
+        // BUGFIX P2-4: 持仓已不存在 (用户手动卖/重置) 静默关闭跟踪行, 无 journal 留痕.
+        //   复盘时用户看不到"为什么仓位消失" → 写一条 journal 记录关闭原因 + 触发 K 线.
         p.closed = true;
         p.exitDate = bar.date;
         p.exitReason = '持仓已不存在 (手动卖出或重置)';
         console.warn(`[Paper] 短线仓位跟踪关闭 ${p.code}: 持仓行不存在`);
+        await this._writeCondJournal({
+          code: p.code, name: p.name,
+          title: `⚡ 短线仓位跟踪关闭: ${p.code} ${p.name || ''}`,
+          lines: [
+            `## ⚡ 短线仓位跟踪关闭 - ${p.code} ${p.name || ''}`, '',
+            `**判定 K 线**: ${bar.date}`,
+            `**原因**: 持仓行已不存在 (用户手动卖出 / 账户重置) — 本想按 ${act.reason} 出场, 跟踪行关闭`,
+            `**入场**: ${p.entryDate} @ ${p.entryPrice} → **关闭**: ${bar.date}`,
+            `**止损/目标**: ${p.stopLoss} / ${p.targetPrice}`, '',
+            '---',
+            '*本条由 StockMaster 条件单引擎 (T3) 自动记录*'
+          ]
+        }).catch(e => console.warn('[Paper] 留痕 journal 失败:', e));
         return;
       }
       const shares = Math.min(p.shares || h.shares, h.shares);

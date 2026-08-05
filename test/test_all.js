@@ -7670,8 +7670,10 @@ section('[44] Bug C 同代码去重: addCondOrder 拒绝同 code pending/已持�
       kv: {
         paper_account_short: { initialCash: 30000, cash: 30000, createdAt: 1, positionPct: 0.20 }
       },
+      // BUGFIX P0-1: 真实生产用 holdings 表 (isPaper + sleeve 过滤), 旧 paper_holdings 已废弃
       tables: {
-        paper_holdings: []
+        paper_holdings: [],
+        holdings: []
       },
       quotes: {}, indexSpot: []
     };
@@ -7794,10 +7796,11 @@ section('[44] Bug C 同代码去重: addCondOrder 拒绝同 code pending/已持�
     } else fail('44.c', JSON.stringify(r3));
 
     // 44.d 清掉 pending, 加一个 short 持仓, 再建同代码 → 拒绝 (已持仓)
+    // BUGFIX P0-1: 模拟盘持仓在 'holdings' 表 + isPaper=true + sleeve 字段 (不是单独的 paper_holdings 表)
     storeC.kv.paper_cond_orders = [];
-    storeC.tables.paper_holdings = [{
-      code: '000001', name: '平安银行', shares: 100, costPrice: 10, sleeve: 'short',
-      boughtAt: Date.now(), source: 'ai'
+    storeC.tables.holdings = [{
+      id: 'h-short-1', code: '000001', name: '平安银行', shares: 100, costPrice: 10,
+      isPaper: true, sleeve: 'short', boughtAt: Date.now(), source: 'ai'
     }];
     const r4 = await PC.addCondOrder({
       code: '000001', triggerDirection: 'above', triggerPrice: 11,
@@ -7808,9 +7811,10 @@ section('[44] Bug C 同代码去重: addCondOrder 拒绝同 code pending/已持�
     } else fail('44.d', JSON.stringify(r4));
 
     // 44.e 长线持仓 (sleeve=long) 不算短线的"同代码已持仓", 短线条件单允许
-    storeC.tables.paper_holdings = [{
-      code: '000001', name: '平安银行', shares: 1000, costPrice: 10, sleeve: 'long',
-      boughtAt: Date.now(), source: 'manual'
+    // 同步清掉 short 持仓, 否则 44.d 留下的持仓会拦 44.e
+    storeC.tables.holdings = [{
+      id: 'h-long-1', code: '000001', name: '平安银行', shares: 1000, costPrice: 10,
+      isPaper: true, sleeve: 'long', boughtAt: Date.now(), source: 'manual'
     }];
     const r5 = await PC.addCondOrder({
       code: '000001', triggerDirection: 'below', triggerPrice: 10,
@@ -7844,7 +7848,8 @@ section('[45] Bug F 空跑 lastSettleDate: codes.size===0 / 0 笔不写 lastSett
       kv: {
         paper_account_short: { initialCash: 30000, cash: 30000, createdAt: 1, positionPct: 0.20 }
       },
-      tables: { paper_holdings: [] },
+      // BUGFIX P0-1: 真实生产用 holdings 表 (isPaper + sleeve 过滤), 旧 paper_holdings 已废弃
+      tables: { paper_holdings: [], holdings: [] },
       quotes: {}, indexSpot: [],
       // kline 兜底返空数组, 让 settle 不会真成交
       klineByCode: {}
@@ -8219,7 +8224,7 @@ section('[48] Bug E 跳空跌破止损: bar.open<stopLoss+有成本价 → 取�
     const paperSrc = readFileSafe(path.join(WWW, 'app', 'paper.js'));
     if (!paperSrc) throw new Error('paper.js 读不到');
     const K = _loadRealConstants();
-    const storeE = { kv: {}, tables: { paper_holdings: [] }, quotes: {}, indexSpot: [], klineByCode: {} };
+    const storeE = { kv: {}, tables: { paper_holdings: [], holdings: [] }, quotes: {}, indexSpot: [], klineByCode: {} };
     const buildCtx = () => {
       const pctx = {
         window: {}, console,

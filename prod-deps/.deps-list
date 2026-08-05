@@ -1,3 +1,13 @@
+@protobufjs/aspromise
+@protobufjs/base64
+@protobufjs/codegen
+@protobufjs/eventemitter
+@protobufjs/fetch
+@protobufjs/float
+@protobufjs/inquire
+@protobufjs/path
+@protobufjs/pool
+@protobufjs/utf8
 @types/http-proxy
 @types/node
 accepts
@@ -12,12 +22,10 @@ cookie
 cookie-signature
 debug
 depd
-dunder-proto
 ee-first
 encodeurl
 es-define-property
 es-errors
-es-object-atoms
 escape-html
 etag
 eventemitter3
@@ -27,12 +35,7 @@ finalhandler
 follow-redirects
 forwarded
 fresh
-function-bind
 get-intrinsic
-get-proto
-gopd
-has-symbols
-hasown
 http-errors
 http-proxy
 http-proxy-middleware
@@ -44,7 +47,7 @@ is-glob
 is-number
 is-plain-object
 is-promise
-math-intrinsics
+long
 media-typer
 merge-descriptors
 micromatch
@@ -58,6 +61,7 @@ once
 parseurl
 path-to-regexp
 picomatch
+protobufjs
 proxy-addr
 qs
 range-parser
@@ -76,6 +80,7 @@ statuses
 to-regex-range
 toidentifier
 type-is
+undici-types
 unpipe
 vary
 wrappy

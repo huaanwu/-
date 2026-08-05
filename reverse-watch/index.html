@@ -1,0 +1,183 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>反向策略工作台 · Reverse Watch</title>
+  <link rel="stylesheet" href="./style.css?v=auto-tune-pending-ui1">
+</head>
+<body>
+  <!-- ========== Header 顶部 ========== -->
+  <header class="app-header">
+    <div class="brand">
+      <span class="brand-icon">🔄</span>
+      <h1>反向策略 · 你拍板</h1>
+      <span class="version-badge">v0.2.28</span>
+    </div>
+    <div class="header-meta">
+      <span id="metaLine"></span>
+      <button id="refreshBtn" class="btn-icon" title="刷新数据">🔄</button>
+      <button id="settingsBtn" class="btn-icon" title="设置">⚙️</button>
+    </div>
+  </header>
+
+  <!-- ========== Toast 容器 ========== -->
+  <div id="toastBox"></div>
+
+  <!-- ========== F1 KPI 5 徽章 ========== -->
+  <section class="section">
+    <div class="section-title">📊 KPI · 今日一览</div>
+    <div class="kpi-row" id="kpiRow"></div>
+  </section>
+
+  <!-- ========== F2 4 闸状态灯 ========== -->
+  <section class="section">
+    <div class="section-title">🚦 4 闸状态灯</div>
+    <div class="gates-row" id="gatesRow"></div>
+  </section>
+
+  <!-- ========== F3 5 台AI 推荐 ========== -->
+  <section class="section">
+    <div class="section-title">💡 AI 推荐 · 5 源</div>
+    <div class="rec-grid" id="recGrid"></div>
+  </section>
+
+  <!-- ========== F4 4 池快照 ========== -->
+  <section class="section">
+    <div class="section-title">🪙 4 池快照</div>
+    <div class="pools-row" id="poolsRow"></div>
+  </section>
+
+  <!-- ========== F4.5 选股逻辑漏斗 ========== -->
+  <section class="section">
+    <div class="section-title">📐 选股漏斗 · 4 层过滤</div>
+    <div class="funnel" id="funnelBox"></div>
+  </section>
+
+  <!-- ========== F4.6 持仓规律 ========== -->
+  <section class="section">
+    <div class="section-title">⚙️ 持仓规律 · 融合 5 源心得</div>
+    <div class="holding-rules" id="holdingRules"></div>
+  </section>
+
+  <!-- ========== F4.7 AI 全能管家 ========== -->
+  <section class="section">
+    <div class="section-title">🧠 AI 管家 · 全页观点</div>
+    <div id="butlerPanel"></div>
+  </section>
+
+  <!-- ========== F4.8 Daemon 操盘大脑 (?v=daemon1) ========== -->
+  <section class="section" id="daemonPanel">
+    <div class="section-title">🤖 操盘大脑 · 7 规则联动</div>
+    <div id="daemonPanelBody">
+      <div class="daemon-status-card" id="daemonStatusCard">
+        <div class="ds-head">
+          <div class="ds-title">
+            <span class="ds-pulse" id="daemonPulse"></span>
+            <span id="daemonTitle">Daemon · 加载中…</span>
+          </div>
+          <div class="ds-meta" id="daemonMeta"></div>
+        </div>
+        <div class="ds-row" id="daemonRow"></div>
+        <div class="daemon-alerts" id="daemonAlerts"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========== F4.9 持仓管理 (?v=daemon3 P0 #150 + ?v=daemon4 P0 #180 资金源) ==========
+       极简手动录入: code + shares + price → daemon fs 同步 (holdings-bridge)
+       顶部现金源 cash + 持仓 + 总资产 + 仓位% + 编辑 → daemon fs (account-bridge)
+       daemon 7 规则依赖 holdings.json + account.json, 两个都录入才能正常跑 -->
+  <section class="section" id="holdingsPanel">
+    <div class="section-title">📋 我的持仓 · 联动 daemon 7 规则</div>
+    <div id="holdingsPanelBody">
+      <div class="holdings-cash-bar" id="holdingsCashBar"></div>
+      <div class="holdings-add-bar">
+        <input type="text" id="holdingsCodeInput" placeholder="代码 (如 600519)" maxlength="6" class="holdings-input">
+        <input type="number" id="holdingsSharesInput" placeholder="股数" min="100" step="100" class="holdings-input">
+        <input type="number" id="holdingsPriceInput" placeholder="成本价" min="0.01" step="0.01" class="holdings-input">
+        <button id="holdingsAddBtn" class="btn-primary">➕ 添加</button>
+        <button id="holdingsSeedBtn" class="btn-secondary" title="写入 3 台mock holdings 演示">🧪 mock</button>
+      </div>
+      <div id="holdingsList" class="holdings-list"></div>
+      <div id="holdingsHint" class="holdings-hint">录入后 daemon 自动通过 :8090 同步到 fs, 下次 slot 触发 7 规则联动</div>
+    </div>
+  </section>
+
+  <!-- ========== F5 隐藏信息 ========== -->
+  <section class="section">
+    <div class="section-title">🔍 隐藏信息</div>
+    <div class="hidden-box" id="hiddenBox"></div>
+  </section>
+
+  <!-- ========== F6 自选下单对话框 ========== -->
+  <div id="buyDialog" class="modal hidden">
+    <div class="modal-content">
+      <h2>📝 自选下单</h2>
+      <div id="buyDialogBody"></div>
+      <div class="modal-actions">
+        <button id="buyCancel" class="btn-secondary">取消</button>
+        <button id="buyConfirm" class="btn-primary">确认下单</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========== F7 详情对话框 ========== -->
+  <div id="detailDialog" class="modal hidden">
+    <div class="modal-content">
+      <h2>🔍 详情</h2>
+      <div id="detailDialogBody"></div>
+      <div class="modal-actions">
+        <button id="detailClose" class="btn-secondary">关闭</button>
+        <button id="detailGoBuy" class="btn-primary">📝 去下单</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========== F8 设置对话框 ========== -->
+  <div id="settingsDialog" class="modal hidden">
+    <div class="modal-content">
+      <h2>⚙️ 设置 · 数据源 + 4 闸阈值</h2>
+      <div id="settingsDialogBody"></div>
+      <div class="modal-actions">
+        <button id="settingsCancel" class="btn-secondary">取消</button>
+        <button id="settingsSave" class="btn-primary">💾 保存</button>
+      </div>
+    </div>
+  </div>
+
+  <footer class="app-footer">
+    <span>反向策略 · 你拍板 + 4 闸兜底</span>
+    <span class="dot">·</span>
+    <span id="sourceLine">数据源 · 本地缓存 · aktools dev-proxy · akshare</span>
+  </footer>
+
+  <script type="module" src="./app.js?v=auto-tune-pending-ui1-detail-holdings-fallback1-butler-cache6-fix2"></script>
+  <script type="module" src="./state-adapter.mjs?v=butler-cache5"></script>
+  <script type="module" src="./holdings-bridge.mjs?v=butler-cache5"></script>
+  <script type="module" src="./account-bridge.mjs?v=butler-cache5"></script>
+  <script type="module" src="./holdings-ui.js?v=holdings-detail-fix1"></script>
+  <script type="module" src="./strategy/screener-pure.mjs?v=butler-cache5"></script>
+  <script type="module" src="./strategy/regime-detector-pure.mjs?v=butler-cache5"></script>
+  <script type="module" src="./strategy/strategy-bull.js?v=learn5-risk2-warm7-tune1-daemon7-ai-fallback1-logic2-fix9"></script>
+  <script type="module" src="./strategy/strategy-bear.js?v=learn5-risk2-warm7-tune1-daemon7-ai-fallback1-logic2-fix9"></script>
+  <script type="module" src="./strategy/strategy-range.js?v=learn5-risk2-warm7-tune1-daemon7-ai-fallback1-logic2-fix9"></script>
+  <script type="module" src="./strategy/strategy-dispatcher.js?v=learn5-risk2-warm7-tune1-daemon7-ai-fallback1-logic2-fix9"></script>
+  <script type="module" src="./strategy/regime-ui.js?v=learn5-risk2-warm7-tune1-daemon7-ai-fallback1-logic2-fix9"></script>
+  <script type="module" src="./ai/ai-adapter.js?v=learn5-risk2-warm7-tune1-daemon7-ai-fallback1-logic2-fix9-ai-detail-fix3-env3"></script>
+  <script type="module" src="./ai/ai-detail.js?v=learn5-risk2-warm7-tune1-daemon7-ai-fallback1-logic2-fix9-ai-detail-fix1"></script>
+  <script type="module" src="./ai/ai-butler.js?v=butler-cache6"></script>
+  <script type="module" src="./ai/daemon-status-ui.js?v=butler-cache5"></script>
+  <script type="module" src="./ai/ai-push.js?v=learn5-risk2-warm7-tune1-daemon7-ai-fallback1-logic2-fix9"></script>
+  <script type="module" src="./ai/ai-feedback.js?v=learn5-risk2-warm7-tune1-daemon7-ai-fallback1-logic2-fix9"></script>
+  <script type="module" src="./ai/ai-chat.js?v=learn5-risk2-warm7-tune1-daemon7-ai-fallback1-logic2-fix9"></script>
+  <script type="module" src="./ai/risk-mine-pure.mjs?v=butler-cache5"></script>
+  <script type="module" src="./ai/risk-mine.js?v=butler-cache5"></script>
+  <script type="module" src="./auto-tuner-pure.mjs?v=butler-cache5"></script>
+  <script type="module" src="./auto-tuner.js?v=butler-cache5"></script>
+</body>
+</html>
+
+
+
+

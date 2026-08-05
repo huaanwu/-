@@ -20,6 +20,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const WWW = path.join(ROOT, 'www');
 const DIST = path.join(WWW, 'dist');
+const DIST_SNAPSHOT = path.join(WWW, '.dist-snapshot');
 const ASSETS = path.join(WWW, 'assets');
 
 async function exists(p) {
@@ -137,6 +138,12 @@ async function main() {
     await fs.writeFile(swOut, sw);
     console.log(`  [sw] CACHE_NAME → ${stamp} (旧缓存随新 SW activate 自动清理)`);
   }
+
+  // 3.9) 保留 dist 临时副本到 .dist-snapshot/ (gitignored) 便于手工核验
+  //      Git 不跟踪 .dist-snapshot/, 这里直接覆盖上次
+  console.log('  [cp] dist/ → .dist-snapshot/ (临时副本)');
+  await rimraf(DIST_SNAPSHOT);
+  await copyDir(DIST, DIST_SNAPSHOT);
 
   // 4) 清理 dist/
   await rimraf(DIST);

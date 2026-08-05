@@ -1,0 +1,21 @@
+{
+  "singleStockMaxPct": 0.05,
+  "basePoolMaxPct": 0.2,
+  "shortTermMaxPct": 0.03,
+  "cashReservePct": 0.1,
+  "totalStockMaxPct": 0.9,
+  "shortStopLossPct": 0.03,
+  "midStopBelowMA": 10,
+  "baseStopBelowMA": 30,
+  "monthlyMaxDrawdown": 0.05,
+  "singleReviewPct": 0.05,
+  "singleIndustryMaxPct": 0.2,
+  "sameAssumptionMaxPct": 0.2,
+  "addOnProfitPct": 0.03,
+  "addMaxRatio": 0.5,
+  "addCooldownDays": 1,
+  "fishTailTrimPct": 0.1,
+  "sectorWeakPct": 0.6,
+  "trapLockHours": 12,
+  "positionMultiplier": 0
+}

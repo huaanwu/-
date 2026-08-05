@@ -57,9 +57,17 @@
     },
     handler: async ({ pageId }) => {
       if (!Core.Router || !Core.Router.switchPage) throw new Error('Core.Router 未就绪');
-      const valid = ['pageWatchlist','pageAccount','pageHoldings','pagePaper','pageJournal',
-        'pageScreener','pageStockAdvisor','pageShortTrader','pageLongTrader','pageBacktest',
-        'pageAlerts','pageFund','pageSettings'];
+      // BUGFIX P2-9: 原代码写死 13 个 pageId, 新增页面要手动同步, 容易漏.
+      //   修后用 Core.Router.listPages() 从 DOM 实时扫 .nav-item + .page[id],
+      //   新增 page 自动在白名单, 无需改本文件.
+      //   兜底: DOM 不可用 (vm 测试 / 极简环境) 时用内置 fallback, 保证向后兼容.
+      let valid = (Core.Router.listPages && typeof Core.Router.listPages === 'function')
+        ? Core.Router.listPages() : [];
+      if (valid.length === 0) {
+        valid = ['pageWatchlist','pageAccount','pageHoldings','pagePaper','pageJournal',
+          'pageScreener','pageStockAdvisor','pageShortTrader','pageLongTrader','pageBacktest',
+          'pageAlerts','pageFund','pageSettings'];
+      }
       if (!valid.includes(pageId)) throw new Error('未知页面: ' + pageId + ', 可用: ' + valid.join(', '));
       Core.Router.switchPage(pageId);
       return { navigated: pageId };
@@ -153,9 +161,15 @@
       additionalProperties: false
     },
     handler: async ({ code }) => {
-      await Core.Storage.remove('alerts', code);
+      // BUGFIX P0-3: 原代码直接 remove('alerts', code), 但 alerts 表主键是 id (UUID) 不是 code.
+      //   6 位代码 '600519' 不会匹配任何 id → 工具永远删不成功.
+      //   修后按 code 索引查所有匹配行, 再逐个按 id 删.
+      const matched = (await Core.Storage.where('alerts', 'code', code)) || [];
+      for (const a of matched) {
+        await Core.Storage.remove('alerts', a.id);
+      }
       if (window.Alerts && window.Alerts.render) window.Alerts.render();
-      return { removed: code };
+      return { removed: code, count: matched.length };
     }
   });
 
@@ -194,7 +208,8 @@
     description: '列出复盘笔记',
     input_schema: { type: 'object', properties: {}, additionalProperties: false },
     handler: async () => {
-      const list = await Core.Storage.all('journal');
+      // BUGFIX P0-2: 表名是 'journals' (复数), 原 'journal' 永远返空
+      const list = await Core.Storage.all('journals');
       return { count: list.length, items: list };
     }
   });
@@ -214,8 +229,9 @@
       additionalProperties: false
     },
     handler: async ({ title, content }) => {
+      // BUGFIX P0-2: 表名是 'journals' (复数), 原 'journal' 抛 TypeError
       const id = 'manual-' + Date.now();
-      await Core.Storage.add('journal', { id, title, content, createdAt: Date.now() });
+      await Core.Storage.add('journals', { id, title, content, createdAt: Date.now() });
       if (window.Journal && window.Journal.render) window.Journal.render();
       return { saved: id, title };
     }
@@ -228,7 +244,8 @@
     description: '列出账户流水 (近 10 条)',
     input_schema: { type: 'object', properties: {}, additionalProperties: false },
     handler: async () => {
-      const list = await Core.Storage.all('account');
+      // BUGFIX P0-2: 资金流水表名是 'cashflow', 原 'account' 永远返空
+      const list = await Core.Storage.all('cashflow');
       return { count: list.length, recent: list.slice(-10) };
     }
   });

@@ -127,6 +127,22 @@
   };
 
   window.Fund.aiAdvisorRun = async function() {
+    // Phase 5: lazy 注册 'fund' strategy 到 Entry (只在第一次调用时注册)
+    try {
+      if (window.Core && Core.AI && Core.AI.Entry && typeof Core.AI.Entry.register === 'function'
+          && !Core.AI.Entry.list().fund) {
+        Core.AI.Entry.register('fund', {
+          description: '基金 sleeve AI 顾问 (调仓建议 + 风险解读)',
+          version: 'v1',
+          risk: 'M'
+        }, async function (ctx, opts) {
+          // fund 的 AI 调用散布在多处 (rebalance / weekly-report / 选基), handler 作为占位
+          // 真实 AI call 仍在 aiAdvisorRun 内部走 callThrough, Entry.run 走 fund strategy 主要
+          // 用于统一 runId + Tracing 串联 (调用方可选)
+          return { ok: true, data: { stub: true }, summary: 'fund strategy 已注册 (内部调用走 callThrough)', raw: null, error: null };
+        });
+      }
+    } catch (e) { console.warn('[Fund] Entry.register 跳过:', e); }
     const amount = parseFloat(document.getElementById('aiAmount').value) || 50000;
     const risk = document.getElementById('aiRisk').value;
     const horizon = document.getElementById('aiHorizon').value;
@@ -141,7 +157,8 @@
     }
 
     // 加载候选数据 + 宏观 + 财经新闻 (并行) + Phase O: 13 维上下文 + KB
-    const seedP = fetch('/fund_ai_seed.json').then(r => r.json());
+    // CLAUDE.md PWA 陷阱: cache:'no-store' 防 SW + 浏览器缓存拦截升级版本
+    const seedP = fetch('/fund_ai_seed.json', { cache: 'no-store' }).then(r => r.json());
     const macroP = Core.Macro.get().catch(e => ({ error: e.message, data: {} }));
     const newsP = includeNews ? Core.News.get().catch(e => ({ error: e.message, relevant: [] })) : Promise.resolve(null);
     const ctxP = Core.Data.getAiContextSnapshot().catch(e => null);
@@ -175,24 +192,19 @@
     const intlText = intl ? Core.Data.formatIntlForPrompt(intl) : '(国际形势不可用)';
     const goldText = gold ? Core.Data.formatGoldForPrompt(gold, 30) : '(黄金数据不可用)';
 
-    // KB 智能匹配 (Phase N+O)
-    // Bug J 修复 (调用方): seed 前 5 当 placeholder (AI picks 还没拿到),
-    //   真正匹配靠 KB.tags 兜底; entries 若带 tags 字段, 即使 keywords
-    //   不命中也会被弱匹配拉出来 (例: 短债 type → 命中 entry.tags=["short_bond"])
-    let kbText = '';
+    // P6.5: 宏观策略指令块 (PolicyBundle 替代 regimeBlock + kbText 2 段)
+    //   sleeve 专属 KB (fund 类: fund/fixed_income/policy/macro_signal) 由 PolicyBundle 注入
+    //   旧 KB.pickRelevant 已废弃, 避免双份注入
+    let policyBlock = '';
     try {
-      const kbEntries = await Core.KB.pickRelevant({
-        holdings: seed.candidates.slice(0, 5).map(c => ({ name: c.name, type: c.category })),
-        context: ctx || {},
-        maxN: 4
-      });
-      kbText = Core.KB.formatForPrompt(kbEntries);
-    } catch (e) { console.warn('[ai-advisor] KB 取条失败:', e); }
+      if (window.Core && Core.AI && Core.AI.PolicyBundle && typeof Core.AI.PolicyBundle.load === 'function') {
+        const bundle = await Core.AI.PolicyBundle.load({ strategy: 'fund', ctx });
+        if (bundle && typeof bundle.toSystemPrompt === 'function') {
+          policyBlock = bundle.toSystemPrompt();
+        }
+      }
+    } catch (e) { console.warn('[ai-advisor] PolicyBundle 加载失败:', e && e.message || e); }
 
-    // H3 大盘状态机段 (commit 6): 多指数共识 + 失灵提示
-    // 基金相对股票更看股债跷跷板, 但仓位/久期决策仍受 Regime 影响
-    const regimeBlock = (Core.Regime && Core.Regime._formatRegimeBlock)
-      ? Core.Regime._formatRegimeBlock() : '';
     // P3 全系统学习池
     let poolBlock = '';
     try {
@@ -207,7 +219,7 @@
 - 趋势: 利率方向 / 板块轮动 / 北向流向
 - 风险平价: 跨资产相关性 / 组合最大回撤 / 夏普
 
-${regimeBlock}
+${policyBlock}
 
 【用户画像】(Core.UserProfile 单次动态注入)
 ${Core.AI.formatUserProfile() || '长期稳健型 (年化 3-5% 跑赢通胀), 不追求暴利。'}
@@ -279,15 +291,16 @@ ${candidatesText}
 请基于【用户画像 + 宏观环境 + 财经新闻 + 市场上下文(Phase M) + 国际形势(Phase L) + 黄金(Phase J) + KB(Phase N) + 候选池】做多维度分析, 严格使用候选项, JSON 输出 (按 systemPrompt 的格式), 总金额 = ${amount} 元。每条 reason 必须引用具体的宏观数据或新闻, 信心等级和 KB 引用必填。`;
 
     try {
-      const fullText = await Core.AI.call({
+      const fullText = await Core.AI.callThrough({
         systemPrompt,
         prompt: userPrompt,
         stream: true,
         onChunk: (delta, full) => {
           streamEl.textContent = full;
           streamEl.scrollTop = streamEl.scrollHeight;
-        }
-      });
+        },
+        page: 'fund', purpose: 'ai-advisor'
+      }, 'fund');
 
       // Phase T: schema 校验 (picks 必填数组, summary/macroView 必填字符串)
       const AI_FUND_SCHEMA = {

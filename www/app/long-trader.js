@@ -222,8 +222,17 @@
           try {
             const h = await Paper.autoTradeFromPick({ code: p.code, name: p.name, sleeve: 'long' });
             results.push({ code: p.code, name: p.name, ok: !!h, reason: p.reason, costPrice: h && h.costPrice, shares: h && h.shares });
-            // Phase L1: 写 journal 行 (verify 后续归因用)
-            if (h) await this._writeLongJournal({ ...p, costPrice: h.costPrice, shares: h.shares });
+            // BUGFIX P1-9: 之前 cashRemaining 只在循环开始处设一次, 后续循环不递减.
+            //   行业 cap 检测用递减后的现金算 pMkt, 但 autoTradeFromPick 内部读 acc.cash 是当前实时值,
+            //   与 cashRemaining 不同步 → 第 2/3 只行业 cap 估算偏高, 可能放过本应被拦的票.
+            //   修后: 实际成交成功后按 h.costPrice * h.shares 递减 cashRemaining,
+            //   下一次行业 cap 检测基于最新可用现金, 边界场景更准.
+            if (h) {
+              const costUsed = (parseFloat(h.costPrice) || 0) * (parseFloat(h.shares) || 0);
+              cashRemaining = Math.max(0, cashRemaining - costUsed);
+              // Phase L1: 写 journal 行 (verify 后续归因用)
+              await this._writeLongJournal({ ...p, costPrice: h.costPrice, shares: h.shares });
+            }
           } catch (e) {
             console.warn(`[LongTrader] autoTradeFromPick 失败 ${p.code}:`, e);
             results.push({ code: p.code, name: p.name, ok: false, reason: p.reason, error: String(e.message || e) });

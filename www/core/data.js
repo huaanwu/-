@@ -11,6 +11,7 @@
 (function() {
   'use strict';
 
+  const Core = window.Core;
   const DEFAULT_PROXY = '/api/akshare';
   const TENCENT_QUOTE = 'https://qt.gtimg.cn/q=';  // 腾讯财经行情, CORS 友好, GBK 编码
   const SINA_QUOTE = 'https://hq.sinajs.cn/list='; // 新浪兜底 (腾讯失败时降级), GBK, 需 Referer
@@ -471,6 +472,37 @@
   // key 形如 "stock_zh_a_hist" / "stock_zh_a_spot" / "_tencentKLine:000001"
   const _limitByPath = {};
 
+  // G1 跨策略隔离: 把 cacheKey 加 :{strategy} 段, 双写 7 天
+  //   调用方传 strategy='long'|'short'|'fund'|'default', 不传默认 'default' (向后兼容旧 APK 缓存)
+  //   实际写两个 key: 新 key (`{base}:{strategy}`) + legacy key (`{base}`), TTL 相同
+  //   读: 先查新 key → miss 则降级读 legacy, 命中标 legacyHit=true (Trace 透明)
+  const _STRATEGY_KEY_TTL_BONUS_MS = 7 * 24 * 60 * 60 * 1000;  // 双写期 7 天
+  function _strategyKey(baseKey, strategy) {
+    return (strategy && strategy !== 'default') ? baseKey + ':' + strategy : baseKey;
+  }
+  async function _strategyCacheGet(baseKey, strategy) {
+    const newKey = _strategyKey(baseKey, strategy);
+    const v = await Core.Storage.cacheGet(newKey);
+    if (v !== null && v !== undefined) return v;
+    // 跨策略隔离: 只有 default 策略 (或未指定) 才降级读 legacy key
+    //   strategy='long' 找不到新 key 时, 不应该读到其他 strategy 写的 legacy (避免污染)
+    //   strategy='default' 显式读 legacy (向后兼容老 APK 缓存)
+    if (!strategy || strategy === 'default') {
+      const legacy = await Core.Storage.cacheGet(baseKey);
+      if (legacy !== null && legacy !== undefined) return legacy;
+    }
+    return null;
+  }
+  async function _strategyCacheSet(baseKey, strategy, value, ttl) {
+    const newKey = _strategyKey(baseKey, strategy);
+    await Core.Storage.cacheSet(newKey, value, ttl);
+    // 双写 legacy: TTL = 原 ttl + 7 天, 保证 7 天双写期内旧 key 仍可读
+    if (strategy && strategy !== 'default') {
+      try { await Core.Storage.cacheSet(baseKey, value, ttl + _STRATEGY_KEY_TTL_BONUS_MS); }
+      catch (e) { /* legacy 写失败不阻塞新 key */ }
+    }
+  }
+
   function _setLimit(path, durationMs, err) {
     if (!_limitByPath[path]) _limitByPath[path] = { blocked: false, until: 0, lastError: '', lastSuccess: 0 };
     _limitByPath[path].blocked = true;
@@ -622,7 +654,8 @@
         _clearLimit(path);
         if (!_limitByPath[path]) _limitByPath[path] = { blocked: false, until: 0, lastError: '', lastSuccess: 0 };
         _limitByPath[path].lastSuccess = Date.now();
-        return await resp.json();
+        try { return await resp.json(); }
+        catch (e) { throw new Error(`${path}: JSON 解析失败 (${resp.status}): ${e.message}`); }
       }
 
       const text = await resp.text();
@@ -750,10 +783,12 @@
    * @param {string} end - YYYYMMDD
    * @param {string} adjust - qfq/hfq(前/后复权)/空(不复权)
    */
-  async function getStockKLine(code, period = 'daily', start, end, adjust = 'qfq') {
-    const cacheKey = `kline_${code}_${period}_${start}_${end}_${adjust}`;
-    // 1) 缓存优先
-    const cached = await Core.Storage.cacheGet(cacheKey);
+  async function getStockKLine(code, period = 'daily', start, end, adjust = 'qfq', strategy) {
+    const baseKey = `kline_${code}_${period}_${start}_${end}_${adjust}`;
+    // G1: 跨策略隔离 — 长线 (基本面) 跟短线 (技术位) 不再共用 K 线缓存
+    const cacheKey = _strategyKey(baseKey, strategy);
+    // 1) 缓存优先 (双查: 新 key → legacy key 降级)
+    const cached = await _strategyCacheGet(baseKey, strategy);
     if (cached) return cached;
 
     // 2) 限流期直接抛 (按 path 独立: stock_zh_a_hist 限流不影响别的)
@@ -765,17 +800,17 @@
     // 3) 优先腾讯 (Y12)
     try {
       const data = await _tencentKLine(code, period, start, end, 240, adjust);
-      await Core.Storage.cacheSet(cacheKey, data, 24 * 60 * 60 * 1000);
+      // G1: 双写 7 天 (新 key + legacy key)
+      await _strategyCacheSet(baseKey, strategy, data, 24 * 60 * 60 * 1000);
       return data;
     } catch (e) {
       console.warn('[Data] 腾讯 K 线失败, 降级 aktools:', e.message);
-      // 4) 降级 aktools
-      return await fetchWithCache(
-        cacheKey,
-        'stock_zh_a_hist',
-        { symbol: code, period, start_date: start, end_date: end, adjust },
-        24 * 60 * 60 * 1000
-      );
+      // 4) 降级 aktools (复用 strategyCacheSet 实现双写)
+      const got = await _strategyCacheGet(baseKey, strategy);
+      if (got) return got;
+      const data = await _fetch('stock_zh_a_hist', { symbol: code, period, start_date: start, end_date: end, adjust });
+      await _strategyCacheSet(baseKey, strategy, data, 24 * 60 * 60 * 1000);
+      return data;
     }
   }
 
@@ -1584,10 +1619,12 @@
    * 端点 2 字段: Data_fundHistoryNetValue (历史日净值数组)
    * 端点 2 注意: 含大量其他 JS 变量 (Data_*: 持仓/分红/业绩), 只解析所需
    */
-  async function getFundHistory(code, start, end) {
-    const cacheKey = `fund_hist_${code}_${start}_${end}`;
-    // 1) 缓存
-    const cached = await Core.Storage.cacheGet(cacheKey);
+  async function getFundHistory(code, start, end, strategy) {
+    const baseKey = `fund_hist_${code}_${start}_${end}`;
+    // G1: 跨策略隔离 — 长线 sleeve 跟基金 sleeve 不再共用基金历史缓存
+    const cacheKey = _strategyKey(baseKey, strategy);
+    // 1) 缓存 (双查: 新 key → legacy 降级)
+    const cached = await _strategyCacheGet(baseKey, strategy);
     if (cached) return cached;
 
     // 2) 限流 (按 path 独立) — 主源被限流时跳过, 直接走天天基金 fallback
@@ -1601,8 +1638,8 @@
           24 * 60 * 60 * 1000
         );
         return data;
-      } catch (e1) {
-        console.warn('[Data] aktools 基金净值失败, 降级天天基金:', e1.message);
+      } catch (e) {
+        console.warn('[Data] aktools 基金净值失败, 降级天天基金:', e.message);
       }
     } else {
       console.warn('[Data] aktools 基金净值限流中, 直接走天天基金 fallback');
@@ -1619,7 +1656,7 @@
         return (!startN || dn >= startN) && (!endN || dn <= endN);
       });
       if (out.length > 0) {
-        await Core.Storage.cacheSet(cacheKey, out, 24 * 60 * 60 * 1000);
+        await _strategyCacheSet(baseKey, strategy, out, 24 * 60 * 60 * 1000);
       }
       return out;
     } catch (e2) {
@@ -2276,18 +2313,25 @@
 
   /**
    * 4) 货币供应量 M2/M1/M0 同比
-   * aktools: macro_china_money_supply
+   * aktools: macro_china_money_supply (降序: 最新→最旧)
+   * 实测字段名: 货币和准货币(M2)-同比增长 / 货币(M1)-同比增长 / 流通中的现金(M0)-同比增长
+   * P0 修复: 原代码字段名 '货币和准货币' 取不到 (实际字段带括号单位), 取 data[length-1] 拿到 2008 旧数据
    */
   async function _fetchMoneySupply() {
     const data = await Core.Data.fetch('ai_ctx_m2', 'macro_china_money_supply', {}, _CTX_TTL);
+    return Core.Data.Normalize.parseMoneySupply(data);
+  }
+
+  /** 纯函数: 把 macro_china_money_supply 原始行归一化为 {date, m2_yoy, m1_yoy, m0_yoy} */
+  function _parseMoneySupply(data) {
     if (!Array.isArray(data) || data.length === 0) return null;
-    const last = data[data.length - 1];
-    const m2 = parseFloat(last['货币和准货币'] || last['M2'] || last.value);
-    const m1 = parseFloat(last['货币'] || last['M1']);
-    const m0 = parseFloat(last['流通中现金'] || last['M0']);
+    const last = data[0];  // 降序, 首条为最新
+    const m2 = parseFloat(last['货币和准货币(M2)-同比增长']);
+    const m1 = parseFloat(last['货币(M1)-同比增长']);
+    const m0 = parseFloat(last['流通中的现金(M0)-同比增长']);
     if (isNaN(m2)) return null;
     return {
-      date: last['月份'] || last.date || '',
+      date: last['月份'] || '',
       m2_yoy: m2,
       m1_yoy: isNaN(m1) ? null : m1,
       m0_yoy: isNaN(m0) ? null : m0
@@ -2544,6 +2588,8 @@
     health,
     getLimitStatus,  // c: UI 读这个显示限流状态
     resetLimit: _clearAllLimit,  // 测试/手动重置 (全部端点; _clearLimit 需带 path)
+    // G1: 跨策略 cacheKey 隔离 helper (测试 + 外部使用)
+    _strategyKey, _strategyCacheGet, _strategyCacheSet,
     // 股票
     getStockSpot, getStockQuote, getStockKLine, getStockFinancial, getStockFinancialBatch, getStockList,
     getStockSpotTencent,    // C: 腾讯 fetcher (codes 参数, 实时)
@@ -2583,6 +2629,9 @@
     formatAiContextForPrompt,
     // Tier 2: 北向个股 + 龙虎榜全市场 (注入 LLM 短线信号)
     getNorthboundFlow, formatNorthboundForPrompt,
-    getLhbSnapshotMap, formatLhbForPrompt
+    getLhbSnapshotMap, formatLhbForPrompt,
+    Normalize: {
+      parseMoneySupply: _parseMoneySupply
+    }
   };
 })();

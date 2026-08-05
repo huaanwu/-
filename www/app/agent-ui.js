@@ -230,15 +230,19 @@
     const tools = Array.from(Core.Agent._toolsIndex.values()).map(t => ({
       name: t.name,
       description: t.description,
-      parameters: { type: 'object', properties: {}, additionalProperties: true } // 简化, 让 LLM 自己看着办
+      // 传真实 schema: 优先 inputSchema (Phase 3 注册), 兼容旧 input_schema
+      // 之前简化成 additionalProperties:true 是 P0 阻塞 — LLM 看不到参数契约, 多轮会乱调
+      parameters: t.inputSchema || t.input_schema || { type: 'object', properties: {}, additionalProperties: true }
     }));
 
     try {
-      await Core.Agent.chat(_messages, {
+      // S2 管家模式开关: 读 window.Core.StewardMode (ui 顶部切换按钮设)
+      const stewardMode = !!(window.Core && window.Core.StewardMode);
+      const chatOpts = {
         provider: cfg.provider,
         model: cfg.model || cfg.localEndpoint?.model,
         tools,
-        maxTurns: 6,
+        maxTurns: stewardMode ? 12 : 6,
         temperature: 0.7,
         onText: (delta) => {
           // 流式更新最后一条 assistant 气泡
@@ -266,7 +270,23 @@
         onTurn: () => {
           // 同上, 暂无特别操作
         }
-      });
+      };
+      // 管家模式额外注入: 硬预算 + 每 3 轮 reflect (走 Core.Agent.chat 已有 onReflect/tokenBudget)
+      if (stewardMode) {
+        chatOpts.tokenBudget = 60000;
+        chatOpts.reflectEvery = 3;
+        chatOpts.onReflect = ({ turn }) => {
+          // 注入 system-style reflect: 让 LLM 自我审视进度
+          return `【管家反思 (turn ${turn})】请检查: 1) 已获取的信息够了吗? 2) 还差什么关键输入? 3) 是否该收敛到答案? 若信息已足, 请直接给最终回答而非继续调工具。`;
+        };
+        chatOpts.onStop = (reason, info) => {
+          if (reason === 'budget' || reason === 'maxTurns') {
+            console.warn('[Agent-UI] 管家模式 stop:', reason, info);
+            root.appendChild(_bubbleText('assistant', `⚠️ 管家模式 stop (${reason}, tokensUsed=${info.tokensUsed || 0}); 请简化为更聚焦的提问。`));
+          }
+        };
+      }
+      await Core.Agent.chat(_messages, chatOpts);
     } catch (e) {
       _appendAssistant(root, '✗ 调用失败: ' + (e.message || String(e)));
       _messages.push({ role: 'assistant', content: '[调用失败]' });

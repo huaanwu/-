@@ -1,0 +1,121 @@
+[
+  {
+    "strategyId": "short-tech-rsi",
+    "sleeve": "short",
+    "name": "RSI 超卖反弹",
+    "desc": "技术指标: RSI 跌破 30 进入超卖区, 博 3-5 日均值回归反弹",
+    "rules": [
+      { "kind": "screener", "ref": "SHORT-rsi<30", "weight": 0.5 },
+      { "kind": "llm", "ref": "scan-market", "weight": 0.5 }
+    ],
+    "experimentWeeks": 0
+  },
+  {
+    "strategyId": "short-news",
+    "sleeve": "short",
+    "name": "消息驱动",
+    "desc": "消息面: 突发利好公告/政策catalyst, 情绪发酵首日介入",
+    "rules": [
+      { "kind": "llm", "ref": "news-snapshot", "weight": 0.5 },
+      { "kind": "kb", "ref": "kb:news-catalyst", "weight": 0.3 },
+      { "kind": "screener", "ref": "SHORT-news-heat", "weight": 0.2 }
+    ],
+    "experimentWeeks": 0
+  },
+  {
+    "strategyId": "short-reversal",
+    "sleeve": "short",
+    "name": "反包",
+    "desc": "昨日阴线今日高开反包吞没, 承接盘强势, 短线情绪反转",
+    "rules": [
+      { "kind": "screener", "ref": "SHORT-engulf-reversal", "weight": 0.6 },
+      { "kind": "kb", "ref": "kb:candlestick-engulfing", "weight": 0.2 },
+      { "kind": "llm", "ref": "scan-market", "weight": 0.2 }
+    ],
+    "experimentWeeks": 0
+  },
+  {
+    "strategyId": "short-breakout",
+    "sleeve": "short",
+    "name": "平台突破",
+    "desc": "横盘 N 日后放量突破箱体上沿, 追突破首日。买点公式 (Kimi 手册第4道筛子第3道): 收盘 ≥ 前 40 日平台高点 × 0.99 且当日放量收阳; 横盘越久突破越有效",
+    "rules": [
+      { "kind": "screener", "ref": "SHORT-box-breakout", "weight": 0.6 },
+      { "kind": "kb", "ref": "kb:breakout-volume", "weight": 0.2 },
+      { "kind": "llm", "ref": "scan-market", "weight": 0.2 }
+    ],
+    "experimentWeeks": 0
+  },
+  {
+    "strategyId": "short-pullback",
+    "sleeve": "short",
+    "name": "缩量回踩",
+    "desc": "突破后缩量回踩 5/10/20 日均线不破, 二次上车点。买点公式 (Kimi 手册): 当日最低价距 MA10 或 MA20 ≤ 3% 且前一日缩量 (量 < 20日均量) 且收盘 > MA5, 重新放量抬头时介入",
+    "rules": [
+      { "kind": "screener", "ref": "SHORT-ma-pullback-lowvol", "weight": 0.6 },
+      { "kind": "kb", "ref": "kb:pullback-support", "weight": 0.2 },
+      { "kind": "llm", "ref": "scan-market", "weight": 0.2 }
+    ],
+    "experimentWeeks": 0
+  },
+  {
+    "strategyId": "short-trend",
+    "sleeve": "short",
+    "name": "趋势跟随",
+    "desc": "多头排列 (5>10>20 日线) 且斜率向上, 顺势持有到破位",
+    "rules": [
+      { "kind": "screener", "ref": "SHORT-ma-bullish-stack", "weight": 0.6 },
+      { "kind": "kb", "ref": "kb:trend-following", "weight": 0.2 },
+      { "kind": "llm", "ref": "scan-market", "weight": 0.2 }
+    ],
+    "experimentWeeks": 0
+  },
+  {
+    "strategyId": "short-limit-relay",
+    "sleeve": "short",
+    "name": "涨停接力",
+    "desc": "首板/连板次日溢价接力, 只做人气龙头, 严格纪律止损",
+    "rules": [
+      { "kind": "screener", "ref": "SHORT-limit-up-relay", "weight": 0.5 },
+      { "kind": "kb", "ref": "kb:limit-up-sentiment", "weight": 0.3 },
+      { "kind": "llm", "ref": "scan-market", "weight": 0.2 }
+    ],
+    "experimentWeeks": 4
+  },
+  {
+    "strategyId": "short-limit-down-bounce",
+    "sleeve": "short",
+    "name": "跌停抢反弹",
+    "desc": "跌停开板后放量承接, 超跌博反弹 (高风险, 默认实验期)",
+    "rules": [
+      { "kind": "screener", "ref": "SHORT-limit-down-open", "weight": 0.5 },
+      { "kind": "kb", "ref": "kb:oversold-bounce-risk", "weight": 0.3 },
+      { "kind": "llm", "ref": "scan-market", "weight": 0.2 }
+    ],
+    "experimentWeeks": 4
+  },
+  {
+    "strategyId": "short-vol-divergence",
+    "sleeve": "short",
+    "name": "量价背离",
+    "desc": "价跌量缩/价涨量增背离信号, 提示主力吸筹或出货拐点",
+    "rules": [
+      { "kind": "screener", "ref": "SHORT-price-volume-divergence", "weight": 0.6 },
+      { "kind": "kb", "ref": "kb:volume-price-analysis", "weight": 0.2 },
+      { "kind": "llm", "ref": "scan-market", "weight": 0.2 }
+    ],
+    "experimentWeeks": 4
+  },
+  {
+    "strategyId": "short-dragon-tiger",
+    "sleeve": "short",
+    "name": "龙虎榜跟庄",
+    "desc": "龙虎榜知名游资席位净买入, 跟随资金流向做短线",
+    "rules": [
+      { "kind": "screener", "ref": "SHORT-lhb-net-buy", "weight": 0.5 },
+      { "kind": "kb", "ref": "kb:dragon-tiger-list", "weight": 0.3 },
+      { "kind": "llm", "ref": "scan-market", "weight": 0.2 }
+    ],
+    "experimentWeeks": 4
+  }
+]

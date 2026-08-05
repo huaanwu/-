@@ -1,12 +1,13 @@
 {
   "name": "stock-master",
-  "version": "0.2.22",
+  "version": "0.2.27",
   "description": "自用 A股/基金投资工具 - 行情/持仓/复盘/选股/回测/提醒",
   "main": "electron/main.js",
   "scripts": {
     "dev": "concurrently -k -n vite,proxy -c blue,magenta \"npm:dev:vite\" \"npm:dev:proxy\"",
     "dev:vite": "vite",
     "dev:proxy": "node scripts/dev-proxy.mjs",
+    "dev:all": "concurrently -k -n vite,proxy,electron -c blue,magenta,yellow \"npm:dev:vite\" \"npm:dev:proxy\" \"npm:dev:electron\"",
     "dev:electron": "electron .",
     "build": "node scripts/copy-libs.mjs && vite build && node scripts/build-web.mjs",
     "build:libs": "node scripts/copy-libs.mjs",
@@ -26,9 +27,7 @@
       "output": "dist"
     },
     "files": [
-      "electron/main.js",
-      "electron/agent-registry.js",
-      "electron/preload.js",
+      "electron/**/*",
       "www/**/*",
       "package.json"
     ],
@@ -67,7 +66,8 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "StockMaster",
-      "artifactName": "StockMaster-Setup-${version}.${ext}"
+      "artifactName": "StockMaster-Setup-${version}.${ext}",
+      "include": "scripts/installer-hook.nsh"
     },
     "portable": {
       "artifactName": "StockMaster-${version}-portable.exe"
@@ -88,19 +88,22 @@
     "@capacitor/local-notifications": "^8.2.1",
     "@capacitor/preferences": "^8.0.1",
     "@capacitor/share": "^8.0.1",
+    "axios": "^1.16.0",
     "dexie": "^4.4.4",
     "echarts": "^5.6.0",
     "electron-updater": "^6.8.9",
-    "marked": "^15.0.12"
+    "marked": "^15.0.12",
+    "protobufjs": "^7.2.6",
+    "ws": "^8.19.0"
   },
   "devDependencies": {
     "concurrently": "^9.1.0",
     "electron": "^43.2.0",
     "electron-builder": "^26.15.3",
     "express": "^5.2.1",
+    "fake-indexeddb": "^6.2.5",
     "http-proxy-middleware": "^3.0.3",
     "typescript": "^5.9.3",
     "vite": "^8.1.5"
   }
 }
-

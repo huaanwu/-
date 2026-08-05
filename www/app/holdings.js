@@ -443,6 +443,35 @@
         h.shares = totalShares;
       } else if (tx.type === 'sell') {
         h.shares = Math.max(0, h.shares - tx.shares);
+      } else if (tx.type === 'dividend') {
+        // BUGFIX P1-8: 原代码 dividend 不动 h.shares 也不入 cash, 用户分红完全没记账.
+        //   修后: tx.dividendKind 字段 'cash' (默认) / 'stock':
+        //     - cash: 把 tx.shares 字段重新解释为"分红金额 (元)", 写 cashflow 表增加现金
+        //     - stock: tx.shares 仍为"送股股数", h.shares += tx.shares
+        //   form 默认 dividendKind='cash' (兼容老字段, 老数据按 'cash' 处理)
+        const kind = tx.dividendKind === 'stock' ? 'stock' : 'cash';
+        if (kind === 'cash') {
+          const amt = parseFloat(tx.shares) || 0;
+          if (amt > 0) {
+            try {
+              await Core.Storage.add('cashflow', {
+                id: 'cf-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+                date: tx.date || fmtDate(new Date()),
+                type: 'dividend',
+                amount: amt,
+                note: `${h.code} ${h.name || ''} 分红 (来自 holdings 交易行 ${tx.id})`,
+                createdAt: Date.now()
+              });
+              // 同步 State.accountCash (account.js 显示依赖此字段)
+              try {
+                const curCash = parseFloat(window.Core.State.get('accountCash')) || 0;
+                window.Core.State.set('accountCash', curCash + amt);
+              } catch (_) { /* 状态未加载, 不阻塞 */ }
+            } catch (e) { console.warn('[Holdings] 分红入 cashflow 失败:', e); }
+          }
+        } else {
+          h.shares = (parseFloat(h.shares) || 0) + (parseFloat(tx.shares) || 0);
+        }
       }
       h.updatedAt = Date.now();
       await Core.Storage.put('holdings', h);

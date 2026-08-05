@@ -185,11 +185,29 @@
    */
   async function chat(messages, opts) {
     const MAX_TURNS = opts.maxTurns || 8;
+    // v0.2.25 S2 Steward: 硬预算 (默认 60000 tokens) + 每 3 turn 强插 reflect
+    const TOKEN_BUDGET = opts.tokenBudget || 0;
+    let _tokensUsed = 0;
+    const _reflectEvery = opts.reflectEvery || 3;
     let lastText = '';
+    let stopReason = 'done';
     const tools = (opts.tools && opts.tools.length > 0)
       ? opts.tools.map(t => ({ type: 'function', function: t }))
       : undefined;
     for (let i = 0; i < MAX_TURNS; i++) {
+      // 预算守卫: 超 budget 提前 return (用于管家 ReAct 防止 token 爆炸)
+      if (TOKEN_BUDGET > 0 && _tokensUsed >= TOKEN_BUDGET) {
+        stopReason = 'budget';
+        if (opts.onStop) opts.onStop(stopReason, { tokensUsed: _tokensUsed });
+        break;
+      }
+      // S2 反思: 每 N 轮强插一条 system reflect 提示, 让 LLM 自我审视进度
+      if (_reflectEvery > 0 && i > 0 && i % _reflectEvery === 0 && opts.onReflect) {
+        const reflect = opts.onReflect({ turn: i, tokensUsed: _tokensUsed });
+        if (reflect && typeof reflect === 'string') {
+          messages.push({ role: 'user', content: reflect });
+        }
+      }
       const resp = await Core.AI.callRawWithTimeout({
         provider: opts.provider,
         model: opts.model,
@@ -200,6 +218,10 @@
         timeout: opts.timeout || 120000,
         stream: false
       });
+      // 累加 token 用量 (provider 不返就当 0)
+      if (resp && resp.usage) {
+        _tokensUsed += (resp.usage.total_tokens || resp.usage.total || 0);
+      }
       const assistantMsg = _normalizeAssistant(resp);
       // 推回 messages 时必须用 OAI 字段 (content / tool_calls), 不能用内部表示 (text / tool_uses)
       // 否则 qwen36 等兼容 provider 在下一轮会拒绝:
@@ -210,7 +232,10 @@
         opts.onText(assistantMsg.text);
       }
       const toolUses = assistantMsg.tool_uses || [];
-      if (toolUses.length === 0) return lastText;
+      if (toolUses.length === 0) {
+        if (i === MAX_TURNS - 1) stopReason = 'maxTurns';
+        break;
+      }
       if (opts.onToolCall) opts.onToolCall(toolUses);
       for (const tu of toolUses) {
         const resultMsg = await executeTool(tu, opts.ctx);
@@ -225,8 +250,10 @@
           opts.onToolResult(tu, parsed);
         }
       }
+      if (i === MAX_TURNS - 1) stopReason = 'maxTurns';
     }
-    return lastText || '(已达到最大工具调用轮次)';
+    if (stopReason === 'done' && opts.onStop) opts.onStop(stopReason, { tokensUsed: _tokensUsed });
+    return { text: lastText || '(已达到最大工具调用轮次)', stopReason, tokensUsed: _tokensUsed };
   }
 
   /** 把内部 assistant 表示 {role, text, tool_uses} 转成 OAI 协议消息 {role, content, tool_calls} */

@@ -161,6 +161,9 @@
   /** 单行业集中度上限 (30%) — 预留字段: 暂无行业数据源, 待接入后启用 */
   const MAX_SINGLE_INDUSTRY_PCT = 0.30;
 
+  /** 股票总仓位上限 (95%) — discipline 默认值 (B2: FIX-2 阈值常量收口, 改一处生效全栈) */
+  const MAX_TOTAL_POSITION_PCT = 0.95;
+
   // ==================== 中长线盯盘 (alerts.js 分层轮询) ====================
 
   /** 短线规则 (价格/涨跌幅/成交量) 轮询间隔: 1 分钟
@@ -362,6 +365,7 @@
     MAX_MONTHLY_DRAWDOWN_PCT,
     MAX_SINGLE_STOCK_PCT,
     MAX_SINGLE_INDUSTRY_PCT,
+    MAX_TOTAL_POSITION_PCT,
     ALERT_TICK_SHORT_MS,
     ALERT_TICK_LONG_MS,
     TRADING_WINDOWS,

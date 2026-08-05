@@ -47,8 +47,8 @@
   window.Fund.buyDialog = function(specificCode) {
     // 候选基金: 用户的自选 + 推荐组合
     const list = [];
-    // 从 ai_seed.json 拿
-    fetch('/fund_ai_seed.json').then(r => r.json()).then(seed => {
+    // 从 ai_seed.json 拿 (CLAUDE.md PWA 陷阱: cache:'no-store' 防 SW + 浏览器缓存拦截)
+    fetch('/fund_ai_seed.json', { cache: 'no-store' }).then(r => r.json()).then(seed => {
       if (specificCode) {
         // 指定了 code: 只显示那一个
         const found = seed.candidates.find(c => c.code === specificCode);

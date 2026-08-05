@@ -143,8 +143,8 @@
             ${list.map(a => `
               <tr>
                 <td><span class="code">${escapeHtml(a.code)}</span><br><span style="color:var(--text-muted);font-size:11px;">${escapeHtml(a.name || '')}</span></td>
-                <td>${this._typeLabel(a.type)}<br>${this._horizonBadge(a.type)}</td>
-                <td>${this._conditionLabel(a)}</td>
+                <td>${escapeHtml(this._typeLabel(a.type))}<br>${this._horizonBadge(a.type)}</td>
+                <td>${escapeHtml(this._conditionLabel(a))}</td>
                 <td>
                   ${a.triggered
                     ? '<span class="tag down">已触发</span>'

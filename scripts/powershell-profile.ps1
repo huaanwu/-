@@ -77,6 +77,58 @@ function gst-test {
     npm test
 }
 
+# ========== 5b. PM2 监管 (dev-proxy + reverse-watch-daemon 自动重启) ==========
+# 用法:
+#   gst-pm2-start  → 把 dev-proxy + daemon 跑进 pm2 (autorestart=true, 进程死了自动拉)
+#   gst-pm2-stop   → 停 pm2 里的两个 app
+#   gst-pm2-logs   → tail 日志 (两个)
+#   gst-pm2-status → 看 pm2 状态
+function gst-pm2-start {
+    Set-Location D:\get\stock-master
+    if (-not (Test-Path 'logs')) { New-Item -ItemType Directory -Path logs | Out-Null }
+    pm2 delete all 2>$null | Out-Null
+    pm2 start ecosystem.config.cjs
+    pm2 save 2>$null
+    Write-Host '✅ dev-proxy + reverse-watch-daemon 已进 PM2 (autorestart=true, 进程死了自动拉)' -ForegroundColor Green
+    Write-Host '  → gst-pm2-stop / gst-pm2-logs / gst-pm2-status' -ForegroundColor Gray
+}
+function gst-pm2-stop {
+    pm2 stop all 2>$null
+    Write-Host '⏸ dev-proxy + reverse-watch-daemon 已停' -ForegroundColor Yellow
+}
+function gst-pm2-logs {
+    pm2 logs --lines 50
+}
+function gst-pm2-logs-daemon {
+    pm2 logs stock-master-reverse-watch-daemon --lines 80
+}
+function gst-pm2-status {
+    pm2 list
+}
+function gst-pm2-status-all {
+    Write-Host '>> dev-proxy + daemon 一并状态' -ForegroundColor Cyan
+    pm2 jlist 2>$null | ForEach-Object {
+        $name = $_.name
+        $status = $_.pm2_env.status
+        $restarts = $_.pm2_env.restart_time
+        $mem = "{0:N0}MB" -f ($_.monit.memory / 1MB)
+        $uptime = if ($_.pm2_env.pm_uptime) {
+            $span = (Get-Date) - ([DateTimeOffset]::FromUnixTimeMilliseconds($_.pm2_env.pm_uptime)).LocalDateTime
+            "{0}天{1}小时" -f [int]$span.TotalDays, $span.Hours
+        } else { '-' }
+        Write-Host ("  {0,-38} {1,-10}  重启:{2,-3}  内存:{3,-8}  启动:{4}" -f $name, $status, $restarts, $mem, $uptime) -ForegroundColor $(if ($status -eq 'online') { 'Green' } else { 'Red' })
+    }
+}
+function gst-daemon-state {
+    if (Test-Path 'D:\get\stock-master\reverse-watch\_rw_daemon_state.json') {
+        Get-Content 'D:\get\stock-master\reverse-watch\_rw_daemon_state.json' -Raw | ConvertFrom-Json | ConvertTo-Json -Depth 10
+    } else {
+        Write-Host '⚠ _rw_daemon_state.json 不存在 (daemon 还没跑过)' -ForegroundColor Yellow
+    }
+}
+
 # ========== 6. 模块加载提示 ==========
 Write-Host "✓ PowerShell Profile loaded (UTF-8 mode)" -ForegroundColor Green
 Write-Host "  常用命令: gst / gst-dev / gst-build / gst-test / port 8089" -ForegroundColor Gray
+Write-Host "  PM2: gst-pm2-start / gst-pm2-stop / gst-pm2-logs / gst-pm2-status-all" -ForegroundColor Gray
+Write-Host "  Daemon: gst-pm2-logs-daemon / gst-daemon-state" -ForegroundColor Gray

@@ -310,6 +310,113 @@
     await Core.Storage.cacheSet(cacheKey, null, 1);
   }
 
+  // ========== V12: 聚合快照 (定时刷新, 不存历史) ==========
+
+  const SNAPSHOT_TTL_MS = 45 * 60 * 1000;   // 45 分钟 (略大于调度频率 30min, 保证命中 100%)
+  const SNAPSHOT_KV_KEY = 'news_snapshot_v1';
+
+  /**
+   * 收集所有关注票的代码 (watchlist ∪ holdings ∪ research_pool, 去重)
+   * @returns {Promise<string[]>}
+   */
+  async function _collectAllCodes() {
+    const set = new Set();
+    try {
+      const wl = (await Core.Storage.all('watchlist')) || [];
+      wl.forEach(w => w && w.code && set.add(w.code));
+    } catch (e) { /* 静默 */ }
+    try {
+      const hl = (await Core.Storage.all('holdings')) || [];
+      hl.forEach(h => h && h.code && set.add(h.code));
+    } catch (e) { /* 静默 */ }
+    try {
+      if (Core.ResearchPool && typeof Core.ResearchPool.list === 'function') {
+        const rp = (await Core.ResearchPool.list()) || [];
+        rp.forEach(r => r && r.code && set.add(r.code));
+      }
+    } catch (e) { /* 静默 */ }
+    return Array.from(set);
+  }
+
+  /**
+   * 拉所有关注票的公告 (单只降级, 不污染整体)
+   * @returns {Promise<{generated: number, codes: number, items: Array, errors: Array}>}
+   */
+  async function _buildSnapshot(opts = {}) {
+    const limit = opts.limit || 5;   // 每只最多 5 条
+    const codes = await _collectAllCodes();
+    const items = [];
+    const errors = [];
+    for (const code of codes) {
+      try {
+        const notices = await getStockNotices(code, limit);
+        if (notices === null) {
+          // 拉取完全失败 (主路径 + 兜底都挂), 不污染其他股票
+          errors.push({ code, msg: '个股公告拉取失败 (主路径+兜底都挂)' });
+          continue;
+        }
+        if (Array.isArray(notices)) {
+          for (const n of notices) {
+            // date 字段是 YYYY-MM-DD, 转 timestamp; 失败兜底 Date.now()
+            let ts = Date.now();
+            if (n.date && /^\d{4}-\d{2}-\d{2}/.test(n.date)) {
+              const parsed = Date.parse(n.date);
+              if (!isNaN(parsed)) ts = parsed;
+            }
+            items.push({
+              code,
+              title: n.title || '',
+              url: n.url || '',
+              ts,
+              source: n.source || 'eastmoney'
+            });
+          }
+        }
+      } catch (e) {
+        errors.push({ code, msg: (e && e.message || e) });
+      }
+    }
+    // 按 ts 倒序 (最新在前)
+    items.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+    const snap = {
+      generated: Date.now(),
+      codes: codes.length,
+      itemCount: items.length,
+      items,
+      errors: errors.slice(0, 20)   // 上限 20 条, 防爆
+    };
+    // 落 kv (短 TTL)
+    try {
+      await Core.Storage.kvSet(SNAPSHOT_KV_KEY, snap);
+    } catch (e) {
+      console.warn('[News.snapshot] 写 kv 失败:', e && e.message || e);
+    }
+    return snap;
+  }
+
+  /**
+   * 拿当前快照 (过期不重拉, 仅返 null 让调用方决定是否触发 build)
+   * @returns {Promise<object|null>}
+   */
+  async function _getSnapshot() {
+    try {
+      const s = await Core.Storage.kvGet(SNAPSHOT_KV_KEY);
+      if (!s) return null;
+      if (_isSnapshotFresh(s)) return s;
+      return null;   // 过期
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /**
+   * 判定快照是否新鲜 (within TTL)
+   */
+  function _isSnapshotFresh(snap) {
+    if (!snap || typeof snap.generated !== 'number') return false;
+    return (Date.now() - snap.generated) < SNAPSHOT_TTL_MS;
+  }
+
   window.Core = window.Core || {};
   window.Core.News = {
     get: _fetch,
@@ -317,6 +424,14 @@
     refresh,
     getStockNotices,
     formatNoticesForPrompt,
-    _filterNoticesByCode
+    _filterNoticesByCode,
+    // V12: 聚合快照 (30min 刷新, 不存历史)
+    snapshot: {
+      build: _buildSnapshot,
+      get: _getSnapshot,
+      isFresh: _isSnapshotFresh,
+      TTL_MS: SNAPSHOT_TTL_MS,
+      KV_KEY: SNAPSHOT_KV_KEY
+    }
   };
 })();

@@ -42,6 +42,19 @@
     switchPage('pageSettings');
   }
 
+  /**
+   * P2-9: 返回当前所有合法 pageId (从 DOM 实时扫, 无需手动维护白名单).
+   * 优先从 .nav-item[data-page] 读, 兜底扫 .page[id] 容器, 合并去重.
+   * 用于 agent-tools 的 ui.navigateTo 等需要白名单校验的场景.
+   * @returns {string[]}
+   */
+  function listPages() {
+    const ids = new Set();
+    document.querySelectorAll('.nav-item[data-page]').forEach(el => { if (el.dataset.page) ids.add(el.dataset.page); });
+    document.querySelectorAll('.page[id]').forEach(el => { if (el.id) ids.add(el.id); });
+    return Array.from(ids);
+  }
+
   window.Core = window.Core || {};
-  window.Core.Router = { switchPage, goSettings };
+  window.Core.Router = { switchPage, goSettings, listPages };
 })();

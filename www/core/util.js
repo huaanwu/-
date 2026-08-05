@@ -105,24 +105,6 @@
   }
 
   /**
-   * 深拷贝(JSON 安全)
-   */
-  function clone(obj) {
-    return JSON.parse(JSON.stringify(obj));
-  }
-
-  /**
-   * debounce
-   */
-  function debounce(fn, delay = 300) {
-    let t = null;
-    return function(...args) {
-      if (t) clearTimeout(t);
-      t = setTimeout(() => fn.apply(this, args), delay);
-    };
-  }
-
-  /**
    * 生成 UUID
    */
   function uuid() {
@@ -153,7 +135,7 @@
   window.Core = window.Core || {};
   window.Core.Util = {
     escapeHtml, safeHTML, fmtNum, fmtPct, fmtMoney, pctClass,
-    stockCodePrefix, fmtDate, fmtDateTime, clone, debounce, uuid,
+    stockCodePrefix, fmtDate, fmtDateTime, uuid,
     parseStockInput,
     renderWithSources
   };

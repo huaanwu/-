@@ -24,10 +24,16 @@
   const ANCHOR_KEY_PAPER = 'discipline_month_anchor_paper';
   const ANCHOR_KEY_PAPER_SHORT = 'discipline_month_anchor_paper_short'; // kv: AI 短线子账户月度锚点 (T1)
 
+  // P1-6: journals 短期缓存 (assumption 字段无索引, 5s TTL 避免 preBuyCheck 反复拉全表)
+  const JOURNALS_CACHE_TTL_MS = 5000;
+  let _journalsCache = { at: 0, rows: null };
+
   // 默认配置 (出厂设置, 真值在 Core.Constants — 改一处生效全栈)
   const DEFAULT_CONFIG = {
     maxSingleStockPct: Core.Constants.MAX_SINGLE_STOCK_PCT,  // 单票占总资产上限
-    maxTotalPositionPct: 0.95,                              // 股票总仓位上限
+    // BUGFIX P1-7: 原代码硬编码 0.95, FIX-2 阈值常量收口时漏了这条, 改 Core.Constants 不生效.
+    //   修后引用 Core.Constants.MAX_TOTAL_POSITION_PCT, 改一处生效全栈.
+    maxTotalPositionPct: Core.Constants.MAX_TOTAL_POSITION_PCT,  // 股票总仓位上限
     // Phase 2.4: chaseWarnPct 改为小数 (0.05 = 5%), 与 envelope.payload.changePercent 语义对齐
     chaseWarnPct: 0.05,                                     // 当日涨幅超过此值视为追高 (警告不拦截)
     maxMonthlyDrawdownPct: Core.Constants.MAX_MONTHLY_DRAWDOWN_PCT,  // 月度回撤熔断线
@@ -52,6 +58,26 @@
       const d = new Date();
       return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
     },
+
+    /**
+     * P1-6: 缓存 journals 全表 5s, assumption 字段无索引, 减少 preBuyCheck 反复拉.
+     * 写入 journal 不主动失效缓存 (5s 后自然失效), 容忍短时 staleness.
+     * 暴露 resetJournalsCache 给 journal.save / 同步钩子主动失效 (可选).
+     * 失败时 rethrow: preBuyCheck 上层 try/catch 会捕获, 加 warn "部分检查跳过",
+     *   与"检查本身失败降级"原则一致 (缓存层不吞 storage 异常).
+     */
+    async _getJournalsCached() {
+      const now = Date.now();
+      if (_journalsCache.rows && (now - _journalsCache.at) < JOURNALS_CACHE_TTL_MS) {
+        return _journalsCache.rows;
+      }
+      _journalsCache.rows = (await window.Core.Storage.all('journals')) || [];
+      _journalsCache.at = now;
+      return _journalsCache.rows;
+    },
+
+    /** P1-6: 主动失效缓存 (journal.save 后调用, 可选; 不调也不影响正确性, 只是 5s 内 staleness) */
+    resetJournalsCache() { _journalsCache = { at: 0, rows: null }; },
 
     // ========== 配置 (kv 'discipline_config', 懒加载) ==========
 
@@ -275,8 +301,12 @@
         }
 
         // 7. 重复错误拦截 (同代码 + 同假设的历史复盘, 不建新表)
+        // BUGFIX P1-6: assumption 不是索引字段, `Storage.all('journals')` 拉全表 + filter 在每次买入前都跑.
+        //   500+ 复盘后单次 check 几十毫秒; 条件单结算 (T3) 一晚上可能跑几十次, 累积明显.
+        //   修后: 5 秒 TTL 内存缓存, 短时间多次 preBuyCheck 共用一次 all(), 减少 IndexedDB 往返.
+        //   写 journal 后下一次 check 会自然读到 (TTL 5s 后失效, 不会长时 staleness).
         const codeJournals = code ? (await window.Core.Storage.where('journals', 'code', code)) : [];
-        const allJournals = (await window.Core.Storage.all('journals')) || [];
+        const allJournals = await this._getJournalsCached();
         const sameAssumption = input.assumption ? allJournals.filter(j => j.assumption === input.assumption) : [];
         result.history = this._summarizeHistory(codeJournals, sameAssumption, input.assumption);
         if (result.history.length) result.warns.push('📜 ' + result.history.join('；'));

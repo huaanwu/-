@@ -193,29 +193,12 @@
     return lines.join('\n');
   }
 
-  /**
-   * 给 UI 用的格式化 (查看单条详情)
-   */
-  function formatOne(entry) {
-    if (!entry) return '';
-    return `### ${entry.id} ${entry.title}\n*分类: ${entry.category}*\n\n${entry.summary}\n\n**关键词**: ${(entry.keywords || []).join(', ')}`;
-  }
-
-  /**
-   * 列出所有分类
-   */
-  function categories() {
-    return ['valuation', 'risk', 'cycle', 'position', 'policy', 'behavior', 'case'];
-  }
-
   // 暴露
   window.Core = window.Core || {};
   window.Core.KB = {
     load: _load,
     get,
     pickRelevant,
-    formatForPrompt,
-    formatOne,
-    categories
+    formatForPrompt
   };
 })();

@@ -31,6 +31,21 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 应用层 (非工具调用, 直接暴露给 UI 用)
   openExternal: (url) => ipcRenderer.invoke('agent:openExternal', url),
 
-  // v0.2.19: dev-proxy 死了后, 用户在自检页点 "🔄 重启 dev-proxy" 触发
-  restartDevProxy: () => ipcRenderer.invoke('restart-dev-proxy')
+  // ===== V13: 服务管理 (统一重启各部) =====
+  restartDevProxy: () => ipcRenderer.invoke('restart-dev-proxy'),
+  restartAktools: () => ipcRenderer.invoke('restart-aktools'),
+  restartVite: () => ipcRenderer.invoke('restart-vite'),
+  restartFeishu: () => ipcRenderer.invoke('restart-feishu'),
+  healthAll: () => ipcRenderer.invoke('health-all'),
+
+  // ===== V13: 飞书凭证 IPC (renderer → main 推送 + 查询) =====
+  feishuSetCreds: (creds) => ipcRenderer.invoke('feishu:set-creds', creds),
+  feishuGetCreds: () => ipcRenderer.invoke('feishu:get-creds'),
+
+  // ===== v27 P0: 管家定时 tick (主进程 daemon 推 → renderer 触发 Steward 扫描) =====
+  onStewardTick: (cb) => {
+    const listener = (_e, data) => cb(data);
+    ipcRenderer.on('steward:tick', listener);
+    return () => ipcRenderer.removeListener('steward:tick', listener);
+  }
 });

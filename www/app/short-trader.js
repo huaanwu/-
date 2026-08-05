@@ -145,6 +145,8 @@
      */
     async _runPhase(phase, opts = {}) {
       const now = opts.now || new Date();
+      // V5: 每次 phase 生成 runId, 用于 decision_traces 串联
+      const runId = 'short-' + phase + '-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
       let decision;
       try {
         decision = await this._aiDecideNextAction({ phase, now, deps: opts.deps });
@@ -153,10 +155,19 @@
         decision = { action: PHASE_FALLBACK[phase] || 'skip', reason: '决策异常降级', source: 'fallback' };
       }
       await this._logDecision({ phase, now, decision });
+      // V5: 落 decision_traces 表 (runId 串联 AI 决策)
+      await this._recordDecisionTrace({ runId, phase, decision, ts: Date.now() });
       const act = String(decision.action || '').toLowerCase();   // v0.2.7: 归一化大小写, 防 LLM 大小写幻觉
       console.log(`[ShortTrader] ${phase} 调度决策: ${act} (${decision.source}) — ${decision.reason}`);
       try {
-        if (act === 'plan') return await this.maybeGeneratePlan(now);
+        if (act === 'plan') {
+          const planRet = await this.maybeGeneratePlan(now);
+          // V5: 把 plan 里被拒的票记 missed_opportunity
+          if (planRet && planRet.ok && planRet.plan) {
+            await this._recordMissedOpportunity(planRet.plan);
+          }
+          return planRet;
+        }
         if (act === 'review') return await this._reviewPlan();
         if (act === 'report') return await this._endOfDayReport();
         if (act === 'skip') return { skipped: true, action: 'skip', reason: 'ai 决定不操作' };
@@ -186,10 +197,10 @@
         return fallback('prompt 组装失败');
       }
       const callLLM = (o.deps && o.deps.callLLM)
-        || (async ({ prompt: pr }) => Core.AI.callWithTimeout({
+        || (async ({ prompt: pr }) => Core.AI.callThrough({
           prompt: pr, model: DECIDE_MODEL, maxTokens: 200, temperature: 0.2,
           timeout: DECIDE_TIMEOUT_MS, page: 'short-trader', purpose: 'short-schedule-decide'
-        }));
+        }, 'short'));
       let text;
       try { text = await callLLM({ prompt }); }
       catch (e) {
@@ -268,6 +279,67 @@
         await Core.Storage.kvSet(DECISION_KEY, [...hist, entry].slice(-DECISION_LOG_LIMIT));
       } catch (e) {
         console.warn('[ShortTrader] 决策 trace 落库失败:', e);
+      }
+    },
+
+    /**
+     * V5: 把每次 phase 调度决策落 decision_traces (runId 串联)
+     * @param {object} ctx - { runId, phase, decision, ts }
+     *   decision.action: plan / review / report / skip
+     *   decision.reason + decision.source: AI 给的理由 + 来源 (fallback/llm)
+     */
+    async _recordDecisionTrace(ctx) {
+      if (!window.Core || !Core.Storage || !Core.Storage.addDecisionTrace) return;
+      const d = ctx.decision || {};
+      const traceId = ctx.runId + ':short';
+      const trace = {
+        traceId: traceId,
+        runId: ctx.runId,
+        strategy: 'short',
+        agentType: 'phase_' + (ctx.phase || 'unknown'),
+        code: d.action || 'skip',
+        sleeve: 'short',
+        regime: (Core.Regime && Core.Regime.gateMultipliers && Core.Regime.gateMultipliers().state) || 'unknown',
+        factor: (Core.PolicyBundle && typeof Core.PolicyBundle._factorFor === 'function')
+          ? Core.PolicyBundle._factorFor('short', (Core.Regime && Core.Regime.gateMultipliers && Core.Regime.gateMultipliers().state) || 'range')
+          : 0.6,
+        ts: ctx.ts || Date.now(),
+        payload: {
+          phase: ctx.phase,
+          action: d.action || 'skip',
+          reason: d.reason || '',
+          source: d.source || 'fallback'
+        }
+      };
+      try {
+        await Core.Storage.addDecisionTrace(trace);
+      } catch (e) {
+        console.warn('[ShortTrader] 写 decision_traces 失败:', e);
+      }
+    },
+
+    /**
+     * V5: 把 plan 里因纪律/资金/集中度被拒的票记 missed_opportunities
+     * 用于长期累积「AI 推荐 vs 实际仓位」覆盖率, 供 weekly-attribution 用
+     * @param {object} plan - generatePlan 返回的 { plans: [...], ... }
+     */
+    async _recordMissedOpportunity(plan) {
+      if (!window.Core || !Core.Storage || !Core.Storage.addMissedOpportunity) return;
+      if (!plan || !Array.isArray(plan.plans)) return;
+      const dateStr = plan.date || new Date().toISOString().slice(0, 10).replace(/-/g, '');
+      for (const p of plan.plans) {
+        if (p && p.ok === false && p.code) {
+          try {
+            await Core.Storage.addMissedOpportunity({
+              code: p.code,
+              date: dateStr,
+              signalType: 'short_' + (p.signal || 'plan_rejected'),
+              sleeve: 'short',
+              score: typeof p.score === 'number' ? p.score : 0,
+              context: { reason: p.reason || p.error || 'unknown', planDate: plan.date }
+            });
+          } catch (e) { console.warn('[ShortTrader] 写 missed_opportunity 失败:', e.message || e); }
+        }
       }
     },
 
@@ -499,6 +571,11 @@
         if (pmErrs.length) { drop(code, 'premortem', pmErrs.join('; ')); continue; }
         // (b) 幻觉防护: 代码必须在候选池
         if (!ctx.pool.has(code)) { drop(code, 'hallucination', '代码不在候选池 (自选股+短线持仓), 疑似幻觉'); continue; }
+        // (b2) P0 偏离修复: 排雷命中 — HIGH (≥2 类 reason) 强制拒, 跟长线同口径
+        if (ctx.riskByCode && ctx.riskByCode.has(code) && ctx.riskByCode.get(code).level >= 2) {
+          const hit = ctx.riskByCode.get(code);
+          drop(code, 'riskmine', '排雷 HIGH 命中: ' + hit.reasons.join('+')); continue;
+        }
         // (c) 价格关系: stopLoss < triggerPrice < targetPrice (双向统一, 与 T3 _checkCondOrder 同口径)
         //     锚定兜底会重写 tp/sl/tg, 故用 let
         let tp = parseFloat(p.triggerPrice), sl = parseFloat(p.stopLoss), tg = parseFloat(p.targetPrice);
@@ -684,6 +761,15 @@
       lines.push('## 大盘状态机 (Regime)');
       lines.push(`状态: ${ctx.regime.label} (${ctx.regime.state})` +
         (ctx.regime.state === 'bear' ? ' —— 下跌市, 仓位自动减半, 门槛从严' : ''));
+      // P4.3: 宏观周期 + 价×时状态矩阵 (Cycle 跟 Regime 冲突时给 LLM 提前预警)
+      if (ctx.cycleText) {
+        lines.push('');
+        lines.push(ctx.cycleText);
+      }
+      if (ctx.stateMatrixText) {
+        lines.push('');
+        lines.push(ctx.stateMatrixText);
+      }
       lines.push('');
       lines.push('## 指数快照');
       lines.push(ctx.marketText || '(市场数据不可用, 按常识谨慎判断)');
@@ -722,7 +808,12 @@
           const noticePart = (notices && notices.length)
             ? ` [公告:${notices.map(n => `${n.type}${(n.text || '').slice(0, 30)}`).join('|')}]`
             : '';
-          return `${x.code} ${x.name} ${pricePart}${kfPart}${indPart}${noticePart}`.trim();
+          // P0 偏离修复: 排雷命中标记 (HIGH 强制拒, LOW 提示谨慎)
+          const riskHit = ctx.riskByCode && ctx.riskByCode.get(x.code);
+          const riskPart = riskHit
+            ? ` [${riskHit.level >= 2 ? '🚫HIGH' : '⚠LOW'}:${riskHit.reasons.join('+')}]`
+            : '';
+          return `${x.code} ${x.name} ${pricePart}${kfPart}${indPart}${noticePart}${riskPart}`.trim();
         }).join(' / '));
       } else {
         lines.push('(候选池为空 → 必须输出 plans: [])');
@@ -789,6 +880,21 @@
         const gate = Core.Regime.gateMultipliers();
         ctx.regime = { state: rec.state, label: gate.label, positionScale: gate.positionScale };
       } catch (e) { console.warn('[ShortTrader] ctx 读 Regime 失败:', e); }
+      // P4.3: 宏观周期 + 价×时状态矩阵 — 注入 ctx 给 _buildUserPrompt 渲染
+      try {
+        if (window.Core && Core.Cycle && typeof Core.Cycle.getCyclePosition === 'function') {
+          const pos = await Core.Cycle.getCyclePosition();
+          ctx.cyclePosition = pos;
+          ctx.cycleText = Core.Cycle.formatForPrompt(pos) || '';
+        }
+      } catch (e) { console.warn('[ShortTrader] ctx 读 Cycle 失败:', e); }
+      try {
+        if (window.Core && Core.StateMatrix && typeof Core.StateMatrix.getPositionScale === 'function') {
+          const sm = await Core.StateMatrix.getPositionScale();
+          ctx.stateMatrix = sm;
+          ctx.stateMatrixText = Core.StateMatrix.formatForPrompt(sm) || '';
+        }
+      } catch (e) { console.warn('[ShortTrader] ctx 读 StateMatrix 失败:', e); }
       // 市场快照: 只用 Core.Data 已验证接口 getIndexSpot (腾讯优先, 失败降级 aktools)
       try {
         const idx = (await Core.Data.getIndexSpot()) || [];
@@ -809,10 +915,64 @@
           }
         } catch (e) { console.warn('[ShortTrader] screener top 拉取跳过:', e); }
 
+        // P4.2: 规则引擎 (Core.Screener.run('short')) — 软打分排序的额外输入
+        //   只在 _ok=true 且 short[] 非空时并入; 失败/降级 → 静默
+        //   short[] 格式: [{code, name, confidence, score, reason}]
+        let ruleTop = [];
+        try {
+          if (window.Core && Core.Screener && typeof Core.Screener.run === 'function') {
+            const scr = await Core.Screener.run('short');
+            if (scr && scr._ok && Array.isArray(scr.short) && scr.short.length > 0) {
+              ruleTop = scr.short.slice(0, _POOL_HARD_CAP).map(p => ({
+                代码: String(p.code || '').padStart(6, '0'),
+                名称: String(p.name || ''),
+                score: p.score,
+                confidence: p.confidence,
+                reason: p.reason
+              }));
+            }
+          }
+        } catch (e) { console.warn('[ShortTrader] Core.Screener.run(\'short\') 失败:', e); }
+
         const wl = (await Core.Storage.all('watchlist')) || [];
         const basePool = this._buildCandidatePool(wl, ctx.positions);
-        ctx.pool = this._mergeCandPools(basePool, screenerTop);
-        ctx.screenerTopCodes = new Set(screenerTop.map(s => s && (s['代码'] || s.code)).filter(Boolean));
+        // P4.2: 先并入旧 screener top, 再并入规则引擎 short[] (去重保序)
+        ctx.pool = this._mergeCandPools(this._mergeCandPools(basePool, screenerTop), ruleTop);
+        ctx.screenerTopCodes = new Set(
+          [...screenerTop, ...ruleTop].map(s => s && (s['代码'] || s.code)).filter(Boolean)
+        );
+        // Phase R: 研究池边界 — 短线选股也只能在研究池里挑
+        try {
+          if (Core.ResearchPool && typeof Core.ResearchPool.filterByPool === 'function') {
+            const r = await Core.ResearchPool.filterByPool(ctx.pool);
+            if (r.poolEmpty) {
+              if (window.Core && Core.Toast && Core.Toast.warning) {
+                Core.Toast.warning('研究池为空 (上限 ' + r.limit + ' 只), 短线 AI 不会从全市场随便挑, 请先加入研究池', 6000);
+              }
+              ctx.pool = [];
+              ctx.skipReason = '研究池为空';
+            } else {
+              ctx.pool = r.kept;
+              console.log('[ShortTrader] 研究池过滤: ' + r.total + ' → ' + r.kept.length + ' (池子大小 ' + r.poolSize + ')');
+            }
+          }
+        } catch (e) {
+          console.warn('[ShortTrader] 研究池过滤失败, 降级放行:', e);
+        }
+        // P0 偏离修复: 排雷 (RiskMine) — 短线也要走
+        //   读 6h 缓存, 给候选池每只标 riskLevel (1=LOW, 2=HIGH), _validatePlans 拒 HIGH
+        ctx.riskByCode = new Map();
+        try {
+          if (window.Core && Core.RiskMine && typeof Core.RiskMine.getCache === 'function') {
+            const riskMap = await Core.RiskMine.getCache();
+            if (riskMap && typeof riskMap.get === 'function' && Array.isArray(ctx.pool)) {
+              const hits = Core.RiskMine.scanHits(ctx.pool.map(c => c.code), riskMap);
+              hits.forEach(h => ctx.riskByCode.set(h.code, h));
+              if (hits.length > 0) console.log('[ShortTrader] RiskMine 命中 ' + hits.length + ' 只 (HIGH ' + hits.filter(h => h.level >= 2).length + ')');
+            }
+          }
+        } catch (e) { console.warn('[ShortTrader] RiskMine.getCache 失败:', e); }
+
         // Bug B 修复 (资料注入 - 候选池 currentPrice): 异步拉每只的现价注入 ctx.pool,
         //   并组装 ctx.priceByCode (Map) 给 _validatePlans 方向对照用.
         //   - 数据源: Core.Data.Facade.getQuoteMany 批量 (60s 缓存, 失败容错)
@@ -1576,7 +1736,7 @@
         ].join('\n');
         const prompt = `# 最近已验证交易 (${feed.length} 笔)\n` + feed.join('\n');
         const callLLM = (deps && deps.callLLM)
-          || (async ({ systemPrompt: sp, prompt: pr }) => Core.AI.callWithTimeout({ systemPrompt: sp, prompt: pr, timeout: LLM_TIMEOUT_MS }));
+          || (async ({ systemPrompt: sp, prompt: pr }) => Core.AI.callThrough({ systemPrompt: sp, prompt: pr, timeout: LLM_TIMEOUT_MS, page: 'short-trader', purpose: 'short-distill-lessons' }, 'short'));
         const text = await callLLM({ systemPrompt, prompt });
         const parsed = Core.AI.parseJsonOutput(text, { required: ['lessons'], types: { lessons: 'array' } });
         if (!parsed.ok) {
@@ -1707,14 +1867,29 @@
       const today = this._todayStr(now);
       const ctx = await this._buildPlanContext(now);
       const systemPrompt = this._buildSystemPrompt();
-      // P0-3: 显式市场状态前缀
-      const regimeLine = '【当前市场状态】' + ctx.regime.label + ' (' + ctx.regime.state + ') — 仓位系数 ×' + ctx.regime.positionScale + '\n\n';
-      const finalSystemPrompt = regimeLine + systemPrompt;
+      // P6.4: 宏观策略指令块 (PolicyBundle 替代 regimeLine + Cycle/StateMatrix/KB/MAO 散拼)
+      //   短线的 regimeLine 已经被 PolicyBundle 内的 _formatRegimeBlock 覆盖, 不重复
+      let policyBlock = '';
+      try {
+        if (window.Core && Core.AI && Core.AI.PolicyBundle && typeof Core.AI.PolicyBundle.load === 'function') {
+          const bundle = await Core.AI.PolicyBundle.load({ strategy: 'short', ctx });
+          if (bundle && typeof bundle.toSystemPrompt === 'function') {
+            policyBlock = bundle.toSystemPrompt();
+          }
+        }
+      } catch (e) { console.warn('[ShortTrader] PolicyBundle 加载失败:', e && e.message || e); }
+      const finalSystemPrompt = (policyBlock ? policyBlock + '\n\n' : '') + systemPrompt;
+      // V12: 注入 news.snapshot 工具提示 (不强制, AI 管家可选调用)
+      const newsHint = '\n\n## 新闻工具提示\n' +
+        '你有一个工具 `news.snapshot` 可调用, 返回所有关注票 (自选+持仓+研究池) 的最近公告快照, 30 分钟自动刷新一次。\n' +
+        '短线决策前建议先调用一次 (特别在 morning phase), 看是否有重大公告/减持/重组/业绩预警, 可能改变你的开仓/平仓判断。\n' +
+        '调用示例: `news.snapshot({})` 拿全量, 或 `news.snapshot({ codes: ["600519"] })` 只看几只。';
+      const finalSystemWithNews = finalSystemPrompt + newsHint;
       // T4: 既有上下文后追加成绩单 + 我的教训
       const learningText = await this._buildLearningPromptText();
       const prompt = this._buildUserPrompt({ ...ctx, today }) + learningText;
       const callLLM = (opts.deps && opts.deps.callLLM)
-        || (async ({ systemPrompt: sp, prompt: pr }) => Core.AI.callWithTimeout({ systemPrompt: sp, prompt: pr, timeout: LLM_TIMEOUT_MS }));
+        || (async ({ systemPrompt: sp, prompt: pr }) => Core.AI.callThrough({ systemPrompt: sp, prompt: pr, timeout: LLM_TIMEOUT_MS, page: 'short-trader', purpose: 'short-generate-plan' }, 'short'));
 
       // P0-1: self-consistency — 3 路并行, plan 级众数聚合
       const CONSENSUS_N = 3;
@@ -1722,7 +1897,7 @@
       const tasks = [];
       const aiStartMs = Date.now();
       for (let i = 0; i < CONSENSUS_N; i++) {
-        tasks.push(callLLM({ systemPrompt: finalSystemPrompt, prompt }).then(raw => {
+        tasks.push(callLLM({ systemPrompt: finalSystemWithNews, prompt }).then(raw => {
           const p = Core.AI.parseJsonOutput(raw, {
             required: ['marketView', 'plans'],
             types: { marketView: 'string', plans: 'array' },
@@ -2120,4 +2295,24 @@
   };
 
   window.ShortTrader = ShortTrader;
+
+  // Phase 5: 注册 'short' strategy 到 Entry.run (统一 runId + Tracing)
+  try {
+    if (window.Core && Core.AI && Core.AI.Entry && typeof Core.AI.Entry.register === 'function'
+        && !Core.AI.Entry.list().short) {
+      Core.AI.Entry.register('short', {
+        description: '短线 sleeve 盘前 AI 计划 + 校准日报 + 教训蒸馏',
+        version: 'v1',
+        risk: 'M'
+      }, async function (ctx, opts) {
+        const action = ctx.action || 'plan';
+        if (action === 'distill') {
+          const r = await ShortTrader._aiDistillLessons(opts);
+          return { ok: !!r, data: r, summary: r ? '教训已蒸馏' : '教训蒸馏失败', raw: null, error: r ? null : 'distill 返空' };
+        }
+        const r = await ShortTrader.generatePlan(opts);
+        return { ok: !!r, data: r, summary: r ? 'short 计划已生成' : 'short 计划失败', raw: null, error: r ? null : 'generatePlan 返空' };
+      });
+    }
+  } catch (e) { console.warn('[ShortTrader] Entry.register 跳过:', e); }
 })();

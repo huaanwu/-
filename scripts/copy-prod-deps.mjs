@@ -33,8 +33,8 @@ const SRC_MODULES = join(ROOT, 'node_modules');
 const OUT_BASE = join(ROOT, 'prod-deps');
 const OUT_MODULES = join(OUT_BASE, 'node_modules');
 
-// 必装的两个根包
-const ROOTS = ['express', 'http-proxy-middleware'];
+// 必装的根包: dev-proxy 需 express + http-proxy-middleware; 主进程 WS 长连需 protobufjs (V13 飞书)
+const ROOTS = ['express', 'http-proxy-middleware', 'protobufjs'];
 
 function log(...a) { console.log('[copy-prod-deps]', ...a); }
 function die(msg, code = 1) { console.error('[copy-prod-deps] ❌', msg); process.exit(code); }

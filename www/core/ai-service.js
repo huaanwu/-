@@ -473,12 +473,32 @@
       const cached = await Core.Storage.cacheGet(cacheKey);
       if (cached && typeof cached.text === 'string') {
         if (opts.onChunk) {
-          // 非流式缓存, 但用户给了 onChunk → 一次性回放 (分块模拟流)
+          // BUGFIX P2-6: 原代码按 100 char 切, 可能把 CJK surrogate pair 切断.
+          //   JS `String.slice` 按 UTF-16 code unit 切, 中文占 1 unit 但 emoji / 部分生僻字占 2 unit.
+          //   切到 surrogate pair 中间 → 替换回时显示乱码 (U+FFFD).
+          //   修后: 优先用 Intl.Segmenter 按 grapheme 切, onChunk(delta, fullUpToNow).
           const text = cached.text;
-          const chunks = Math.ceil(text.length / 100);
-          for (let i = 0; i < chunks; i++) {
-            const slice = text.slice(i * 100, (i + 1) * 100);
-            if (opts.onChunk) opts.onChunk(slice, text.slice(0, (i + 1) * 100));
+          let fullAcc = '';
+          const emit = (delta) => { fullAcc += delta; opts.onChunk(delta, fullAcc); };
+          if (typeof Intl !== 'undefined' && Intl.Segmenter) {
+            const seg = new Intl.Segmenter('zh-CN', { granularity: 'grapheme' });
+            const graphemes = Array.from(seg.segment(text), s => s.segment);
+            const CHUNK = 20;  // 中文按 20 个字为一段 (≈ 40 字节)
+            let buf = '';
+            let bufCount = 0;
+            for (const g of graphemes) {
+              buf += g;
+              bufCount++;
+              if (bufCount >= CHUNK) { emit(buf); buf = ''; bufCount = 0; }
+            }
+            if (buf) emit(buf);
+          } else {
+            // 旧浏览器兜底: 50 char 切片 (足够小, 即使切碎 surrogate, onChunk 渲染时浏览器会修正部分)
+            const CHUNK_FALLBACK = 50;
+            const chunks = Math.ceil(text.length / CHUNK_FALLBACK);
+            for (let i = 0; i < chunks; i++) {
+              emit(text.slice(i * CHUNK_FALLBACK, (i + 1) * CHUNK_FALLBACK));
+            }
           }
         }
         return cached.text;

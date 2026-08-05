@@ -85,7 +85,6 @@
   window.Core.CrossCheck = {
     pickSecondProvider,
     resolveSecondOpinion,
-    buildComparePrompt,
-    PROVIDER_ORDER
+    buildComparePrompt
   };
 })();

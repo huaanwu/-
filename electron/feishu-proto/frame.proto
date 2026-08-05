@@ -1,0 +1,47 @@
+/**
+ * Feishu WS Frame schema (反向工程自 lark_oapi/ws/pb/pbbp2.proto)
+ *
+ * 来源依据:
+ *   C:\Users\laowu\.hermes\.lingma\agents\hermes-agent\venv\Lib\site-packages\
+ *   lark_oapi\ws\pb\pbbp2_pb2.py
+ *
+ * 原始 schema 是 proto2 + gogo extensions:
+ *   - `headers` 字段标了 [packed=false] (gogo extension)
+ *   - protobufjs 不支持 gogo extensions, 但 wire format 兼容
+ *     (gogo emit 时不写 packed marker 字节; protobufjs decode 端不查 packed marker)
+ *
+ * 简化:
+ *   - 不引 gogo extensions (protobufjs 解析会失败)
+ *   - 不引 payload_encoding / payload_type / LogIDNew
+ *     (服务端偶尔带, 客户端忽略即可)
+ *   - 字段名保留驼峰以对应 Hermes Python SDK 的 Frame.SeqID / Frame.headers
+ *
+ * Frame.method: 0 = CONTROL, 1 = DATA
+ *   CONTROL frame headers["type"]: "ping" | "pong"
+ *   DATA    frame headers["type"]: "event" | "card"
+ *   DATA    frame headers 还带 message_id / trace_id / sum / seq (合包重组用)
+ *
+ * EndpointResp (不是 protobuf, JSON 返回):
+ *   { code: 0, msg: "ok",
+ *     data: {
+ *       URL: "wss://xxxx.feishu.cn/...",
+ *       ClientConfig: { ReconnectCount, ReconnectInterval, ReconnectNonce, PingInterval }
+ *     } }
+ */
+syntax = "proto2";
+package pbbp2;
+
+message Header {
+  required string key = 1;
+  required string value = 2;
+}
+
+message Frame {
+  required uint64 SeqID = 1;
+  required uint64 LogID = 2;
+  required int32 service = 3;
+  required int32 method = 4;
+  repeated Header headers = 5;
+  optional bytes payload = 8;
+  optional string LogIDNew = 9;
+}

@@ -1,5 +1,6 @@
 node_modules/
 www/dist/
+www/.dist-snapshot/
 www/assets/
 www/styles.css
 www/public/icons-source/

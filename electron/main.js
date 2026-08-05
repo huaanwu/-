@@ -18,6 +18,36 @@ const path = require('path');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const agentRegistry = require('./agent-registry');
+const { registerExtension } = require('./agent-registry-ext');
+
+// V13: 扩展工具集 (22 个域写工具, R/W 两档)
+registerExtension(agentRegistry);
+
+// ===== 启动前清理: 杀残留进程 (端口 8088/8089) =====
+// 解决: 上次 Electron 崩溃后 dev-proxy / aktools / vite / static-server 进程残留,
+//       端口占用导致新实例启动失败 (用户反馈: "运行 npx electron . 时自动杀一下死进程")
+// 注意: execSync 走 cmd.exe (不是 PowerShell), 管道符直接用 | 不用 ^|
+const { execSync } = require('child_process');
+(function cleanupStaleProcesses() {
+  const ports = [8088, 8089];
+  const myPid = process.pid;
+  let killed = 0;
+  ports.forEach(port => {
+    try {
+      const out = execSync('netstat -ano | findstr ":' + port + ' "', { encoding: 'utf8', timeout: 3000, stdio: ['pipe', 'pipe', 'ignore'] });
+      out.split(/\r?\n/).forEach(line => {
+        const m = line.match(/LISTENING\s+(\d+)/);
+        if (m) {
+          const pid = parseInt(m[1]);
+          if (pid && pid !== myPid) {
+            try { execSync('taskkill /f /pid ' + pid, { stdio: 'ignore' }); killed++; } catch (e) { /* 进程可能已结束 */ }
+          }
+        }
+      });
+    } catch (e) { /* 端口未被占用, 正常跳过 */ }
+  });
+  if (killed > 0) console.log('[main] 已清理 ' + killed + ' 个残留进程 (端口 ' + ports.join(',') + ')');
+})();
 
 // ===== 自动更新 (electron-updater) =====
 function setupAutoUpdater() {
@@ -131,7 +161,8 @@ const children = [];
 
 // ===== 子进程启动 =====
 function spawnChild(name, cmd, args, cwd, color) {
-  const child = spawn(cmd, args, { cwd, shell: true, env: { ...process.env, FORCE_COLOR: color || '1' } });
+  const child = spawn(cmd, args, { cwd, shell: true, env: { ...process.env, FORCE_COLOR: color || '1', NO_AKTOOLS_AUTOSTART: name === 'proxy' ? '1' : undefined } });
+  child._serviceName = name;
   children.push(child);
   const tag = '[' + name + ']';
   child.stdout.on('data', (d) => process.stdout.write(tag + ' ' + d));
@@ -167,7 +198,18 @@ function _spawnDevProxy() {
     }
     const c = spawn('node', [proxyScript], {
       cwd: IS_DEV ? ROOT : RESOURCES,
-      env: { ...process.env, FORCE_COLOR: '1' }
+      env: {
+        ...process.env,
+        FORCE_COLOR: '1',
+        NO_AKTOOLS_AUTOSTART: '1',
+        // 生产模式: dev-proxy 同时 serve 静态文件, 需要知道 www 路径
+        ...(IS_DEV
+          ? {}
+          : {
+            NODE_PATH: require('path').join(RESOURCES, 'node_modules'),
+            STATIC_ROOT: require('path').join(RESOURCES, 'app', 'www')
+          })
+      }
     });
     c.stdout.on('data', (d) => process.stdout.write('[proxy] ' + d));
     c.stderr.on('data', (d) => process.stderr.write('[proxy] ' + d));
@@ -244,61 +286,28 @@ async function _ensureAktools() {
     await new Promise(r => setTimeout(r, 1000));
   }
 }
-
-/** V14: 启动内置静态 HTTP 服务器 (避免 file:// fetch CORS 问题) */
-function _startStaticServer(port) {
-  const http = require('http');
-  let staticDir;
-  if (IS_DEV) {
-    staticDir = path.join(ROOT, 'www');
-  } else {
-    staticDir = path.join(RESOURCES, 'app', 'www');
-  }
-  if (!fs.existsSync(staticDir)) {
-    process.stderr.write('[static] www 目录不存在: ' + staticDir + '\n');
-    return;
-  }
-  const DEVO_PROXY_TARGET = 'http://127.0.0.1:8089';
-  const server = http.createServer((req, res) => {
-    if (req.url.startsWith('/api/') || req.url === '/health') {
-      const options = {
-        hostname: '127.0.0.1',
-        port: 8089,
-        path: req.url,
-        method: req.method,
-        headers: { ...req.headers, host: '127.0.0.1:8089' }
-      };
-      const proxyReq = http.request(options, (proxyRes) => {
-        res.writeHead(proxyRes.statusCode, proxyRes.headers);
-        proxyRes.pipe(res);
-      });
-      proxyReq.on('error', (e) => { res.writeHead(502); res.end(JSON.stringify({ error: 'dev-proxy 不通', detail: e.message })); });
-      req.pipe(proxyReq);
-      return;
-    }
-    let filePath = path.join(staticDir, req.url === '/' ? 'index.html' : req.url);
-    if (!fs.existsSync(filePath)) filePath = path.join(staticDir, 'index.html');
-    const ext = path.extname(filePath).toLowerCase();
-    const mime = { '.html': 'text/html', '.js': 'application/javascript', '.css': 'text/css', '.json': 'application/json', '.png': 'image/png', '.ico': 'image/x-icon', '.svg': 'image/svg+xml', '.webmanifest': 'application/manifest+json' };
-    res.writeHead(200, { 'Content-Type': mime[ext] || 'application/octet-stream' });
-    res.end(fs.readFileSync(filePath));
-  });
-  server.listen(port, '127.0.0.1', () => process.stdout.write('[static] 静态文件服务器 -> http://127.0.0.1:' + port + '/\n'));
-  server.on('error', (e) => process.stderr.write('[static] 启动失败: ' + e.message + '\n'));
-  const cleanup = () => { try { server.close(); } catch (_) {} };
-  children.push({ kill: cleanup });
-  process.on('exit', cleanup);
-}
+// _startStaticServer 已迁移到 dev-proxy.mjs (端口 8089 同时 serve 静态文件)
 
 async function startBackend() {
   await _ensureAktools();
 
+  // 检查目标 URL 是否可访问 (避免与外部已启动的服务冲突)
+  async function _portUp(url, timeoutMs = 1000) {
+    try { await waitForUrl(url, timeoutMs); return true; } catch (e) { return false; }
+  }
+
   if (IS_DEV) {
     const proxyScript = path.join(ROOT, 'scripts', 'dev-proxy.mjs');
     if (fs.existsSync(proxyScript)) {
-      spawnChild('proxy', 'node', [proxyScript], ROOT, '1');
+      // 如果端口 8089 已被占用 (外部 npm run dev 已启 proxy), 跳过
+      const proxyUp = await _portUp('http://127.0.0.1:8089/health', 1000);
+      if (!proxyUp) spawnChild('proxy', 'node', [proxyScript], ROOT, '1');
+      else process.stdout.write('[startBackend] 检测到外部 dev-proxy 已在运行 (端口 8089), 跳过启动\n');
     }
-    spawnChild('vite', 'npx', ['vite'], ROOT, '2');
+    // 如果端口 3003 已被占用 (外部 vite 已启), 跳过
+    const viteUp = await _portUp('http://127.0.0.1:3003', 1000);
+    if (!viteUp) spawnChild('vite', 'npx', ['vite'], ROOT, '2');
+    else process.stdout.write('[startBackend] 检测到外部 vite 已在运行 (端口 3003), 跳过启动\n');
     await waitForUrl('http://127.0.0.1:3003', 15000);
     await waitForUrl('http://127.0.0.1:8089/health', 5000).catch(() => {
       process.stderr.write('[startBackend] ⚠️ dev-proxy 启动 5s 内未就绪, selfCheck 会显示 ×\n');
@@ -313,10 +322,6 @@ async function startBackend() {
       const ready = await waitForUrl('http://127.0.0.1:8089/health', 8000).then(() => true).catch(() => false);
       if (!ready) process.stderr.write('[startBackend] ⚠️ dev-proxy 启动 8s 内未就绪, 看 selfCheck 状态 (可手动点 🔄 重启 dev-proxy)\n');
     }
-    _startStaticServer(29037);
-    await waitForUrl('http://127.0.0.1:29037', 3000).catch(() => {
-      process.stderr.write('[startBackend] 静态服务器未在 3s 内就绪, 继续尝试加载窗口\n');
-    });
   }
 }
 
@@ -364,7 +369,7 @@ function createWindow() {
     mainWindow.loadURL('http://127.0.0.1:3003');
     mainWindow.webContents.openDevTools({ mode: 'detach' });
   } else {
-    mainWindow.loadURL('http://127.0.0.1:29037');
+    mainWindow.loadURL('http://127.0.0.1:8089');
   }
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -397,26 +402,417 @@ function buildMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
+// ===== Headless 模式 (--agent-mode=headless) =====
+/**
+ * headless 模式: 不创建 BrowserWindow, 通过内置 HTTP endpoint 远程触发 AI 调度
+ *
+ * 设计:
+ *   - agent:headless:invoke IPC channel — main 进程主动调工具, 与 agent:invoke (renderer→main) 反方向
+ *   - /api/headless/run  HTTP endpoint — 外部/定时任务 POST 触发 AI strategy
+ *   - 所有 tool 调用直接走 agentRegistry (不经过 IPC serialization)
+ *   - V13 阶段 2: 主进程 Daemon — 60s tick 调度 news-refresh / portfolio-scan 等
+ */
+const { Daemon } = require('./daemon');
+
+function setupHeadless() {
+  // 注册 headless IPC channel (用于 main→main 自调用, 或者将来 Electron renderer+headless 混合模式)
+  ipcMain.handle('agent:headless:invoke', async (event, name, args, ctx) => {
+    process.stdout.write('[headless] invoke: ' + name + '\n');
+    try {
+      const result = await agentRegistry.invoke(name, args || {}, ctx || {});
+      return result;
+    } catch (e) {
+      return { ok: false, error: e.message || String(e) };
+    }
+  });
+
+  // app.on('headless:run') 事件触发器: 内部调度入口
+  //   - HTTP endpoint POST /api/headless/run 时调用
+  //   - 将来定时任务 / 飞书 webhook 回调也可触发
+  app.on('headless:run', async (strategy, payload) => {
+    process.stdout.write('[headless] 收到调度请求: ' + (strategy || 'agents') + '\n');
+    try {
+      const result = await agentRegistry.invoke('ai.runStrategy', { strategy: strategy || 'agents', payload: payload || {} }, {});
+      return { ok: true, mode: 'headless', strategy: strategy || 'agents', result: result };
+    } catch (e) {
+      return { ok: false, mode: 'headless', strategy: strategy || 'unknown', error: e.message || String(e) };
+    }
+  });
+
+  // G5: HTTP endpoint — 独立 HTTP server 监听 8090 端口 (不动 startBackend)
+  //   POST /api/headless/run  body: { strategy: 'long'|'short'|'fund'|'agents', payload: {...} }
+  //   替代 startBackend listener 修改, 简单可靠
+  const HEADLESS_HTTP_PORT = 8090;
+  const http = require('http');
+  const headlessServer = http.createServer((req, res) => {
+    // CORS (开发时浏览器跨域调)
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+    if (req.method === 'GET' && req.url === '/api/headless/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, mode: 'headless', port: HEADLESS_HTTP_PORT }));
+      return;
+    }
+
+    if (req.method === 'POST' && req.url === '/api/headless/run') {
+      let body = '';
+      req.on('data', (chunk) => { body += chunk; if (body.length > 1024 * 1024) { req.destroy(); } });
+      req.on('end', async () => {
+        let payload = {};
+        try { payload = body ? JSON.parse(body) : {}; }
+        catch (e) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'JSON parse failed: ' + e.message }));
+          return;
+        }
+        const strategy = payload.strategy || 'agents';
+        try {
+          const result = await new Promise((resolve) => {
+            // emit 事件, headless:run handler 处理; resolve(handler 返回值)
+            app.emit('headless:run', strategy, payload);
+            // 注: app.emit 不返回 handler 结果, 我们直接 await registry.invoke
+            resolve(agentRegistry.invoke('ai.runStrategy', { strategy, payload }, {}));
+          });
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, strategy, result: await result }));
+        } catch (e) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, strategy, error: e.message || String(e) }));
+        }
+      });
+      return;
+    }
+
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'not found: ' + req.url }));
+  });
+  headlessServer.listen(HEADLESS_HTTP_PORT, '127.0.0.1', () => {
+    process.stdout.write('[headless] HTTP 监听 127.0.0.1:' + HEADLESS_HTTP_PORT + ' (POST /api/headless/run)\n');
+  });
+  headlessServer.on('error', (e) => {
+    process.stderr.write('[headless] HTTP server 失败: ' + e.message + '\n');
+  });
+
+  // 启动健康检查
+  setInterval(async () => {
+    try {
+      const health = await new Promise((resolve) => {
+        const req = http.get('http://127.0.0.1:8089/health', { timeout: 5000 }, (res) => {
+          let body = '';
+          res.on('data', (c) => { body += c; });
+          res.on('end', () => resolve({ ok: res.statusCode === 200, status: res.statusCode, body: body.slice(0, 200) }));
+        });
+        req.on('error', (e) => resolve({ ok: false, error: e.code }));
+        req.on('timeout', () => { req.destroy(); resolve({ ok: false, error: 'timeout' }); });
+      });
+      process.stdout.write('[headless] heartbeat: dev-proxy ' + (health.ok ? 'OK' : 'FAIL') + (health.error ? ' (' + health.error + ')' : '') + '\n');
+    } catch (e) {
+      process.stderr.write('[headless] heartbeat 异常: ' + e.message + '\n');
+    }
+  }, 60000); // 每分钟心跳
+
+  process.stdout.write('[headless] 已就绪, 等待 AI 调度请求\n');
+
+  // V13 阶段 2: 启动主进程 Daemon — 60s tick 调度后台任务
+  // 与 renderer 端 Core.Scheduler 并行不冲突 (daemon task 用 daemon.* 前缀命名)
+  setupDaemon();
+
+  // V13 阶段 3: 启动飞书 (WebSocket 长连); 凭证从环境变量读 (开发), 或从 Dexie kv 同步 (生产)
+  setupFeishu({ appId: process.env.FEISHU_APP_ID, appSecret: process.env.FEISHU_APP_SECRET });
+}
+
+/** V13: Daemon — 主进程常驻调度器 */
+const daemon = new Daemon({ runOnInit: true });
+let _daemonConfigured = false;
+
+function setupDaemon() {
+  if (_daemonConfigured) return daemon;
+  _daemonConfigured = true;
+  // news-refresh: 每 30 分钟拉一次所有关注票新闻快照 (复用 V12 工具)
+  // 注: 通过 executeJavaScript 调 renderer 端的 Core.News.snapshot.build
+  daemon.register('daemon.news-refresh', 30 * 60 * 1000, async (now) => {
+    const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+    if (!win) { console.warn('[daemon] news-refresh: 无窗口, 跳过'); return; }
+    const r = await win.webContents.executeJavaScript(
+      'window.Core && window.Core.News && window.Core.News.snapshot ? window.Core.News.snapshot.build() : null',
+      true
+    );
+    if (r) console.log('[daemon] news-refresh: 拉了 ' + (r.codes || 0) + ' 只, ' + (r.itemCount || 0) + ' 条公告');
+  }, { jitterMs: 2 * 60 * 1000, runOnInit: false });
+
+  // heartbeat: 每分钟上报 daemon + agentRegistry 状态 (调试用)
+  daemon.register('daemon.heartbeat', 60 * 1000, async (now) => {
+    const status = daemon.status();
+    const running = status.filter(t => t.running).map(t => t.name);
+    process.stdout.write('[daemon] heartbeat: ' + status.length + ' task, 运行中=[' + running.join(',') + ']\n');
+  }, { jitterMs: 5 * 1000, runOnInit: false });
+
+  // v27 P0: steward-tick — 每 5 分钟推一次给 renderer 触发 Steward 扫描
+  daemon.register('daemon.steward-tick', 5 * 60 * 1000, async () => {
+    const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+    if (!win) { console.warn('[daemon] steward-tick: 无窗口, 跳过'); return; }
+    win.webContents.send('steward:tick', { phase: 'preopen', ts: Date.now() });
+  }, { jitterMs: 30 * 1000, runOnInit: false });
+
+  // 注: portfolio-scan / morning-briefing / evening-review / weekly-attribution
+  //     在后续阶段实现 (需要更多 agentRegistry 工具 + 飞书推送通道), 此处先留口子
+
+  // 退出清理 hook
+  app.on('before-quit', () => {
+    daemon.stop();
+    if (global._feishuApp) global._feishuApp.stop();
+  });
+
+  daemon.start();
+  process.stdout.write('[daemon] 已启动\n');
+  return daemon;
+}
+
+// ===== V13 阶段 3: 飞书应用模块 (WebSocket 长连 + 消息路由) =====
+const { FeishuApp } = require('./feishu-app');
+const { parseUserMessage } = require('./feishu-parser');
+const { Permission } = require('./permission');
+const { PendingConfirmations } = require('./feishu-pending');
+let _permission = null;   // 单例, 飞书 setup 时初始化
+const _pendingConfirms = new PendingConfirmations();
+
+/**
+ * 启动飞书 (从 Dexie kv 读凭证; kv 由 renderer 端 settings-sync 同步)
+ * 凭证来源: 优先 global._feishuCreds (主进程 init 时从 kv 拿), fallback 环境变量
+ */
+function setupFeishu(creds) {
+  // 优先级: 显式参数 > 缓存 > 环境变量
+  const c = creds || _feishuCredsCache || {};
+  const appId = c.appId || process.env.FEISHU_APP_ID || '';
+  const appSecret = c.appSecret || process.env.FEISHU_APP_SECRET || '';
+  if (!appId || !appSecret) {
+    process.stdout.write('[feishu] 未配置凭证 (FEISHU_APP_ID/FEISHU_APP_SECRET 或 Dexie kv), 跳过启动\n');
+    return null;
+  }
+  if (c.enabled === false) {
+    process.stdout.write('[feishu] 凭证 feishu_enabled=false, 跳过启动\n');
+    return null;
+  }
+
+  const feishu = new FeishuApp({
+    appId,
+    appSecret,
+    onMessage: async (msg) => {
+      // V13 阶段 5.6: openId 白名单
+      const allowList = (c.allowedOpenIds || []).filter(Boolean);
+      process.stdout.write('[feishu] 来消息 openId=' + msg.openId + ' text=' + JSON.stringify(msg.text) + ' allowList=' + JSON.stringify(allowList) + '\n');
+      if (allowList.length > 0 && !allowList.includes(msg.openId)) {
+        process.stdout.write('[feishu] openId 未在白名单: ' + msg.openId + ', 拒绝\n');
+        return null;   // 不回消息
+      }
+      // V13 阶段 4: LLM 解析 → ToolRegistry
+      try {
+        const parsed = await parseUserMessage({
+          text: msg.text,
+          agentRegistry,
+          openId: msg.openId,
+          pending: _pendingConfirms,
+          llmConfig: {
+            provider: _llmConfigCache.provider || process.env.LLM_PROVIDER || 'deepseek',
+            apiKey: _llmConfigCache.apiKey || process.env.LLM_API_KEY || '',
+            baseURL: process.env.LLM_BASE_URL,
+            model: _llmConfigCache.model || process.env.LLM_MODEL || ''
+          }
+        });
+        if (parsed.error) return '[Feishu] 解析失败: ' + parsed.error;
+        if (parsed.intent === 'chat') return parsed.reply || '(空回复)';
+        if (parsed.intent === 'clarify') return '🤔 ' + parsed.question;
+        if (parsed.intent === 'cancelled') {
+          _pendingConfirms.consume(msg.openId);
+          return '⛔ 已取消 ' + parsed.tool;
+        }
+        if (parsed.intent === 'confirm' && parsed.tool) {
+          _pendingConfirms.set(msg.openId, { tool: parsed.tool, args: parsed.args, rationale: parsed.rationale });
+          return '🤔 ' + (parsed.question || '请回复"确认"或"取消"');
+        }
+        if (parsed.tool) {
+          // V13 阶段 5.2: W 类先发确认卡片
+          // (parser 已经把 W 转 clarify, 这里是兜底 — 直接调也走确认)
+          const meta = agentRegistry.get && agentRegistry.get(parsed.tool);
+          if (meta && meta.risk === 'W' && _permission) {
+            if (parsed.confirmReuse) {
+              _pendingConfirms.consume(msg.openId);
+            } else {
+              _pendingConfirms.set(msg.openId, { tool: parsed.tool, args: parsed.args, rationale: parsed.rationale });
+              const ok = await _permission.askConfirm(msg.openId, parsed.tool, parsed.args || {});
+              if (!ok) return '⛔ ' + parsed.tool + ' 已取消 (用户拒绝或超时)';
+              _pendingConfirms.consume(msg.openId);
+            }
+          } else if (meta && meta.risk === 'W' && !_permission) {
+            _pendingConfirms.set(msg.openId, { tool: parsed.tool, args: parsed.args, rationale: parsed.rationale });
+          }
+          const r = await agentRegistry.invoke(parsed.tool, parsed.args || {}, { source: 'feishu', userOpenId: msg.openId });
+          if (r.ok) return '✅ ' + parsed.tool + ' 成功: ' + JSON.stringify(r.data).slice(0, 800);
+          return '❌ ' + parsed.tool + ' 失败: ' + r.error;
+        }
+        return '[Feishu] 未知解析结果: ' + JSON.stringify(parsed);
+      } catch (e) {
+        return '[Feishu] handler 异常: ' + e.message;
+      }
+    },
+    onAction: async (act) => {
+      // 卡片按钮回调 → permission 匹配
+      if (_permission && act.action && act.action.askId) {
+        const handled = _permission.handleAction(act.action.askId, act.action.decision);
+        if (handled) {
+          // 给用户回执
+          await feishu.sendText(act.openId, act.action.decision === 'confirm' ? '✅ 已确认, 正在执行...' : '❌ 已取消');
+        }
+      }
+    },
+    onError: (e) => process.stderr.write('[feishu] ' + e.message + '\n'),
+    onStatus: (s) => {
+      process.stdout.write('[feishu] 状态: ' + (s.connected ? '已连' : '断') + (s.lastError ? ' (' + s.lastError + ')' : '') + '\n');
+      // V13 5.4: tray 菜单显示最新飞书状态
+      refreshTrayMenu();
+    }
+  });
+
+  // V13 阶段 5.2: 初始化 Permission + attachTo
+  _permission = new Permission({ timeoutMs: 5 * 60 * 1000 });
+  _permission.attachTo(feishu);
+
+  feishu.start().then((ok) => {
+    if (ok) process.stdout.write('[feishu] 已启动, app_id=' + appId.slice(0, 8) + '...\n');
+    else process.stderr.write('[feishu] 启动失败\n');
+  });
+  global._feishuApp = feishu;
+  return feishu;
+}
+
 // ===== 退出清理 =====
 function killChildren() {
   for (const c of children) {
-    try { c.kill('SIGTERM'); } catch (_) {}
+    try {
+      // Windows 上 child.kill('SIGTERM') 只杀直接子进程,
+      // 用 taskkill /t 杀整棵树 (dev-proxy → aktools)
+      if (c.pid) {
+        const cp = require('child_process');
+        try { cp.execSync('taskkill /f /t /pid ' + c.pid, { stdio: 'ignore', timeout: 2000 }); } catch (_) {}
+      }
+    } catch (_) {}
   }
 }
+
+// ===== CLI 参数解析 =====
+const AGENT_MODE = process.argv.includes('--agent-mode=headless');
+if (AGENT_MODE) process.stdout.write('[main] 启动模式: headless (无窗口)\n');
+
+// ===== 主入口 =====
+// ===== 全局崩溃保护 (V13 fix: unhandled rejection / uncaught exception 不杀死进程) =====
+process.on('unhandledRejection', (reason, p) => {
+  process.stderr.write('[crash] UnhandledRejection: ' + (reason?.message || reason || String(reason)) + '\n');
+});
+process.on('uncaughtException', (err) => {
+  process.stderr.write('[crash] UncaughtException: ' + (err?.message || err) + '\n' + (err?.stack || '').slice(0, 500) + '\n');
+});
 
 app.whenReady().then(async () => {
   buildMenu();
   await startBackend();
-  createWindow();
-  setupAutoUpdater();
+  if (!AGENT_MODE) {
+    createWindow();
+    setupAutoUpdater();
+    setupDaemon();
+    // V13 阶段 5.4: 启 tray (关窗不退出, 飞书/daemon 继续常驻)
+    setupTray();
+    // 桌面模式也启飞书 (用户关窗不影响 daemon + feishu, 见 before-quit)
+    setupFeishu({ appId: process.env.FEISHU_APP_ID, appSecret: process.env.FEISHU_APP_SECRET });
+  } else {
+    // headless 模式: 注册 headless IPC channel + 启动 AI
+    setupHeadless();
+  }
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    if (BrowserWindow.getAllWindows().length === 0 && !AGENT_MODE) createWindow();
   });
 });
 
+// ===== V13 阶段 5.4: 桌面关窗 → tray 常驻 =====
+// 关窗口时只 hide (不 quit), 飞书 + daemon 继续跑; 真正退出走菜单/Tray
+let _tray = null;
+let _trayEnabled = false;
+
+function setupTray() {
+  if (_tray) return _tray;
+  try {
+    const { Tray, Menu, nativeImage } = require('electron');
+    // 优先用 www/icons/icon.ico, fallback 空图标
+    const iconCandidates = [
+      require('path').join(ROOT, 'www', 'icons', 'icon.ico'),
+      require('path').join(RESOURCES, 'www', 'icons', 'icon.ico')
+    ];
+    let img;
+    for (const p of iconCandidates) {
+      try {
+        img = nativeImage.createFromPath(p);
+        if (!img.isEmpty()) break;
+      } catch (_) {}
+    }
+    if (!img || img.isEmpty()) img = nativeImage.createEmpty();
+    _tray = new Tray(img);
+    _tray.setToolTip('StockMaster 管家常驻中');
+    _tray.setContextMenu(Menu.buildFromTemplate([
+      { label: '🚀 StockMaster (管家常驻中)', enabled: false },
+      { type: 'separator' },
+      { label: '📊 显示主窗口', click: () => { _showMainWindow(); } },
+      { label: '📱 飞书状态: ' + (global._feishuApp && global._feishuApp.isConnected() ? '✅ 已连' : '❌ 断'), enabled: false },
+      { type: 'separator' },
+      { label: '❌ 退出 StockMaster', click: () => { app.isQuitting = true; app.quit(); } }
+    ]));
+    _tray.on('click', () => { _showMainWindow(); });
+    _trayEnabled = true;
+    process.stdout.write('[tray] 已启动\n');
+    return _tray;
+  } catch (e) {
+    process.stderr.write('[tray] 启动失败: ' + e.message + '\n');
+    return null;
+  }
+}
+
+function _showMainWindow() {
+  const wins = BrowserWindow.getAllWindows();
+  if (wins.length > 0) {
+    const win = wins[0];
+    if (win.isMinimized()) win.restore();
+    win.show();
+    win.focus();
+  } else if (!AGENT_MODE) {
+    createWindow();
+  }
+}
+
+function refreshTrayMenu() {
+  if (!_tray) return;
+  const { Menu } = require('electron');
+  _tray.setContextMenu(Menu.buildFromTemplate([
+    { label: '🚀 StockMaster (管家常驻中)', enabled: false },
+    { type: 'separator' },
+    { label: '📊 显示主窗口', click: () => { _showMainWindow(); } },
+    { label: '📱 飞书状态: ' + (global._feishuApp && global._feishuApp.isConnected() ? '✅ 已连' : '❌ 断'), enabled: false },
+    { type: 'separator' },
+    { label: '❌ 退出 StockMaster', click: () => { app.isQuitting = true; app.quit(); } }
+  ]));
+}
+
 app.on('window-all-closed', () => {
-  killChildren();
-  if (process.platform !== 'darwin') app.quit();
+  // V13: 关窗不退出, 飞书 + daemon 继续跑 (tray 常驻)
+  // 真正退出走 tray 菜单 "❌ 退出 StockMaster" 或 menu bar
+  if (!_trayEnabled) {
+    // tray 没启 (开发模式或 headless) 才真退出
+    killChildren();
+    if (process.platform !== 'darwin') app.quit();
+  } else {
+    process.stdout.write('[main] 窗口已关, 管家继续常驻 (Tray 在系统托盘)\n');
+    refreshTrayMenu();
+  }
 });
 
 app.on('before-quit', () => { app.isQuitting = true; killChildren(); });
@@ -452,6 +848,64 @@ ipcMain.handle('restart-dev-proxy', async () => {
   return { ok: ready, message: ready ? 'dev-proxy 已启动' : '启动了但 4s 内未就绪' };
 });
 
+// ===== 服务管理 IPC (V13 统一启动/重启面板) =====
+ipcMain.handle('health-all', async () => {
+  const http = require('http');
+  const probe = (url, timeout = 3000) => new Promise(resolve => {
+    const req = http.get(url, { timeout }, res => { res.resume(); resolve({ ok: res.statusCode >= 200 && res.statusCode < 400, status: res.statusCode }); });
+    req.on('error', e => resolve({ ok: false, error: e.code || e.message }));
+    req.on('timeout', () => { req.destroy(); resolve({ ok: false, error: 'timeout' }); });
+  });
+  const [dp, akt] = await Promise.all([
+    probe('http://127.0.0.1:8089/health', 3000),
+    probe('http://127.0.0.1:8088/api/public/macro_china_lpr', 3000)
+  ]);
+  const feishuStatus = global._feishuApp ? (global._feishuApp.isConnected ? global._feishuApp.isConnected() : false) : false;
+  return {
+    services: [
+      { name: 'dev-proxy', ok: dp.ok, error: dp.error, port: 8089 },
+      { name: 'aktools', ok: akt.ok, error: akt.error, port: 8088 },
+      { name: '飞书', ok: feishuStatus, error: feishuStatus ? null : (global._feishuApp ? '未连接' : '未配置'), port: null }
+    ]
+  };
+});
+
+ipcMain.handle('restart-aktools', async () => {
+  // kill existing aktools child
+  for (const c of children) {
+    if (c._serviceName === 'aktools') {
+      try { c.kill('SIGTERM'); } catch (_) {}
+      break;
+    }
+  }
+  await _ensureAktools();
+  const ok = await waitForUrl('http://127.0.0.1:8088/api/public/macro_china_lpr', 15000).then(() => true).catch(() => false);
+  return { ok, message: ok ? 'aktools 已启动' : '启动超时, 看控制台日志' };
+});
+
+ipcMain.handle('restart-vite', async () => {
+  if (!IS_DEV) return { ok: false, message: '生产模式无 Vite' };
+  for (const c of children) {
+    if (c._serviceName === 'vite') {
+      try { c.kill('SIGTERM'); } catch (_) {}
+      break;
+    }
+  }
+  spawnChild('vite', 'npx', ['vite'], ROOT, '2');
+  const ok = await waitForUrl('http://127.0.0.1:3003', 15000).then(() => true).catch(() => false);
+  return { ok, message: ok ? 'Vite 已重启' : '启动超时' };
+});
+
+ipcMain.handle('restart-feishu', async () => {
+  if (global._feishuApp) {
+    global._feishuApp.stop();
+    global._feishuApp = null;
+  }
+  const f = setupFeishu(_feishuCredsCache);
+  if (f) global._feishuApp = f;
+  return { ok: true, message: '飞书已重启' };
+});
+
 // ===== AI Agent 工具调用 (IPC) =====
 // 渲染进程通过 electronAPI.invokeAgent(name, args) 调用,
 // 主进程路由到 agent-registry 的对应 handler
@@ -465,10 +919,14 @@ ipcMain.handle('agent:invoke', async (event, name, args) => {
     webContents: event.sender,
     llmBaseUrl: (args && args.__llmBaseUrl) || process.env.LLM_BASE_URL || 'http://127.0.0.1:11434'
   };
-  // 把 __llmBaseUrl 从 args 删掉, 不让它传到工具 handler 里污染实际输入
-  if (args && args.__llmBaseUrl) {
-    const { __llmBaseUrl, ...rest } = args;
-    args = rest;
+  // 把 __llmBaseUrl / __llmApiKey / __page 等内部字段从 args 删掉, 不让它传到工具 handler 里污染实际输入
+  if (args) {
+    const clean = {};
+    for (const k of Object.keys(args)) {
+      if (k.startsWith('__')) continue;  // 跳过所有 __ 前缀的内部字段
+      clean[k] = args[k];
+    }
+    args = clean;
   }
   const result = await agentRegistry.invoke(name, args, ctx);
   return result;
@@ -478,4 +936,50 @@ ipcMain.handle('agent:openExternal', async (event, url) => {
   if (!/^https?:\/\//.test(url)) return { ok: false, error: '非 http(s) URL' };
   await shell.openExternal(url);
   return { ok: true };
+});
+
+// ===== V13: 飞书凭证 IPC (renderer → main 推送 Dexie kv 里的凭证) =====
+let _feishuCredsCache = null;   // { appId, appSecret, allowedOpenIds, enabled }
+
+// V13: LLM 配置缓存 (renderer → main 同步)
+let _llmConfigCache = { provider: 'deepseek', apiKey: '', model: '' };
+
+ipcMain.handle('feishu:set-creds', async (event, creds) => {
+  if (!creds || typeof creds !== 'object') {
+    _feishuCredsCache = null;
+    return { ok: true };
+  }
+  _feishuCredsCache = {
+    appId: creds.appId || '',
+    appSecret: creds.appSecret || '',
+    allowedOpenIds: Array.isArray(creds.allowedOpenIds) ? creds.allowedOpenIds : [],
+    enabled: creds.enabled !== false
+  };
+  // V13: 同时接收 LLM 配置 (renderer 设置页同步过来)
+  if (creds.llmConfig) {
+    _llmConfigCache = {
+      provider: creds.llmConfig.provider || 'deepseek',
+      apiKey: creds.llmConfig.apiKey || '',
+      model: creds.llmConfig.model || ''
+    };
+  }
+  process.stdout.write('[feishu] 凭证已从 renderer 同步: appId=' + (_feishuCredsCache.appId ? _feishuCredsCache.appId.slice(0, 8) + '...' : '(空)') + ', 白名单=' + _feishuCredsCache.allowedOpenIds.length + ' 人\n');
+  // 如果飞书已经在跑, 凭证变了需要重启 feishu; 如果还没启动, 收到凭证后立即启动
+  if (global._feishuApp && global._feishuApp.isConnected && global._feishuApp.isConnected()) {
+    process.stdout.write('[feishu] 凭证变更, 重启飞书连接\n');
+    global._feishuApp.stop();
+    setTimeout(() => {
+      const f = setupFeishu(_feishuCredsCache);
+      if (f) global._feishuApp = f;
+    }, 500);
+  } else if (_feishuCredsCache.appId && _feishuCredsCache.appSecret) {
+    // 首次收到凭证, 立即启动飞书 WS
+    const f = setupFeishu(_feishuCredsCache);
+    if (f) global._feishuApp = f;
+  }
+  return { ok: true };
+});
+
+ipcMain.handle('feishu:get-creds', async () => {
+  return _feishuCredsCache || { appId: '', appSecret: '', allowedOpenIds: [], enabled: false };
 });

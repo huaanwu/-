@@ -15,7 +15,6 @@ export default defineConfig({
         '/app/holdings.js',
         '/app/paper.js',
         '/app/short-trader.js',
-        '/app/intraday-trader.js',
         '/app/long-trader.js',
         '/app/journal.js',
         '/app/screener.js',
@@ -32,13 +31,31 @@ export default defineConfig({
         '/app/fund/buy-import.js',
         '/app/fund/weekly-report.js',
         '/app/account.js',
+        '/app/research-pool.js',
         '/app/market-bar.js',
         '/core/ai-service.js',
+        '/core/behavioral.js',
+        '/core/research-pool.js',
         '/core/ai-call-log.js',
+        '/core/ai/effect-request.js',
+        '/core/ai/tool-registry.js',
+        '/core/ai/tracing.js',
+        '/core/ai/orchestrator.js',
+        '/core/ai/entry.js',
+        '/core/ai/policy-bundle.js',  // P6.2: 宏观策略注入层
+        '/core/ai/weekly-attribution.js',  // V7: 周度归因
+        '/core/ai/post-mortem.js',  // V8: 事后复盘
+        '/core/ai/kb-feedback.js',  // V9: KB 命中率
+        '/app/weekly-review.js',  // V7: 周度归因调度器
+        '/sim-runner.js',  // V10: 模拟盘实时监控 SPA
+        '/core/scheduler.js',  // V2: 跨域定时调度器
         '/core/self-consistency.js',
         '/core/learning-pool.js',
         '/core/agents.js',
         '/core/macro.js',
+'/core/cycle.js',  // P2: 宏观周期定位
+'/core/screener-rules.js',  // P3.1: 选股规则引擎
+'/core/state-matrix.js',  // P3.2: 价×时状态矩阵
         '/core/news.js',
         '/core/market.js',
         '/core/sync.js',
@@ -59,19 +76,34 @@ export default defineConfig({
         '/core/alerts-agent.js',
         '/core/util.js',
         '/core/risk-mine.js',  // Phase Y.1.2: 排雷数据聚合
+        '/core/reverse-discipline.js',  // P0.5: 反向策略 4 闸预检 (code-level 偏误防御)
+        '/core/screener-reverse.js',  // P1.0: 反向策略选股器
+        '/core/reverse-pool.js',  // P1.0: 反向策略 4 池存储
         '/core/scoring.js',     // Tier 6: 多因子打分
         '/core/weight-advisor.js',  // Tier 6: LLM 周度动态权重
         '/core/user-profile.js',  // Commit 1: 用户画像 (7 字段 schema)
         '/core/agent.js',         // AI 管家: 工具调用循环 + 分级授权
         '/core/agent-tools.js',   // AI 管家: renderer-direct 工具集 (v0.2.0 全盘接管)
         '/app/agent-ui.js',       // AI 管家: 侧边栏对话窗
-        '/core/settings-sync.js'  // v0.2.3: 设置项云同步 (WebDAV)
+        '/core/settings-sync.js',  // v0.2.3: 设置项云同步 (WebDAV)
+        '/app/feishu-app-settings.js',  // V13: 飞书凭证设置页
+        '/core/steward/allocator.js',  // S4: 配资计划生成器
+        '/core/steward/pool.js',      // S3: 股池快照
+        '/core/steward/graph.js',     // V14 G1: 决策图谱数据模型
+        '/core/steward/strategies.js', // ST: 子策略 + 实验期
+        '/core/steward/lessons.js',   // v27: 教训库
+        '/core/steward/index.js',     // v27.1: Steward 门面入口
+        '/app/steward-ui.js'          // S4: 管家计划卡片 UI
       ]
     }
   },
   server: {
     host: '0.0.0.0',  // V12: LAN 访问用 (手机浏览器 / APK 调试)
     port: 3003,
+    // P3-3: 允许 vite dev 服务 www/ 之外的 reverse-watch/ 独立 SPA
+    fs: {
+      allow: ['..']   // 相对 www/ 的父目录(D:\get\stock-master\)都能访问
+    },
     // 开发环境用 vite proxy 转后端
     // aktools 0.0.91+ 接口路径是 /api/public/{item_id}
     // vite 保留原始路径(不会剥前缀),所以 path.replace 正常工作

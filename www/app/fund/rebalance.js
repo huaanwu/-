@@ -219,15 +219,14 @@
     const prompt = `用户当前持仓 + 再平衡建议(JSON):\n${JSON.stringify(payload, null, 2)}\n\n请用通俗中文解释这份建议,采用上面 3 段格式。`;
 
     try {
-      await Core.AI.call({
+      await Core.AI.callThrough({
         systemPrompt,
         prompt,
         stream: true,
         maxTokens: 600,
-        onChunk: (delta, full) => {
-          if (panel) panel.textContent = full;
-        }
-      });
+        onChunk: (delta, full) => { outputEl.innerHTML = '<div style="white-space:pre-wrap;font-size:13px;line-height:1.6;">' + Core.Util.escapeHtml(full) + '</div>'; },
+        page: 'fund', purpose: 'rebalance-explain'
+}, 'fund');
       const finalText = panel ? panel.textContent : '';
       if (panel) {
         panel.innerHTML = '🤖 AI 讲解:\n\n' + window.Core.Util.escapeHtml(finalText);

@@ -38,7 +38,12 @@
     'agent_once_allow',
     'agent_llm_config',
     'discipline_config',
-    'feishu_webhook'
+    'feishu_webhook',
+    'feishu_app_id',
+    'feishu_allowed_open_ids',
+    'feishu_enabled'
+    // feishu_app_secret 故意从同步白名单移除 — SettingsSync 不加密, 上传到 WebDAV 会泄漏密钥
+    // 如需跨设备同步, 请改用本地加密备份或单独安全通道
   ]);
 
   // ============ 配置 (用户填的 WebDAV) ============

@@ -1,0 +1,52 @@
+L6 x1: chars=[17]
+  >   <title>反向策略工作台<BAD>?Reverse Watch</title>
+L14 x1: chars=[20]
+  >       <h1>反向策略 · 你拍<BAD>?/h1>
+L18 x1: chars=[27]
+  >       <span id="metaLine"><BAD>?/span>
+L29 x1: chars=[43]
+  >     <div class="section-title">📊 KPI · 今日一<BAD>?/div>
+L41 x1: chars=[44]
+  >     <div class="section-title">💡 AI 推荐 · 5 <BAD>?div>
+L45 x1: chars=[26]
+  >   <!-- ========== F4 4 池快<BAD>?========== -->
+L47 x1: chars=[38]
+  >     <div class="section-title">🪙 4 池快<BAD>?/div>
+L53 x1: chars=[45]
+  >     <div class="section-title">📐 选股漏斗 · 4 层过<BAD>?/div>
+L59 x1: chars=[49]
+  >     <div class="section-title">⚙️ 持仓规律 · 融合 5 源心<BAD>?/div>
+L77 x1: chars=[48]
+  >             <span id="daemonTitle">Daemon · 加载中<BAD>?/span>
+L79 x1: chars=[48]
+  >           <div class="ds-meta" id="daemonMeta"><BAD>?/div>
+L87 x1: chars=[72]
+  >   <!-- ========== F4.9 持仓管理 (?v=daemon3 P0 #150 + ?v=daemon4 P0 #180 资金<BAD>? ==========
+L88 x1: chars=[38]
+  >        极简手动录入: code + shares + price <BAD>?daemon fs 同步 (holdings-bridge)
+L89 x3: chars=[12, 29, 42]
+  >        顶部现金<BAD>? cash + 持仓 + 总资<BAD>?+ 仓位% + 编辑 <BAD>?daemon fs (account-bridge)
+L96 x1: chars=[68]
+  >         <input type="text" id="holdingsCodeInput" placeholder="代码 (<BAD>?600519)" maxlength="6" class="holdings-input">
+L98 x1: chars=[69]
+  >         <input type="number" id="holdingsPriceInput" placeholder="成本<BAD>? min="0.01" step="0.01" class="holdings-input">
+L99 x1: chars=[57]
+  >         <button id="holdingsAddBtn" class="btn-primary"><BAD>?添加</button>
+L103 x2: chars=[54, 76]
+  >       <div id="holdingsHint" class="holdings-hint">录入<BAD>?daemon 自动通过 :8090 同步<BAD>?fs, 下次 slot 触发 7 规则联动</div>
+L116 x1: chars=[16]
+  >       <h2>📝 自选下<BAD>?/h2>
+L125 x1: chars=[26]
+  >   <!-- ========== F7 详情对话<BAD>?========== -->
+L132 x1: chars=[58]
+  >         <button id="detailGoBuy" class="btn-primary">📝 去下<BAD>?/button>
+L137 x1: chars=[26]
+  >   <!-- ========== F8 设置对话<BAD>?========== -->
+L140 x2: chars=[21, 29]
+  >       <h2>⚙️ 设置 · 数据<BAD>?+ 4 闸阈<BAD>?/h2>
+L150 x2: chars=[20, 28]
+  >     <span>反向策略 · 你拍<BAD>?+ 4 闸兜<BAD>?/span>
+L152 x1: chars=[29]
+  >     <span id="sourceLine">数据<BAD>? 本地缓存 · aktools dev-proxy · akshare</span>
+
+TOTAL_BAD_BYTES: 30

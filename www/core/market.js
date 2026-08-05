@@ -115,7 +115,9 @@
       }
     }
     if (!resp || !resp.ok) throw lastErr || new Error('行业所有源失败');
-    const j = await resp.json();
+    let j;
+    try { j = await resp.json(); }
+    catch (e) { throw new Error(`${used} JSON 解析失败: ${e.message}`); }
     if (!j.data || !j.data.diff) throw new Error(`东方财富行业返空 (源: ${used})`);
     // 字段映射: f12 板块代码, f14 名称, f2 总成交额(万元), f3 涨跌幅(基点), f4 涨跌额(万元), f8 换手率(基点)
     const parsed = Object.values(j.data.diff).map(r => ({
@@ -261,7 +263,8 @@
       try {
         let items, top, bottom;
         if (group === 'industry') {
-          const r = await _fetchIndustry();
+          let r;
+          try { r = await _fetchIndustry(); } catch (e) { throw new Error('行业数据拉取失败: ' + e.message); }
           top = r.top; bottom = r.bottom;
           items = [];
         } else {

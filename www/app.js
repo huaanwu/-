@@ -3,8 +3,8 @@
  * 挂全局兼容层 + 初始化
  */
 
-var APP_VERSION = 'v0.2.22';
-var APP_BUILD_DATE = '2026-07-30';
+var APP_VERSION = 'v0.2.27';  // ST: sub_strategies 表 (Dexie v8) + 子策略实验期机制
+var APP_BUILD_DATE = '2026-08-03';
 var APP_GIT_COMMIT = '';
 // build-web.mjs 写入 www/version.json, 启动时读它覆盖 (保证 package.json 是单一来源)
 (function _syncVersionFromBuild() {
@@ -280,7 +280,6 @@ function hideRegimeAlertBanner() {
         document.body.appendChild(el);
       });
     }
-;
 
     // 4b. 大盘状态机每日重算 (Z1 Phase A, 接管 Kimi 活; H3 多指数 + 失灵熔断)
     // 异步, 失败不阻塞 UI; 每日 1 次 by kv lastDate 去重
@@ -306,14 +305,33 @@ function hideRegimeAlertBanner() {
         _ensureRegimeBadge();
       }
       // H3: 5 分钟轮询一次, 兜底处理"setInterval 失灵"导致 stale 累计
-      setInterval(() => {
-        Core.Regime.refresh().then(_renderRegimeBadge).catch(e => console.warn('[App] Regime 周期 refresh 失败:', e && e.message || e));
-      }, 5 * 60 * 1000);
+      // V2: 改走 Core.Scheduler.register (统一调度 + 重叠防护 + 失败兜底)
+      if (window.Core && Core.Scheduler && Core.Scheduler.register) {
+        Core.Scheduler.register(
+          'regime-refresh',
+          () => Core.Regime.refresh().then(rec => {
+            console.log('[App] 大盘状态:', rec.state);
+            _renderRegimeBadge();
+          }),
+          5 * 60 * 1000
+        );
+      } else {
+        // fallback: 旧 setInterval (Scheduler 不可用时, 兜底)
+        setInterval(() => {
+          Core.Regime.refresh().then(_renderRegimeBadge).catch(e => console.warn('[App] Regime 周期 refresh 失败:', e && e.message || e));
+        }, 5 * 60 * 1000);
+      }
+    }
+
+    // V2: 启动调度器 (放在域 init 之后, 让所有 fn 都可用)
+    if (window.Core && Core.Scheduler && Core.Scheduler.init) {
+      Core.Scheduler.init();
     }
 
     // 5. 初始化各域
     if (window.Watchlist && Watchlist.init) Watchlist.init();
     if (window.Holdings && Holdings.init) Holdings.init();
+    if (window.ResearchPool && ResearchPool.init) ResearchPool.init();
     if (window.Paper && Paper.init) Paper.init();
     // Phase C: 模拟盘日终小结 (异步, 不阻塞启动, 参照上面 Data.health 的写法)
     if (window.Paper && Paper.maybeGenerateEodReport) {
@@ -379,6 +397,27 @@ function hideRegimeAlertBanner() {
     if (window.Fund && Fund.init) Fund.init();
     if (window.Backtest && Backtest.init) Backtest.init();
     if (window.Alerts && Alerts.init) Alerts.init();
+    // V7: 周度归因 (周日 21:00 自动跑, 启动时补跑)
+    if (window.Core && Core.AI && Core.AI.WeeklyReview && Core.AI.WeeklyReview.init) {
+      Core.AI.WeeklyReview.init().catch(e => console.warn('[App] WeeklyReview init 失败:', e));
+    }
+    // V8: 事后复盘 (15:30 EOD 后跑, 给短线当日成交写 postMortem)
+    if (window.Core && Core.AI && Core.AI.PostMortem && Core.AI.PostMortem.init) {
+      Core.AI.PostMortem.init().catch(e => console.warn('[App] PostMortem init 失败:', e));
+    }
+    // V9: KB 命中率统计 + 调权重 (启动时加载 kb_order_override)
+    if (window.Core && Core.AI && Core.AI.KBFeedback && Core.AI.KBFeedback.init) {
+      Core.AI.KBFeedback.init().catch(e => console.warn('[App] KBFeedback init 失败:', e));
+    }
+    // V12: 定时聚合新闻快照 (30min 跑一次, 启动时跑一次预热)
+    if (window.Core && Core.Scheduler && Core.Scheduler.register && Core.News && Core.News.snapshot) {
+      Core.Scheduler.register(
+        'news-refresh',
+        () => Core.News.snapshot.build().then(s => console.log('[App] 新闻快照刷新:', s.codes, '只,', s.itemCount, '条')).catch(e => console.warn('[App] news-refresh 失败:', e && e.message || e)),
+        30 * 60 * 1000,
+        { jitterMs: 2 * 60 * 1000, runOnInit: true }
+      );
+    }
 
     // AI 管家 - 启动顺序: Core.Agent 先 await (拉工具表 + 加载授权偏好) → AgentUI 后 (渲染侧边栏, 注册 confirmUI)
     // 必须 await, 否则用户在 AgentUI.init 之后立刻发消息时 _toolsIndex 还没就绪
@@ -387,6 +426,49 @@ function hideRegimeAlertBanner() {
     }
     if (window.Core && Core.AgentUI && Core.AgentUI.init) {
       Core.AgentUI.init();
+    }
+    // S4: 管家计划卡片 UI
+    if (window.StewardUI && StewardUI.init) {
+      StewardUI.init();
+    }
+    // P1.5: 反向策略工作台 UI
+    if (window.ReverseWatch && typeof ReverseWatch.init === 'function') {
+      ReverseWatch.init();
+    }
+    // V13: 飞书凭证启动同步 + 管家定时 tick 订阅
+    if (window.Core && Core.FeishuSettings && typeof Core.FeishuSettings.init === 'function') {
+      Core.FeishuSettings.init().catch(e => console.warn('[App] FeishuSettings.init 失败:', e && e.message || e));
+    }
+    if (window.Core && Core.Steward && typeof Core.Steward.init === 'function') {
+      Core.Steward.init().catch(e => console.warn('[App] Steward.init 失败:', e && e.message || e));
+    }
+    // v27.5: 启动 Steward 门面 (集成 scanMarket + guard, 每 5min 由 Electron daemon 触发)
+    if (window.Core && Core.Steward && typeof Core.Steward.init === 'function') {
+      Core.Steward.init().catch(e => console.warn('[App] Steward.init 失败:', e));
+    }
+    // Phase 4: EffectRequest 事件订阅 — renderer 端副作用处理
+    // Phase 4 是 dual-write (工具仍直接调 window.X.render()), 订阅仅做日志
+    // Phase 5 headless 时去掉工具内的直接 render() 调用, 全由订阅驱动
+    if (window.Core && Core.Bus) {
+      Core.Bus.on('effect', function (ev) {
+        if (!ev || !ev.kind) return;
+        // storage 类事件: 按 collection 刷新对应 UI
+        if (ev.kind === 'storage') {
+          var col = ev.payload && ev.payload.collection;
+          if (col === 'watchlist' && window.Watchlist && window.Watchlist.render) {
+            try { window.Watchlist.render(); } catch (e) { console.warn('[App] effect→watchlist.render:', e); }
+          } else if (col === 'alerts' && window.Alerts && window.Alerts.render) {
+            try { window.Alerts.render(); } catch (e) { console.warn('[App] effect→alerts.render:', e); }
+          } else if (col === 'journal' && window.Journal && window.Journal.render) {
+            try { window.Journal.render(); } catch (e) { console.warn('[App] effect→journal.render:', e); }
+          }
+        }
+        // ui 类事件: log 即可, 路由已由工具完成
+        if (ev.kind === 'ui') {
+          console.log('[App] EffectRequest ui:', ev.tool, ev.payload);
+        }
+      });
+      console.log('[App] EffectRequest 事件订阅已注册');
     }
     // Phase W-P1: 中长线盯盘改事件驱动 — 启动时先跑一轮 (异步不阻塞, 参照上面 Data.health 的写法;
     // 规则自带 nextCheck 门控, 频繁触发无副作用)
@@ -399,6 +481,8 @@ function hideRegimeAlertBanner() {
 
     // 7. 渲染设置页表单
     if (window._renderSettings) _renderSettings();
+    // V13: 首次显示设置页时刷新服务面板
+    setTimeout(() => { if (window.refreshServicePanel) refreshServicePanel(); }, 500);
 
     // 8. 注册 Service Worker (PWA 离线基础)
     if ('serviceWorker' in navigator && location.protocol !== 'file:') {
@@ -534,11 +618,14 @@ window._renderSettings = function() {
       </div>
     </div>
     <div class="form-row">
-      <label>🔧 服务自检 (APK 在外网/连不上后端时点这个)</label>
-      <button class="btn" onclick="selfCheckServices()">▶ 一键自检 dev-proxy / aktools / LLM</button>
-      <button class="btn" id="btnRestartDevProxy" style="display:none;" onclick="restartDevProxyIPC()">🔄 重启 dev-proxy</button>
-      <span id="selfCheckResult" style="font-size:12px;color:var(--text-muted);margin-left:8px;"></span>
+      <label>🔧 服务面板 (一启动就全启, 挂了点独立重启)</label>
+      <div style="font-size:11px;color:var(--text-muted);margin-bottom:6px;">各服务状态 + 一键重启。挂了的服务变红, 点按钮单独重启。</div>
+      <div id="servicePanel" style="margin-top:4px;font-size:12px;">
+        <span id="servicePanelStatus" style="color:var(--text-muted);">⏳ 检查中...</span>
+      </div>
+      <div id="servicePanelButtons" style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;"></div>
     </div>
+    <div id="selfCheckResult" style="margin-bottom:4px;font-size:12px;color:var(--text-muted);"></div>
     <div id="selfCheckList" style="margin-top:8px;"></div>
 
     <div class="form-row">
@@ -615,6 +702,35 @@ window._renderSettings = function() {
     <div class="form-row">
       <label>当前生效</label>
       <span id="aiCurrentConfig" style="font-size:12px;color:var(--text-secondary);"></span>
+    </div>
+
+    <div class="form-row" style="border-top:1px solid var(--border);padding-top:12px;margin-top:12px;">
+      <label style="font-size:14px;font-weight:600;">🤖 AI 总管 (反向工作台)</label>
+      <div style="font-size:11px;color:var(--text-muted);margin-bottom:6px;">控制 4 个 AI 子模块: 详情简评 / 管家周报 / 推送通道 / 每日简报。</div>
+    </div>
+    <div class="form-row">
+      <label>管家语气</label>
+      <select id="settingRWButlerTone">
+        <option value="concise" ${(ai.reverseWatch?.butlerTone || 'concise') === 'concise' ? 'selected' : ''}>简洁 (默认)</option>
+        <option value="detailed" ${ai.reverseWatch?.butlerTone === 'detailed' ? 'selected' : ''}>详细</option>
+        <option value="socratic" ${ai.reverseWatch?.butlerTone === 'socratic' ? 'selected' : ''}>苏格拉底式提问</option>
+      </select>
+    </div>
+    <div class="form-row">
+      <label>推送通道</label>
+      <select id="settingRWNotifyChannel">
+        ${['toast+web','toast','web','none'].map(v => `<option value="${v}" ${(ai.reverseWatch?.notifyChannel || 'toast+web') === v ? 'selected' : ''}>${({toast:'仅 Toast',web:'仅 Web Notification',none:'关闭'})[v] || 'Toast + Web Notification (默认)'}</option>`).join('')}
+      </select>
+    </div>
+    <div class="form-row">
+      <label>
+        <input type="checkbox" id="settingRWAutoPush" ${ai.reverseWatch?.autoPush ? 'checked' : ''}> 自动推送 (持仓规则命中时)
+      </label>
+    </div>
+    <div class="form-row">
+      <label>
+        <input type="checkbox" id="settingRWDailyDigest" ${ai.reverseWatch?.dailyDigest ? 'checked' : ''}> 每日 09:35 收盘后简报
+      </label>
     </div>
 
     <div class="form-row" style="border-top:1px solid var(--border);padding-top:12px;margin-top:12px;">
@@ -750,12 +866,20 @@ window._renderSettings = function() {
       </div>
     </div>
     ${_renderUserProfileSection()}
+    <div id="feishu-settings-slot"></div>
     <div class="form-row" style="position:sticky;bottom:0;background:var(--bg-base);padding:12px 0;margin-top:8px;border-top:1px solid var(--border);z-index:10;">
       <label></label>
       <button class="btn btn-primary" id="saveSettingsBtn" onclick="saveSettings()">💾 保存所有设置</button>
       <span style="font-size:11px;color:var(--text-muted);margin-left:8px;">填完所有改动后点这个一次保存</span>
     </div>
   `;
+  // V13 阶段 5.3: 飞书设置页挂载 (在 root.innerHTML 之后, 必须 setTimeout 等 root 渲染完)
+  setTimeout(() => {
+    if (window.Core && Core.FeishuSettings && Core.FeishuSettings.render) {
+      const slot = document.getElementById('feishu-settings-slot');
+      if (slot) Core.FeishuSettings.render(slot);
+    }
+  }, 0);
 };
 
 // ===== 用户画像 (Core.UserProfile) 设置区块 =====
@@ -1156,14 +1280,23 @@ window.selfCheckServices = async function() {
     }
   ];
 
-  const results = await Promise.all(checks.map(async (c) => {
-    try {
-      const r = await c.test();
-      return { ...c, ...r, error: null };
-    } catch (e) {
-      return { ...c, ok: false, latencyMs: 0, detail: '', error: e.message };
-    }
-  }));
+  const results = await Promise.race([
+    Promise.all(checks.map(async (c) => {
+      try {
+        const r = await c.test();
+        return { ...c, ...r, error: null };
+      } catch (e) {
+        return { ...c, ok: false, latencyMs: 0, detail: '', error: e.message };
+      }
+    })),
+    new Promise(r => setTimeout(() => r(null), 30000)) // 30s 超时兜底
+  ]);
+  if (results === null) {
+    // 超时: 标记全部失败
+    if (status) { status.textContent = '⏱ 自检超时 (30s), 部分服务可能卡住'; status.style.color = 'var(--down)'; }
+    if (list) list.innerHTML = '<div style="font-size:12px;color:var(--down);padding:8px 0;">⏱ 自检超时 (30s)。常见原因: dev-proxy 扫描局域网超时。请重启 dev-proxy 后重试。</div>';
+    return;
+  }
 
   const allOk = results.every(r => r.ok);
   const someOk = results.some(r => r.ok);
@@ -1225,14 +1358,129 @@ window.restartDevProxyIPC = async function() {
   try {
     const r = await window.electronAPI.restartDevProxy();
     if (window.Core && Core.Toast) Core.Toast.show(r.ok ? '✅ dev-proxy 已重启' : '⚠️ ' + r.message, 4000);
-    // 自动重跑 selfCheck 看效果
-    if (r.ok) setTimeout(() => selfCheckServices(), 1500);
+    if (r.ok) setTimeout(() => refreshServicePanel(), 1500);
   } catch (e) {
     if (window.Core && Core.Toast) Core.Toast.show('❌ 重启失败: ' + e.message, 5000);
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = '🔄 重启 dev-proxy (Electron)'; }
   }
 };
+
+// ===== 统一服务面板 (V13: 一启动就全启, 挂了点重启) =====
+const SERVICE_MAP = [
+  { name: 'dev-proxy', label: 'Dev-Proxy', port: 8089 },
+  { name: 'aktools', label: 'AKTools', port: 8088 },
+  { name: 'Vite', label: 'Vite (dev)', port: 3003 },
+  { name: '飞书', label: '飞书 WS', port: null }
+];
+
+window.refreshServicePanel = async function() {
+  const panel = document.getElementById('servicePanel');
+  const btnContainer = document.getElementById('servicePanelButtons');
+  if (!panel) return;
+  panel.innerHTML = '⏳ 检查中...';
+  if (btnContainer) btnContainer.innerHTML = '';
+
+  let services;
+  if (window.electronAPI && window.electronAPI.healthAll) {
+    try {
+      const r = await window.electronAPI.healthAll();
+      services = r.services;
+    } catch (e) {
+      services = null;
+    }
+  }
+  // fallback: 浏览器 dev 模式用 selfCheck
+  if (!services) {
+    services = [
+      { name: 'dev-proxy', ok: null, port: 8089 },
+      { name: 'aktools', ok: null, port: 8088 },
+      { name: 'Vite', ok: null, port: 3003 },
+      { name: '飞书', ok: null, port: null }
+    ];
+    // 并行探测
+    const results = await Promise.all(services.map(async (s) => {
+      if (s.name === '飞书') return { ...s, ok: false, error: '仅 Electron' };
+      try {
+        const r = await fetch('http://127.0.0.1:' + s.port + '/health', { method: 'GET', cache: 'no-store', signal: AbortSignal.timeout(3000) });
+        return { ...s, ok: r.ok, error: r.ok ? null : 'HTTP ' + r.status };
+      } catch (e) {
+        // Vite 没有 /health, 试 / 看 200
+        if (s.name === 'Vite') {
+          try {
+            const r2 = await fetch('http://127.0.0.1:3003/', { method: 'GET', cache: 'no-store', signal: AbortSignal.timeout(2000) });
+            return { ...s, ok: r2.ok, error: r2.ok ? null : 'HTTP ' + r2.status };
+          } catch (e2) { return { ...s, ok: false, error: e2.message }; }
+        }
+        return { ...s, ok: false, error: e.message };
+      }
+    }));
+    services = results;
+  }
+
+  const allOk = services.every(s => s.ok);
+  const statusEl = document.getElementById('servicePanelStatus');
+  if (statusEl) {
+    statusEl.textContent = allOk ? '✅ 全部在线' : services.some(s => s.ok) ? '⚠️ 部分异常' : '❌ 全部离线';
+    statusEl.style.color = allOk ? 'var(--up)' : (services.some(s => s.ok) ? 'var(--accent)' : 'var(--down)');
+  }
+
+  panel.innerHTML = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:6px;">' +
+    services.map(s => {
+      const color = s.ok === null ? 'var(--text-muted)' : s.ok ? 'var(--up)' : 'var(--down)';
+      const icon = s.ok === null ? '⏳' : s.ok ? '✅' : '❌';
+      return '<div style="background:var(--bg-base);border:1px solid ' + color + ';border-radius:6px;padding:8px 10px;font-size:12px;">' +
+        '<div style="font-weight:600;">' + icon + ' ' + escapeHtml(s.label || s.name) + '</div>' +
+        '<div style="color:' + color + ';margin-top:2px;">' + (s.ok ? '在线' : (s.error || '离线')) + '</div>' +
+        (s.port ? '<div style="color:var(--text-muted);font-size:11px;">:' + s.port + '</div>' : '') +
+        '</div>';
+    }).join('') + '</div>';
+
+  if (btnContainer) {
+    const isBrowser = !window.electronAPI;
+    const btns = [
+      { key: 'dev-proxy', label: '🔄 重启 dev-proxy', ipc: 'restartDevProxy', electronOnly: false },
+      { key: 'aktools', label: '🔄 重启 aktools', ipc: 'restartAktools', electronOnly: true },
+      { key: 'Vite', label: '🔄 重启 Vite', ipc: 'restartVite', electronOnly: true, hidden: !window.electronAPI },
+      { key: '飞书', label: '🔄 重启飞书', ipc: 'restartFeishu', electronOnly: true }
+    ];
+    btnContainer.innerHTML = btns.filter(b => !b.hidden).map(b => {
+      if (b.electronOnly && isBrowser) return '';
+      const svc = services.find(s => s.name === b.key);
+      const disabled = !svc || svc.ok === null ? '' : svc.ok ? '' : '';
+      return '<button class="btn btn-sm" style="font-size:11px;" data-ipc="' + b.ipc + '" ' +
+        (disabled ? 'disabled' : '') + ' onclick="restartService(\'' + b.ipc + '\',\'' + b.label + '\')">' + b.label + '</button>';
+    }).join('');
+  }
+};
+
+window.restartService = async function(ipcName, label) {
+  if (!window.electronAPI || !window.electronAPI[ipcName]) {
+    if (window.Core && Core.Toast) Core.Toast.show(label + ' 只能在 Electron 重启', 3000);
+    return;
+  }
+  if (window.Core && Core.Toast) Core.Toast.show('⏳ 重启 ' + label + '...', 3000);
+  try {
+    const r = await window.electronAPI[ipcName]();
+    if (window.Core && Core.Toast) Core.Toast.show(r.ok ? '✅ ' + label + ' 已重启' : '⚠️ ' + (r.message || '失败'), 4000);
+    if (r.ok) setTimeout(() => refreshServicePanel(), 2000);
+  } catch (e) {
+    if (window.Core && Core.Toast) Core.Toast.show('❌ 重启 ' + label + ' 失败: ' + e.message, 5000);
+  } finally {
+    setTimeout(() => refreshServicePanel(), 3000);
+  }
+};
+
+// 设置页显示时自动刷新服务面板
+document.addEventListener('DOMContentLoaded', () => {
+  // 监听页面切换
+  if (window.Core && Core.State) {
+    const origSwitch = Core.SwitchPage || Core.State.switchPage;
+    // 不破坏现有 onShow 机制, 用主动轮询
+  }
+});
+
+// 原有 selfCheck 保留但被服务面板取代
 
 // 局域网自动发现本地大模型 (Phase 自动发现)
 window.discoverLLM = async function() {
@@ -1441,6 +1689,12 @@ window.saveSettings = function(silent) {
       baseURL: aiLocalBaseURL,
       apiKey: aiLocalApiKey,
       model: aiLocalModel
+    },
+    reverseWatch: {
+      butlerTone: document.getElementById('settingRWButlerTone')?.value || 'concise',
+      notifyChannel: document.getElementById('settingRWNotifyChannel')?.value || 'toast+web',
+      autoPush: document.getElementById('settingRWAutoPush')?.checked || false,
+      dailyDigest: document.getElementById('settingRWDailyDigest')?.checked || false
     }
   });
 

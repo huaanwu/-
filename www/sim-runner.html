@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>StockMaster · 模拟盘实时监控</title>
+  <link rel="stylesheet" crossorigin href="/styles.src.css">
+  <style>
+    body { padding: 12px; max-width: 1200px; margin: 0 auto; }
+    .sim-nav { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+    .sim-nav button { padding: 6px 14px; }
+    .sim-nav button.active { background: var(--accent); color: white; }
+    .sim-section { display: none; }
+    .sim-section.active { display: block; }
+    .sim-card { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 12px; margin-bottom: 8px; }
+    .sim-row { display: flex; justify-content: space-between; align-items: center; padding: 4px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+    .sim-row:last-child { border-bottom: none; }
+    .sim-tag { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 11px; }
+    .sim-tag.long { background: #1e88e5; color: white; }
+    .sim-tag.short { background: #e65100; color: white; }
+    .sim-tag.win { background: #43a047; color: white; }
+    .sim-tag.loss { background: #e53935; color: white; }
+    .sim-empty { color: var(--text-muted); padding: 12px; text-align: center; }
+    .sim-stat { display: inline-block; padding: 8px 12px; margin: 2px; background: var(--bg-2); border-radius: 4px; }
+    .sim-stat-num { font-size: 18px; font-weight: bold; }
+    .sim-missed { padding: 8px; margin: 4px 0; border-left: 3px solid var(--accent); background: var(--bg-2); font-size: 12px; }
+  </style>
+</head>
+<body>
+
+<h2>📊 模拟盘实时监控</h2>
+<div style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">
+  v0.2.24 V10 — 决策流 / PnL / 周度归因 / 错过机会
+</div>
+
+<div class="sim-nav">
+  <button class="btn btn-sm active" data-section="simSectionFlow">📡 决策流</button>
+  <button class="btn btn-sm" data-section="simSectionPnl">📈 PnL 曲线</button>
+  <button class="btn btn-sm" data-section="simSectionWeekly">📅 周度归因</button>
+  <button class="btn btn-sm" data-section="simSectionMissed">⚠️ 错过机会</button>
+  <button class="btn btn-sm btn-ghost" onclick="SimRunner.refresh()">🔄 刷新</button>
+  <button class="btn btn-sm btn-ghost" onclick="SimRunner.toggleAuto()" id="simAutoBtn">▶ 自动刷新</button>
+</div>
+
+<!-- Section 1: 决策流 -->
+<div id="simSectionFlow" class="sim-section active">
+  <div class="sim-card">
+    <h3>📡 实时 AI 决策流 (最近 50 条 decision_traces)</h3>
+    <div id="simFlowContent">加载中…</div>
+  </div>
+</div>
+
+<!-- Section 2: PnL 曲线 -->
+<div id="simSectionPnl" class="sim-section">
+  <div class="sim-card">
+    <h3>📈 模拟盘 PnL 曲线 (paper_snapshots)</h3>
+    <div id="simPnlSummary"></div>
+    <div id="simPnlContent" style="margin-top:12px;">加载中…</div>
+  </div>
+</div>
+
+<!-- Section 3: 周度归因 -->
+<div id="simSectionWeekly" class="sim-section">
+  <div class="sim-card">
+    <h3>📅 周度 AI 归因 (weekly_attribution)</h3>
+    <div id="simWeeklyContent">加载中…</div>
+  </div>
+</div>
+
+<!-- Section 4: 错过机会 -->
+<div id="simSectionMissed" class="sim-section">
+  <div class="sim-card">
+    <h3>⚠️ 错过机会雷达 (missed_opportunities)</h3>
+    <div id="simMissedSummary"></div>
+    <div id="simMissedContent" style="margin-top:12px;">加载中…</div>
+  </div>
+</div>
+
+<!-- 第三方库 -->
+<script src="/lib/echarts.min.js"></script>
+<script src="/lib/dexie.min.js"></script>
+
+<!-- Core 模块 (复用主页同款) -->
+<script src="/core/util.js"></script>
+<script src="/core/storage.js"></script>
+<script src="/core/data.js"></script>
+<script src="/core/data/schema.js"></script>
+<script src="/core/data/normalize.js"></script>
+<script src="/core/data/provenance.js"></script>
+<script src="/core/data/facade.js"></script>
+<script src="/core/state.js"></script>
+<script src="/core/constants.js"></script>
+<script src="/core/toast.js"></script>
+<script src="/core/regime.js"></script>
+<script src="/core/kb.js"></script>
+<script src="/core/ai-service.js"></script>
+<script src="/core/ai/effect-request.js"></script>
+<script src="/core/ai/tool-registry.js"></script>
+<script src="/core/ai/tracing.js"></script>
+<script src="/core/ai/orchestrator.js"></script>
+<script src="/core/ai/entry.js"></script>
+<script src="/core/ai/policy-bundle.js"></script>
+<script src="/core/ai/weekly-attribution.js"></script>
+<script src="/core/ai/post-mortem.js"></script>
+<script src="/core/ai/kb-feedback.js"></script>
+<script src="/app/weekly-review.js"></script>
+
+<!-- 应用脚本 -->
+<script src="/sim-runner.js"></script>
+</body>
+</html>

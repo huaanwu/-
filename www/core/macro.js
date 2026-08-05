@@ -90,12 +90,19 @@
         if (isNaN(parseFloat(last.今值))) return null;
         return { value: parseFloat(last.今值), date: String(last.日期).slice(0, 10) };
       }),
-      _safeFetch('M2 同比', async () => {
-        const data = await Core.Data.fetch('macro_m2', 'macro_china_m2_yearly', {}, 24*60*60*1000);
+      _safeFetch('M2 同比 (含 M1/M0)', async () => {
+        // P0 修复: 原 macro_china_m2_yearly 接口末尾 3 行今值=null (预测占位行)
+        // 改用 macro_china_money_supply 一次性拿 M0/M1/M2 (降序, data[0] 是最新)
+        const data = await Core.Data.fetch('macro_m2_full', 'macro_china_money_supply', {}, 24*60*60*1000);
         if (!data || data.length === 0) return null;
-        const last = data[data.length - 1];
-        if (isNaN(parseFloat(last.今值))) return null;
-        return { value: { yoy: parseFloat(last.今值) }, date: String(last.日期).slice(0, 10) };
+        const last = data[0];
+        const m2 = parseFloat(last['货币和准货币(M2)-同比增长']);
+        const m1 = parseFloat(last['货币(M1)-同比增长']);
+        if (isNaN(m2)) return null;
+        return {
+          value: { yoy: m2, m1_yoy: isNaN(m1) ? null : m1 },
+          date: String(last['月份'] || '')
+        };
       }),
       _safeFetch('工业增加值', async () => {
         const data = await Core.Data.fetch('macro_ip', 'macro_china_industrial_production_yoy', {}, 24*60*60*1000);
@@ -165,7 +172,15 @@
       lines.push(`- **制造业 PMI**: ${d.pmi} (${state}, 更新于 ${d.pmi_date}, 50 是荣枯线)`);
     }
     if (d.m2 !== undefined) {
-      lines.push(`- **M2 同比**: ${d.m2}% (更新于 ${d.m2_date}, > 10% 偏宽松, < 8% 偏紧)`);
+      const m1 = d.m1_yoy;
+      const scissors = (typeof m1 === 'number') ? (m1 - d.m2).toFixed(1) : 'N/A';
+      const scissorsNote = (typeof m1 === 'number')
+        ? (scissors > 0 ? ' (正剪刀差, 资金活化)' : ' (负剪刀差, 资金沉淀)')
+        : '';
+      lines.push(`- **M2 同比**: ${d.m2}% (更新于 ${d.m2_date}, > 10% 偏宽松, < 8% 偏紧)${scissorsNote}`);
+      if (typeof m1 === 'number') {
+        lines.push(`- **M1 同比**: ${m1}% | M1-M2 剪刀差 = ${scissors} pct (正数=资金活化=股市利好; 负数=定期化=股市偏空)`);
+      }
     }
     if (d.ip !== undefined) {
       lines.push(`- **规模以上工业增加值**: ${d.ip}% YoY (更新于 ${d.ip_date})`);
@@ -192,6 +207,44 @@
   window.Core.Macro = {
     get: _getMacro,
     formatForPrompt,
-    refresh
+    refresh,
+    /**
+     * P6.8 审计修补: getText() 返 markdown 字符串 (内部委托 formatForPrompt)
+     *   journal.js:44 调用, 用于注入复盘 AI 上下文
+     *   失败返空字符串, 不抛
+     */
+    async getText() {
+      try {
+        const snap = await _getMacro();
+        if (!snap) return '';
+        return formatForPrompt(snap) || '';
+      } catch (e) {
+        console.warn('[Macro] getText 失败:', e && e.message || e);
+        return '';
+      }
+    },
+    /**
+     * P6.8 审计修补: formatPolicyForPrompt() 返当前宏观政策环境 markdown 段
+     *   weight-advisor.js:123 调用, 用于 LLM 周度动态权重
+     *   数据源走 LPR / CPI / PMI / M2 4 个核心指标, 拼接成 1-2 段
+     *   失败返空字符串
+     */
+    async formatPolicyForPrompt() {
+      try {
+        const snap = await _getMacro();
+        if (!snap) return '';
+        const d = snap.data || {};
+        const lines = [];
+        lines.push('## 当前宏观政策环境');
+        if (d.lpr_1y != null) lines.push(`- **LPR 1Y**: ${d.lpr_1y}%${d.lpr_5y != null ? `, 5Y: ${d.lpr_5y}%` : ''}`);
+        if (d.pmi != null) lines.push(`- **制造业 PMI**: ${d.pmi} (${d.pmi > 50 ? '扩张' : (d.pmi < 50 ? '收缩' : '持平')})`);
+        if (d.cpi != null) lines.push(`- **CPI**: ${d.cpi}% YoY`);
+        if (d.m2 != null) lines.push(`- **M2 同比**: ${d.m2}%${d.m1_yoy != null ? `, M1-M2 剪刀差 ${(d.m1_yoy - d.m2).toFixed(1)} pct` : ''}`);
+        return lines.filter(l => l.indexOf('undefined') < 0).join('\n');
+      } catch (e) {
+        console.warn('[Macro] formatPolicyForPrompt 失败:', e && e.message || e);
+        return '';
+      }
+    }
   };
 })();

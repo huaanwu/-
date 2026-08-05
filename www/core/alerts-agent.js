@@ -157,10 +157,11 @@
 
     let text;
     try {
-      text = await Core.AI.call({
+      text = await Core.AI.Entry.callThrough({
         systemPrompt, prompt,
-        stream: false, maxTokens: 600
-      });
+        stream: false, maxTokens: 600,
+        page: 'alerts', purpose: 'parse-intent'
+      }, 'alerts');
     } catch (e) {
       throw _err('AI 调用失败: ' + (e.message || e));
     }
@@ -353,10 +354,11 @@
 
     let text;
     try {
-      text = await Core.AI.call({
+      text = await Core.AI.Entry.callThrough({
         systemPrompt, prompt,
-        stream: false, maxTokens: 500
-      });
+        stream: false, maxTokens: 500,
+        page: 'alerts', purpose: 'interpret-alert'
+      }, 'alerts');
     } catch (e) {
       throw _err('AI 调用失败: ' + (e.message || e));
     }

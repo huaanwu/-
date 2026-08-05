@@ -156,16 +156,14 @@
     const prompt = `基金周报数据:\n${JSON.stringify(data, null, 2)}\n\n请生成给小白看的本周小结。`;
 
     try {
-      await Core.AI.call({
+      await Core.AI.callThrough({
         systemPrompt,
         prompt,
         stream: true,
         maxTokens: 1400,
-        onChunk: (delta, full) => {
-          if (ld) ld.remove();
-          if (el) el.textContent = full;
-        }
-      });
+        onChunk: (delta, full) => { outputEl.textContent = full; },
+        page: 'fund', purpose: 'weekly-report'
+      }, 'fund');
       const finalText = (el && el.textContent) || '';
       if (el) el.innerHTML = window.Core.Util.renderWithSources(finalText);
       // 保存到 Dexie (Phase N: 历史复盘)

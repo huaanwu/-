@@ -209,6 +209,24 @@
     <div id="accountFlowList" class="data-card"></div>
   </section>
 
+  <!-- 研究池 (Phase R) -->
+  <section class="page" id="pageResearchPool">
+    <div class="page-header">
+      <h2>研究池</h2>
+      <div>
+        <button class="btn btn-sm" onclick="ResearchPool.addDialog()">+ 添加</button>
+        <button class="btn btn-sm btn-ghost" onclick="ResearchPool.importFromWatchlist()">📥 从自选股导入</button>
+        <button class="btn btn-sm btn-primary" onclick="ResearchPool.generateFromScreener()">⚡ 规则引擎生成候选</button>
+      </div>
+    </div>
+    <div style="font-size:11px;color:var(--text-muted);line-height:1.5;margin-bottom:12px;">
+      🗂 <b>研究池</b>是 AI 选股的边界: 长线/短线/选股 AI 只能从这里的票里挑, 最多 50 只, 强制精选。
+      <br>💡 与自选股的区别: 自选股可以很多 (临时关注), 研究池是你愿意花时间研究的票。
+    </div>
+    <div id="researchPoolSummary" style="margin-bottom:8px;font-size:12px;"></div>
+    <div id="researchPoolTable" class="data-card"></div>
+  </section>
+
   <!-- 基金专项 -->
   <section class="page" id="pageFund">
     <div class="page-header">
@@ -252,10 +270,38 @@
     <div id="alertsList" class="data-card"></div>
   </section>
 
+  <!-- 管家计划 (S4 + V14 + v27.3) — 待拍板 + 决策图谱 -->
+  <section id="pageSteward" class="page">
+    <div class="page-header"><h2>AI 管家 — 待拍板 + 决策图谱</h2></div>
+    <div id="stewardPending"></div>
+    <div id="stewardGraph" style="margin-top:20px;"></div>
+  </section>
+
   <!-- 设置 -->
   <section class="page" id="pageSettings">
     <div class="page-header"><h2>设置</h2></div>
     <div id="settingsForm" class="filter-form"></div>
+  </section>
+
+  <!-- 反向策略工作台 (P1.5) -->
+  <section class="page" id="pageReverseWatch">
+    <div class="page-header">
+      <h2>🔄 反向工作台</h2>
+      <div style="display:flex;gap:6px;">
+        <button class="btn btn-sm" id="reverseRefreshBtn" onclick="ReverseWatch.render()">🔄 刷新</button>
+      </div>
+    </div>
+    <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">
+      反向策略: AI 推荐 5 只左右 (同板块非龙头 + PB 低 + 无量化席), 你拍板 + 4 闸兜底。
+    </div>
+    <div id="reverseAlertBox"></div>
+    <div id="reverseStatusLights" class="summary-cards"></div>
+    <h3 style="margin-top:16px;font-size:14px;color:var(--text-muted);">🤖 AI 总管 (F4.7)</h3>
+    <div id="reverseButlerPanel" class="data-card"></div>
+    <h3 style="margin-top:16px;font-size:14px;color:var(--text-muted);">📋 今日 AI 推荐</h3>
+    <div id="reverseRecommendations" class="data-card"></div>
+    <h3 style="margin-top:16px;font-size:14px;color:var(--text-muted);">🗂 4 池快照</h3>
+    <div id="reversePoolsView" class="data-card"></div>
   </section>
 
 </main>
@@ -277,8 +323,14 @@
   <button class="nav-item" data-page="pageJournal" onclick="switchPage('pageJournal')">
     <span class="nav-icon">📝</span><span class="nav-label">复盘</span>
   </button>
+  <button class="nav-item" data-page="pageSteward" onclick="switchPage('pageSteward')">
+    <span class="nav-icon">🤖</span><span class="nav-label">管家</span>
+  </button>
   <button class="nav-item" data-page="pageScreener" onclick="switchPage('pageScreener')">
     <span class="nav-icon">🔍</span><span class="nav-label">选股</span>
+  </button>
+  <button class="nav-item" data-page="pageResearchPool" onclick="switchPage('pageResearchPool')">
+    <span class="nav-icon">🗂</span><span class="nav-label">研究池</span>
   </button>
   <button class="nav-item" data-page="pageFund" onclick="switchPage('pageFund')">
     <span class="nav-icon">🏦</span><span class="nav-label">基金</span>
@@ -288,6 +340,9 @@
   </button>
   <button class="nav-item" data-page="pageAlerts" onclick="switchPage('pageAlerts')">
     <span class="nav-icon">🔔</span><span class="nav-label">提醒</span>
+  </button>
+  <button class="nav-item" data-page="pageReverseWatch" onclick="switchPage('pageReverseWatch')">
+    <span class="nav-icon">🔄</span><span class="nav-label">反向</span>
   </button>
 </nav>
 
@@ -327,12 +382,28 @@
 <script src="/core/crosscheck.js"></script>
 <script src="/core/toast.js"></script>
 <script src="/core/ai-service.js"></script>
+<script src="/core/behavioral.js"></script>
+<script src="/core/research-pool.js"></script>
+<script src="/app/research-pool.js"></script>
 <script src="/core/agent.js"></script>
 <script src="/core/agent-tools.js"></script>
 <script src="/core/ai-call-log.js"></script>
+<script src="/core/ai/effect-request.js"></script>
+<script src="/core/ai/tool-registry.js"></script>
+<script src="/core/ai/tracing.js"></script>
+<script src="/core/ai/orchestrator.js"></script>
+<script src="/core/ai/entry.js"></script>
+<script src="/core/ai/policy-bundle.js"></script>  <!-- P6.2: 宏观策略注入层 (依赖 Regime+Cycle+StateMatrix+KB+Discipline) -->
+<script src="/core/ai/weekly-attribution.js"></script>  <!-- V7: 周度归因 ETL (拉 4 表 + 喂 AI + 落 weekly_attribution) -->
+<script src="/core/ai/post-mortem.js"></script>  <!-- V8: 事后复盘 (EOD 后跑, 给当天短线成交写 postMortem) -->
+<script src="/core/ai/kb-feedback.js"></script>  <!-- V9: KB 命中率统计 + 自动调权重 -->
+<script src="/core/scheduler.js"></script>  <!-- V2: 跨域定时调度器 (60s tick + 重叠防护 + 失败兜底) -->
 <script src="/core/self-consistency.js"></script>
 <script src="/core/learning-pool.js"></script>
 <script src="/core/macro.js"></script>
+<script src="/core/cycle.js"></script>  <!-- P2: 宏观周期定位 (5 维信号 + KB 三类) -->
+<script src="/core/screener-rules.js"></script>  <!-- P3.1: 选股规则引擎 (硬过滤 + 软打分) -->
+<script src="/core/state-matrix.js"></script>  <!-- P3.2: 价×时状态矩阵 (Regime × Cycle) -->
 <script src="/core/news.js"></script>
 <script src="/core/market.js"></script>
 <script src="/core/sync.js"></script>
@@ -340,6 +411,15 @@
 <script src="/core/router.js"></script>
 <script src="/core/market-width.js"></script>
 <script src="/core/regime.js"></script>  <!-- 依赖 Core.Constants (state.js + constants.js 在前面) -->
+<script src="/core/steward/allocator.js"></script>  <!-- S4: 配资计划生成器 -->
+<script src="/core/steward/pool.js"></script>      <!-- S3: 股池快照 (已在 allocator 之前) -->
+<script src="/core/steward/graph.js"></script>     <!-- V14 G1: 决策图谱数据模型 (allocator 之后) -->
+<script src="/core/steward/strategies.js"></script> <!-- ST: sleeve 下的子策略 + 实验期 -->
+<script src="/core/steward/lessons.js"></script>     <!-- v27: 教训库 (策略评估后固化) -->
+<script src="/core/steward/index.js"></script>      <!-- v27.1: Steward 门面入口 (集成 Pool/Allocator/Strategies/Lessons) -->
+<script src="/core/reverse-discipline.js"></script>  <!-- P0.5: 反向策略 4 闸预检 -->
+<script src="/core/screener-reverse.js"></script>  <!-- P1.0: 反向策略选股器 -->
+<script src="/core/reverse-pool.js"></script>  <!-- P1.0: 反向策略 4 池存储 -->
 
 <!-- ========== 域脚本 (按域拆分) ========== -->
 <script src="/app/watchlist.js"></script>
@@ -348,6 +428,7 @@
 <script src="/app/paper.js"></script>
 <script src="/app/short-trader.js"></script>
 <script src="/app/long-trader.js"></script>
+<script src="/app/weekly-review.js"></script>  <!-- V7: 周度归因调度器 (注册到 Core.Scheduler, 周日 21:00 自动跑) -->
 <script src="/app/journal.js"></script>
 <script src="/app/screener.js"></script>
 <script src="/app/fund.js"></script>
@@ -366,6 +447,13 @@
 <script src="/app/account.js"></script>
 <script src="/app/market-bar.js"></script>
 <script src="/app/agent-ui.js"></script>
+<script src="/app/feishu-app-settings.js"></script>
+<script src="/app/steward-ui.js"></script>  <!-- S4: 管家计划卡片 UI -->
+<script src="/app/reverse-watch.js"></script>  <!-- P1.5: 反向策略工作台 UI -->
+<script src="/reverse-watch/ai/ai-adapter.js"></script>
+<script src="/reverse-watch/ai/ai-detail.js"></script>
+<script src="/reverse-watch/ai/ai-butler.js"></script>
+<script src="/reverse-watch/ai/ai-push.js"></script>
 
 <!-- ========== 主入口 ========== -->
 <script src="/app.js"></script>

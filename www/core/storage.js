@@ -98,6 +98,22 @@
   }
 
   /**
+   * P2-1/P2-2: Dexie 跨表事务 (读写)
+   * 解决 addCondOrder / buy 等"读 + 校验 + 写多表"流程的 TOCTOU / 状态半成品问题.
+   * @param {'rw'|'r'} mode - 读写/只读
+   * @param {string[]} tables - 涉及的表名 (例 ['kv', 'holdings', 'transactions'])
+   * @param {Function} fn - 事务体 (async, 可用 d.transaction-bound 的 this 访问同名 helper)
+   * @returns Promise<fn 的返回值>
+   */
+  async function transaction(mode, tables, fn) {
+    const d = init();
+    if (!d) throw new Error('DB not ready');
+    if (!Array.isArray(tables) || tables.length === 0) throw new Error('transaction: tables 非空数组');
+    if (typeof fn !== 'function') throw new Error('transaction: fn 必填');
+    return await d.transaction(mode, tables, fn);
+  }
+
+  /**
    * 缓存层(带 TTL)
    * key: string
    * data: any
@@ -236,6 +252,7 @@
   window.Core.Storage = {
     init,
     add, put, get, all, where, remove, clear,
+    transaction,  // P2-1/P2-2: 跨表事务 (Dexie transaction)
     cacheGet, cacheSet, cacheClear,
     kvGet, kvSet, kvDelete,
     onKvChange,
