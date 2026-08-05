@@ -284,7 +284,7 @@ else {
   }
   // 关键 onclick 引用 — 只检查"基名"在不在已知全局(支持 XX.YY 形式,如 Watchlist.addDialog)
   const onclicks = [...html.matchAll(/onclick="([^(]+)\(/g)].map(m => m[1].trim());
-  const knownGlobals = new Set(['switchPage', 'goSettings', 'showToast', 'saveSettings', 'checkHealth', 'exportData', 'importData', 'clearAllData', 'Watchlist', 'Holdings', 'Paper', 'Journal', 'Screener', 'Fund', 'Backtest', 'Alerts']);
+  const knownGlobals = new Set(['switchPage', 'goSettings', 'showToast', 'saveSettings', 'checkHealth', 'exportData', 'importData', 'clearAllData', 'Watchlist', 'Holdings', 'Paper', 'Journal', 'Screener', 'Fund', 'Backtest', 'Alerts', 'ResearchPool', 'ReverseWatch', 'StockAdvisor']);
   for (const fn of new Set(onclicks)) {
     const baseName = fn.split('.')[0];
     if (knownGlobals.has(baseName)) ok(`onclick: ${fn}`);
@@ -1567,7 +1567,8 @@ try {
     };
     jctx.window.Core.AI = {
       getConfig: () => ({ provider: 'deepseek', apiKey: 'test' }),
-      call: async () => '{"assumption":"估值修复","emotion":"长期持有中","verify":"1w"}',
+      // v0.2.x: journal._runAiAssistant 走 callThrough (域脚本统一入口, 内部 → callWithTimeout)
+      callThrough: async () => '{"assumption":"估值修复","emotion":"长期持有中","verify":"1w"}',
       parseJsonOutput: _parseJsonOutput
     };
     await Journal._runAiAssistant(fakeNote);
@@ -1577,7 +1578,7 @@ try {
     else fail('AI 助手合法 JSON', JSON.stringify(putCalls));
 
     // 2) LLM 自由发挥 → 落到"其他"/"pending"
-    jctx.window.Core.AI.call = async () => '{"assumption":"自我编造的","emotion":"FOMO","verify":"invalid"}';
+    jctx.window.Core.AI.callThrough = async () => '{"assumption":"自我编造的","emotion":"FOMO","verify":"invalid"}';
     putCalls.length = 0;
     await Journal._runAiAssistant({ ...fakeNote, id: 'n2' });
     const sug2 = putCalls[0]?.obj?.aiSuggested;
@@ -1585,7 +1586,7 @@ try {
     else fail('AI 助手非法值', JSON.stringify(sug2));
 
     // 3) JSON 解析失败 → 静默, 不抛
-    jctx.window.Core.AI.call = async () => 'not json at all';
+    jctx.window.Core.AI.callThrough = async () => 'not json at all';
     putCalls.length = 0;
     await Journal._runAiAssistant({ ...fakeNote, id: 'n3' });
     if (putCalls.length === 0) ok('AI 助手: JSON 失败静默');
@@ -4128,7 +4129,7 @@ section('26] Phase D2 回测前置 + 双模型交叉验证');
     else fail('screener D2 接线', '');
     const saSrc = readFileSafe(path.join(WWW, 'app', 'stock-advisor.js'));
     if (saSrc.includes('Core.PreBacktest.runForPick') && saSrc.includes('Core.CrossCheck.resolveSecondOpinion')
-      && saSrc.includes('Core.CrossCheck.buildComparePrompt') && saSrc.includes('callWithTimeout')
+      && saSrc.includes('Core.CrossCheck.buildComparePrompt') && (saSrc.includes('callThrough') || saSrc.includes('callWithTimeout'))
       && saSrc.includes('saSecondBtn') && saSrc.includes('saPreBtBtn') && saSrc.includes('local: false')) ok('stock-advisor: 历史验证+第二意见+强制远程三处接线');
     else fail('stock-advisor D2 接线', '');
     const appSrc = readFileSafe(path.join(WWW, 'app.js'));
@@ -5976,7 +5977,7 @@ section('[37] Core.AlertsAgent: 白名单校验 / parseIntent / preview / apply 
         Storage: {
           add: async () => {}, get: async () => null, put: async () => {}, remove: async () => {}, where: async () => [], all: async () => []
         },
-        AI: { call: async () => '' }
+        AI: { call: async () => '', Entry: { callThrough: async () => '' } }
       }
     });
     ctx.window = ctx;
@@ -6042,28 +6043,29 @@ section('[37] Core.AlertsAgent: 白名单校验 / parseIntent / preview / apply 
     else fail('37.7b 空数组');
 
     // parseIntent: 模拟 AI 返回合规 JSON → 应通过 validate
-    ctx.Core.AI.call = async () => '{"intents":[{"action":"create","specs":{"type":"price_above","code":"600519","value":1700},"reasoning":"用户想止盈"}]}';
+    // v0.2.x: alerts-agent 调 Core.AI.Entry.callThrough, 不用 Core.AI.call
+    ctx.Core.AI.Entry.callThrough = async () => '{"intents":[{"action":"create","specs":{"type":"price_above","code":"600519","value":1700},"reasoning":"用户想止盈"}]}';
     const parsed = await A.parseIntent('给 600519 设个 1700 止盈', { holdings: [{ code: '600519', name: '茅台' }] });
     if (parsed.intents.length === 1 && parsed.intents[0].action === 'create' && parsed.intents[0].specs.type === 'price_above') {
       ok('37.8a parseIntent: AI 返回合规 JSON → 通过白名单校验');
     } else fail('37.8a parseIntent', JSON.stringify(parsed));
 
     // parseIntent: AI 编造未知 type → 应抛错 (不静默)
-    ctx.Core.AI.call = async () => '{"intents":[{"action":"create","specs":{"type":"invented_type","code":"600519","value":1},"reasoning":"x"}]}';
+    ctx.Core.AI.Entry.callThrough = async () => '{"intents":[{"action":"create","specs":{"type":"invented_type","code":"600519","value":1},"reasoning":"x"}]}';
     threw = false;
     try { await A.parseIntent('造个新规则', {}); } catch (e) { threw = e.message.includes('未知规则类型'); }
     if (threw) ok('37.8b parseIntent: AI 编造 type → 抛错 (抗幻觉)');
     else fail('37.8b 抗幻觉失败');
 
     // parseIntent: AI 返回非 JSON → 抛错
-    ctx.Core.AI.call = async () => '对不起, 我不能...';
+    ctx.Core.AI.Entry.callThrough = async () => '对不起, 我不能...';
     threw = false;
     try { await A.parseIntent('...', {}); } catch (e) { threw = e.message.includes('未返回 JSON'); }
     if (threw) ok('37.8c parseIntent: 非 JSON 输出 → 抛错');
     else fail('37.8c 非 JSON');
 
     // parseIntent: AI 包 ```json ... ``` → 应能抽
-    ctx.Core.AI.call = async () => '```json\n{"intents":[{"action":"create","specs":{"type":"regime_change"},"reasoning":"大盘切换"}]}\n```';
+    ctx.Core.AI.Entry.callThrough = async () => '```json\n{"intents":[{"action":"create","specs":{"type":"regime_change"},"reasoning":"大盘切换"}]}\n```';
     const r4 = await A.parseIntent('...', {});
     if (r4.intents[0].specs.type === 'regime_change') ok('37.8d parseIntent: AI 包 ```json``` 仍能抽');
     else fail('37.8d 包代码块', JSON.stringify(r4));
@@ -6078,14 +6080,14 @@ section('[37] Core.AlertsAgent: 白名单校验 / parseIntent / preview / apply 
     } else fail('37.9 preview', JSON.stringify(previews));
 
     // interpretAlert: AI 调用错误应 throw (不吞)
-    ctx.Core.AI.call = async () => { throw new Error('AI 离线'); };
+    ctx.Core.AI.Entry.callThrough = async () => { throw new Error('AI 离线'); };
     threw = false;
     try { await A.interpretAlert({ type: 'price_above', code: '600519' }, {}); } catch (e) { threw = e.message.includes('AI 调用失败'); }
     if (threw) ok('37.10 interpretAlert: AI 失败 throw, 不静默');
     else fail('37.10 interpretAlert 吞错');
 
     // interpretAlert: 正常调用返回文本
-    ctx.Core.AI.call = async () => '⚡ 600519 触发价格 ≥ 1700 ...';
+    ctx.Core.AI.Entry.callThrough = async () => '⚡ 600519 触发价格 ≥ 1700 ...';
     const interp = await A.interpretAlert({ type: 'price_above', code: '600519', value: 1700, hitCount: 1, lastHit: Date.now() }, { regime: { state: 'bull', label: '趋势市 🐂' } });
     if (interp.includes('600519')) ok('37.11 interpretAlert: 返回中文解读');
     else fail('37.11 interpretAlert', interp);
@@ -10650,11 +10652,12 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
     } else fail('67.7 stale line', '缺');
 
     // 67.8-67.11 4 调用方 prompt 注入 (v0.2.6 关闭盘中盯盘, intraday-trader.js 删除)
+    //   v0.2.x 累积改动: fund/ai-advisor 改用 PolicyBundle 替代 RegimeBlock (避免双份注入)
     const callers = [
       ['short-trader.js', /Core\.Regime\._formatRegimeBlock/],
       ['long-trader.js', /Core\.Regime[\s\S]{0,40}gateMultipliers/],
       ['screener.js', /Core\.Regime[\s\S]{0,40}_formatRegimeBlock/],
-      ['fund/ai-advisor.js', /Core\.Regime[\s\S]{0,40}_formatRegimeBlock/]
+      ['fund/ai-advisor.js', /Core\.AI\.PolicyBundle[\s\S]{0,80}load/]
     ];
     callers.forEach(([name, re], i) => {
       const src = readFileSafe(path.join(WWW, 'app', name));
@@ -11691,10 +11694,10 @@ section('[66] L1: LongTrader._judgeLongOutcome / _buildLongTrackRecord / verifyL
   try {
     const kbJson = fs.readFileSync(path.join(__dirname, '..', 'www', 'kb_data', 'investment_kb.json'), 'utf8');
     const kbData = JSON.parse(kbJson);
-    // 94.1: investment_kb.json _meta.version = "1.4"
-    if (kbData._meta && kbData._meta.version === '1.4')
-      ok('94.1 KB _meta.version = 1.4');
-    else fail('94.1 KB version 应为 1.4', 'got: ' + (kbData._meta && kbData._meta.version));
+    // 94.1: investment_kb.json _meta.version = "1.5" (v0.2.x 累积: 加 CYC/MAC/HIS/MAO 共 24 条, 见 _meta.description)
+    if (kbData._meta && kbData._meta.version === '1.5')
+      ok('94.1 KB _meta.version = 1.5');
+    else fail('94.1 KB version 应为 1.5', 'got: ' + (kbData._meta && kbData._meta.version));
 
     // 94.2: 4 条 SKL 条目存在
     const sklIds = ['SKL-001', 'SKL-002', 'SKL-003', 'SKL-004'];
@@ -12456,7 +12459,7 @@ try {
   for (const block of registerBlocks) {
     const body = block;
     const name = (block.match(/name:\s*'([^']+)'/) || [])[1];
-    const risk = (block.match(/risk:\s*'([LMH])'/) || [])[1];
+    const risk = (block.match(/risk:\s*'([LMHRW])'/) || [])[1];
     const desc = (block.match(/description:\s*'([^']+)'/) || [])[1];
     const inputSchema = /input_schema/.test(block);
     const handler = /handler:/.test(block);
@@ -12470,14 +12473,14 @@ try {
   if (missing.length === 0) ok('104.2 所有工具都有 name/risk/description');
   else fail('104.2 缺字段', JSON.stringify(missing));
 
-  // 每个 risk 必须是 L/M/H
-  const badRisk = tools.filter(t => !['L','M','H'].includes(t.risk));
-  if (badRisk.length === 0) ok('104.3 所有 risk 都是 L/M/H');
+  // 每个 risk 必须是 L/M/H (浏览器 agent-tools.js 3 级) 或 R/W (electron agent-registry.js 二分, daemon 授权策略)
+  const badRisk = tools.filter(t => !['L','M','H','R','W'].includes(t.risk));
+  if (badRisk.length === 0) ok('104.3 所有 risk 都是 L/M/H/R/W');
   else fail('104.3 bad risk', JSON.stringify(badRisk));
 
-  // 至少存在一个 L 和一个 H
-  if (tools.some(t => t.risk === 'L') && tools.some(t => t.risk === 'H'))
-    ok('104.4 同时覆盖 L/H 风险等级');
+  // 至少存在一个 L/R 和一个 H/W
+  if (tools.some(t => t.risk === 'L' || t.risk === 'R') && tools.some(t => t.risk === 'H' || t.risk === 'W'))
+    ok('104.4 同时覆盖 低(L/R) / 高(H/W) 风险等级');
   else fail('104.4 风险覆盖不全', '');
 } catch (e) { fail('104.x 工具注册表', e.message); }
 

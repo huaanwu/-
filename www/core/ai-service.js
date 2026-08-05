@@ -539,6 +539,17 @@
   }
 
   /**
+   * callThrough (v0.2.x) - 域脚本统一入口, 走带超时的 call() 并支持 pageTag 透传 (用于 audit / tracing)
+   * opts: 同 call() + callWithTimeout() (timeout/maxTokens/stream/... 都透传)
+   * pageTag: 可选, 业务标识 (e.g. 'journal' / 'stock-advisor' / 'fund-ai'), 仅作占位, 未来可接 audit log
+   * @returns {string} AI 输出
+   */
+  async function callThrough(opts, pageTag) {
+    // 透传 page 到 opts, 给未来 audit hook 留口子 (call/callWithTimeout 会忽略未知字段)
+    return await callWithTimeout({ ...(opts || {}), _pageTag: pageTag || (opts && opts.page) || 'unknown' });
+  }
+
+  /**
    * callRaw (Phase: AI 管家) - 透传完整 messages + tools, 返回原始结构化响应
    *
    * 与 call() 区别:
@@ -859,6 +870,7 @@
     call,
     cachedCall,
     callWithTimeout,
+    callThrough,
     callRaw,
     callRawWithTimeout,
     jsonCall,

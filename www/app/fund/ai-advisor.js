@@ -127,6 +127,7 @@
   };
 
   window.Fund.aiAdvisorRun = async function() {
+    // Bug J 修复: 调用方注解 — seed 前 5 候选作 placeholder 占位, 真匹配走 Core.KB.pickRelevant 的 tags 兜底 (score += 0.5)
     // Phase 5: lazy 注册 'fund' strategy 到 Entry (只在第一次调用时注册)
     try {
       if (window.Core && Core.AI && Core.AI.Entry && typeof Core.AI.Entry.register === 'function'
