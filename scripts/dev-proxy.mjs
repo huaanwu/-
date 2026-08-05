@@ -452,11 +452,12 @@ app.options('/health', (req, res) => {
 app.get('/health', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   // 顺便 ping aktools (Python 后端), selfCheck 一次性拿到 dev-proxy + aktools 状态
-  // ?v=daemon7-degraded-fix: 探针改用 /api/public/version (aktools 0.0.91+ 必定存在 + 无参数必返 200)
+  // ?v=daemon7-degraded-fix: 探针改用 /version (aktools 0.0.91+ 必定存在 + 无参数必返 200)
   // 旧 bug: 用 /api/public/macro_china_lpr 探 (0.0.91 已废弃, 接口不存在) → 永远 timeout → akshare_status=down
   //       → 联动 daemon 报 degraded
+  // 二次修: /api/public/version 也不存在 (该 endpoint 无前缀), 改用 /version (OpenAPI 确认 0.0.91+ 存在)
   const aktoolsCheck = await new Promise((resolve) => {
-    const req2 = http.get(AKSHARE_TARGET + '/api/public/version', { timeout: 4000 }, (r2) => {
+    const req2 = http.get(AKSHARE_TARGET + '/version', { timeout: 4000 }, (r2) => {
       let body = '';
       r2.on('data', (c) => { body += c; if (body.length > 4096) body = body.slice(0, 4096); });
       r2.on('end', () => {

@@ -672,12 +672,10 @@ async function tick() {
   finally { _running = false; }
 }
 
-// ?v=daemon6-test: 守卫 — 只在直接 `node scripts/reverse-watch-daemon.mjs` 启动时才跑 main + HTTP server
-//   避免 `import()` 触发 (测试场景) 重复启动跟 PM2 撞 EADDRINUSE
-const __isMain = (() => {
-  try { return import.meta.url === pathToFileURL(process.argv[1]).href; }
-  catch (e) { return false; }
-})();
+// ?v=daemon6-test: 守卫 — 默认跑 main, 仅在测试导入时通过 env 跳过
+//   旧版用 import.meta.url === pathToFileURL(process.argv[1]) 判定 (PM2 fork 模式子进程 argv[1] 不是 daemon.mjs 路径, 守卫 false → main 不跑 → 5min 后自杀)
+//   新版: 默认 true (跑 main), 显式 RW_DAEMON_DISABLE_AUTORUN=1 才跳过 (测试场景用)
+const __isMain = !process.env.RW_DAEMON_DISABLE_AUTORUN;
 
 async function main() {
   log('启动 reverse-watch-daemon v0.1.0, pid=' + process.pid);
