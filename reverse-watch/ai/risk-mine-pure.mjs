@@ -68,6 +68,12 @@ function judgeRisks(code, goodwillList, decreaseList, profitList) {
 // IO + 判定: 拉数据 + 调 judgeRisks, 写缓存
 // opts: { fetchAkshare, state, now }
 // 返回: { reasons, status: 'ok'|'failed' }
+//
+// [P0 修] 写缓存用 module-level Promise 链串行化, 防 prewarmPoolRisk Promise.all 并发写覆盖
+//   旧 bug: 多个 scanRisk 并发各自读 cache{} → 各自本地写 cache[code]=... → state.safeWrite 整对象
+//          后写的覆盖前面的, 前面那只的 cache 字段丢失
+//   新版: _writeChain 串行化读-改-写, 等前面那只的 cache 落盘后再读最新版本
+let _writeChain = Promise.resolve();
 async function scanRisk(code, opts = {}) {
   const state = opts.state || makeStateAdapter();
   const fetchAkshare = opts.fetchAkshare || (async () => null);
@@ -92,9 +98,16 @@ async function scanRisk(code, opts = {}) {
   const reasons = judgeRisks(code, goodwillList, decreaseList, profitList);
   const status = allFailed ? 'failed' : 'ok';
 
-  // 4. 写缓存
-  cache[code] = { ts: now, status, reasons };
-  state.safeWrite(RISK_CACHE_KEY, cache);
+  // 4. 写缓存 (串行化, 防并发覆盖)
+  //    _writeChain 接龙: 自己排在最后, 写之前先 re-read 最新 cache (前面那只刚写完的版本)
+  const myWrite = _writeChain.then(() => {
+    const fresh = state.safeReadJson(RISK_CACHE_KEY, {});
+    fresh[code] = { ts: now, status, reasons };
+    state.safeWrite(RISK_CACHE_KEY, fresh);
+  });
+  // 异常隔离: 自己的写失败不影响后续链
+  _writeChain = myWrite.catch(e => console.warn('[risk-mine-pure] 写链失败:', e.message));
+  await myWrite;
   return { reasons, status, fromCache: false };
 }
 

@@ -404,6 +404,32 @@ const RM_PURE = pathToFileURL(path.join(ROOT, 'reverse-watch', 'ai', 'risk-mine-
   assert(c.fromCache === false, '4.10c 异 code 新调 → fromCache=false');
   assert(a.status && b.status && c.status, '4.10d 3 个 promise 全部返回 status');
 
+  // 4.11 scanRisk 并发写 cache (race 修复)
+  //   旧 bug: 2 个 scanRisk 并发 → 各自读 cache{} → 各自本地改 → safeWrite 整对象 → 后写覆盖前写
+  //   修法: scanRisk 内部 _writeChain Promise 链串行化读-改-写
+  const rmStRace = makeMockState();
+  await Promise.all([
+    RM.scanRisk('990001', { state: rmStRace, fetchAkshare: async () => [{ '代码': '990001' }] }),
+    RM.scanRisk('990002', { state: rmStRace, fetchAkshare: async () => [{ '代码': '990002' }] }),
+    RM.scanRisk('990003', { state: rmStRace, fetchAkshare: async () => [{ '代码': '990003' }] })
+  ]);
+  const raceCache = rmStRace.safeReadJson('_rw_risk_cache');
+  assert(raceCache['990001'], '4.11a 并发 3 只 → 990001 cache 写入 (未被覆盖)');
+  assert(raceCache['990002'], '4.11b 并发 3 只 → 990002 cache 写入 (未被覆盖)');
+  assert(raceCache['990003'], '4.11c 并发 3 只 → 990003 cache 写入 (未被覆盖)');
+  assertEq(Object.keys(raceCache).length, 3, '4.11d cache 共 3 个 key (无丢失)');
+
+  // 4.12 prewarmPoolRisk 多只: 修后无丢失
+  const rmStPrewarm = makeMockState();
+  let prewarmFetchCalls = 0;
+  const pwFetch = async (p) => { prewarmFetchCalls++; await new Promise(r => setTimeout(r, 30)); return [{ '代码': 'X' }]; };
+  await RM.prewarmPoolRisk(['880001', '880002', '880003'], {
+    state: rmStPrewarm,
+    fetchAkshare: pwFetch
+  });
+  const pwCache = rmStPrewarm.safeReadJson('_rw_risk_cache');
+  assertEq(Object.keys(pwCache).length, 3, '4.12a prewarm 3 只 → cache 3 个 key (race 修后无丢失)');
+
   // ============================================================
   console.log(`\n===== 测试结果 =====`);
   console.log(`通过: ${pass}  |  失败: ${fail}`);
