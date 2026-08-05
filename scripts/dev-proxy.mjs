@@ -40,6 +40,16 @@ const AKSHARE_TARGET = process.env.AKSHARE_TARGET || 'http://127.0.0.1:8088';
 const NO_AKTOOLS_AUTOSTART = process.env.NO_AKTOOLS_AUTOSTART === '1';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+// ===== 多源数据 sidecar (Tushare + Baostock + Aktools) =====
+// ?v=dev-proxy-multisrc1: 统一数据源入口, 任一源挂时其他源继续工作
+const DATASOURCES_TARGET = process.env.DATASOURCES_TARGET || 'http://127.0.0.1:8091';
+const NO_DATASOURCES_AUTOSTART = process.env.NO_DATASOURCES_AUTOSTART === '1';
+const _datasourcesParsed = _parseHostPort(DATASOURCES_TARGET);
+let _datasourcesChild = null;
+let _datasourcesShuttingDown = false;
+let _datasourcesRestartAttempts = 0;
+const _datasourcesRestartDelay = (n) => Math.min(30000, 1000 * Math.pow(2, n));
+
 // ?v=dev-proxy-env1: 启动时读 .env (项目根目录), 把 MINIMAX_KEY 等塞进 process.env
 // ?v=dev-proxy-env4 P1-2: 抽成可重入函数 + fs.watch 热加载
 // 浏览器调 /api/llm/minimax 时 dev-proxy 自动注入 Authorization: Bearer ${MINIMAX_KEY}
@@ -351,6 +361,146 @@ async function _ensureAktools() {
   return { spawned: true, ok: false, probe: settle };
 }
 
+// ===== datasources sidecar (Tushare + Baostock + Aktools 三源) =====
+// ?v=dev-proxy-multisrc1: 跟 aktools 一样的 spawn + watchdog 模式
+//   不同点: 端点固定 /health, 不需要预拉 patched 目录
+// ?v=dev-proxy-multisrc4: datasources 需要的依赖包列表 (uv --with 不支持 -r 一次性加载)
+// 跟 scripts/datasources/requirements.txt 保持一致
+const _DATASOURCES_DEPS = [
+  'aktools', 'fastapi>=0.110', 'uvicorn[standard]>=0.27',
+  'httpx>=0.27', 'baostock>=0.8.8', 'tushare>=1.4',
+  'pandas>=2.0', 'akshare>=1.18'
+];
+
+function _spawnDatasources(py) {
+  const host = _datasourcesParsed?.host || '127.0.0.1';
+  const port = _datasourcesParsed?.port || 8091;
+  const startScript = path.join(__dirname, 'datasources', 'start_datasources.py');
+  // ?v=dev-proxy-multisrc4: 按 py.cmd 决定 spawn 方式
+  //   - uv: 临时 venv + --with 装齐所有依赖 (首选)
+  //   - python/py/python3.x: 先 pip install 装齐 (慢但能用)
+  // 之前是硬编码 uv, 形参 py 完全没用上, 系统 python 用户直接打不开
+  let cmd, args;
+  const baseName = (py.cmd || '').toLowerCase().replace(/\.exe$/, '');
+  if (baseName === 'uv') {
+    cmd = 'uv';
+    args = ['run', '--python', '3.12'];
+    for (const dep of _DATASOURCES_DEPS) {
+      args.push('--with', dep);
+    }
+    args.push('python', startScript, host, String(port));
+  } else {
+    // 系统 python: 先一次性 pip install -q 装齐依赖, 再跑脚本
+    //   用户系统 python 大概率没装 baostock/tushare, 这里走用户级 install 不污染全局
+    console.log(`[datasources] 系统 python (${py.cmd}) 模式, 先 pip install 依赖 (慢, 一次性)...`);
+    try {
+      execFileSync(py.cmd, [...(py.preArgs || []), '-m', 'pip', 'install', '--user', '--quiet', ..._DATASOURCES_DEPS], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 180000, // 3min 上限
+      });
+    } catch (e) {
+      console.warn(`[datasources] pip install 失败 (${e.message}), 仍尝试启动 (可能 import 报错)`);
+    }
+    cmd = py.cmd;
+    args = [...(py.preArgs || []), startScript, host, String(port)];
+  }
+  _datasourcesChild = spawn(cmd, args, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true
+  });
+  const tag = `[datasources pid=${_datasourcesChild.pid}]`;
+  _datasourcesChild.stdout.on('data', (c) => process.stdout.write(`${tag} ${c}`));
+  _datasourcesChild.stderr.on('data', (c) => process.stderr.write(`${tag} ${c}`));
+  _datasourcesChild.on('exit', (code, signal) => {
+    console.log(`[datasources] 子进程 exit (code=${code}, signal=${signal})`);
+    _datasourcesChild = null;
+    if (_datasourcesShuttingDown) return;
+    if (signal === 'SIGTERM' || signal === 'SIGINT') return;
+    const delay = _datasourcesRestartDelay(_datasourcesRestartAttempts);
+    _datasourcesRestartAttempts++;
+    console.log(`[datasources] watchdog 将在 ${delay}ms 后重拉 (第 ${_datasourcesRestartAttempts} 次)`);
+    setTimeout(async () => {
+      const py2 = _pickPython();
+      if (!py2) {
+        console.warn('[datasources] watchdog 找不到 python, 放弃重拉');
+        return;
+      }
+      try {
+        _spawnDatasources(py2);
+        const waitMs = await _waitForPort(port, host, 15000);
+        if (waitMs >= 0) {
+          _datasourcesRestartAttempts = 0;
+          console.log(`[datasources] watchdog ✅ 重拉成功 (端口等 ${waitMs}ms)`);
+        } else {
+          console.warn('[datasources] watchdog 端口没起来, 下次 exit 再试');
+        }
+      } catch (e) {
+        console.warn('[datasources] watchdog 重拉失败:', e.message);
+      }
+    }, delay);
+  });
+  return _datasourcesChild;
+}
+
+async function _ensureDatasources() {
+  // ?v=dev-proxy-multisrc3: 抽 _probeDatasourcesHealth 助手, 避免 1/5 两段重复
+  // _probeOnce 是给 aktools /api/public/* 用的 (路径硬编码), datasources 是 /health 不能复用
+  const probeHealth = (timeoutMs, captureBody = false) => new Promise((resolve) => {
+    const r = http.get(DATASOURCES_TARGET + '/health', { timeout: timeoutMs }, (resp) => {
+      let body = '';
+      resp.on('data', (c) => { body += c; if (body.length > 2048) body = body.slice(0, 2048); });
+      resp.on('end', () => resolve({
+        ok: resp.statusCode === 200,
+        status: resp.statusCode,
+        ...(captureBody ? { body: body.slice(0, 200) } : {})
+      }));
+    });
+    r.on('timeout', () => { r.destroy(); resolve({ ok: false, status: 0, reason: 'timeout' }); });
+    r.on('error', (e) => resolve({ ok: false, status: 0, reason: e.code || e.message }));
+  });
+
+  // 1) 先探一次, 通就直接用
+  const initial = await probeHealth(1500, true);
+  if (initial.ok) {
+    console.log(`[datasources] 已有外部进程在 ${DATASOURCES_TARGET} (HTTP ${initial.status}), 不自动拉起`);
+    return { spawned: false, ok: true, probe: initial };
+  }
+  if (NO_DATASOURCES_AUTOSTART) {
+    console.log(`[datasources] ${DATASOURCES_TARGET} ❌ 不通, NO_DATASOURCES_AUTOSTART=1 跳过自动拉起`);
+    return { spawned: false, ok: false, probe: initial };
+  }
+  // 2) 找 python
+  const py = _pickPython();
+  if (!py) {
+    console.log(`[datasources] ${DATASOURCES_TARGET} ❌ 不通, 且没找到 python, 跳过`);
+    return { spawned: false, ok: false, probe: initial, noPython: true };
+  }
+  // 3) spawn
+  const _dsStartScript = path.join(__dirname, 'datasources', 'start_datasources.py');
+  console.log(`[datasources] ${DATASOURCES_TARGET} 不通, 自动拉起: ${py.cmd} ${_dsStartScript}`);
+  try {
+    _spawnDatasources(py);
+  } catch (e) {
+    console.log(`[datasources] spawn 失败: ${e.message}`);
+    return { spawned: false, ok: false, probe: initial };
+  }
+  // 4) 等端口
+  const waitMs = await _waitForPort(_datasourcesParsed?.port || 8091, _datasourcesParsed?.host || '127.0.0.1', 20000);
+  if (waitMs < 0) {
+    console.log(`[datasources] 20s 内没起来, 跳过 (其他路由不受影响)`);
+    return { spawned: true, ok: false, probe: initial };
+  }
+  // 5) 再探 /health
+  const settle = await probeHealth(5000, false);
+  if (settle.ok) {
+    _datasourcesRestartAttempts = 0;
+    console.log(`[datasources] ✅ 起来了 (端口等 ${waitMs}ms, /health HTTP ${settle.status})`);
+    return { spawned: true, ok: true, probe: settle };
+  }
+  console.log(`[datasources] ⚠️ 端口开了但 /health 没就绪 (HTTP ${settle.status})`);
+  return { spawned: true, ok: false, probe: settle };
+}
+
 // ===== LLM 代理 (解决浏览器 CORS) =====
 // 浏览器 → /api/llm/{provider}/v1/chat/completions
 //         ↓ (dev-proxy)
@@ -526,17 +676,32 @@ app.get('/health', async (req, res) => {
     req2.on('error', (e) => { resolve({ ok: false, status: 0, reason: e.code || e.message }); });
   });
   const akshare_status = aktoolsCheck.ok ? 'ok' : 'down';
+  // ?v=dev-proxy-multisrc3: 顺便 ping datasources sidecar, /health 暴露多源状态
+  const datasourcesCheck = await new Promise((resolve) => {
+    const req3 = http.get(DATASOURCES_TARGET + '/health', { timeout: 3000 }, (r3) => {
+      let body = '';
+      r3.on('data', (c) => { body += c; if (body.length > 4096) body = body.slice(0, 4096); });
+      r3.on('end', () => resolve({ ok: r3.statusCode === 200, status: r3.statusCode, sample: body.slice(0, 200) }));
+    });
+    req3.on('timeout', () => { req3.destroy(); resolve({ ok: false, status: 0, reason: 'timeout' }); });
+    req3.on('error', (e) => resolve({ ok: false, status: 0, reason: e.code || e.message }));
+  });
+  const datasources_status = datasourcesCheck.ok ? 'ok' : 'down';
   res.json({
     status: 'ok',
     akshare_target: AKSHARE_TARGET,
     akshare_status,
     akshare_check_detail: aktoolsCheck,
+    datasources_target: DATASOURCES_TARGET,
+    datasources_status,
+    datasources_check_detail: datasourcesCheck,
     timestamp: new Date().toISOString()
   });
 });
 
 // 启动时探测 aktools: 通则不动, 不通则自动 spawn 子进程
 let _aktoolsBootResult = { spawned: false, ok: false };
+let _datasourcesBootResult = { spawned: false, ok: false };
 (async () => {
   // 50ms 等 express 起来再 ping (避免冷启动顺序问题)
   await new Promise(r => setTimeout(r, 50));
@@ -547,7 +712,13 @@ let _aktoolsBootResult = { spawned: false, ok: false };
     console.log('[dev-proxy] → 然后: python -m aktools --host 127.0.0.1 --port 8088');
     console.log('[dev-proxy] → (aktools 0.0.91+ 已移除 http 子命令, 直接 --host/--port)');
   }
-})().catch(e => console.error('[dev-proxy] _ensureAktools 异常:', e));
+  // ?v=dev-proxy-multisrc1: 多源数据 sidecar 探测
+  // 不阻塞 dev-proxy 启动, 失败也只是 datasource 路由返 502, 其他路由不受影响
+  _datasourcesBootResult = await _ensureDatasources().catch(e => {
+    console.warn('[datasources] boot 异常:', e.message);
+    return { spawned: false, ok: false, error: e.message };
+  });
+})().catch(e => console.error('[dev-proxy] boot 异常:', e));
 
 // V13: 防止未捕获拒绝导致进程静默退出 (Express listen 后 event loop 仍在活跃,
 // 但 unhandledRejection 会让 Node 16+ 打印警告然后 exit 0)
@@ -567,6 +738,13 @@ function _killAktoolsChild() {
     try { _aktoolsChild.kill(); } catch (e) { /* 静默退出 */ }
   }
 }
+// ?v=dev-proxy-multisrc1: datasources 退出清理 (同 aktools 模式)
+function _killDatasourcesChild() {
+  _datasourcesShuttingDown = true;
+  if (_datasourcesChild && !_datasourcesChild.killed) {
+    try { _datasourcesChild.kill(); } catch (e) { /* 静默退出 */ }
+  }
+}
 // ?v=dev-proxy-env4 P0-2: 软退出 — server.close() 等 in-flight 完成, 5s timeout 后再硬退
 //   之前 _killAktoolsChild() + process.exit(0) 直接 TCP RST 中断飞行请求 (minimax 8-15s 慢响应经常被切)
 let _isShuttingDown = false;
@@ -575,6 +753,7 @@ function _gracefulShutdown(signal) {
   _isShuttingDown = true;
   console.log(`[shutdown] ${signal} received, 软退出...`);
   _killAktoolsChild();
+  _killDatasourcesChild();
   // server.close 停止接收新连接, 等待已有连接自然结束
   if (server && server.close) {
     try {
@@ -675,6 +854,141 @@ app.use('/api/akshare', createProxyMiddleware({
     }
   }
 }));
+
+// ===== 多源数据路由 (Tushare + Baostock + Aktools) =====
+// ?v=dev-proxy-multisrc1: 上层用 /api/datasource/<name>/<action> 显式选源
+//   - /api/datasource/health         → sidecar 探活
+//   - /api/datasource/baostock/daily → 历史日线 (批量快 4 倍, 无 token)
+//   - /api/datasource/baostock/stock_list → 全市场股票
+//   - /api/datasource/tushare/daily  → 日线 (Tushare 走 token)
+//   - /api/datasource/tushare/basic  → 股票基础信息
+//   - /api/datasource/tushare/fina   → 财务摘要
+//   - /api/datasource/aktools/{item_id} → 透传 patched aktools 实时端点
+// 多源并行 fallback 路由 (上层业务用, 必须在 app.use 之前注册, Express 顺序匹配):
+//   - /api/datasource/multi/stock_daily?code=000001&start=...&end=...
+//     并发试 baostock + aktools + tushare (按优先级), 第一个 OK 的返
+// 任一源故障不影响其他, 上层代码只用一种格式
+// ?v=dev-proxy-multisrc3: OPTIONS 预检 (跨域 PC 浏览器从 :3003 访问 :8089 会先发)
+app.options('/api/datasource/multi/:action', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.status(204).end();
+});
+app.get('/api/datasource/multi/:action', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const { action } = req.params;
+  const qs = req.url.split('?')[1] || '';
+  const params = new URLSearchParams(qs);
+
+  // ?v=dev-proxy-multisrc2: 多源路由表 action → [{source, path, paramMap?}, ...]
+  //   paramMap: { 字段名: (value) => 本源期望的格式 } — 解决 baostock adj=1/2/3 vs tushare/aktools adj=qfq/hfq
+  const routes = _multiSourceRoutes(action);
+  if (!routes || routes.length === 0) {
+    res.status(404).json({ error: 'UNKNOWN_ACTION', action });
+    return;
+  }
+
+  // 真正竞速: 并发请求, 第一个 ok + data 非空 的胜出, 其他 abort
+  //   之前 for-of await 是按数组顺序回退 (慢的在前会拖到末尾), 现改 Promise.all + winner flag
+  //   任一源先 resolve 就立即 set winner + ctl.abort(), 不再按数组下标排队
+  const ctl = new AbortController();
+  const attempts = routes.map((r) => _datasourceFetch(r, params, ctl.signal, req).then(
+    (result) => ({ ok: true, ...result, source: r.source }),
+    (err) => ({ ok: false, source: r.source, error: err.message || String(err) })
+  ));
+  let winner = null;
+  await Promise.all(attempts.map((a) => a.then((r) => {
+    if (r.ok && r.data !== null && r.data !== undefined && !winner) {
+      winner = r;
+      ctl.abort(); // 取消其他还在跑的请求
+    }
+  })));
+
+  if (winner) {
+    res.json({ ok: true, source: winner.source, data: winner.data, latencyMs: winner.latencyMs });
+    console.log(`[datasource/multi] ${action} → ${winner.source} 胜出 (${winner.latencyMs}ms)`);
+    return;
+  }
+
+  ctl.abort(); // 一个都没成, 清掉残留
+  res.status(502).json({ error: 'ALL_SOURCES_FAILED', action });
+  console.warn(`[datasource/multi] ${action} → 全部源失败`);
+});
+
+app.use('/api/datasource', createProxyMiddleware({
+  target: DATASOURCES_TARGET,
+  changeOrigin: true,
+  // pathRewrite 透传 (sidecar 自己处理 /api/datasource 前缀剥掉后的 path)
+  pathRewrite: (path) => path,
+  on: {
+    proxyRes: _proxyOpts.on.proxyRes,
+    error: (err, req, res) => {
+      console.error(`[datasource] ${req.method} ${req.url} → ${err.message}`);
+      res.status(502).json({
+        error: 'DATASOURCE_PROXY_ERROR',
+        message: `无法连接到 datasources sidecar (${DATASOURCES_TARGET})。请检查: 1) sidecar 进程是否在跑 2) Python 是否能 import tushare/baostock 3) TUSHARE_TOKEN 是否配`,
+        detail: err.message
+      });
+    },
+    proxyReq: (proxyReq, req) => {
+      const target = new URL(req.url, 'http://placeholder').pathname;
+      console.log(`[datasource] ${req.method} ${req.url} → ${DATASOURCES_TARGET}${target}`);
+    }
+  }
+}));
+
+// ?v=dev-proxy-multisrc1: 多源路由表
+// 每个 action 列可选源 + 路径 + paramMap
+//   paramMap 按字段名归一化 (例: baostock adj=1/2/3, 其他源 qfq/hfq/None)
+// 上层业务只调 /api/datasource/multi/<action>, 不关心具体哪个源胜出
+function _multiSourceRoutes(action) {
+  const R = {
+    // 日线: 优先 baostock (快+免费), 退 aktools (实时), 最后 tushare (要 token)
+    stock_daily: [
+      // baostock adj 编码: 1=后复权 2=前复权 3=不复权; 上层默认 qfq→2
+      { source: 'baostock', path: '/baostock/daily', paramMap: { adj: (v) => v === 'qfq' ? '2' : v === 'hfq' ? '1' : '3' } },
+      { source: 'aktools', path: '/aktools/stock_zh_a_hist' },
+      { source: 'tushare', path: '/tushare/daily' },
+    ],
+    // 股票基础信息
+    stock_basic: [
+      { source: 'tushare', path: '/tushare/basic' },
+      { source: 'aktools', path: '/aktools/stock_individual_info_em' },
+    ],
+    // 财务摘要
+    stock_fina: [
+      { source: 'tushare', path: '/tushare/fina' },
+    ],
+    // 全市场股票列表
+    stock_list: [
+      { source: 'baostock', path: '/baostock/stock_list' },
+      { source: 'aktools', path: '/aktools/stock_info_a_code_name' },
+    ],
+  };
+  return R[action] || null;
+}
+
+async function _datasourceFetch(route, params, signal, req) {
+  // ?v=dev-proxy-multisrc2: 按 route.paramMap 把上层 query 归一化成本源格式
+  //   缺字段映射的源透传原值 (start_date/end_date/code 等三源命名一致)
+  const mapped = new URLSearchParams();
+  for (const [k, v] of params) {
+    const mapper = route.paramMap && route.paramMap[k];
+    mapped.set(k, mapper ? mapper(v) : v);
+  }
+  const qs = mapped.toString();
+  const url = `${DATASOURCES_TARGET}${route.path}${qs ? '?' + qs : ''}`;
+  const t0 = Date.now();
+  const r = await fetch(url, { signal, timeout: 15000 });
+  if (!r.ok) throw new Error(`${route.source} HTTP ${r.status}`);
+  const body = await r.json();
+  return {
+    data: body?.data ?? null,
+    latencyMs: Date.now() - t0,
+    sourceResponse: body
+  };
+}
 
 // 东方财富代理 — 解决浏览器 CORS (push2.eastmoney.com / 82.push2.eastmoney.com 等)
 // 用法: /api/eastmoney/{rest} → https://push2.eastmoney.com/{rest} (querystring 原样透传)

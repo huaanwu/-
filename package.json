@@ -17,7 +17,8 @@
     "exe:build": "electron-builder --win portable --x64",
     "preview": "vite preview --port 3003",
     "typecheck": "tsc --noEmit",
-    "test": "node test/test_runtime.js && node test/test_all.js && node test/orchestration/reverse-watch-pure.test.js && node test/orchestration/reverse-watch-daemon-pure.test.js",
+    "test": "node test/test_runtime.js && node test/test_all.js && node test/test_multisrc.js && node test/orchestration/reverse-watch-pure.test.js && node test/orchestration/reverse-watch-daemon-pure.test.js",
+    "test:multisrc:e2e": "set MULTISRC_E2E=1 && node test/test_multisrc.js",
     "sync": "npm run build && npx cap sync android"
   },
   "build": {
