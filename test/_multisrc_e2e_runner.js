@@ -2,6 +2,7 @@
 // 走 curl 而非 fetch + AbortController, 绕开 Node 18 Windows UV_HANDLE_CLOSING fatal
 // 用法: node test/_multisrc_e2e_runner.js
 const { execFileSync } = require('node:child_process');
+const path = require('node:path');
 
 let passed = 0, failed = 0;
 const t = async (name, fn) => {
@@ -48,6 +49,38 @@ const curl = (url, timeoutSec = 60) => {
     const r = curl('http://127.0.0.1:8089/api/datasource/multi/stock_basic?code=000001', 90);
     // 现状: tushare 503 (没 token) + aktools 500 (akshare 网络) → dev-proxy 返 502
     if (r.status !== 502) throw new Error('期望 502, got ' + r.status);
+  });
+
+  // ===== baostock socket 半死自愈测试 (Python, 需要 uv + baostock) =====
+  await t('baostock socket 半死自愈 (Python 单测 6 case)', () => {
+    // 用 uv 跑 Python 测试 (test/_test_baostock_reauth.py)
+    // 测试内已 SKIP-on-import-fail, 这里只看 uv 是否存在
+    let uvVersion = '';
+    try {
+      uvVersion = execFileSync('uv', ['--version'], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] });
+    } catch (e) {
+      throw new Error('uv 不在 PATH, 跳过 (set MULTISRC_PYTEST=1 强制跑)');
+    }
+    if (process.env.MULTISRC_PYTEST !== '1') {
+      console.log(`    (uv ${uvVersion.trim()} 存在, 但需要 MULTISRC_PYTEST=1 才跑, skip)`);
+      return;
+    }
+    const r = execFileSync('uv', [
+      'run', '--python', '3.12',
+      '--with', 'baostock', '--with', 'fastapi', '--with', 'httpx',
+      '--with', 'tushare', '--with', 'pandas', '--with', 'akshare', '--with', 'uvicorn',
+      'python', 'test/_test_baostock_reauth.py'
+    ], {
+      cwd: path.resolve(__dirname, '..'),
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    process.stdout.write(r);
+    if (r.match(/(\d+)\s*通过\s*\/\s*(\d+)\s*失败/)) {
+      const [, p, f] = r.match(/(\d+)\s*通过\s*\/\s*(\d+)\s*失败/);
+      if (parseInt(f, 10) > 0) throw new Error(`Python 测试 ${f} 个失败`);
+      console.log(`    (Python e2e: ${p} 通过 / ${f} 失败)`);
+    }
   });
 
   console.log(`\n${passed} 通过 / ${failed} 失败`);

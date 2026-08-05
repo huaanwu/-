@@ -223,41 +223,78 @@ async def tushare_fina(
 # ?v=datasources-baostock1: baostock login 是 thread-local, 跨请求会丢
 #   改成"每次请求都 login + 用完 logout", 避免第一次 login 后续请求全失败
 import contextlib
+import threading
+
+# ?v=datasources-baostock7: socket 累积用久会半死修复
+#   - getpeername() 查不出 socket 半死 (TCP 连接能 getpeername 但 send/recv 已死)
+#   - 实测累积几小时后会出 [WinError 10038] + error_code=10002007
+#   - 修法: 标脏 + auto-retry — 任何 query 收到 BSERR_RECVSOCK_FAIL 或 send_msg 静默 None
+#     → 设 _BS_FORCE_REAUTH 标志, 下次 _bs_session 入口强制重 login
+_BS_REAUTH_LOCK = threading.Lock()
+_BS_FORCE_REAUTH = False  # 任意线程标脏, 下次 _bs_session 重 login
+
+
+def _force_reauth(reason: str):
+    """baostock socket 半死 → 标脏, 下次 _bs_session 入口重 login"""
+    global _BS_FORCE_REAUTH
+    with _BS_REAUTH_LOCK:
+        _BS_FORCE_REAUTH = True
+    log.warning(f"baostock 标脏重 auth: {reason}")
+
+
+def _consume_reauth():
+    global _BS_FORCE_REAUTH
+    with _BS_REAUTH_LOCK:
+        if _BS_FORCE_REAUTH:
+            _BS_FORCE_REAUTH = False
+            return True
+        return False
+
+
+def _socket_alive():
+    """检查 baostock default_socket 是否仍可用
+    - 没设置过 → False
+    - 已 close (fileno 抛 OSError) → False
+    注意: getpeername() 查不出 socket 半死 (TCP 连接能 getpeername 但 send/recv 已死)
+          这种半死由路由层 BSERR 标脏 + 一次 retry 覆盖
+    """
+    import baostock.common.context as _conx
+    sock = getattr(_conx, "default_socket", None)
+    if sock is None:
+        return False
+    try:
+        sock.getpeername()  # closed socket 这里抛 OSError
+        return True
+    except Exception:
+        return False
 
 
 @contextlib.contextmanager
 def _bs_session():
     """baostock session 上下文
-    ?v=datasources-baostock6: baostock 0.9.30 三层坑
+    ?v=datasources-baostock7: baostock 0.9.30 三层坑 + socket 半死自愈
        1. SocketUtil 是单例, login 创建 socket 写到 conx.default_socket, logout 关闭它
        2. context 里 user_id 即使 logout 后仍 set 着, 只看 user_id 没法判断 socket 死活
        3. send_msg 的 except 静默吞 OSError, 返 None, query 走 BSERR_RECVSOCK_FAIL
-          但 sidecar HTTP 200 + data=[] — 上层以为"无数据", 其实是 socket 已死
+       4. (新) socket 累积用久半死: getpeername() 仍 OK 但 send/recv 已死 → 任何 query 必失败
     修法:
       - 启动 smoke test **成功就保留 login**, 失败才 logout 重试
-      - _bs_session 检查 socket.fileno() 是否仍可用, 不可用就强制重 login
+      - _bs_session 三重触发重 auth: socket fileno 死 / 标脏标志 / 无 user_id
+      - 路由在 BSERR (尤其 10002007) 时标脏 + 一次 retry
       - BSERR_RECVSOCK_FAIL (10002007) 走 503 而不是 200+空数组
     """
     import baostock as bs
     import time as _time
     import baostock.common.context as _conx
 
-    def _socket_alive():
-        """检查 default_socket 是否仍可用
-        - 没设置过 → False
-        - 已 close (fileno 抛 OSError) → False
-        """
-        sock = getattr(_conx, "default_socket", None)
-        if sock is None:
-            return False
-        try:
-            sock.getpeername()  # closed socket 这里抛 OSError
-            return True
-        except Exception:
-            return False
-
-    # 双重条件: user_id 在 且 socket 仍活跃 — 才复用
-    if not (hasattr(_conx, "user_id") and _socket_alive()):
+    # 三重触发重 auth: socket 死 / 标脏 / 无 user_id
+    need_reauth = (
+        not hasattr(_conx, "user_id")
+        or not _socket_alive()
+        or _consume_reauth()
+    )
+    if need_reauth:
+        log.info("baostock 重 auth 触发 (socket 死 / 标脏 / 无 user_id)")
         for attempt in range(3):
             # 先把可能残留的 closed socket 清掉 (logout 后 attribute 还在)
             if hasattr(_conx, "default_socket"):
@@ -266,6 +303,9 @@ def _bs_session():
                 except Exception:
                     pass
                 delattr(_conx, "default_socket")
+            # 把 user_id 也清掉, 避免 stale 状态
+            if hasattr(_conx, "user_id"):
+                delattr(_conx, "user_id")
             lg = bs.login()
             if lg.error_code == "0":
                 _time.sleep(0.2)
@@ -305,48 +345,67 @@ def baostock_daily(
     ?v=datasources-baostock2: 用 sync def (不是 async def), 让 fastapi 走 threadpool
        之前用 async def, baostock 同步阻塞 + asyncio event loop 冲突, query 返 None
     """
-    try:
-        with _bs_session() as session:
-            if session is None:
-                raise HTTPException(503, "Baostock login 失败")
-            # Baostock code 格式: sh.000001 / sz.000001 / bj.830xxx
-            bs_code = _bs_code_for(code)
-            rs = session.query_history_k_data_plus(
-                bs_code,
-                "date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg",
-                start_date=start_date, end_date=end_date,
-                frequency="d", adjustflag=adj,
-            )
-            log.info(f"baostock query {bs_code} {start_date}..{end_date} → rs type={type(rs).__name__}")
-            if rs is None:
-                raise HTTPException(503, "baostock query 返回 None (底层抛异常被吞)")
-            log.info(f"baostock query error_code={rs.error_code} error_msg={rs.error_msg}")
-            # ?v=datasources-baostock6: 把网络/解析错误显式暴露 503
-            # 之前这层只判断 rs.error_code=="0", socket 死时 send_msg 返 None → 走到这
-            # 是 BSERR_RECVSOCK_FAIL="10002007" 或 BSERR_NO_LOGIN="10001001", 之前一律当空数组返
-            if rs.error_code != "0":
-                raise HTTPException(503, f"baostock error: code={rs.error_code} msg={rs.error_msg}")
-            rows = []
-            while (rs.error_code == "0") and rs.next():
-                row = rs.get_row_data()
-                row_dict = {
-                    "date": row[0], "code": row[1].split(".")[-1],
-                    "open": float(row[2]) if row[2] else None,
-                    "high": float(row[3]) if row[3] else None,
-                    "low": float(row[4]) if row[4] else None,
-                    "close": float(row[5]) if row[5] else None,
-                    "preclose": float(row[6]) if row[6] else None,
-                    "volume": float(row[7]) if row[7] else None,
-                    "amount": float(row[8]) if row[8] else None,
-                    "pct_chg": float(row[12]) if row[12] else None,
-                }
-                rows.append(row_dict)
-            return _ok(rows, "baostock")
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.error(f"baostock daily 失败: {e}")
-        return _err(str(e), "baostock")
+    # ?v=datasources-baostock7: socket 半死自愈 — 一次 retry
+    #   第一次失败 → 标脏 + 重试 (下次 _bs_session 入口会重 login)
+    #   第二次失败 → 503 (真的 baostock 服务挂了)
+    BSERR_RECVSOCK_FAIL = "10002007"
+    BSERR_SOCKET_ERR = "10002001"
+    for attempt in range(2):
+        try:
+            with _bs_session() as session:
+                if session is None:
+                    raise HTTPException(503, "Baostock login 失败")
+                # Baostock code 格式: sh.000001 / sz.000001 / bj.830xxx
+                bs_code = _bs_code_for(code)
+                rs = session.query_history_k_data_plus(
+                    bs_code,
+                    "date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg",
+                    start_date=start_date, end_date=end_date,
+                    frequency="d", adjustflag=adj,
+                )
+                log.info(f"baostock query {bs_code} {start_date}..{end_date} (attempt {attempt+1}) → rs type={type(rs).__name__}")
+                if rs is None:
+                    # send_msg 静默失败 — socket 半死
+                    if attempt == 0:
+                        _force_reauth(f"query {bs_code} 返 None (socket 半死)")
+                        continue
+                    raise HTTPException(503, "baostock query 返回 None (底层抛异常被吞)")
+                log.info(f"baostock query error_code={rs.error_code} error_msg={rs.error_msg}")
+                if rs.error_code != "0":
+                    # BSERR socket 类 — 标脏 + retry 一次
+                    if attempt == 0 and rs.error_code in (BSERR_RECVSOCK_FAIL, BSERR_SOCKET_ERR, "10001001"):
+                        _force_reauth(f"BSERR {rs.error_code} (socket 半死)")
+                        continue
+                    raise HTTPException(503, f"baostock error: code={rs.error_code} msg={rs.error_msg}")
+                # 成功
+                rows = []
+                while (rs.error_code == "0") and rs.next():
+                    row = rs.get_row_data()
+                    row_dict = {
+                        "date": row[0], "code": row[1].split(".")[-1],
+                        "open": float(row[2]) if row[2] else None,
+                        "high": float(row[3]) if row[3] else None,
+                        "low": float(row[4]) if row[4] else None,
+                        "close": float(row[5]) if row[5] else None,
+                        "preclose": float(row[6]) if row[6] else None,
+                        "volume": float(row[7]) if row[7] else None,
+                        "amount": float(row[8]) if row[8] else None,
+                        "pct_chg": float(row[12]) if row[12] else None,
+                    }
+                    rows.append(row_dict)
+                return _ok(rows, "baostock")
+        except HTTPException:
+            raise
+        except Exception as e:
+            # query 抛异常 — 标脏 + retry
+            if attempt == 0:
+                _force_reauth(f"query 异常: {e}")
+                log.warning(f"baostock 异常, 标脏重试: {e}")
+                continue
+            log.error(f"baostock daily 失败: {e}")
+            return _err(str(e), "baostock")
+    # 走到这里说明两次都失败
+    raise HTTPException(503, "baostock query 两次都失败 (socket 重置无效)")
 
 
 @app.get("/baostock/stock_list")
@@ -355,33 +414,48 @@ def baostock_stock_list():
     返回: [{code, code_name, ipo_date, industry, ...}]
     ?v=datasources-baostock2: sync def (同 daily)
     """
-    try:
-        with _bs_session() as session:
-            if session is None:
-                raise HTTPException(503, "Baostock login 失败")
-            rs = session.query_stock_industry()
-            if rs is None:
-                raise HTTPException(503, "baostock query_stock_industry 返回 None")
-            if rs.error_code != "0":
-                raise HTTPException(503, f"baostock error: code={rs.error_code} msg={rs.error_msg}")
-            rows = []
-            while (rs.error_code == "0") and rs.next():
-                row = rs.get_row_data()
-                code = row[1] if len(row) > 1 else ""
-                if not code or not code.startswith(("sh.", "sz.", "bj.")):
-                    continue
-                rows.append({
-                    "code": code.split(".")[-1],
-                    "code_name": row[2] if len(row) > 2 else "",
-                    "industry": row[3] if len(row) > 3 else "",
-                    "ipo_date": row[4] if len(row) > 4 else "",
-                })
-            return _ok(rows, "baostock", {"count": len(rows)})
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.error(f"baostock stock_list 失败: {e}")
-        return _err(str(e), "baostock")
+    BSERR_RECVSOCK_FAIL = "10002007"
+    BSERR_SOCKET_ERR = "10002001"
+    for attempt in range(2):
+        try:
+            with _bs_session() as session:
+                if session is None:
+                    raise HTTPException(503, "Baostock login 失败")
+                rs = session.query_stock_industry()
+                if rs is None:
+                    if attempt == 0:
+                        _force_reauth("query_stock_industry 返 None (socket 半死)")
+                        continue
+                    raise HTTPException(503, "baostock query_stock_industry 返回 None")
+                if rs.error_code != "0":
+                    if attempt == 0 and rs.error_code in (BSERR_RECVSOCK_FAIL, BSERR_SOCKET_ERR, "10001001"):
+                        _force_reauth(f"BSERR {rs.error_code} (socket 半死)")
+                        continue
+                    raise HTTPException(503, f"baostock error: code={rs.error_code} msg={rs.error_msg}")
+                # 成功
+                rows = []
+                while (rs.error_code == "0") and rs.next():
+                    row = rs.get_row_data()
+                    code = row[1] if len(row) > 1 else ""
+                    if not code or not code.startswith(("sh.", "sz.", "bj.")):
+                        continue
+                    rows.append({
+                        "code": code.split(".")[-1],
+                        "code_name": row[2] if len(row) > 2 else "",
+                        "industry": row[3] if len(row) > 3 else "",
+                        "ipo_date": row[4] if len(row) > 4 else "",
+                    })
+                return _ok(rows, "baostock", {"count": len(rows)})
+        except HTTPException:
+            raise
+        except Exception as e:
+            if attempt == 0:
+                _force_reauth(f"stock_list 异常: {e}")
+                log.warning(f"baostock stock_list 异常, 标脏重试: {e}")
+                continue
+            log.error(f"baostock stock_list 失败: {e}")
+            return _err(str(e), "baostock")
+    raise HTTPException(503, "baostock stock_list 两次都失败 (socket 重置无效)")
 
 
 # ===== Aktools 路由 (透传 patched aktools, 实时行情) =====
