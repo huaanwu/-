@@ -286,6 +286,13 @@ function _spawnAktools(py) {
     // watchdog: dev-proxy 主动停时不重拉 (避免退出阻塞); 其余情况指数退避重拉
     if (_aktoolsShuttingDown) return;
     if (signal === 'SIGTERM' || signal === 'SIGINT') return;
+    // code=3 是 uvicorn bind 失败 ([Errno 10048] 端口被占); 4294967295 是 -1 (Windows bind error)
+    // 这两个是永久错 (别人占着), 重启无意义
+    if (code === 3 || code === 4294967295) {
+      console.warn(`[aktools] watchdog 检测到 bind 错误 (code=${code}), 端口 ${port} 已被其他进程占着, 不重试`);
+      console.warn(`[aktools] 提示: 若想自己接管 aktools, 设 NO_AKTOOLS_AUTOSTART=1 跳过我自己的启停`);
+      return;
+    }
     const delay = _aktoolsRestartDelay(_aktoolsRestartAttempts);
     _aktoolsRestartAttempts++;
     console.log(`[aktools] watchdog 将在 ${delay}ms 后重拉 (第 ${_aktoolsRestartAttempts} 次)`);
@@ -420,6 +427,12 @@ function _spawnDatasources(py) {
     _datasourcesChild = null;
     if (_datasourcesShuttingDown) return;
     if (signal === 'SIGTERM' || signal === 'SIGINT') return;
+    // code=3 (uvicorn bind) / 4294967295 (-1, Windows bind) 都是永久错, 别人占着端口
+    if (code === 3 || code === 4294967295) {
+      console.warn(`[datasources] watchdog 检测到 bind 错误 (code=${code}), 端口 ${port} 已被其他进程占着, 不重试`);
+      console.warn(`[datasources] 提示: 若想自己接管 datasources, 设 NO_DATASOURCES_AUTOSTART=1`);
+      return;
+    }
     const delay = _datasourcesRestartDelay(_datasourcesRestartAttempts);
     _datasourcesRestartAttempts++;
     console.log(`[datasources] watchdog 将在 ${delay}ms 后重拉 (第 ${_datasourcesRestartAttempts} 次)`);

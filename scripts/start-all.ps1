@@ -38,7 +38,7 @@ function Cyan($s)  { Write-Host "  › $s" -ForegroundColor Cyan }
 function Title($s) { Write-Host "`n[StockMaster] $s" -ForegroundColor Cyan }
 
 # ---------- 1. pm2 是否可用 ----------
-Title "1/4 检查 pm2"
+Title "1/5 检查 pm2"
 try {
   $pm2 = (Get-Command pm2 -ErrorAction Stop).Source
   Green "pm2 在 $pm2"
@@ -47,8 +47,31 @@ try {
   exit 1
 }
 
+# ---------- 1.5 清理孤儿 Python (避免端口冲突) ----------
+# 之前手动跑过 `npm run dev` 留的 aktools/datasources 子进程没人管
+# 启动 PM2 后, dev-proxy 内的 watchdog 启新子进程会撞端口 → 死循环
+# 这里先按端口清掉占的 Python 进程
+$orphanPorts = @(8088, 8091)
+foreach ($port in $orphanPorts) {
+  $conn = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($conn) {
+    $pid = $conn.OwningProcess
+    if ($pid -gt 0) {
+      $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$pid" -ErrorAction SilentlyContinue
+      $cmd = if ($proc) { $proc.CommandLine } else { '' }
+      if ($cmd -match 'python|aktools|datasources') {
+        Cyan "清理孤儿: port $port ← PID $pid (Python, 非 PM2 管)"
+        try { Stop-Process -Id $pid -Force -ErrorAction Stop } catch { Red "  杀不掉: $($_.Exception.Message)" }
+      } else {
+        Yellow "port $port 被非 Python 进程占 (PID $pid), 跳过 — 你自己处理"
+      }
+    }
+  }
+}
+Start-Sleep -Seconds 1
+
 # ---------- 2. PM2 启动所有 stock-master app (幂等) ----------
-Title "2/4 启动 PM2 app (已起的跳过)"
+Title "2/5 启动 PM2 app (已起的跳过)"
 Set-Location $projectRoot
 foreach ($name in $stockApps) {
   # 已 online 的不重起
@@ -63,7 +86,7 @@ foreach ($name in $stockApps) {
 }
 
 # ---------- 3. 健康检查 (轮询 /health) ----------
-Title "3/4 等待服务就绪"
+Title "3/5 等待服务就绪"
 foreach ($ep in $endpoints) {
   $ok = $false
   for ($i = 1; $i -le $ep.timeout; $i++) {
@@ -87,7 +110,7 @@ foreach ($ep in $endpoints) {
 }
 
 # ---------- 4. 打开浏览器 ----------
-Title "4/4 打开浏览器"
+Title "4/5 打开浏览器"
 try {
   Start-Process $browserUrl
   Green "已打开: $browserUrl"
