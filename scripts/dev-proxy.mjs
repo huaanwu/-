@@ -1173,7 +1173,7 @@ const LLM_AUTH_HEADERS = {
   moonshot: 'Authorization',      // Bearer sk-...
   zhipu:    'Authorization',      // Bearer ...
   custom:   'Authorization'       // OpenAI 兼容
-  // qwen: 'X-DashScope-API-Key' (DashScope 不接受 Bearer)
+  // qwen 走 OpenAI-兼容 endpoint (/v1/chat/completions), 默认 Authorization: Bearer 即可
 };
 const LLM_AUTH_SCHEMES = {
   minimax:  'Bearer',
@@ -1190,15 +1190,28 @@ const LLM_AUTH_SCHEMES = {
 //   5 个 listener 跟 IncomingMessage 互相持有引用, 长跑 (天级 PM2) 会 listener 累积
 //   Express 已剥 /api/llm, req.url 是 /{provider}/{rest}。pathRewrite 剥掉 /{provider} 前缀
 const _llmProxyPathRewrite = (path) => path.replace(/^\/[^/?]+/, '') || '/';
+// ?v=dev-proxy-llm1: LLM 代理超时 (默认 60s, 可由 LLM_PROXY_TIMEOUT_MS env 调)
+//   之前 http-proxy-middleware 默认 timeout=0 (永等), 上游 hang 时浏览器 spinner 转死
+//   60s 够 DeepSeek 慢请求 / OpenAI 长时间生成, 但又能在网络死时快速 fail
+//   注意: SSE 流式响应 (stream=true) 不能用同步 timeout, 见下 onProxyReq 钩子里的 bypass
+const LLM_PROXY_TIMEOUT_MS = Number(process.env.LLM_PROXY_TIMEOUT_MS) || 60000;
 const _llmProxyInstances = {};
 for (const [_p, _t] of Object.entries(LLM_TARGETS)) {
   _llmProxyInstances[_p] = createProxyMiddleware({
     target: _t,
     changeOrigin: true,
     pathRewrite: _llmProxyPathRewrite,
+    timeout: LLM_PROXY_TIMEOUT_MS,
+    proxyTimeout: LLM_PROXY_TIMEOUT_MS,
     on: {
       proxyRes: _proxyOpts.on.proxyRes,
-      error: (err, _req, _res) => console.error(`[llm] ${_p} ${err.message}`)
+      error: (err, _req, _res) => console.error(`[llm] ${_p} ${err.message}`),
+      proxyReq: (proxyReq, req) => {
+        // SSE 流式: 标记 isStreaming, 让 timeout 钩子放它一马
+        if (req.headers.accept === 'text/event-stream' || (req.body && req.body.stream)) {
+          req._llmStreaming = true;
+        }
+      }
     }
   });
 }
