@@ -22,6 +22,8 @@
  */
 'use strict';
 
+// 仅 Electron 主进程飞书 WS 长连接用 — 跟 web / dev-proxy 无关
+// 这 3 个 deps 暂时放根 dependencies,electron-builder 打包时自动 tree-shake
 const path = require('path');
 const WebSocket = require('ws');
 const axios = require('axios');

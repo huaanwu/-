@@ -43,7 +43,9 @@ npm run dev:proxy           # 只起 dev-proxy (scripts/dev-proxy.mjs)
 
 - **AKShare** (实时行情, 默认) — `python -m aktools http --host 127.0.0.1 --port 8088`
 - **Baostock** (历史日线, 免费批量) — `scripts/datasources/start_datasources.py` 自动启,无需配
-- **Tushare** (财务/基本面, 需 token) — `.env` 加 `TUSHARE_TOKEN=xxx`,datasources sidecar 自动启用
+- **Tushare** (财务/基本面, 需 token) — 两种配法:
+  1. **运行时下发** (推荐): Settings UI "Tushare Token" 输入框 → 保存 → 立即生效,无需重启 dev-proxy (走 `POST /api/datasource/tushare-token`,token 仅在 dev-proxy 内存, dev-proxy 重启失效)
+  2. **启动时加载**: `.env` 加 `TUSHARE_TOKEN=xxx`,dev-proxy 启动时读,传给 sidecar (持久,但改了要重启)
   - 注册: https://tushare.pro (免费 200/分,基础数据够用)
   - 不配 token → Tushare 源自动下线,只剩 baostock + aktools
 - **多源并发**: `GET /api/datasource/multi/<action>` — baostock 优先 (快+免费),失败 fall back aktools/tushare
