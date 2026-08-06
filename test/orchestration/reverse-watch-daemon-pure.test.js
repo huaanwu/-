@@ -271,10 +271,10 @@ const DAEMON_PURE = pathToFileURL(path.join(ROOT, 'reverse-watch', 'daemon-pure.
   // 空持仓 → 应该 0 条
   assertEq(all1.length, 0, '7.1 空持仓 + 满 cash → 0 alerts');
 
-  // 7.2 单票超限 + 鱼尾 + 板块弱 全部命中 → 4 条 (板块弱被鱼尾幂等覆盖)
-  //   已知行为: runAllRules 按 id 幂等去重, 同 code+同 action 留 severity 最高
-  //   鱼尾 (warn) 和 板块走弱 (info) 都是 action=trim, 同 code, 鱼尾覆盖板块走弱
-  //   这是 P0 设计 bug (不同规则的 trim 决策应分开, 留作 P2 重构)
+  // 7.2 单票超限 + 鱼尾 + 板块弱 全部命中 → 4 条
+  //   ?v=daemon7: id 格式加 rule 维度 (fishTail / sectorWeak), 板块走弱独立保留
+  //   旧 P0 bug: 鱼尾 (warn) 跟板块走弱 (info) 同 code+同 action, 板块走弱被静默吞
+  //   新行为: 两条都触发, 用户能看到 板块走弱 info + 鱼尾 warn
   const ctxAllFull = makeCtx({
     holdings: [makeHolding({ code: '600519', name: 'X', price: 100, shares: 1000, chg5: 0.20, sectorStrength: 0.3 })],  // 100% / 20% / 0.3 全触发
     portfolio: { cash: 0, stockMkt: 100000, total: 100000, stockPct: 1.0 }
@@ -285,8 +285,8 @@ const DAEMON_PURE = pathToFileURL(path.join(ROOT, 'reverse-watch', 'daemon-pure.
   const aWeak = all2.find(a => a.action === 'trim' && a.title.includes('板块走弱'));
   const aVeto = all2.find(a => a.action === 'add-veto');
   assert(aStock, '7.2a 单票超限');
-  assert(aFish, '7.2b 鱼尾 (warn, 覆盖板块走弱)');
-  assert(!aWeak, '7.2c 板块走弱被鱼尾幂等覆盖 (同 code 同 action) [P0 设计 bug 待修]');
+  assert(aFish, '7.2b 鱼尾 (warn)');
+  assert(aWeak, '7.2c 板块走弱 (info) 独立保留 — 不再被鱼尾覆盖 (?v=daemon7 P0 修复)');
   assert(aVeto, '7.2d 加仓预算耗尽');
 
   // 7.3 排序: high 优先
@@ -302,9 +302,12 @@ const DAEMON_PURE = pathToFileURL(path.join(ROOT, 'reverse-watch', 'daemon-pure.
   assertEq(all3[0].severity, 'high', '7.3a 第 1 条 severity=high (单票超限排序在前)');
 
   // 7.4 id 格式: slot-action-code-dayKey
+  // ?v=daemon7 修: dayKey 拿实时 (跟 runAllRules 一致), 不写死
+  //   之前用 '2026-08-05' hardcode, 隔天后会挂
   const firstId = all3[0].id;
+  const todayDayKey = DP.shanghaiStr().slice(0, 10);
   assert(firstId.startsWith('morningBrief-'), '7.4a id 前缀 = slot 名');
-  assert(firstId.includes('2026-08-05'), '7.4b id 末段 = dayKey (上海日)');
+  assert(firstId.includes(todayDayKey), '7.4b id 末段 = dayKey (上海日, 实时)');
 
   // 7.5 幂等去重: 同 code 同 action 只保留最高 severity
   //   单票超限 (high) 和仓位偏重 (warn) 同 code 同 action → 留 high

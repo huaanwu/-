@@ -62,13 +62,21 @@ const ALERT_LIMIT = 30;  // 跑出 alerts[] 最多保留 30 条 (避免 panel �
 // 原 bug: runRule1/decideAddOn/decideStopAndTrim 内部调 makeAlert 时都没传 slot, id 字符串已生成 = "unknown-*"
 // runAllRules 后续 .map({ ...a, slot }) 只覆盖 slot 字段, 不重算 id, 导致所有 alerts.id 都是 unknown-* 前缀
 // 幂等去重对真实 slot 名彻底失效. 现在把 id 计算挪到 runAllRules.
-function makeAlert({ severity, action, code, name, title, body, linked_rules, context }) {
+function makeAlert({ severity, action, rule, code, name, title, body, linked_rules, context }) {
   // ?v=daemon5 P0 (TZ #3): ts 用 shanghaiISO (带 +08:00 时区), 跟 alerts.dayKey (shanghaiStr) 一致
-  return { severity, action, code, name, title, body, linked_rules, context, ts: shanghaiISO() };
+  // ?v=daemon7: 加 rule 字段 (鱼尾/板块走弱/MA20 等), 给 attachAlertId 用作 id 维度
+  return { severity, action, rule, code, name, title, body, linked_rules, context, ts: shanghaiISO() };
 }
 // ?v=daemon4: id 计算从 makeAlert 抽出, runAllRules 注入 slot + dayKey 后再算
+// ?v=daemon7: id 格式加 rule 维度 `{slot}-{action}-{rule}-{code}-{dayKey}`
+//   原因: 同 code+同 action 不同规则 (如鱼尾 vs 板块走弱 都是 trim) 之前会被幂等去重覆盖
+//   板块走弱 (info) 被鱼尾 (warn) 静默吞掉, 这是 P0 设计 bug (7.2c)
+//   加 rule 字段后不同规则 id 不同, 都保留
+//   兼容: 未传 rule 时省去, 旧 id 格式不变 (linked_rules 不参与 id, 避免误判)
 function attachAlertId(alert, slot, dayKey) {
-  const id = `${slot}-${alert.action}-${alert.code || '*'}-${dayKey}`;
+  const id = alert.rule
+    ? `${slot}-${alert.action}-${alert.rule}-${alert.code || '*'}-${dayKey}`
+    : `${slot}-${alert.action}-${alert.code || '*'}-${dayKey}`;
   return { ...alert, id, slot };
 }
 
@@ -218,7 +226,7 @@ function decideStopAndTrim(ctx) {
   for (const h of holdings) {
     if (h.belowMA20) {
       notifs.push(makeAlert({
-        severity: 'high', action: 'stop', code: h.code, name: h.name,
+        severity: 'high', action: 'stop', rule: 'ma20', code: h.code, name: h.name,
         title: `${h.name} 跌破 MA20`,
         body: '触发中线止损复盘, 建议检查买入假设',
         linked_rules: [4, 6],
@@ -227,7 +235,7 @@ function decideStopAndTrim(ctx) {
     }
     if (h.chg5 != null && h.chg5 > trimPct) {
       notifs.push(makeAlert({
-        severity: 'warn', action: 'trim', code: h.code, name: h.name,
+        severity: 'warn', action: 'trim', rule: 'fishTail', code: h.code, name: h.name,
         title: `${h.name} 鱼尾行情${isBear ? ' (bear 严)' : ''}`,
         // ?v=daemon5 P0 (审计 #4): 鱼尾行情 = 5日累计涨幅 (冲高乏力), 用 chg5 而不是 fishTail5d
         // 旧 bug: fishTail5d 算的是累计跌幅, 跟"鱼尾冲高减仓"语义完全相反
@@ -238,7 +246,7 @@ function decideStopAndTrim(ctx) {
     }
     if (h.sectorStrength != null && h.sectorStrength < weakPct) {
       notifs.push(makeAlert({
-        severity: 'info', action: 'trim', code: h.code, name: h.name,
+        severity: 'info', action: 'trim', rule: 'sectorWeak', code: h.code, name: h.name,
         title: `${h.name} 板块走弱${isBear ? ' (bear 严)' : ''}`,
         body: `板块强度 ${(h.sectorStrength*100).toFixed(0)}% < ${(weakPct*100).toFixed(0)}%, 该板块持仓减半`,
         linked_rules: [5, 6],
