@@ -623,6 +623,8 @@ const KNOWN_ORIGINS = [
 ];
 
 // V15: CORS preflight — 用 middleware 避 path-to-regexp 5.x 的 * 通配符废弃
+// ?v=dev-proxy-tushare1: 同时挂 express.json 给 POST 用 (tushare token 下发)
+app.use(express.json({ limit: '64kb' }));
 app.use((req, res, next) => {
   // 对所有路由加 ACAO:* (包括非 /api/*, 因 /api/sina 等经 proxy 后 ACAO 丢失)
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -700,6 +702,73 @@ app.get('/health', async (req, res) => {
     datasources_status,
     datasources_check_detail: datasourcesCheck,
     timestamp: new Date().toISOString()
+  });
+});
+
+// ?v=dev-proxy-tushare1: Tushare token 运行时下发端点
+//   浏览器 Settings 页保存后 POST 这里, dev-proxy 写 process.env.TUSHARE_TOKEN
+//   杀掉现 sidecar, watchdog 拉新时会带新 env 起来
+//   纯本机工具, 不做鉴权 (CORS 已限制 origin)
+app.use('/api/datasource/tushare-token', (req, res, next) => {
+  if (req.method === 'OPTIONS') return next(); // 让 CORS 预检通过
+  if (req.method !== 'POST') return res.status(405).json({ error: 'METHOD_NOT_ALLOWED', allow: 'POST' });
+  // body 解析 — 用 express.json 已挂载 (line ~)
+  const token = (req.body?.token || '').trim();
+  if (token && !/^[a-zA-Z0-9]{20,80}$/.test(token)) {
+    return res.status(400).json({ error: 'INVALID_TOKEN_FORMAT', message: 'tushare token 长度一般 32 位字母数字' });
+  }
+  if (token) {
+    process.env.TUSHARE_TOKEN = token;
+    console.log(`[tushare] ✅ token 已设置 (长度 ${token.length}), 准备重启 sidecar 生效`);
+  } else {
+    delete process.env.TUSHARE_TOKEN;
+    console.log('[tushare] ⚠️  token 已清空, Tushare 源下线');
+  }
+  // 杀现 sidecar, watchdog 会自动用新 env 拉起
+  let killed = false;
+  if (_datasourcesChild && !_datasourcesShuttingDown) {
+    _datasourcesShuttingDown = true; // 短暂屏蔽 watchdog 重拉
+    try { _datasourcesChild.kill('SIGTERM'); killed = true; } catch (e) { /* noop */ }
+    setTimeout(() => {
+      _datasourcesShuttingDown = false; // 恢复 watchdog, 允许 watchdog 重拉
+      // 如果 sidecar 死了, watchdog 会拉新的; 如果没死, 下一轮自己重启
+      // 保险起见, 这里再 trigger 一次重启
+      if (!_datasourcesChild) {
+        const py = _pickPython();
+        if (py) {
+          console.log('[tushare] 主动拉起 sidecar (带新 token)');
+          try { _spawnDatasources(py); } catch (e) { console.log('[tushare] spawn 失败:', e.message); }
+        }
+      }
+    }, 1500);
+  } else if (!_datasourcesChild) {
+    // 没有 sidecar 在跑, 直接启 (除非 NO_DATASOURCES_AUTOSTART=1 显式禁用)
+    if (NO_DATASOURCES_AUTOSTART) {
+      console.log('[tushare] token 已更新, 但 NO_DATASOURCES_AUTOSTART=1 不自动拉 sidecar');
+    } else {
+      const py = _pickPython();
+      if (py) {
+        try { _spawnDatasources(py); killed = true; } catch (e) { console.log('[tushare] spawn 失败:', e.message); }
+      }
+    }
+  }
+  res.json({
+    ok: true,
+    token_set: !!token,
+    sidecar_restart: killed,
+    message: token
+      ? `token 已保存, sidecar ${killed ? '正在重启' : '下次重启时生效'}`
+      : 'token 已清空',
+  });
+});
+
+// 查询 Tushare 状态 (浏览器侧用, 显示 Settings 页"是否在线"指示)
+app.get('/api/datasource/tushare-status', (req, res) => {
+  res.json({
+    has_token: !!process.env.TUSHARE_TOKEN,
+    token_length: process.env.TUSHARE_TOKEN?.length || 0,
+    source: 'dev-proxy in-memory',
+    note: 'token 仅存在 dev-proxy 进程内存, 不持久化 (重启 dev-proxy 失效, 重配)'
   });
 });
 

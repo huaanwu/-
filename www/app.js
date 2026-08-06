@@ -648,6 +648,9 @@ window._renderSettings = function() {
       <label>Tushare Token</label>
       <input type="text" id="settingTushareToken" value="${escapeHtml(state.apiKeys.tushare || '')}"
              placeholder="可选,用于深度财务数据">
+      <div id="tushareStatusBadge" style="font-size:11px;margin-top:4px;color:var(--text-muted);">
+        状态检测中...
+      </div>
     </div>
 
     <div class="form-row" style="border-top:1px solid var(--border);padding-top:12px;margin-top:12px;">
@@ -880,6 +883,9 @@ window._renderSettings = function() {
       if (slot) Core.FeishuSettings.render(slot);
     }
   }, 0);
+
+  // ?v=settings-tushare1: 渲染完顺手拉一次 tushare 状态
+  _refreshTushareStatus().catch(() => {});
 };
 
 // ===== 用户画像 (Core.UserProfile) 设置区块 =====
@@ -1667,6 +1673,12 @@ window.saveSettings = function(silent) {
   Core.State.set('proxyBase', proxyBase);
   Core.State.set('apiKeys', { ...Core.State.get('apiKeys'), tushare: tushareToken, llm: llmKeys });
 
+  // ?v=settings-tushare1: 把 token 推到 dev-proxy (写 process.env + 重启 sidecar)
+  //   token 改了就必须 POST, 不然 sidecar 不知道; 即便 token 没改也 post 一次幂等
+  _pushTushareTokenToProxy(tushareToken).catch(e => {
+    console.warn('[settings] tushare token 推到 dev-proxy 失败 (不影响保存):', e.message);
+  });
+
   // AI 配置
   const aiProvider = document.getElementById('settingAIProvider')?.value || 'deepseek';
   const aiApiKey = document.getElementById('settingAIApiKey')?.value.trim() || '';
@@ -1710,6 +1722,44 @@ window.saveSettings = function(silent) {
   if (!silent) toastSuccess('已保存');
   _renderSyncAuth();
 };
+
+// ?v=settings-tushare1: 把 tushare token 推到 dev-proxy, 触发 sidecar 重启带新 env
+async function _pushTushareTokenToProxy(token) {
+  // dev-proxy 在 :8089, 不管当前 proxyBase 是什么, 直连 8089 (设的就是本机 dev-proxy)
+  const url = (window.PROXY_BASE || 'http://127.0.0.1:8089').replace(/\/api\/akshare\/?$/, '').replace(/\/$/, '') + '/api/datasource/tushare-token';
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: token || '' })
+  });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}));
+    throw new Error(err.message || `HTTP ${r.status}`);
+  }
+  const body = await r.json();
+  console.log('[settings] tushare token pushed:', body);
+  // 重启 sidecar 后续状态会变, 1.5s 后刷一次状态
+  setTimeout(() => _refreshTushareStatus().catch(() => {}), 2000);
+  return body;
+}
+
+// ?v=settings-tushare1: 拉 dev-proxy 端 tushare 状态, 显示在 Settings UI
+async function _refreshTushareStatus() {
+  const badge = document.getElementById('tushareStatusBadge');
+  if (!badge) return;
+  const base = (window.PROXY_BASE || 'http://127.0.0.1:8089').replace(/\/api\/akshare\/?$/, '').replace(/\/$/, '');
+  try {
+    const r = await fetch(base + '/api/datasource/tushare-status');
+    const body = await r.json();
+    if (body.has_token) {
+      badge.innerHTML = `<span style="color:var(--accent);">✅ token 已激活</span> <span style="color:var(--text-muted);">(长度 ${body.token_length}, 仅 dev-proxy 内存)</span>`;
+    } else {
+      badge.innerHTML = `<span style="color:var(--text-muted);">⚪ 未激活 — 留空或填入后保存即生效</span>`;
+    }
+  } catch (e) {
+    badge.innerHTML = `<span style="color:var(--text-muted);">⚠️ 状态查询失败: ${escapeHtml(e.message)}</span>`;
+  }
+}
 
 // Settings UI 加载完后, 绑 UP 表单 onchange 实时刷新 preview
 document.addEventListener('DOMContentLoaded', () => {
