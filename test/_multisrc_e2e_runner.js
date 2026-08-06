@@ -26,22 +26,27 @@ const curl = (url, timeoutSec = 60) => {
 (async () => {
   console.log('multisrc e2e (curl)');
 
-  await t('multi/stock_daily baostock 真实胜出', async () => {
+  await t('multi/stock_daily 多源 OK 胜出 (baostock 或 aktools, first-OK-wins)', async () => {
     const url = 'http://127.0.0.1:8089/api/datasource/multi/stock_daily?code=000001&start_date=2024-06-01&end_date=2024-06-10&adj=qfq';
     const r = curl(url, 30);
     if (r.status !== 200) throw new Error('status ' + r.status);
     const body = JSON.parse(r.body);
     if (!body.ok) throw new Error('body.ok=false: ' + r.body);
-    if (body.source !== 'baostock') throw new Error('source 期望 baostock, got ' + body.source);
+    // ?v=aktools-timeout: 不写死 baostock — 任何源 OK 都算胜出 (first-OK-wins 实际)
+    if (!['baostock', 'aktools', 'tushare'].includes(body.source)) {
+      throw new Error('source 应是 baostock/aktools/tushare, got ' + body.source);
+    }
     if (!Array.isArray(body.data) || body.data.length === 0) throw new Error('data 为空');
     if (!body.data[0].close) throw new Error('第一行无 close: ' + JSON.stringify(body.data[0]));
   });
 
-  await t('multi/stock_list baostock 真实胜出 (全 A 股)', async () => {
+  await t('multi/stock_list 多源 OK 胜出 (A 股 4000+)', async () => {
     const r = curl('http://127.0.0.1:8089/api/datasource/multi/stock_list', 90);
     if (r.status !== 200) throw new Error('status ' + r.status);
     const body = JSON.parse(r.body);
-    if (body.source !== 'baostock') throw new Error('source 期望 baostock, got ' + body.source);
+    if (!['baostock', 'aktools', 'tushare'].includes(body.source)) {
+      throw new Error('source 应是 baostock/aktools/tushare, got ' + body.source);
+    }
     if (!body.data || body.data.length < 4000) throw new Error('A 股应 4000+, got ' + (body.data?.length || 0));
   });
 

@@ -39,6 +39,17 @@ npm run dev:vite            # 只起 Vite
 npm run dev:proxy           # 只起 dev-proxy (scripts/dev-proxy.mjs)
 ```
 
+### 数据源 (3 路 + 多源 fallback)
+
+- **AKShare** (实时行情, 默认) — `python -m aktools http --host 127.0.0.1 --port 8088`
+- **Baostock** (历史日线, 免费批量) — `scripts/datasources/start_datasources.py` 自动启,无需配
+- **Tushare** (财务/基本面, 需 token) — `.env` 加 `TUSHARE_TOKEN=xxx`,datasources sidecar 自动启用
+  - 注册: https://tushare.pro (免费 200/分,基础数据够用)
+  - 不配 token → Tushare 源自动下线,只剩 baostock + aktools
+- **多源并发**: `GET /api/datasource/multi/<action>` — baostock 优先 (快+免费),失败 fall back aktools/tushare
+  - `stock_daily` / `stock_list` 走 baostock → aktools → tushare
+  - `stock_basic` / `stock_fina` 走 tushare → aktools
+
 - Vite 端口固定 **3003**。dev-proxy 健康检查: `http://127.0.0.1:8089/health`。
 - Vite proxy: `/api/akshare → 127.0.0.1:8088` (rewrite 成 `/api/public/{item_id}`,匹配 aktools 0.0.91+),`/api/llm → 127.0.0.1:8089` (dev-proxy 自己再转 DeepSeek/OpenAI/...)。
 - **生产/APK 不走 vite proxy**,APK 通过局域网 IP 访问本机 dev-proxy;`proxyBase` 设置项可切换后端地址。

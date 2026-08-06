@@ -465,10 +465,13 @@ def baostock_stock_list():
 async def aktools_proxy(item_id: str):
     """透传任何 /api/public/{item_id} 或 /api/private/{item_id} 到 patched aktools
     item_id 允许点 (例 stock_zh_a_spot_em), 用 :path 转换器接受多段 / 点路径
+    ?v=aktools-timeout: 6s 默认 (够日常 akshare 2-3s, 撞网络死快速 fail)
     """
+    import os as _os
+    timeout = float(_os.environ.get("AKTOOLS_TIMEOUT_MS", "6000")) / 1000.0
     target = f"{AKTOOLS_BASE}/api/public/{item_id}"
     try:
-        async with httpx.AsyncClient(timeout=30.0) as c:
+        async with httpx.AsyncClient(timeout=timeout) as c:
             r = await c.get(target)
             return JSONResponse(
                 status_code=r.status_code,

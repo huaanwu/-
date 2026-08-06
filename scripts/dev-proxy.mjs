@@ -833,6 +833,12 @@ app.get('/api/discover/dev-proxy', (req, res) => {
 app.use('/api/akshare', createProxyMiddleware({
   target: AKSHARE_TARGET,
   changeOrigin: true,
+  // ?v=aktools-timeout: akshare 1.18.x 网络死时 aktools 单次调用能挂 42s+ (in_retry backoff)
+  //   之前 http-proxy-middleware 默认 timeout=0 (永等), 前端 / 用户请求也跟着挂 42s
+  //   改成 6s: 够日常 akshare (2-3s), 撞网络死就快速 fail → 上层走 multi-source fallback
+  //   (dev-proxy /api/datasource/multi/* 走 first-OK-wins, baostock 18-300ms 就返了)
+  timeout: parseInt(process.env.AKTOOLS_TIMEOUT_MS || '6000', 10),
+  proxyTimeout: parseInt(process.env.AKTOOLS_TIMEOUT_MS || '6000', 10),
   pathRewrite: (path) => `/api/public${path}`,
   on: {
     proxyRes: _proxyOpts.on.proxyRes,
