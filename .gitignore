@@ -2,18 +2,23 @@ node_modules/
 www/dist/
 www/.dist-snapshot/
 www/assets/
-www/styles.css
-www/public/icons-source/
+www/styles.css/
 www/lib/node_modules/
+www/public/icons-source/
 *.log
+*.log.*
 .DS_Store
 .vscode/
 .idea/
+__pycache__/
+*.pyc
+*.pyo
 android/.gradle/
 android/app/build/
 android/build/
 android/local.properties
 android/capacitor-cordova-android-plugins/
+android/
 *.apk
 *.aab
 .env
@@ -22,47 +27,36 @@ data-cache/
 fund_*.json
 fund_*.txt
 mavis-deep-research/
+.claude/
 .chrome-e2e-tmp-*/
 .chrome-rw-tmp-*/
 e2e_screenshots/
 emu_screenshots/
-*.log.*
-android/
-.claude/
-www/sw.js
-www/version.json
-dp.log
-dp.err
-dist/
-dist2/
-kimi/
-.tmp_*.png
-.tmp_*.js
 
-# 临时调试/绕开脚本 (bash 魔改、调试探针)
-__*.mjs
-run*.mjs
+# 临时补丁脚本 (一次性, 用完即扔) — 改完代码 commit 完即弃
+scripts/_*.mjs
+scripts/_*.mjs.unused
+test/_*.js
+!test/_tushare_token_smoke.js   # 例外: 留作 e2e 测试
 
-# 调研期临时产物 (AKShare / aktools 接口文档 + 实测 JSON)
-akshare_*.html
-aktools_*.html
-aktools_*.json
-zygc_*.json
-zyjs_*.json
-yjyg_*.json
-
-# Python aktools patched cache
-scripts/aktools-patched/**/__pycache__/
-scripts/aktools-patched/**/__pycache__/**
-
-# Python datasources sidecar cache
+# Python 缓存 (脚本目录) — 防 datasources/*.py 生成 __pycache__ 污染
 scripts/datasources/**/__pycache__/
 scripts/datasources/**/__pycache__/**
-
-# Python test cache
 test/__pycache__/
 test/**/__pycache__/
 
-# reverse-watch daemon 心跳文件 (每 30s 重写, 进 git 会污染每次 diff)
-#   工作树留着, daemon 启动后会重新生成; 新克隆用户手动跑一次 daemon 即可
+# 运行时临时文件
+*.pid
+.cache/
+tmp/
+aktools_log.log.*
+aktools_log.log
+dp.err
+archive/
+dist2/
+kimi/
 reverse-watch/_rw_daemon_state.json
+www/fund_ai_seed.json
+www/version.json
+www/sw.js
+.tmp_*
