@@ -20,7 +20,7 @@
 'use strict';
 
 // ============== 配置 ==============
-// ?v=daemon7-ai-fallback1-logic2-fix5: 改 let, 设置页改了 proxyBase 后 saveSettings 要同步 (否则存了但全局仍是旧值)
+// 改 let, 设置页改了 proxyBase 后 saveSettings 要同步 (否则存了但全局仍是旧值)
 let PROXY_BASE = 'http://127.0.0.1:8089';   // akshare dev-proxy
 const AKTOOLS_BASE = 'http://127.0.0.1:8088';  // aktools 直连(可选)
 let DATA_MODE = 'auto';                       // auto | mock | real (改为 let 以支持运行时切换)
@@ -65,7 +65,7 @@ function saveSettings(s) { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s))
 let SETTINGS = loadSettings();  // 全局可读, reverseScreener 会消费
 // 启动时同步到 DATA_MODE / PROXY_BASE
 DATA_MODE = SETTINGS.dataMode;
-// ?v=daemon7-ai-fallback1-logic2-fix5: 启动时同步 PROXY_BASE (原来漏了, 设置页改了不生效)
+// 启动时同步 PROXY_BASE (原来漏了, 设置页改了不生效)
 if (SETTINGS.proxyBase) PROXY_BASE = SETTINGS.proxyBase;
 
 // ============== DOM 引用 ==============
@@ -80,7 +80,7 @@ const funnelBox = $('funnelBox');
 const holdingRules = $('holdingRules');
 const hiddenBox = $('hiddenBox');
 let refreshBtn = $('refreshBtn');
-// ?v=daemon7-ai-fallback1-logic2-fix8: index.html 文本字节损坏导致 header-meta 里
+// index.html 文本字节损坏导致 header-meta 里
 // 的 refreshBtn/settingsBtn 被 HTML parser 吞掉 (document.getElementById 返回 null)。
 // 这里做兜底注入: 如果原 button 不存在, 程序启动时动态造一个, 否则整个 header
 // 没刷新/没设置按钮, 关键功能失效。注入后用 document.getElementById 重取引用。
@@ -594,7 +594,7 @@ function loadHolding() {
 function saveHolding(patch) {
   const merged = { ...loadHolding(), ...patch };
   try { localStorage.setItem(HOLDING_KEY, JSON.stringify(merged)); } catch (e) { console.warn('[saveHolding] 写本地失败:', e.message); }
-  // ?v=daemon5 P0 (审计 #1): 同步推 daemon fs, daemon 7 规则立刻用新值 (旧 bug: 只写 localStorage, daemon 永远走默认)
+  // (审计 #1): 同步推 daemon fs, daemon 7 规则立刻用新值 (旧 bug: 只写 localStorage, daemon 永远走默认)
   // PUT :8090/rules + _ctx=null 失效, 强制下次 buildContext 重读
   fetch(`http://${location.hostname}:8090/rules`, {
     method: 'PUT',
@@ -1070,7 +1070,7 @@ function dailySeed() {
 
 // 跑反向 4 闸: 返回 { passed: [...], blocked: [{code, reason}] }
 // 第 0 闸: pool.exclude (AI 管家 chat 维护的"用户否定名单", 学习闭环 ① 反馈层入口)
-// 重构 (?v=daemon1): 实际逻辑迁到 strategy/screener-pure.mjs, 浏览器侧仅留 thin wrapper
+// 重构 ( ): 实际逻辑迁到 strategy/screener-pure.mjs, 浏览器侧仅留 thin wrapper
 // 供 daemon (Node) 复用同一份纯函数, 保证 passed/blocked 完全一致
 function reverseScreener(pool, rng) {
   const rw = window.ReverseWatch || {};

@@ -44,11 +44,11 @@ function getProxyBase() {
 }
 
 // 核心调用: 走主程序 dev-proxy /api/llm/{provider}/chat/completions
-// ?v=daemon4-logic2 P0 #21: 支持 opts.config 临时覆盖 (testBtn 不污染 localStorage)
+// #21: 支持 opts.config 临时覆盖 (testBtn 不污染 localStorage)
 async function callLLM(prompt, opts = {}) {
   const baseCfg = getAIConfig();
   const cfg = (opts.config && typeof opts.config === 'object') ? { ...baseCfg, ...opts.config } : baseCfg;
-  // ?v=ai-adapter-env3: minimax 等 forceProxy provider 即使没填 apiKey 也能调通 — dev-proxy 启动时读 .env 注入
+  // minimax 等 forceProxy provider 即使没填 apiKey 也能调通 — dev-proxy 启动时读 .env 注入
   //   浏览器发无 Authorization 的请求, dev-proxy 看到 .env 有 key 就自动注入
   //   (浏览器源码/UI 永远不出现明文 key)
   const _isProxyProvider = !!PROVIDER_DEFAULTS[cfg.provider]?.forceProxy;
@@ -99,7 +99,7 @@ async function callLLM(prompt, opts = {}) {
   }
 }
 
-// 测试连接 (单 ping) — ?v=daemon4-logic2 P0 #21: 支持 opts.config 临时 cfg, 不写 localStorage
+// 测试连接 (单 ping) — #21: 支持 opts.config 临时 cfg, 不写 localStorage
 async function testConnection(opts = {}) {
   const t0 = Date.now();
   try {
@@ -111,7 +111,7 @@ async function testConnection(opts = {}) {
 }
 
 // 单股简评 — 详情页用
-// ?v=ai-detail-fix1: 补 MA5/MA10/MA20 价格 + 量比, 让 AI 算真实偏离, 不再编造"偏离MA20较多"
+// 补 MA5/MA10/MA20 价格 + 量比, 让 AI 算真实偏离, 不再编造"偏离MA20较多"
 async function summarizeStock(stock, context = '') {
   const tech = stock.tech || null;
   const ma5 = (tech && typeof tech.ma5 === 'number') ? tech.ma5.toFixed(2) : '?';
@@ -126,7 +126,7 @@ async function summarizeStock(stock, context = '') {
     ? (tech.price > tech.ma5 ? '价在 MA5 之上' : tech.price > tech.ma20 ? '价在 MA5 之下 MA20 之上' : '价跌破 MA20')
     : '';
 
-  // ?v=ai-detail-fix2: 算真实偏离, 喂"预计算"文本, 禁止 AI 自己拿原数算百分比
+  // 算真实偏离, 喂"预计算"文本, 禁止 AI 自己拿原数算百分比
   // 之前给 AI 喂 "MA20 5.06 + 20日涨幅 -6.2%" → 模型把两个数拼接变成 -623.2%
   // 这次给的具体描述, 让 AI 改不到数字
   const calcPos = (() => {

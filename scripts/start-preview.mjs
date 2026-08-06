@@ -1,5 +1,5 @@
 // ============== scripts/start-preview.mjs ==============
-// 桌面一键启动器 (?v=launcher1): 启动 reverse-watch preview :3020
+// 桌面一键启动器 ( ): 启动 reverse-watch preview :3020
 // 为什么不直接 PM2 跑 python -m http.server:
 //   PM2 把 script 字段当 Node 解析, python.exe 报 SyntaxError
 // 为什么不直接 Start-Process python ... :
@@ -11,7 +11,7 @@ import path from 'node:path';
 import process from 'node:process';
 
 const PORT = Number(process.env.PORT) || 3020;  // ?v=daemon7-ai-fallback1-logic2-fix5: 接受 PORT env (Browser preview autoPort)
-// ?v=daemon7-ai-fallback1-logic2-fix5: 改 0.0.0.0 (默认), 让手机/APK/局域网能访问 (原 127.0.0.1 互锁)
+// 改 0.0.0.0 (默认), 让手机/APK/局域网能访问 (原 127.0.0.1 互锁)
 const HOST = process.env.RW_HOST || '0.0.0.0';
 const CWD = process.env.RW_DIR || path.resolve(process.cwd(), 'reverse-watch');
 
@@ -39,7 +39,7 @@ function shutdown(sig) {
   killed = true;
   console.log(`[start-preview] received ${sig}, killing child pid=${child.pid}`);
   try {
-    // ?v=daemon7-ai-fallback1-logic2-fix5: Windows 下 child.kill('SIGTERM') 对 python 子进程不可靠
+    // Windows 下 child.kill('SIGTERM') 对 python 子进程不可靠
     // 用 taskkill /T /F 杀进程树, 防止 python http.server 残留 (实测 netstat 会看到两个 LISTENING 端口)
     if (process.platform === 'win32' && child.pid) {
       spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });

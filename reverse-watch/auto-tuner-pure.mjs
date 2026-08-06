@@ -3,7 +3,7 @@
 // execute / rollbackAll / approvePending / scheduleWeekly 留在浏览器侧 (auto-tuner.js),
 // 因依赖 AIFeedback.applyAdjustments (落盘 + 派事件), daemon 会另写自己的 execute 通道。
 //
-// 重构 (?v=daemon1): 把 _computeSignals / _shouldSkip / _decide 抽出来, 让 daemon 跑同款判定
+// 重构 ( ): 把 _computeSignals / _shouldSkip / _decide 抽出来, 让 daemon 跑同款判定
 
 import { makeStateAdapter, IS_NODE } from './state-adapter.mjs';
 

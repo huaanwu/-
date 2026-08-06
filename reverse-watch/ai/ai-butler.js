@@ -32,7 +32,7 @@ function renderButlerPanel(snapshot, container, opts = {}) {
       return downs > 0 ? `${downs} 否定` : '';
     } catch (e) { console.warn('[ai-butler] holdingFbMeta 解析失败:', e.message); return ''; }
   })();
-  // ?v=daemon2 修复 P0-5: 头部加 daemon 心跳 + regime 状态
+  // 修复 P0-5: 头部加 daemon 心跳 + regime 状态
   const daemonMeta = (() => {
     try {
       const ds = window._daemonState || null;
@@ -55,13 +55,13 @@ function renderButlerPanel(snapshot, container, opts = {}) {
   body.className = 'butler-body';
   card.appendChild(head);
 
-  // ?v=daemon2 修复 P0-5: 顶部加 daemon 上次巡检摘要卡片
+  // 修复 P0-5: 顶部加 daemon 上次巡检摘要卡片
   const daemonSummary = renderDaemonSummary();
   if (daemonSummary) card.appendChild(daemonSummary);
 
   card.appendChild(body);
 
-  // ?v=daemon4-logic2 P1 #12: 用 _userCollapsed 记住用户折叠意图, 异步设 display=grid 不覆盖
+  // #12: 用 _userCollapsed 记住用户折叠意图, 异步设 display=grid 不覆盖
   let _userCollapsed = false;
   head.onclick = () => {
     _userCollapsed = !_userCollapsed;
@@ -82,7 +82,7 @@ function renderButlerPanel(snapshot, container, opts = {}) {
           : '⚠ 未配置 API key · 显示规则版';
         renderBrief(body, ruleFallbackBrief(snapshot));
         body.style.display = _userCollapsed ? 'none' : 'grid';
-        // ?v=butler-cache4: 通知失败回调, 让 wrapper 跳过 cache 写入
+        // 通知失败回调, 让 wrapper 跳过 cache 写入
         if (typeof opts.onSuccess === 'function') opts.onSuccess(null, cfg.provider);
         return;
       }
@@ -90,7 +90,7 @@ function renderButlerPanel(snapshot, container, opts = {}) {
       meta.textContent = `🟢 ${cfg.provider} · ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
       renderBrief(body, report);
       body.style.display = _userCollapsed ? 'none' : 'grid';
-      // ?v=butler-cache4: LLM 成功回调 — 拿 brief + provider 给 wrapper 写缓存
+      // LLM 成功回调 — 拿 brief + provider 给 wrapper 写缓存
       if (typeof opts.onSuccess === 'function') opts.onSuccess(report, cfg.provider);
     } catch (e) {
       console.warn('[ai-butler] LLM 调用失败, 走规则版:', e.message);

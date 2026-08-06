@@ -1,6 +1,6 @@
 // ============== reverse-watch/ai/daemon-status-ui.js · F4.8 daemon panel 渲染 ==============
-// ?v=daemon4 P0 #156: 修复僵尸 panel (index.html L69-85 写死 ID, 但无 JS 渲染, 永远加载中)
-// ?v=daemon4 P0 #157: onboarding 黑洞 — ds===null / !heartbeatAt 时显 placeholder 红卡
+// #156: 修复僵尸 panel (index.html L69-85 写死 ID, 但无 JS 渲染, 永远加载中)
+// #157: onboarding 黑洞 — ds===null / !heartbeatAt 时显 placeholder 红卡
 //
 // 设计: 复用 ai-butler 的 window._daemonState (app.js firstRender 写入)
 // 失败/未启动/无心跳 → 推 🛰 daemon 未启动 placeholder 卡, 提示 pm2 start

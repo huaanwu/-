@@ -32,7 +32,7 @@ const curl = (url, timeoutSec = 60) => {
     if (r.status !== 200) throw new Error('status ' + r.status);
     const body = JSON.parse(r.body);
     if (!body.ok) throw new Error('body.ok=false: ' + r.body);
-    // ?v=aktools-timeout: 不写死 baostock — 任何源 OK 都算胜出 (first-OK-wins 实际)
+    // 不写死 baostock — 任何源 OK 都算胜出 (first-OK-wins 实际)
     if (!['baostock', 'aktools', 'tushare'].includes(body.source)) {
       throw new Error('source 应是 baostock/aktools/tushare, got ' + body.source);
     }

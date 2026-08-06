@@ -12,7 +12,7 @@
 //   state.safeRead(key, fallback)  /  state.safeWrite(key, value)
 //   默认用 makeStateAdapter() 自动选 localStorage/fs
 
-// ?v=daemon7-ai-fallback1-logic2-fix5: state-adapter.mjs 在上级目录, 原来写 './state-adapter.mjs' 导致 ES module 加载 404
+// state-adapter.mjs 在上级目录, 原来写 './state-adapter.mjs' 导致 ES module 加载 404
 import { makeStateAdapter, IS_NODE } from '../state-adapter.mjs';
 
 const DEFAULT_GATES = { sectorMin: 0.55, pbDeltaMin: 15, quantRejectPct: 0.5, excludeLeaders: true };

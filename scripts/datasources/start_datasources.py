@@ -12,7 +12,7 @@ import os
 import sys
 import logging
 
-# ?v=datasources-utf8-1: Windows 控制台 cp936 默认会把 UTF-8 中文当 GBK 解, 看到 `??` / `δ��`
+# Windows 控制台 cp936 默认会把 UTF-8 中文当 GBK 解, 看到 `??` / `δ��`
 #   reconfigure stdout/stderr → UTF-8, logger 也强制 UTF-8
 #   dev-proxy 拉起 sidecar 时再补 PYTHONIOENCODING=utf-8 双保险
 for _stream in (sys.stdout, sys.stderr):
@@ -103,7 +103,7 @@ def _source_available(source_name):
         return bool(TUSHARE_TOKEN)
     return True
 
-# ?v=datasources-bjcode1: 北交所代码前缀归一化 (4xxxxx / 8xxxxx -> .BJ)
+# 北交所代码前缀归一化 (4xxxxx / 8xxxxx -> .BJ)
 # 之前只用 6→SH, 否则 SZ, 4/8 开头的北交所标的全错
 def _ts_code_for(code: str) -> str:
     if "." in code:
@@ -278,12 +278,12 @@ async def tushare_fina(
 
 
 # ===== Baostock 路由 (日线/分钟/复权 — 批量快 4 倍) =====
-# ?v=datasources-baostock1: baostock login 是 thread-local, 跨请求会丢
+# baostock login 是 thread-local, 跨请求会丢
 #   改成"每次请求都 login + 用完 logout", 避免第一次 login 后续请求全失败
 import contextlib
 import threading
 
-# ?v=datasources-baostock7: socket 累积用久会半死修复
+# socket 累积用久会半死修复
 #   - getpeername() 查不出 socket 半死 (TCP 连接能 getpeername 但 send/recv 已死)
 #   - 实测累积几小时后会出 [WinError 10038] + error_code=10002007
 #   - 修法: 标脏 + auto-retry — 任何 query 收到 BSERR_RECVSOCK_FAIL 或 send_msg 静默 None
@@ -407,7 +407,7 @@ def baostock_daily(
     # 统一日期格式 (baostock 严格要 YYYY-MM-DD)
     start_date = _bs_date(start_date)
     end_date = _bs_date(end_date)
-    # ?v=datasources-baostock7: socket 半死自愈 — 一次 retry
+    # socket 半死自愈 — 一次 retry
     #   第一次失败 → 标脏 + 重试 (下次 _bs_session 入口会重 login)
     #   第二次失败 → 503 (真的 baostock 服务挂了)
     BSERR_RECVSOCK_FAIL = "10002007"

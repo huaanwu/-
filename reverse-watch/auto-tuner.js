@@ -6,7 +6,7 @@
 //   3. 大道至简: 4 项信号 + 5 条规则, 不上 ML
 //   4. 赚钱机会: 7d 后 down 比率反升 → 自动回滚, 调参器自校准
 //
-// 重构 (?v=daemon1): 实际 signals/guard/decide 逻辑迁到 auto-tuner-pure.mjs,
+// 重构 ( ): 实际 signals/guard/decide 逻辑迁到 auto-tuner-pure.mjs,
 // execute / rollbackAll / approvePending / scheduleWeekly 留在浏览器 (依赖 AIFeedback 落盘)
 
 const AUTO_LOG_KEY = '_rw_auto_adjustments_log';

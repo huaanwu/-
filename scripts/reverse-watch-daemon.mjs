@@ -34,7 +34,7 @@ const RW_DIR = path.join(ROOT, 'reverse-watch');
 const STATE_FILE = path.join(RW_DIR, '_rw_daemon_state.json');
 const SCHEDULER_FILE = path.join(RW_DIR, '_rw_scheduler_last_run.json');
 const ACCOUNT_FILE = path.join(RW_DIR, '_rw_account.json');
-// ?v=daemon5 P0 (审计 #1): _rw_holding_rules.json 顶层常量, 给 PUT /rules 用
+// (审计 #1): _rw_holding_rules.json 顶层常量, 给 PUT /rules 用
 const RULES_FILE = path.join(RW_DIR, '_rw_holding_rules.json');
 const LOG_FILE = path.join(ROOT, 'logs', 'daemon-out.log');
 
@@ -58,7 +58,7 @@ function log(...args) {
 }
 
 // ---------- 原子写 ----------
-// ?v=daemon4-logic2 P2 #5: fsyncSync 强制 page cache 落盘 + rename 失败 .tmp 清理
+// #5: fsyncSync 强制 page cache 落盘 + rename 失败 .tmp 清理
 // 避免断电/OS crash 后读旧 state; Windows 下 AV/编辑器短暂占用 EBUSY 时 .tmp 不残留
 function atomicWrite(filePath, value) {
   const tmp = `${filePath}.tmp`;
@@ -90,7 +90,7 @@ function safeReadJson(filePath, fallback = {}) {
   }
 }
 
-// ?v=daemon4: atomicWrite (tmp + rename) 落盘, 防 daemon 崩溃半截写入
+// atomicWrite (tmp + rename) 落盘, 防 daemon 崩溃半截写入
 function safeWriteJson(filePath, obj) {
   try {
     const dir = path.dirname(filePath);
@@ -158,7 +158,7 @@ function markSlot(slotKey) {
   catch (e) { log('markSlot 写失败:', e.message); }
 }
 
-// ---------- 飞书推送 (severity 分级: ?v=daemon3) ----------
+// ---------- 飞书推送 (severity 分级: ) ----------
 // 旧版限频函数 feishuPush() / _feishuToday 已迁移到下方分级版本
 
 // ---------- 依赖探测 ----------
@@ -169,7 +169,7 @@ async function probeDevProxy() {
   } catch (e) { return 'down'; }
 }
 async function probeAktools() {
-  // ?v=daemon7-degraded-fix3: 改读 dev-proxy /health 的 akshare_status 字段
+  // 改读 dev-proxy /health 的 akshare_status 字段
   // 历史:
   //   - stock_sy_em?symbol=test (v0): 端点不存在 + 无效参数 → 500 → 误报
   //   - stock_zh_a_spot_em?symbol=000001 (v1): aktools 0.0.91 + akshare 1.18.x API 不兼容
@@ -331,7 +331,7 @@ async function buildSingleContext() {
     singleStockMaxPct: 0.10, basePoolMaxPct: 0.50, cashReservePct: 0.05,
     addOnProfitPct: 0.05, addMaxRatio: 0.50, addCooldownDays: 3,
     fishTailTrimPct: 0.15, sectorWeakPct: 0.50, trapLockHours: 24,
-    stockOverPct: 0.30   // 单票 + 板块池警戒占比 (?v=daemon3)
+    stockOverPct: 0.30   // 单票 + 板块池警戒占比
   });
   const regimeHist = safeReadJson(path.join(RW_DIR, '_rw_regime_history.json'), []);
   const latestRegime = Array.isArray(regimeHist) && regimeHist.length > 0 ? regimeHist[regimeHist.length - 1] : null;

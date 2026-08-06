@@ -209,7 +209,7 @@ function describeRisk(reasons) {
 }
 
 window.ReverseWatch = window.ReverseWatch || {};
-// 重构 (?v=daemon1): 实际逻辑迁到 ai/risk-mine-pure.mjs, 浏览器侧仅留薄 wrapper
+// 重构 ( ): 实际逻辑迁到 ai/risk-mine-pure.mjs, 浏览器侧仅留薄 wrapper
 // 供 daemon (Node) 复用同一份纯函数, 保证 scanRisk 行为一致
 // fetchAkshare 保留本地 (浏览器侧走 dev-proxy :8089, Node daemon 走自己的实现)
 const rw0 = window.ReverseWatch;

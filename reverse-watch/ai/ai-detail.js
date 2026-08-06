@@ -27,7 +27,7 @@ async function renderDetailAI(c, tech, container) {
     ctxParts.push(`技术: MA20偏离 ${tech.chg20 ? (tech.chg20 * 100).toFixed(1) + '%' : '?'}, 量比 ${tech.volRatio ?? '?'}`);
   }
   try {
-    // ?v=ai-detail-fix1: 把 tech 字段直接塞 stock, summarizeStock 会取 ma5/ma10/ma20/volRatio/price
+    // 把 tech 字段直接塞 stock, summarizeStock 会取 ma5/ma10/ma20/volRatio/price
     const stockWithTech = { ...c, tech };
     const r = await window.ReverseWatch.AIAdapter.summarizeStock(stockWithTech, ctxParts.join('\n'));
     header.textContent = `🤖 AI 简评 · ${r.provider} · ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;

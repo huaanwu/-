@@ -1,6 +1,6 @@
 // ============== reverse-watch/holdings-ui.js · F4.9 持仓管理 UI ==============
-// ?v=daemon3 P0 #150: 极简手动录入, 联动 holdings-bridge 同步到 daemon fs
-// ?v=daemon4 P0 #180: 顶部加"可用现金"行 + 编辑按钮 (cash 模型, 总资金 = cash + 持仓市值)
+// #150: 极简手动录入, 联动 holdings-bridge 同步到 daemon fs
+// #180: 顶部加"可用现金"行 + 编辑按钮 (cash 模型, 总资金 = cash + 持仓市值)
 //
 // 用法:
 //   import { mountHoldingsPanel } from './holdings-ui.js'
@@ -97,7 +97,7 @@ function _fmtPrice(p) {
 }
 
 // 单只持股的数据加载 + 行渲染
-// ?v=daemon4-logic2 P0 #24 (b): myGen + row.isConnected 防御
+// #24 (b): myGen + row.isConnected 防御
 // 场景: 用户连点 _renderList() 多次, 旧 _renderRow 内 await _fetchHoldingQuote 完成后, 该 row 已被新 _renderList replaceChildren 卸掉
 // 不防御会: 旧 row.appendChild() → 节点已被 GC → "Cannot read properties of null" + 内存泄漏
 async function _renderRow(h, row, myGen) {
@@ -108,10 +108,10 @@ async function _renderRow(h, row, myGen) {
     console.warn('[holdings-ui] 拉实时数据失败:', h.code, e.message);
   }
 
-  // ?v=daemon4-logic2 P0 #24 (b): await 完成后, 检查 row 还在不在 DOM + generation 一致
+  // #24 (b): await 完成后, 检查 row 还在不在 DOM + generation 一致
   if (!row.isConnected || myGen !== _renderGen) return;
 
-  // 用拉到的真名覆盖 + 缓存实时价 (供 _renderCashBar 汇总用, ?v=daemon4-logic2)
+  // 用拉到的真名覆盖 + 缓存实时价 (供 _renderCashBar 汇总用, )
   if (q?.name) h._displayName = q.name;
   if (q && typeof q.price === 'number' && q.price > 0) {
     _quoteCache.set(h.code, { price: q.price, ts: Date.now() });

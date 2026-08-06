@@ -20,10 +20,10 @@
 //   - lastAddTsMap:{ [code]: msTimestamp }
 //   - regime:      { current: 'bull'|'range_weak'|'range_strong'|'bear'|'unknown', positionMultiplier: number }
 //
-// ?v=daemon3: severity 排序 (3 档 high > warn > info)
-// ?v=daemon5 (TZ #3): ts 用 shanghaiISO (带 +08:00), 跟 alerts.dayKey (shanghaiStr) 一致
+// severity 排序 (3 档 high > warn > info)
+// (TZ #3): ts 用 shanghaiISO (带 +08:00), 跟 alerts.dayKey (shanghaiStr) 一致
 
-// ---------- 时间工具 (?v=daemon5: 本地时区, TZ=Asia/Shanghai 由 PM2 注入) ----------
+// ---------- 时间工具 ( 本地时区, TZ=Asia/Shanghai 由 PM2 注入) ----------
 function nowShanghai() {
   return new Date();
 }
@@ -53,12 +53,12 @@ function shanghaiISO(date = new Date()) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${String(date.getMilliseconds()).padStart(3, '0')}${sign}${tzHH}:${tzMM}`;
 }
 
-// ---------- 严重度排序 (?v=daemon3) ----------
+// ---------- 严重度排序 ( ) ----------
 const SEVERITY_RANK = { high: 3, warn: 2, info: 1 };
 const ALERT_LIMIT = 30;  // 跑出 alerts[] 最多保留 30 条 (避免 panel 爆栈)
 
 // ---------- alert 工厂 ----------
-// ?v=daemon4 P0 F1 修: makeAlert 不在内部算 id, 改成返回无 id 对象, 让 runAllRules 注入 slot 后再算 id
+// F1 修: makeAlert 不在内部算 id, 改成返回无 id 对象, 让 runAllRules 注入 slot 后再算 id
 // 原 bug: runRule1/decideAddOn/decideStopAndTrim 内部调 makeAlert 时都没传 slot, id 字符串已生成 = "unknown-*"
 // runAllRules 后续 .map({ ...a, slot }) 只覆盖 slot 字段, 不重算 id, 导致所有 alerts.id 都是 unknown-* 前缀
 // 幂等去重对真实 slot 名彻底失效. 现在把 id 计算挪到 runAllRules.

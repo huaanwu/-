@@ -16,7 +16,7 @@
 
 const HOLDINGS_KEY = '_rw_holdings';
 const HOLDINGS_VERSION_KEY = '_rw_holdings_version';
-// ?v=daemon2: 默认指向 daemon HTTP :8090
+// 默认指向 daemon HTTP :8090
 // 浏览器侧可通过 window.__HOLDINGS_SYNC_URL__ 覆盖
 const DEFAULT_SYNC_URL = (typeof window !== 'undefined')
   ? `${window.location.protocol}//${window.location.hostname}:8090/holdings`
@@ -24,7 +24,7 @@ const DEFAULT_SYNC_URL = (typeof window !== 'undefined')
 const HOLDSYNC_URL = (typeof window !== 'undefined' && window.__HOLDINGS_SYNC_URL__) || DEFAULT_SYNC_URL;
 
 // 启动时拉 daemon fs 兜底 (避免 daemon 比浏览器先启动时读不到 holdings)
-// ?v=daemon4-logic1: 用 ts 比较, 只在 daemon 的 ts 较新时覆盖本地
+// 用 ts 比较, 只在 daemon 的 ts 较新时覆盖本地
 // 防止 "用户刚录 holdings 但 PUT 还没回包 + 刷新页面" 场景下 daemon 旧值覆盖新值
 // (跟 account-bridge.bootstrapFromDaemon 同 pattern, 保证两个 bridge 行为一致)
 export async function bootstrapFromDaemon() {
@@ -79,7 +79,7 @@ export function saveHoldings(holdings) {
     console.warn('[holdings-bridge] 写本地失败:', e.message);
     return false;
   }
-  // ?v=daemon5 P0 (race #3): 写完派 CustomEvent, 同 tab 内 AI 管家 / AutoTuner / 候选池也能感知
+  // (race #3): 写完派 CustomEvent, 同 tab 内 AI 管家 / AutoTuner / 候选池也能感知
   document.dispatchEvent(new CustomEvent('rw:holdings-changed', { detail: { count: arr.length, ts: Date.now() } }));
   // 后台异步推 fs (给 daemon 读), 失败不阻塞
   syncHoldingsToFs(arr).catch(e => console.warn('[holdings-bridge] 后台同步 daemon fs 失败:', e.message))  // ?v=daemon4 P1 #161: 不再吞;

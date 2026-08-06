@@ -272,7 +272,7 @@ const DAEMON_PURE = pathToFileURL(path.join(ROOT, 'reverse-watch', 'daemon-pure.
   assertEq(all1.length, 0, '7.1 空持仓 + 满 cash → 0 alerts');
 
   // 7.2 单票超限 + 鱼尾 + 板块弱 全部命中 → 4 条
-  //   ?v=daemon7: id 格式加 rule 维度 (fishTail / sectorWeak), 板块走弱独立保留
+  // id 格式加 rule 维度 (fishTail / sectorWeak), 板块走弱独立保留
   //   旧 P0 bug: 鱼尾 (warn) 跟板块走弱 (info) 同 code+同 action, 板块走弱被静默吞
   //   新行为: 两条都触发, 用户能看到 板块走弱 info + 鱼尾 warn
   const ctxAllFull = makeCtx({
@@ -302,7 +302,7 @@ const DAEMON_PURE = pathToFileURL(path.join(ROOT, 'reverse-watch', 'daemon-pure.
   assertEq(all3[0].severity, 'high', '7.3a 第 1 条 severity=high (单票超限排序在前)');
 
   // 7.4 id 格式: slot-action-code-dayKey
-  // ?v=daemon7 修: dayKey 拿实时 (跟 runAllRules 一致), 不写死
+  // 修: dayKey 拿实时 (跟 runAllRules 一致), 不写死
   //   之前用 '2026-08-05' hardcode, 隔天后会挂
   const firstId = all3[0].id;
   const todayDayKey = DP.shanghaiStr().slice(0, 10);

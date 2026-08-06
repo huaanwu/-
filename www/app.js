@@ -884,7 +884,7 @@ window._renderSettings = function() {
     }
   }, 0);
 
-  // ?v=settings-tushare1: 渲染完顺手拉一次 tushare 状态
+  // 渲染完顺手拉一次 tushare 状态
   _refreshTushareStatus().catch(() => {});
 };
 
@@ -1673,7 +1673,7 @@ window.saveSettings = function(silent) {
   Core.State.set('proxyBase', proxyBase);
   Core.State.set('apiKeys', { ...Core.State.get('apiKeys'), tushare: tushareToken, llm: llmKeys });
 
-  // ?v=settings-tushare1: 把 token 推到 dev-proxy (写 process.env + 重启 sidecar)
+  // 把 token 推到 dev-proxy (写 process.env + 重启 sidecar)
   //   token 改了就必须 POST, 不然 sidecar 不知道; 即便 token 没改也 post 一次幂等
   _pushTushareTokenToProxy(tushareToken).catch(e => {
     console.warn('[settings] tushare token 推到 dev-proxy 失败 (不影响保存):', e.message);
@@ -1723,7 +1723,7 @@ window.saveSettings = function(silent) {
   _renderSyncAuth();
 };
 
-// ?v=settings-tushare1: 把 tushare token 推到 dev-proxy, 触发 sidecar 重启带新 env
+// 把 tushare token 推到 dev-proxy, 触发 sidecar 重启带新 env
 async function _pushTushareTokenToProxy(token) {
   // dev-proxy 在 :8089, 不管当前 proxyBase 是什么, 直连 8089 (设的就是本机 dev-proxy)
   const url = (window.PROXY_BASE || 'http://127.0.0.1:8089').replace(/\/api\/akshare\/?$/, '').replace(/\/$/, '') + '/api/datasource/tushare-token';
@@ -1743,7 +1743,7 @@ async function _pushTushareTokenToProxy(token) {
   return body;
 }
 
-// ?v=settings-tushare1: 拉 dev-proxy 端 tushare 状态, 显示在 Settings UI
+// 拉 dev-proxy 端 tushare 状态, 显示在 Settings UI
 async function _refreshTushareStatus() {
   const badge = document.getElementById('tushareStatusBadge');
   if (!badge) return;

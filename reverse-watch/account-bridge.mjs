@@ -51,14 +51,14 @@ export function saveAccount({ cash }) {
     console.warn('[account-bridge] 写本地失败:', e.message);
     return false;
   }
-  // ?v=daemon5 P0 (race #3): 写完派 CustomEvent, 同 tab 内 AI 管家 / AutoTuner / KPI 能感知
+  // (race #3): 写完派 CustomEvent, 同 tab 内 AI 管家 / AutoTuner / KPI 能感知
   document.dispatchEvent(new CustomEvent('rw:account-changed', { detail: { cash: obj.cash, ts: obj.ts } }));
   syncAccountToFs(obj).catch(e => console.warn('[account-bridge] 后台同步 daemon fs 失败:', e.message));
   return true;
 }
 
 // 启动时拉 daemon fs 兜底 (跟 holdings-bridge 一样: daemon 优先, 浏览器 localStorage 兜底)
-// ?v=daemon4-logic1: 用 ts 比较, 只在 daemon 的 ts 较新时覆盖本地
+// 用 ts 比较, 只在 daemon 的 ts 较新时覆盖本地
 // 防止 "用户刚改 cash 但 PUT 还没回包 + 刷新页面" 场景下 daemon 旧值覆盖新值
 export async function bootstrapFromDaemon() {
   if (!ACCSYNC_URL) return false;
@@ -70,7 +70,7 @@ export async function bootstrapFromDaemon() {
     const local = _safeRead();
     // 本地有值且 ts 更晚 → 不覆盖 (用户刚改完, daemon 还没收到)
     if (local && local.ts > (body.ts || 0)) return false;
-    // ?v=daemon4-logic2: 区分 "未初始化" vs "cash=0"
+    // 区分 "未初始化" vs "cash=0"
     // daemon 文件不存在时 safeReadJson fallback {cash:0} → body.ts=0 → 不能写入 {cash:0, ts:Date.now()}
     // 那样会吞掉 "未设定" 语义, 新用户首访看到 "¥0" 而不是 "未设定"
     if (!body.ts || body.ts <= 0) return false;

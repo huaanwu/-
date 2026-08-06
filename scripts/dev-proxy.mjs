@@ -41,7 +41,7 @@ const NO_AKTOOLS_AUTOSTART = process.env.NO_AKTOOLS_AUTOSTART === '1';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ===== 多源数据 sidecar (Tushare + Baostock + Aktools) =====
-// ?v=dev-proxy-multisrc1: 统一数据源入口, 任一源挂时其他源继续工作
+// 统一数据源入口, 任一源挂时其他源继续工作
 const DATASOURCES_TARGET = process.env.DATASOURCES_TARGET || 'http://127.0.0.1:8091';
 const NO_DATASOURCES_AUTOSTART = process.env.NO_DATASOURCES_AUTOSTART === '1';
 const _datasourcesParsed = _parseHostPort(DATASOURCES_TARGET);
@@ -50,12 +50,12 @@ let _datasourcesShuttingDown = false;
 let _datasourcesRestartAttempts = 0;
 const _datasourcesRestartDelay = (n) => Math.min(30000, 1000 * Math.pow(2, n));
 
-// ?v=dev-proxy-env1: 启动时读 .env (项目根目录), 把 MINIMAX_KEY 等塞进 process.env
-// ?v=dev-proxy-env4 P1-2: 抽成可重入函数 + fs.watch 热加载
+// 启动时读 .env (项目根目录), 把 MINIMAX_KEY 等塞进 process.env
+// 抽成可重入函数 + fs.watch 热加载
 // 浏览器调 /api/llm/minimax 时 dev-proxy 自动注入 Authorization: Bearer ${MINIMAX_KEY}
 // → 浏览器零 key, 项目源码零硬编码, .env 由 .gitignore 隔离
 const _envPath = resolve(__dirname, '..', '.env');
-// ?v=dev-proxy-env4 P0-C: 启动前快照真·shell env keys (只保护这些, 允许 .env 覆盖自己加载过的 key)
+// -C: 启动前快照真·shell env keys (只保护这些, 允许 .env 覆盖自己加载过的 key)
 //   之前 if (process.env[_k] === undefined) 把"启动时 .env 加载的"和"PowerShell 直传的"混为一谈
 //   导致 key rotation 永远不生效 (reloaded 0 keys 误导)
 const _shellEnvKeys = new Set(Object.keys(process.env));
@@ -108,7 +108,7 @@ function _reloadEnv(logPrefix = '[env]') {
 // 启动时一次性加载
 const LLM_KEYS = {};
 _reloadEnv('[env] loaded');
-// ?v=dev-proxy-env4 P1-2: fs.watch 监听 .env 改动, 热加载 (debounce 500ms, 防止编辑器多次写入触发多次 reload)
+// fs.watch 监听 .env 改动, 热加载 (debounce 500ms, 防止编辑器多次写入触发多次 reload)
 // ?v=dev-proxy-env4 P0-C: Windows 编辑器 (VSCode/Sublime/Notepad++) 用 write-temp-then-rename 模式保存
 //   会触发 `rename` 事件而非 `change` — 不能过滤 rename, 否则永远不 reload
 if (existsSync(_envPath)) {
