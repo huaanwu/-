@@ -35,6 +35,7 @@ $browserUrl = 'http://127.0.0.1:3020/index.html'
 function Green($s) { Write-Host "  ✓ $s" -ForegroundColor Green }
 function Red($s)   { Write-Host "  ✗ $s" -ForegroundColor Red }
 function Cyan($s)  { Write-Host "  › $s" -ForegroundColor Cyan }
+function Yellow($s) { Write-Host "  ! $s" -ForegroundColor Yellow }
 function Title($s) { Write-Host "`n[StockMaster] $s" -ForegroundColor Cyan }
 
 # ---------- 1. pm2 是否可用 ----------
@@ -47,28 +48,29 @@ try {
   exit 1
 }
 
-# ---------- 1.5 清理孤儿 Python (避免端口冲突) ----------
-# 之前手动跑过 `npm run dev` 留的 aktools/datasources 子进程没人管
-# 启动 PM2 后, dev-proxy 内的 watchdog 启新子进程会撞端口 → 死循环
-# 这里先按端口清掉占的 Python 进程
-$orphanPorts = @(8088, 8091)
-foreach ($port in $orphanPorts) {
+# ---------- 1.5 端口占用检查 (只警告, 不杀) ----------
+# 之前 (b2498f0) 这里会按 cmdline 杀 "python|aktools|datasources" 的进程,
+# 但 PM2 启的 dev-proxy 拉起的 aktools/datasources 也匹配, 误杀导致 .lnk 闪退.
+# 现在 dev-proxy watchdog 已有 bind error detection (code === 3 / 4294967295 认输),
+# 端口被外部占就 fail loud 不循环, 不需要 .lnk 自动杀进程.
+# 如果之前手动跑过 `npm run dev` 留了 orphan, 请手动 pm2 kill 或 taskkill.
+$warnPorts = @(8088, 8091)
+$warnHit = $false
+foreach ($port in $warnPorts) {
   $conn = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
   if ($conn) {
-    $pid = $conn.OwningProcess
-    if ($pid -gt 0) {
-      $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$pid" -ErrorAction SilentlyContinue
-      $cmd = if ($proc) { $proc.CommandLine } else { '' }
-      if ($cmd -match 'python|aktools|datasources') {
-        Cyan "清理孤儿: port $port ← PID $pid (Python, 非 PM2 管)"
-        try { Stop-Process -Id $pid -Force -ErrorAction Stop } catch { Red "  杀不掉: $($_.Exception.Message)" }
-      } else {
-        Yellow "port $port 被非 Python 进程占 (PID $pid), 跳过 — 你自己处理"
-      }
-    }
+    $connPid = $conn.OwningProcess
+    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$connPid" -ErrorAction SilentlyContinue
+    $cmdShort = if ($proc) { ($proc.CommandLine -split ' ' | Select-Object -First 3) -join ' ' } else { '?' }
+    Yellow "port $port 被占: PID $connPid  ($cmdShort)"
+    $warnHit = $true
   }
 }
-Start-Sleep -Seconds 1
+if ($warnHit) {
+  Write-Host "  ↑ 如果是 PM2 启的, dev-proxy watchdog 会自动接管; 否则 dev-proxy 启不了." -ForegroundColor DarkGray
+  Write-Host "    手动清理: pm2 list | pm2 kill;  或 taskkill /F /PID <pid>" -ForegroundColor DarkGray
+}
+
 
 # ---------- 2. PM2 启动所有 stock-master app (幂等) ----------
 Title "2/5 启动 PM2 app (已起的跳过)"
