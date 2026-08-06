@@ -164,10 +164,24 @@
     }
 
     // 1) 拉 long/short 两池 (各 sleeve 一份, 简化版只要 long)
-    const longSnap = (Steward.Pool && typeof Steward.Pool.latest === 'function')
+    let longSnap = (Steward.Pool && typeof Steward.Pool.latest === 'function')
       ? await Steward.Pool.latest('long', t).catch(() => null) : null;
-    const shortSnap = (Steward.Pool && typeof Steward.Pool.latest === 'function')
+    let shortSnap = (Steward.Pool && typeof Steward.Pool.latest === 'function')
       ? await Steward.Pool.latest('short', t).catch(() => null) : null;
+
+    // v0.2.1-P3: 池子空 -> 现跑 ScreenerReverse 填池 (之前永远 no-pool, 管家没数据可配资)
+    if (!longSnap && !shortSnap) {
+      try {
+        const r = await refreshPool('long', t);
+        if (r && r.ok) longSnap = await Steward.Pool.latest('long', t).catch(() => null);
+      } catch (_) { /* refreshPool 失败仍返 no-pool */ }
+      if (!longSnap) {
+        try {
+          const r = await refreshPool('short', t);
+          if (r && r.ok) shortSnap = await Steward.Pool.latest('short', t).catch(() => null);
+        } catch (_) { /* 同上 */ }
+      }
+    }
 
     if (!longSnap && !shortSnap) {
       return { phase, runId, ok: false, skippedReason: 'no-pool' };
@@ -274,6 +288,9 @@
 
   /**
    * 扫描给定代码列表, 给出 0-100 评分 (无 LLM, 纯规则 + 知识库查表)
+   * v0.2.1-P2 修复: 之前用 Math.random() 凑数, reason 是写死的模板串
+   *   现在走 Core.Data 真查行情 + Core.Storage 缓存的行业索引, 按 PB vs 板块中位评分
+   *   (注意: 这是单票打分; 真正"扫描全市场选股"走 Core.ScreenerReverse.run())
    * @param {string[]} codes - 股票代码列表 (≤60)
    * @param {{ sleeve?: 'long'|'short', ruleRefs?: string[] }} [opts]
    * @returns {Promise<Array<{code, name, score, reason, ruleRefs, sleeve, confidence}>>}
@@ -284,29 +301,74 @@
     const sleeve = o.sleeve === 'short' ? 'short' : 'long';
     if (list.length === 0) return [];
 
-    // 简化评分: 50 + random()*30 (50~80 之间), sleeve 推断走 opts
-    // ruleRefs: sleeve 区分 → long-value / short-momentum
     const baseRefs = sleeve === 'long'
-      ? ['SCR-LONG-roe', 'SCR-LONG-pb', 'KB-MAO-001']
-      : ['SCR-SHORT-momentum', 'SCR-SHORT-volume', 'KB-MAO-002'];
+      ? ['PB-VS-SECTOR-MEDIAN', 'PB-PERCENTILE']
+      : ['PB-VS-SECTOR-MEDIAN-MOMENTUM', 'PB-PERCENTILE'];
 
-    return list.map((code) => {
-      const name = String(code); // 简化: name 同 code
-      const score = Math.round(50 + Math.random() * 30); // 50~80
-      const confidence = +(0.55 + Math.random() * 0.25).toFixed(2); // 0.55~0.80
-      const reason = sleeve === 'long'
-        ? `符合 long-value 准入: ROE>10, PB<2 (代码 ${code})`
-        : `符合 short-momentum 准入: 量比>2, 涨幅 3%~6% (代码 ${code})`;
-      return {
+    // 拿全市场快照 (5min 缓存) + 行业 code→industry 索引 (24h 缓存)
+    let spots = [];
+    let industryByCode = {};
+    try {
+      if (Core.Data && typeof Core.Data.getStockSpotEfinanceCached === 'function') {
+        spots = await Core.Data.getStockSpotEfinanceCached();
+      }
+      if (Core.Storage && typeof Core.Storage.cacheGet === 'function') {
+        industryByCode = (await Core.Storage.cacheGet('industry_by_code_index')) || {};
+      }
+    } catch (_) { /* 降级返中性分 */ }
+    spots = Array.isArray(spots) ? spots : [];
+    const spotByCode = {};
+    const sectorPbs = {};
+    for (const s of spots) {
+      if (!s || !s.code) continue;
+      spotByCode[s.code] = s;
+      const ind = industryByCode[s.code];
+      if (ind && typeof s.pb === 'number' && s.pb > 0) {
+        if (!sectorPbs[ind]) sectorPbs[ind] = [];
+        sectorPbs[ind].push(s.pb);
+      }
+    }
+    const sectorMedian = {};
+    for (const k of Object.keys(sectorPbs)) {
+      const arr = sectorPbs[k].slice().sort((a, b) => a - b);
+      const mid = Math.floor(arr.length / 2);
+      sectorMedian[k] = arr.length % 2 ? arr[mid] : (arr[mid - 1] + arr[mid]) / 2;
+    }
+
+    // 给每只入参打分 (PB vs 板块中位, 低分位高分)
+    const out = [];
+    for (const code of list) {
+      const spot = spotByCode[code];
+      if (!spot) {
+        out.push({ code: String(code), name: String(code), score: 50, reason: '行情缺失', ruleRefs: baseRefs.slice(), sleeve, confidence: 0.3 });
+        continue;
+      }
+      const ind = industryByCode[code] || null;
+      const med = ind ? sectorMedian[ind] : null;
+      let score, reason, confidence;
+      if (med && typeof spot.pb === 'number' && spot.pb > 0) {
+        // gap > 0 表示 PB 比板块中位低; gap = 0.3 → 30% 低估 → score ≈ 80
+        const gap = (med - spot.pb) / med;
+        score = Math.round(Math.max(0, Math.min(100, 50 + gap * 200)));
+        reason = (sleeve === 'long' ? 'long-value: ' : 'short-mom: ')
+          + `PB ${spot.pb.toFixed(2)} 低于 ${ind} 板块中位 ${med.toFixed(2)} (gap ${(gap * 100).toFixed(1)}%)`;
+        confidence = 0.7;
+      } else {
+        score = 50;
+        reason = '板块 / PB 数据缺失, 暂以中性分';
+        confidence = 0.4;
+      }
+      out.push({
         code: String(code),
-        name,
+        name: spot.name || String(code),
         score,
         reason,
         ruleRefs: baseRefs.slice(),
         sleeve,
         confidence
-      };
-    });
+      });
+    }
+    return out;
   }
 
   /**
@@ -425,6 +487,69 @@
     TABLE_PLANS
   };
 
+  /**
+   * v0.2.1-P3: refreshPool — 跑 ScreenerReverse 灌 pool_snapshots
+   * 之前 Pool.save 没人调, runDailyCycle 永远 no-pool, 管家没数据可配资
+   * 现在: 调一次 ScreenerReverse, 把 candidates 映射成 Pool.items, save 进 pool_snapshots
+   * @param {'long'|'short'} sleeve
+   * @param {Date} [now]
+   * @returns {Promise<{ok:boolean, snapId?:string, itemCount?:number, error?:string}>}
+   */
+  async function refreshPool(sleeve, now) {
+    if (!['long', 'short'].includes(sleeve)) return { ok: false, error: 'sleeve 必须是 long/short' };
+    const t = now instanceof Date ? now : new Date();
+    if (Steward.Pool && typeof Steward.Pool.save !== 'function') return { ok: false, error: 'Steward.Pool.save 不可用' };
+    if (window.Core && Core.ScreenerReverse && typeof Core.ScreenerReverse.run === 'function') {
+      const ScreenerReverse = Core.ScreenerReverse;
+      let r;
+      try { r = await ScreenerReverse.run({ targetCount: 10 }); }
+      catch (e) { return { ok: false, error: 'ScreenerReverse.run 失败: ' + (e && e.message || e) }; }
+      if (!r || !r._ok) return { ok: false, error: 'ScreenerReverse 没产出候选' };
+      const date = _dateStr(t);
+      const snap = {
+        snapId: date + '-' + sleeve,
+        date,
+        sleeve,
+        ts: t.getTime(),
+        runId: _uuid(),
+        source: 'screener-reverse',
+        regime: 'range',
+        cycleStage: 'preopen',
+        factor: 1,
+        items: (r.candidates || []).map((c, i) => ({
+          code: c.code,
+          name: c.name || c.code,
+          strategy: 'SCR-REVERSE-v0.2.1',
+          rank: i + 1,
+          score: Number.isFinite(c.score) ? c.score : (100 - (c.pbPercentile || 50)),
+          price: Number(c.price) || 0,
+          confidence: c.confidence === 'high' ? 0.8 : (c.confidence === 'medium' ? 0.6 : 0.4),
+          dims: {
+            sector: c.sector,
+            pbPercentile: c.pbPercentile,
+            sectorPbMedian: c.sectorPbMedian,
+            isSectorLeader: c.isSectorLeader,
+            limitUpRate: c.limitUpRate_2d
+          },
+          ruleReason: c.aiReason || ('板块 ' + (c.sector || '?') + ' PB 分位 ' + c.pbPercentile + ', 反向 7 铁律规则 2'),
+          llmReason: '',
+          ruleRefs: ['PB-VS-SECTOR-MEDIAN', 'LIMIT-UP-RATE'],
+          delta: 'new'
+        })),
+        kbIds: [],
+        promptDigest: ''
+      };
+      if (snap.items.length === 0) return { ok: false, error: '0 个候选, 不落库' };
+      try {
+        const saved = await Steward.Pool.save(snap);
+        return { ok: true, snapId: saved.snapId, itemCount: saved.itemCount };
+      } catch (e) {
+        return { ok: false, error: 'Pool.save 失败: ' + (e && e.message || e) };
+      }
+    }
+    return { ok: false, error: 'ScreenerReverse 未挂载' };
+  }
+
   // 暴露 — 覆盖原 Steward 命名空间但保留子模块
   Steward.init = init;
   Steward.runDailyCycle = runDailyCycle;
@@ -433,6 +558,7 @@
   Steward.buildPortfolioPlan = buildPortfolioPlan;
   Steward.recordLesson = recordLesson;
   Steward._handleDaemonTick = _handleDaemonTick;
+  Steward.refreshPool = refreshPool;
   Steward._testExports = _testExports;
 
   console.log('[Steward] 管家门面已就绪 (runDailyCycle / scanMarket / guard)');

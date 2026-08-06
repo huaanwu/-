@@ -80,9 +80,23 @@ function readCurrent(target) {
 
 // ----- 写新值 -----
 // 写入失败时抛错, 由调用方决定是否回滚
+// [P1 #10+#11] 走 AIFeedbackPure.validateAdjustment: 白名单 + 范围校验
+//   防止 LLM 写 holding.cash=99999 (字段不在白名单) 或 holding.cashReservePct=2000 (比例超 1)
 function writeValue(target, newValue) {
-  const { ns, field } = parseTarget(target);
   const rw = window.ReverseWatch || {};
+  // [P1 #10+#11] 校验入口: 浏览器侧 _rw_ai_feedback_pure 已经通过 module 加载
+  const Pure = rw.AIFeedbackPure;
+  if (Pure && typeof Pure.validateAdjustment === 'function') {
+    const v = Pure.validateAdjustment(target, newValue);
+    if (!v.ok) {
+      console.warn('[ai-feedback] 拒绝调整:', target, '=', newValue, '原因:', v.message);
+      // [P1 #10+#11] 用特殊 return false + 把 message 写进 console (UI 端会显示)
+      //   不能 throw 因为 applyAdjustments 期望 graceful fail
+      writeValue._lastRejectMessage = v.message;
+      return false;
+    }
+  }
+  const { ns, field } = parseTarget(target);
   if (ns === 'gates') {
     if (rw.SETTINGS && rw.SETTINGS.gates) {
       // L4-1 修: newValue===undefined 时 delete key, 避免 NaN 比较崩 4 闸
@@ -166,7 +180,9 @@ function applyAdjustments(list) {
     }
     const ok = writeValue(a.target, a.value);
     if (!ok) {
-      results.push({ target: a.target, ok: false, message: '写入失败' });
+      // [P1 #10+#11] writeValue 失败原因可能是白名单/范围拒绝, 透传给 UI
+      const reason = writeValue._lastRejectMessage || '写入失败';
+      results.push({ target: a.target, ok: false, message: reason });
       continue;
     }
     // preference.customPrompt / pool.exclude 不进 log (不是真调整, 只是偏好)

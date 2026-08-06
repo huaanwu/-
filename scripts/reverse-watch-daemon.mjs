@@ -739,198 +739,202 @@ function _jsonRes(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-// ?v=daemon6-test: HTTP server 也用 __isMain 守卫, 测试 import 不起 server
-if (__isMain && !_httpServer_ref.current && !process.env.DAEMON_DISABLE_HTTP) {
-  const server = http.createServer(async (req, res) => {
-    // ?v=daemon5 P0 (HTTP #2): URL 解析用 pathname, 防止 `?cachebust=1` / `?_=12345` 等 query string 绕过
-    let pathname = req.url || '/';
-    try { pathname = new URL(req.url, 'http://localhost').pathname; } catch {}
-    // ?v=daemon5 P1 (HTTP #3): Content-Type 校验 (PUT 必须 application/json)
-    const isJsonPut = (req.method === 'PUT' && (pathname === '/holdings' || pathname === '/account'));
-    if (isJsonPut) {
+// [统一服务迁移] daemon HTTP handler 抽成命名函数, 供 unified-server 挂载
+//   同时支持 NO_LISTEN 守卫, 不自启 listen
+async function daemonHttpHandler(req, res) {
+  // ?v=daemon5 P0 (HTTP #2): URL 解析用 pathname, 防止 `?cachebust=1` / `?_=12345` 等 query string 绕过
+  let pathname = req.url || '/';
+  try { pathname = new URL(req.url, 'http://localhost').pathname; } catch {}
+  // ?v=daemon5 P1 (HTTP #3): Content-Type 校验 (PUT 必须 application/json)
+  const isJsonPut = (req.method === 'PUT' && (pathname === '/holdings' || pathname === '/account'));
+  if (isJsonPut) {
+    const ct = (req.headers['content-type'] || '').split(';')[0].trim();
+    if (ct !== 'application/json') return _jsonRes(res, 415, { error: 'Content-Type 必须是 application/json' });
+  }
+  if (req.method === 'OPTIONS') return _jsonRes(res, 204, null);
+  if (req.method === 'GET' && pathname === '/health') {
+    return _jsonRes(res, 200, { ok: true, ts: Date.now(), heartbeatAt: _state.heartbeatAt });
+  }
+  if (req.method === 'PUT' && pathname === '/holdings') {
+    try {
+      const chunks = [];
+      let totalBytes = 0;
+      const MAX_BYTES = 1024 * 1024;  // ?v=daemon4 P1 #162: 1MB 上限, 防 OOM
+      for await (const c of req) {
+        totalBytes += c.length;
+        if (totalBytes > MAX_BYTES) {
+          return _jsonRes(res, 413, { error: '请求体超 1MB 上限' });
+        }
+        chunks.push(c);
+      }
+      const raw = Buffer.concat(chunks).toString('utf-8');
+      // ?v=daemon5 P1 (HTTP #3): JSON.parse 失败返 400 而非 500
+      let body;
+      try { body = JSON.parse(raw); }
+      catch (e) { return _jsonRes(res, 400, { error: 'JSON 解析失败', detail: e.message }); }
+      if (!Array.isArray(body.holdings)) return _jsonRes(res, 400, { error: 'holdings 必须是数组' });
+      // ?v=daemon5 P1 (数据 #10): PUT /holdings 加 ts 竞争保护
+      if (typeof body.ts === 'number') {
+        const cur = safeReadJson(HOLDINGS_FILE, []);
+        const curTs = (Array.isArray(cur) && cur._ts) ? cur._ts : 0;
+        if (curTs > body.ts) return _jsonRes(res, 409, { error: 'PUT ts 落后于 fs, 拒绝覆盖', curTs });
+        body.holdings._ts = body.ts;  // 写进数组 meta, 跟现有 schema 兼容
+      }
+      atomicWrite(HOLDINGS_FILE, body.holdings);
+      _ctx = null; _ctxBuiltAt = 0;  // 失效 ctx, 强制下次 buildContext 重读
+      // ?v=daemon5 P1 (race #4): 新 holdings 进来后, _poolRiskPreWarmed + enrichCache 失效, 强制 prewarm 重跑
+      _poolRiskPreWarmed = false;
+      _enrichCache.clear();
+      log('holdings 同步:', body.holdings.length, '只 → fs');
+      return _jsonRes(res, 200, { ok: true, count: body.holdings.length });
+    } catch (e) {
+      log('PUT /holdings 失败:', e.message);
+      return _jsonRes(res, 500, { error: e.message });
+    }
+  }
+  if (req.method === 'GET' && pathname === '/holdings') {
+    const arr = safeReadJson(HOLDINGS_FILE, []);
+    // ?v=daemon4-logic1: 返回 ts (mtime ms) 供浏览器 bootstrapFromDaemon 比较,
+    // 防止 "用户刚录 holdings 但 PUT 还没回包 + 刷新页面" 场景下 daemon 旧值覆盖新值
+    let ts = 0;
+    try { ts = fs.statSync(HOLDINGS_FILE).mtimeMs; } catch {}
+    return _jsonRes(res, 200, { holdings: arr, count: Array.isArray(arr) ? arr.length : 0, ts });
+  }
+  // ?v=daemon5 P1 (HTTP #1): 不支持的 method 返 405 + Allow 头
+  // ?v=daemon7-ai-fallback1-logic2-fix5: 加 method 白名单, 防止 GET /state / GET /holdings / GET /account 也被误返 405
+  // (原来这块没 method 限制, 任何 method 命中 pathname 都返 405, 导致 GET 永远落不到下面真路由)
+  if ((pathname === '/holdings' || pathname === '/account' || pathname === '/state')
+      && req.method !== 'GET' && req.method !== 'PUT' && req.method !== 'OPTIONS') {
+    const allowed = pathname === '/state' ? 'GET, OPTIONS' : 'GET, PUT, OPTIONS';
+    res.setHeader('Allow', allowed);
+    return _jsonRes(res, 405, { error: 'method not allowed', allowed });
+  }
+  // ?v=daemon4 P0 #180: 资金额端点, 浏览器持仓 UI "改现金" 写到 _rw_account.json
+  if (req.method === 'GET' && pathname === '/account') {
+    const acc = safeReadJson(ACCOUNT_FILE, { cash: 0 });
+    // ?v=daemon5 P2 (数据 #12): 返 ts=null 而非 0, 区分"未设"vs"cash=0"
+    return _jsonRes(res, 200, { cash: acc.cash, ts: acc.ts ?? null });
+  }
+  if (req.method === 'PUT' && pathname === '/account') {
+    try {
+      const chunks = [];
+      let totalBytes = 0;
+      const MAX_BYTES = 64 * 1024;  // 资金额只是数字, 64KB 绰绰有余
+      for await (const c of req) {
+        totalBytes += c.length;
+        if (totalBytes > MAX_BYTES) {
+          return _jsonRes(res, 413, { error: '请求体超 64KB 上限' });
+        }
+        chunks.push(c);
+      }
+      const raw = Buffer.concat(chunks).toString('utf-8');
+      // ?v=daemon5 P1 (HTTP #3): JSON.parse 失败返 400 而非 500
+      let body;
+      try { body = JSON.parse(raw); }
+      catch (e) { return _jsonRes(res, 400, { error: 'JSON 解析失败', detail: e.message }); }
+      const cash = Number(body.cash);
+      if (!Number.isFinite(cash) || cash < 0) {
+        return _jsonRes(res, 400, { error: 'cash 必须是 ≥ 0 的数字' });
+      }
+      // ?v=daemon5 P1 (数据 #10): PUT /account 加 ts 竞争保护
+      const cur = safeReadJson(ACCOUNT_FILE, {});
+      if (typeof body.ts === 'number' && typeof cur.ts === 'number' && cur.ts > body.ts) {
+        return _jsonRes(res, 409, { error: 'PUT ts 落后于 fs, 拒绝覆盖', curTs: cur.ts });
+      }
+      const next = { cash, ts: Date.now() };
+      atomicWrite(ACCOUNT_FILE, next);
+      _ctx = null; _ctxBuiltAt = 0;  // 失效 ctx, 强制下次 buildContext 重读
+      log('account 同步: cash =', cash, '→ fs');
+      return _jsonRes(res, 200, { ok: true, cash });
+    } catch (e) {
+      log('PUT /account 失败:', e.message);
+      return _jsonRes(res, 500, { error: e.message });
+    }
+  }
+  // ?v=daemon5 P0 (审计 #1): 规则端点, 浏览器 UI 改 preset/字段时同步落 fs, daemon 7 规则立刻生效
+  if (req.method === 'GET' && pathname === '/rules') {
+    const r = safeReadJson(RULES_FILE, {});
+    return _jsonRes(res, 200, { rules: r });
+  }
+  if (req.method === 'PUT' && pathname === '/rules') {
+    try {
       const ct = (req.headers['content-type'] || '').split(';')[0].trim();
       if (ct !== 'application/json') return _jsonRes(res, 415, { error: 'Content-Type 必须是 application/json' });
-    }
-    if (req.method === 'OPTIONS') return _jsonRes(res, 204, null);
-    if (req.method === 'GET' && pathname === '/health') {
-      return _jsonRes(res, 200, { ok: true, ts: Date.now(), heartbeatAt: _state.heartbeatAt });
-    }
-    if (req.method === 'PUT' && pathname === '/holdings') {
-      try {
-        const chunks = [];
-        let totalBytes = 0;
-        const MAX_BYTES = 1024 * 1024;  // ?v=daemon4 P1 #162: 1MB 上限, 防 OOM
-        for await (const c of req) {
-          totalBytes += c.length;
-          if (totalBytes > MAX_BYTES) {
-            return _jsonRes(res, 413, { error: '请求体超 1MB 上限' });
-          }
-          chunks.push(c);
-        }
-        const raw = Buffer.concat(chunks).toString('utf-8');
-        // ?v=daemon5 P1 (HTTP #3): JSON.parse 失败返 400 而非 500
-        let body;
-        try { body = JSON.parse(raw); }
-        catch (e) { return _jsonRes(res, 400, { error: 'JSON 解析失败', detail: e.message }); }
-        if (!Array.isArray(body.holdings)) return _jsonRes(res, 400, { error: 'holdings 必须是数组' });
-        // ?v=daemon5 P1 (数据 #10): PUT /holdings 加 ts 竞争保护
-        if (typeof body.ts === 'number') {
-          const cur = safeReadJson(HOLDINGS_FILE, []);
-          const curTs = (Array.isArray(cur) && cur._ts) ? cur._ts : 0;
-          if (curTs > body.ts) return _jsonRes(res, 409, { error: 'PUT ts 落后于 fs, 拒绝覆盖', curTs });
-          body.holdings._ts = body.ts;  // 写进数组 meta, 跟现有 schema 兼容
-        }
-        atomicWrite(HOLDINGS_FILE, body.holdings);
-        _ctx = null; _ctxBuiltAt = 0;  // 失效 ctx, 强制下次 buildContext 重读
-        // ?v=daemon5 P1 (race #4): 新 holdings 进来后, _poolRiskPreWarmed + enrichCache 失效, 强制 prewarm 重跑
-        _poolRiskPreWarmed = false;
-        _enrichCache.clear();
-        log('holdings 同步:', body.holdings.length, '只 → fs');
-        return _jsonRes(res, 200, { ok: true, count: body.holdings.length });
-      } catch (e) {
-        log('PUT /holdings 失败:', e.message);
-        return _jsonRes(res, 500, { error: e.message });
+      const chunks = [];
+      let totalBytes = 0;
+      const MAX_BYTES = 32 * 1024;  // rules 字段就十几个, 32KB 足够
+      for await (const c of req) {
+        totalBytes += c.length;
+        if (totalBytes > MAX_BYTES) return _jsonRes(res, 413, { error: '请求体超 32KB 上限' });
+        chunks.push(c);
       }
-    }
-    if (req.method === 'GET' && pathname === '/holdings') {
-      const arr = safeReadJson(HOLDINGS_FILE, []);
-      // ?v=daemon4-logic1: 返回 ts (mtime ms) 供浏览器 bootstrapFromDaemon 比较,
-      // 防止 "用户刚录 holdings 但 PUT 还没回包 + 刷新页面" 场景下 daemon 旧值覆盖新值
-      let ts = 0;
-      try { ts = fs.statSync(HOLDINGS_FILE).mtimeMs; } catch {}
-      return _jsonRes(res, 200, { holdings: arr, count: Array.isArray(arr) ? arr.length : 0, ts });
-    }
-    // ?v=daemon5 P1 (HTTP #1): 不支持的 method 返 405 + Allow 头
-    // ?v=daemon7-ai-fallback1-logic2-fix5: 加 method 白名单, 防止 GET /state / GET /holdings / GET /account 也被误返 405
-    // (原来这块没 method 限制, 任何 method 命中 pathname 都返 405, 导致 GET 永远落不到下面真路由)
-    if ((pathname === '/holdings' || pathname === '/account' || pathname === '/state')
-        && req.method !== 'GET' && req.method !== 'PUT' && req.method !== 'OPTIONS') {
-      const allowed = pathname === '/state' ? 'GET, OPTIONS' : 'GET, PUT, OPTIONS';
-      res.setHeader('Allow', allowed);
-      return _jsonRes(res, 405, { error: 'method not allowed', allowed });
-    }
-    // ?v=daemon4 P0 #180: 资金额端点, 浏览器持仓 UI "改现金" 写到 _rw_account.json
-    if (req.method === 'GET' && pathname === '/account') {
-      const acc = safeReadJson(ACCOUNT_FILE, { cash: 0 });
-      // ?v=daemon5 P2 (数据 #12): 返 ts=null 而非 0, 区分"未设"vs"cash=0"
-      return _jsonRes(res, 200, { cash: acc.cash, ts: acc.ts ?? null });
-    }
-    if (req.method === 'PUT' && pathname === '/account') {
-      try {
-        const chunks = [];
-        let totalBytes = 0;
-        const MAX_BYTES = 64 * 1024;  // 资金额只是数字, 64KB 绰绰有余
-        for await (const c of req) {
-          totalBytes += c.length;
-          if (totalBytes > MAX_BYTES) {
-            return _jsonRes(res, 413, { error: '请求体超 64KB 上限' });
-          }
-          chunks.push(c);
+      const raw = Buffer.concat(chunks).toString('utf-8');
+      let body;
+      try { body = JSON.parse(raw); }
+      catch (e) { return _jsonRes(res, 400, { error: 'JSON 解析失败', detail: e.message }); }
+      if (!body.rules || typeof body.rules !== 'object') return _jsonRes(res, 400, { error: 'rules 必须是 object' });
+      // 数值字段必须 ≥ 0 (防御性, 避免 UI 写入 NaN 把规则污染)
+      for (const [k, v] of Object.entries(body.rules)) {
+        if (typeof v === 'number' && !Number.isFinite(v)) {
+          return _jsonRes(res, 400, { error: `${k} 必须是有限数字`, field: k });
         }
-        const raw = Buffer.concat(chunks).toString('utf-8');
-        // ?v=daemon5 P1 (HTTP #3): JSON.parse 失败返 400 而非 500
-        let body;
-        try { body = JSON.parse(raw); }
-        catch (e) { return _jsonRes(res, 400, { error: 'JSON 解析失败', detail: e.message }); }
-        const cash = Number(body.cash);
-        if (!Number.isFinite(cash) || cash < 0) {
-          return _jsonRes(res, 400, { error: 'cash 必须是 ≥ 0 的数字' });
-        }
-        // ?v=daemon5 P1 (数据 #10): PUT /account 加 ts 竞争保护
-        const cur = safeReadJson(ACCOUNT_FILE, {});
-        if (typeof body.ts === 'number' && typeof cur.ts === 'number' && cur.ts > body.ts) {
-          return _jsonRes(res, 409, { error: 'PUT ts 落后于 fs, 拒绝覆盖', curTs: cur.ts });
-        }
-        const next = { cash, ts: Date.now() };
-        atomicWrite(ACCOUNT_FILE, next);
-        _ctx = null; _ctxBuiltAt = 0;  // 失效 ctx, 强制下次 buildContext 重读
-        log('account 同步: cash =', cash, '→ fs');
-        return _jsonRes(res, 200, { ok: true, cash });
-      } catch (e) {
-        log('PUT /account 失败:', e.message);
-        return _jsonRes(res, 500, { error: e.message });
       }
+      atomicWrite(RULES_FILE, body.rules);
+      _ctx = null; _ctxBuiltAt = 0;  // 失效 ctx, 强制下次 buildContext 重读 → 7 规则立刻用新值
+      log('rules 同步: ', Object.keys(body.rules).length, '字段 → fs');
+      return _jsonRes(res, 200, { ok: true, count: Object.keys(body.rules).length });
+    } catch (e) {
+      log('rules 同步失败:', e.message);
+      return _jsonRes(res, 500, { error: e.message });
     }
-    // ?v=daemon5 P0 (审计 #1): 规则端点, 浏览器 UI 改 preset/字段时同步落 fs, daemon 7 规则立刻生效
-    if (req.method === 'GET' && pathname === '/rules') {
-      const r = safeReadJson(RULES_FILE, {});
-      return _jsonRes(res, 200, { rules: r });
-    }
-    if (req.method === 'PUT' && pathname === '/rules') {
-      try {
-        const ct = (req.headers['content-type'] || '').split(';')[0].trim();
-        if (ct !== 'application/json') return _jsonRes(res, 415, { error: 'Content-Type 必须是 application/json' });
-        const chunks = [];
-        let totalBytes = 0;
-        const MAX_BYTES = 32 * 1024;  // rules 字段就十几个, 32KB 足够
-        for await (const c of req) {
-          totalBytes += c.length;
-          if (totalBytes > MAX_BYTES) return _jsonRes(res, 413, { error: '请求体超 32KB 上限' });
-          chunks.push(c);
-        }
-        const raw = Buffer.concat(chunks).toString('utf-8');
-        let body;
-        try { body = JSON.parse(raw); }
-        catch (e) { return _jsonRes(res, 400, { error: 'JSON 解析失败', detail: e.message }); }
-        if (!body.rules || typeof body.rules !== 'object') return _jsonRes(res, 400, { error: 'rules 必须是 object' });
-        // 数值字段必须 ≥ 0 (防御性, 避免 UI 写入 NaN 把规则污染)
-        for (const [k, v] of Object.entries(body.rules)) {
-          if (typeof v === 'number' && !Number.isFinite(v)) {
-            return _jsonRes(res, 400, { error: `${k} 必须是有限数字`, field: k });
-          }
-        }
-        atomicWrite(RULES_FILE, body.rules);
-        _ctx = null; _ctxBuiltAt = 0;  // 失效 ctx, 强制下次 buildContext 重读 → 7 规则立刻用新值
-        log('rules 同步: ', Object.keys(body.rules).length, '字段 → fs');
-        return _jsonRes(res, 200, { ok: true, count: Object.keys(body.rules).length });
-      } catch (e) {
-        log('PUT /rules 失败:', e.message);
-        return _jsonRes(res, 500, { error: e.message });
-      }
-    }
-    if (pathname === '/rules') {
-      res.setHeader('Allow', 'GET, PUT, OPTIONS');
-      return _jsonRes(res, 405, { error: 'method not allowed', allowed: 'GET, PUT, OPTIONS' });
-    }
-    if (req.method === 'GET' && pathname === '/state') {
+  }
+  if (pathname === '/rules') {
+    res.setHeader('Allow', 'GET, PUT, OPTIONS');
+    return _jsonRes(res, 405, { error: 'method not allowed', allowed: 'GET, PUT, OPTIONS' });
+  }
+  if (req.method === 'GET' && pathname === '/state') {
+    res.setHeader('Cache-Control', 'no-store');
+    return _jsonRes(res, 200, _state);
+  }
+  // ?v=daemon3 P0 #149: 暴露 _rw_daemon_state.json 静态读 (浏览器侧 fetch 路径走 vite 失败时兜底)
+  if (req.method === 'GET' && pathname === '/daemon-state.json') {
+    try {
+      const raw = fs.readFileSync(STATE_FILE, 'utf-8');
       res.setHeader('Cache-Control', 'no-store');
-      return _jsonRes(res, 200, _state);
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET,POST,PUT,OPTIONS'
+      });
+      return res.end(raw);
+    } catch (e) {
+      return _jsonRes(res, 404, { error: 'state 文件不存在 (daemon 还没跑过任何 slot)', detail: e.message });
     }
-    // ?v=daemon3 P0 #149: 暴露 _rw_daemon_state.json 静态读 (浏览器侧 fetch 路径走 vite 失败时兜底)
-    if (req.method === 'GET' && pathname === '/daemon-state.json') {
-      try {
-        const raw = fs.readFileSync(STATE_FILE, 'utf-8');
-        res.setHeader('Cache-Control', 'no-store');
-        res.writeHead(200, {
-          'Content-Type': 'application/json; charset=utf-8',
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET,POST,PUT,OPTIONS'
-        });
-        return res.end(raw);
-      } catch (e) {
-        return _jsonRes(res, 404, { error: 'state 文件不存在 (daemon 还没跑过任何 slot)', detail: e.message });
-      }
-    }
-    // ?v=daemon3 应急: 手动触发 slot (浏览器侧 "立即跑" 按钮 / 调试)
-    // ?v=daemon4-logic2 P1 #1 + P1 #2: 手动 trigger 必须 markSlot (防二次跑) + 防并发
-    // ?v=daemon5 P0 (race #1): 手动 trigger 也设 _running = true (之前只检查不设, tick 30s 后并发跑同 slot)
-    if (req.method === 'POST' && req.url.startsWith('/trigger/')) {
-      const slotName = req.url.replace('/trigger/', '').trim();
-      const validSlots = SCHEDULE_SLOTS.map(s => s.name);
-      if (!validSlots.includes(slotName)) return _jsonRes(res, 400, { error: '未知 slot', validSlots });
-      if (_running) return _jsonRes(res, 429, { ok: false, busy: true, message: '上一轮 slot 还在跑, 请稍后' });
-      log('手动触发 slot:', slotName);
-      // 立刻构造 slotKey + markSlot, 防止 tick 看到 lastTs=0 在 SLOT_TOLERANCE_MS 内二次跑
-      const today = shanghaiStr().slice(0, 10);
-      const slotKey = `${today}_${slotName}`;
-      markSlot(slotKey);
-      // ?v=daemon5 P0: _running 置位, runSlot 完成清零; tick 同时被 mutex 阻塞
-      _running = true;
-      runSlot(slotName).catch(e => log('手动触发异常:', e.message)).finally(() => { _running = false; });
-      return _jsonRes(res, 202, { ok: true, slot: slotName, message: '已加入执行' });
-    }
-    _jsonRes(res, 404, { error: 'not found', url: req.url });
-  });
+  }
+  // ?v=daemon3 应急: 手动触发 slot (浏览器侧 "立即跑" 按钮 / 调试)
+  // ?v=daemon4-logic2 P1 #1 + P1 #2: 手动 trigger 必须 markSlot (防二次跑) + 防并发
+  // ?v=daemon5 P0 (race #1): 手动 trigger 也设 _running = true (之前只检查不设, tick 30s 后并发跑同 slot)
+  if (req.method === 'POST' && req.url.startsWith('/trigger/')) {
+    const slotName = req.url.replace('/trigger/', '').trim();
+    const validSlots = SCHEDULE_SLOTS.map(s => s.name);
+    if (!validSlots.includes(slotName)) return _jsonRes(res, 400, { error: '未知 slot', validSlots });
+    if (_running) return _jsonRes(res, 429, { ok: false, busy: true, message: '上一轮 slot 还在跑, 请稍后' });
+    log('手动触发 slot:', slotName);
+    // 立刻构造 slotKey + markSlot, 防止 tick 看到 lastTs=0 在 SLOT_TOLERANCE_MS 内二次跑
+    const today = shanghaiStr().slice(0, 10);
+    const slotKey = `${today}_${slotName}`;
+    markSlot(slotKey);
+    // ?v=daemon5 P0: _running 置位, runSlot 完成清零; tick 同时被 mutex 阻塞
+    _running = true;
+    runSlot(slotName).catch(e => log('手动触发异常:', e.message)).finally(() => { _running = false; });
+    return _jsonRes(res, 202, { ok: true, slot: slotName, message: '已加入执行' });
+  }
+  _jsonRes(res, 404, { error: 'not found', url: req.url });
+}
+
+// ?v=daemon6-test: HTTP server 也用 __isMain 守卫, 测试 import 不起 server
+if (__isMain && !_httpServer_ref.current && !process.env.DAEMON_DISABLE_HTTP && !process.env.NO_LISTEN && !process.env.UNIFIED_NO_LISTEN) {
+  const server = http.createServer(daemonHttpHandler);
   // ?v=daemon7-ai-fallback1-logic2-fix5: 监听 0.0.0.0 (默认), 让手机/APK/局域网可访问; 通过 DAEMON_HOST=127.0.0.1 可回退
   const DAEMON_HOST = process.env.DAEMON_HOST || '0.0.0.0';
   server.listen(DAEMON_HTTP_PORT, DAEMON_HOST, () => {
@@ -942,6 +946,10 @@ if (__isMain && !_httpServer_ref.current && !process.env.DAEMON_DISABLE_HTTP) {
 
 // 启动
 //   守卫 __isMain 已在 main 之前定义 (line 674)
+//   NO_LISTEN 时仍然跑 main() (cron / heartbeat / 7 规则要执行), 只是不 listen
 if (__isMain) {
   main().catch(e => { log('main 异常:', e.message); process.exit(1); });
 }
+
+// [统一服务迁移] 导出供 unified-server 挂载
+export { daemonHttpHandler, _httpServer, main };

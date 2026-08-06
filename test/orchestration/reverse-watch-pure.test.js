@@ -116,14 +116,55 @@ const RM_PURE = pathToFileURL(path.join(ROOT, 'reverse-watch', 'ai', 'risk-mine-
   });
   assert(sk4.skip && sk4.reason.includes('样本不足'), '1.3d 样本<20 → skip (带 signals)');
 
-  // 1.4 decide: bear 护栏
+  // 1.4 decide: bear 护栏 + [P0 #3] 修 bear 护栏失效 + [P1 #15] bear 联动
+  // 旧实现: bear 下只产 positionMultiplier=0
+  // 新实现: bear 下产 3 条 (positionMultiplier=0 + cashReservePct=0.15 + singleStockMaxPct=0.03)
   const decBear = AT.decide({ downRatio: 0, sampleSize: 50 }, {
-    deps: { getSettings: () => ({ sectorMin: 0.55 }) },
+    deps: {
+      getSettings: () => ({ sectorMin: 0.55 }),
+      getHolding: () => ({ cashReservePct: 0.10, singleStockMaxPct: 0.05 })
+    },
     state: makeMockState({ '_rw_regime_history': [{ regime: 'bear' }] })
   });
-  assertEq(decBear.length, 1, '1.4a bear → 1 条 adjustment');
-  assertEq(decBear[0].target, 'holding.positionMultiplier', '1.4b bear → target 是 holding.positionMultiplier');
-  assertEq(decBear[0].value, 0, '1.4c bear → value=0 (空仓合法)');
+  assertEq(decBear.length, 3, '1.4a [P1#15] bear → 3 条 (positionMultiplier + cashReservePct + singleStockMaxPct)');
+  const aPos = decBear.find(a => a.target === 'holding.positionMultiplier');
+  const aCash = decBear.find(a => a.target === 'holding.cashReservePct');
+  const aSingle = decBear.find(a => a.target === 'holding.singleStockMaxPct');
+  assert(aPos && aPos.value === 0, '1.4b bear → positionMultiplier=0');
+  assert(aCash && aCash.value === 0.15, '1.4c [P1#15] bear → cashReservePct 0.10→0.15');
+  assert(aSingle && aSingle.value === 0.03, '1.4d [P1#15] bear → singleStockMaxPct 0.05→0.03');
+
+  // 1.4e [P0 #3] 修: 多条历史时, 旧代码读 length-1 (最老), 新代码读 [0] (最新)
+  //   unshift 顺序: index 0 = 最新, length-1 = 最老
+  //   旧 bug: 永远读最老, bear 护栏失效
+  //   新行为: 数组里最新是 bear → 命中; 最新是 bull → 不命中
+  const decBearMulti = AT.decide({ downRatio: 0, sampleSize: 50 }, {
+    deps: { getSettings: () => ({ sectorMin: 0.55 }), getHolding: () => ({}) },
+    state: makeMockState({ '_rw_regime_history': [{ regime: 'bear' }, { regime: 'bull' }, { regime: 'range' }] })
+  });
+  assertEq(decBearMulti.length, 3, '1.4e [P0#3] 最新 bear (index 0) → 命中, 3 条');
+
+  // 1.4f 最新不是 bear → 不应触发 bear 护栏
+  const decBullLatest = AT.decide({ downRatio: 0.7, passRate: 0.5, sampleSize: 50 }, {
+    deps: { getSettings: () => ({ sectorMin: 0.55 }), getHolding: () => ({}) },
+    state: makeMockState({ '_rw_regime_history': [{ regime: 'bull' }, { regime: 'bear' }] })
+  });
+  // 最新是 bull, down↑+池子松 → 规则 1: sectorMin+0.02
+  const bullSector = decBullLatest.find(a => a.target === 'gates.sectorMin');
+  assert(bullSector, '1.4f [P0#3] 最新 bull → 不触发 bear 护栏, 走规则 1');
+  assert(!decBullLatest.some(a => a.target === 'holding.positionMultiplier'),
+    '1.4f2 [P0#3] 最新 bull → 没有 positionMultiplier=0');
+
+  // 1.4g [P1 #15] bear 联动: 已 ≥ 阈值不重复调
+  //   cashReservePct 已 0.20 → 不上调; singleStockMaxPct 已 0.02 → 不下调
+  const decBearNoOp = AT.decide({ downRatio: 0, sampleSize: 50 }, {
+    deps: {
+      getSettings: () => ({ sectorMin: 0.55 }),
+      getHolding: () => ({ cashReservePct: 0.20, singleStockMaxPct: 0.02 })
+    },
+    state: makeMockState({ '_rw_regime_history': [{ regime: 'bear' }] })
+  });
+  assertEq(decBearNoOp.length, 1, '1.4g [P1#15] bear 但 cashReserve/singleMax 已达标 → 只产 positionMultiplier');
 
   // 1.5 decide: 规则 1 (down↑ + 池子松 → sectorMin+0.02)
   const dec1 = AT.decide({ downRatio: 0.7, passRate: 0.5, sampleSize: 50 }, {

@@ -2,6 +2,8 @@
 // 挂在 F4.7 butlerPanel 末尾: 用户 → LLM 多轮对话, LLM 返回结构化
 // {reply, adjustments[]} → 走 AIFeedback.previewAdjustment 渲染 diff 卡片
 // → 用户点 ✓ 才 applyAdjustment, ✗ 跳过 (避免误改)
+//
+// [P1 #17] 偏好蒸馏: 走 ai-chat-pure.mjs (纯函数, 可测), 旧 inline 逻辑保留为 fallback
 
 // ----- constants -----
 const CHAT_HISTORY_KEY = '_rw_chat_history';
@@ -196,13 +198,53 @@ ${candSummary || '(暂无)'}
 // ----- 学习闭环 ② 偏好蒸馏 -----
 // 从用户消息里抽强偏好关键词, 自动追加到 _rw_custom_prompt
 // 触发模式: "不要 X" / "拒绝 X" / "我想看 X" / "我不接 X"
-const PREFERENCE_PATTERNS = [
-  { regex: /(不要|不接|拒绝|不想)([^。,!?\n]{2,15})/g, kind: 'avoid', capture: 2 },
-  { regex: /(我想看|我想找|偏好|倾向)([^。,!?\n]{2,15})/g, kind: 'favor', capture: 2 },
-  { regex: /(永远|始终)(不要|不接)([^。,!?\n]{2,15})/g, kind: 'avoid_perm', capture: 3 }
-];
+// [P1 #17] customPrompt 上限 50 行 + 7d 清理:
+//   - 走 ai-chat-pure.mjs 的纯函数 (可测)
+//   - 旧 inline 逻辑保留为 fallback (pure 加载失败时)
+const PREFERENCE_PATTERNS = (window.ReverseWatch && window.ReverseWatch.AIChatPure)
+  ? window.ReverseWatch.AIChatPure.PREFERENCE_PATTERNS
+  : [
+      { regex: /(不要|不接|拒绝|不想)([^。,!?\n]{2,15})/g, kind: 'avoid', capture: 2 },
+      { regex: /(我想看|我想找|偏好|倾向)([^。,!?\n]{2,15})/g, kind: 'favor', capture: 2 },
+      { regex: /(永远|始终)(不要|不接)([^。,!?\n]{2,15})/g, kind: 'avoid_perm', capture: 3 }
+    ];
+const PROMPT_META_KEY = '_rw_custom_prompt_meta';
+const PROMPT_MAX_LINES = 50;
+const PROMPT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+// 读现有 meta (浏览器侧 IO, 仅 fallback 用)
+function _loadPromptMetaLocal() {
+  try {
+    const raw = localStorage.getItem(PROMPT_META_KEY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) { return []; }
+}
+function _savePromptMetaLocal(arr) {
+  try { localStorage.setItem(PROMPT_META_KEY, JSON.stringify(arr)); }
+  catch (e) {}
+}
+
+// [P1 #17] 走 pure (preferred), fallback 到 inline (仅 pure 没加载时)
 function distillPreferences(userText) {
+  const Pure = window.ReverseWatch && window.ReverseWatch.AIChatPure;
+  if (Pure && typeof Pure.distillPreferences === 'function') {
+    const result = Pure.distillPreferences(userText);
+    // 同步 customPrompt 字符串 (pure 已经写 _rw_custom_prompt_meta, 但 customPrompt 字符串也要更新)
+    if (result && result.totalLines > 0) {
+      const promptStr = result.next.map(m => m.line).join('; ');
+      const rw = window.ReverseWatch || {};
+      if (rw.setCustomPrompt) rw.setCustomPrompt(promptStr);
+    }
+    if (result && result.appended.length > 0) {
+      console.log('[ai-chat] 蒸馏偏好:', result.appended, '当前共', result.totalLines, '行');
+    }
+    return !!(result && result.appended.length > 0);
+  }
+  // Fallback: 旧 inline 逻辑
   if (!userText) return false;
+  const now = Date.now();
   let appended = [];
   for (const p of PREFERENCE_PATTERNS) {
     let m;
@@ -215,15 +257,20 @@ function distillPreferences(userText) {
     }
   }
   if (appended.length === 0) return false;
-  // 去重 (跟现有 customPrompt 比对)
-  const rw = window.ReverseWatch || {};
-  const cur = rw.getCustomPrompt ? rw.getCustomPrompt() : '';
-  const curLines = cur.split(/[,\n;]+/).map(s => s.trim()).filter(Boolean);
-  const fresh = appended.filter(a => !curLines.some(l => l === a));
+  const meta = _loadPromptMetaLocal();
+  const existingLines = new Set(meta.map(m => m.line));
+  const fresh = appended.filter(a => !existingLines.has(a));
   if (fresh.length === 0) return false;
-  const merged = cur ? `${cur}; ${fresh.join('; ')}` : fresh.join('; ');
-  if (rw.setCustomPrompt) rw.setCustomPrompt(merged);
-  console.log('[ai-chat] 蒸馏偏好:', fresh);
+  const updated = [...meta, ...fresh.map(line => ({ line, ts: now }))];
+  const filtered = updated.filter(m => (now - (m.ts || 0)) < PROMPT_TTL_MS);
+  const trimmed = filtered.length > PROMPT_MAX_LINES
+    ? filtered.slice(filtered.length - PROMPT_MAX_LINES)
+    : filtered;
+  _savePromptMetaLocal(trimmed);
+  const newPrompt = trimmed.map(m => m.line).join('; ');
+  const rw = window.ReverseWatch || {};
+  if (rw.setCustomPrompt) rw.setCustomPrompt(newPrompt);
+  console.log('[ai-chat] 蒸馏偏好 (fallback):', fresh, '当前共', trimmed.length, '行');
   return true;
 }
 

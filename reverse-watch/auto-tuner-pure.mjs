@@ -120,12 +120,17 @@ function decide(signals, opts = {}) {
   const state = opts.state || makeStateAdapter();
   const deps = opts.deps || {};
   const G = (typeof deps.getSettings === 'function' ? deps.getSettings() : {}) || {};
+  // 读 holding 现状 (P1 #15 bear 联动 cashReservePct / singleStockMaxPct 用)
+  const H = (typeof deps.getHolding === 'function' ? deps.getHolding() : {}) || {};
   const adj = [];
   // bear 护栏
+  // [P0 #3] 修: regime-detector 用 unshift 把最新 push 到 index 0, 不是 length-1
+  // 旧 bug: 永远读最老, bear 护栏永不出
   let isBear = false;
   try {
     const regimeHist = state.safeReadJson('_rw_regime_history', []);
-    const latest = Array.isArray(regimeHist) ? regimeHist[regimeHist.length - 1] : null;
+    // 取最新一条: unshift → [0] 是最新, length-1 是最老
+    const latest = Array.isArray(regimeHist) && regimeHist.length > 0 ? regimeHist[0] : null;
     if (latest && latest.regime === 'bear') isBear = true;
     else if (typeof opts.regime === 'string') isBear = opts.regime === 'bear';  // 显式传入 (daemon 用)
   } catch (e) { console.warn('[auto-tuner-pure] decide 读 regime 失败:', e.message); }
@@ -141,8 +146,23 @@ function decide(signals, opts = {}) {
     return filtered;
   }
   if (isBear) {
+    // [P0 #3] 仓位倍数归 0 (空仓合法)
     adj.push({ target: 'holding.positionMultiplier', value: 0,
-      reason: 'bear 信号, 仓位倍数归 0 (空仓合法, gates/holding 不动)' });
+      reason: 'bear 信号, 仓位倍数归 0 (空仓合法)' });
+    // [P1 #15] bear 联动 cashReservePct: 现金储备上调 (留更多现金)
+    //   当前值 < 0.15 → 上调到 0.15; 已 ≥ 0.15 不动
+    const curCashReserve = H.cashReservePct ?? 0.10;
+    if (curCashReserve < 0.15) {
+      adj.push({ target: 'holding.cashReservePct', value: 0.15,
+        reason: `bear 信号, 现金储备从 ${(curCashReserve*100).toFixed(0)}% 上调到 15% (留更多现金应对回撤)` });
+    }
+    // [P1 #15] bear 联动 singleStockMaxPct: 单票上限下调 (更分散)
+    //   当前值 > 0.03 → 下调到 0.03; 已 ≤ 0.03 不动
+    const curSingleMax = H.singleStockMaxPct ?? 0.05;
+    if (curSingleMax > 0.03) {
+      adj.push({ target: 'holding.singleStockMaxPct', value: 0.03,
+        reason: `bear 信号, 单票上限从 ${(curSingleMax*100).toFixed(0)}% 下调到 3% (更分散降低单票风险)` });
+    }
     return filterByRecent(adj);
   }
   // 规则 1: down↑ + 池子松 → sectorMin 拉严

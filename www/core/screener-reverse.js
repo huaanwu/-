@@ -27,6 +27,56 @@
   const TARGET_CANDIDATES = 5;           // 目标推倌 5 只左右 (V13 拍板 / 小白起步)
   const MAX_AWAIT_MS = 8000;             // 单阶段超时 8s
   const FISH_TAIL_PCT = 60;              // 60 日涨幅上限 (复用 SHORT_CRITERIA.maxGain60Pct)
+  // P1-1: sector 成分股真映射 — 用 Core.Data 缓存的 industry_by_code_index 倒排
+  // 之前 _sectorStocksApprox 永远返 [], fallback 用"全市场涨幅前 50", 5 个 sector 抢同一份池
+  // 现在按真实申万一级成员筛
+  let _sectorMembersCache = null;        // Map<industryName, [code, ...]>
+
+  async function _getIndustryIndex() {
+    if (_sectorMembersCache) return _sectorMembersCache;
+    let idx = null;
+    try {
+      if (Core.Storage && typeof Core.Storage.cacheGet === 'function') {
+        idx = await Core.Storage.cacheGet('industry_by_code_index');
+      }
+    } catch (_) {}
+    if (!idx || typeof idx !== 'object') {
+      // 缓存未命中 → 触发 getStockIndustryByCode 走其 in-flight + 重建路径 (24h TTL)
+      if (Core.Data && typeof Core.Data.getStockIndustryByCode === 'function') {
+        await Core.Data.getStockIndustryByCode('000000').catch(() => null);
+        try { idx = await Core.Storage.cacheGet('industry_by_code_index'); } catch (_) {}
+      }
+    }
+    if (!idx || typeof idx !== 'object') return null;
+    // 倒排: code→industry → industry→[codes]
+    const byInd = {};
+    for (const code in idx) {
+      const ind = idx[code];
+      if (!ind || typeof ind !== 'string') continue;
+      if (!byInd[ind]) byInd[ind] = [];
+      byInd[ind].push(code);
+    }
+    _sectorMembersCache = byInd;
+    return byInd;
+  }
+
+  // P1-3: 龙头真识别 — sector.leaderStock 是 NAME (例"贵州茅台"), 需 name→code 查表
+  function _buildNameToCodeMap(spots) {
+    const m = {};
+    for (const s of spots || []) {
+      if (s && s.name && s.code) m[s.name] = s.code;
+    }
+    return m;
+  }
+
+  // P1-2: 真 sector 成分股 — 用 industry_by_code_index 倒排 + spot 合并 PB/价
+  function _sectorStocksReal(sector, spots, industryIndex) {
+    if (!industryIndex || !sector || !sector.name) return [];
+    const codes = industryIndex[sector.name];
+    if (!Array.isArray(codes) || codes.length === 0) return [];
+    const codeSet = new Set(codes);
+    return (spots || []).filter(s => s && s.code && codeSet.has(s.code));
+  }
 
   /**
    * 板块强度评分 (无封板率数据时的降级近似)
@@ -44,42 +94,15 @@
   }
 
   /**
-   * 从全 A 股快照找某板块的成分股 (粗粒度: 用 leaderStock 字段做近似)
-   * @param {string} sectorName
-   * @param {Array} spots - getStockSpotEfinanceCached 返回
-   * @returns {string|null} leader code
-   */
-  function _findLeaderCode(sectorName, spots) {
-    if (!sectorName || !Array.isArray(spots)) return null;
-    for (const s of spots) {
-      if (s.name === sectorName) return s.code;
-    }
-    return null;
-  }
-
-  /**
-   * 板块 → 候选股映射 (粗粒度: 只能看到 leaderStock 字段)
-   * V13 拍板: 真实生产中用 aktools 反查接口; 这里用 leaderStock + 板块涨幅推断
-   * 降级策略: 数据缺失返回空数组, 不 block 整体
-   */
-  function _sectorStocksApprox(sector, spots) {
-    const out = [];
-    const leaderCode = _findLeaderCode(sector.name, spots);
-    if (!leaderCode) return out;
-    // 反向策略: 同板块非龙头 → 只能从 spots 里按板块代码前缀筛 (粗略)
-    // 这里退化: 仅返回 leader (供后续剔除), 不做板块成员匹配
-    return out;
-  }
-
-  /**
    * 主入口: AI 推倌 (V13 拍板: 5 只左右)
    * @param {object} [opts]
    * @param {number} [opts.targetCount=5] - 目标候选数
    * @param {boolean} [opts.useLLMExplain=true] - 是否生成 AI 自然语言解释 (UI 阶段才用)
    * @returns {Promise<{
-   *   candidates: Array<{code, name, sector, pbPercentile, sectorPbMedian, isSectorLeader, hasQuantSeat, aiReason, confidence, limitsUpRate_2d}>,
+   *   candidates: Array<{code, name, sector, pbPercentile, sectorPbMedian, isSectorLeader, aiReason, confidence, limitUpRate_2d}>,
    *   blocked: Array<{code, reason}>,
    *   sectorStats: object,
+   *   gates: Array<{key,label,status,metric,note}>,
    *   _ok: boolean,
    *   stats: object
    * }>}
@@ -144,34 +167,52 @@
     const sectorStats = {};
     const candidates = [];
     const blocked = [];
+    // P1-2: 跟踪最后一个有效 sector 的 PB 中位, 给 _buildGatesSummary 用 (原本是闭包泄漏变量, line 292 引用不到)
+    let _lastSectorPbMedian = 50;
 
     // 阶段 2 + 3 + 4: 板块 → 选股 → 鱼尾排除 → 4 闸预检
     const ReverseDiscipline = window.Core && window.Core.ReverseDiscipline;
+
+    // P1-1: 预加载 industry_by_code_index 倒排 + name→code 龙头表 (一次性, 后续 sector 复用)
+    let industryIndex = null;
+    try {
+      industryIndex = await _withTimeout(_getIndustryIndex(), MAX_AWAIT_MS, null);
+    } catch (_) { industryIndex = null; }
+    const nameToCode = _buildNameToCodeMap(spots);
 
     for (const ss of sectorScores) {
       if (candidates.length >= targetCount) break;
 
       const sector = ss.sector;
+
+
+      // P1-1: 板块成分股 — 用 industry_by_code_index 真映射, 没数据就跳过本板块 (不再退到"全市场涨幅前 50")
+      const sectorStocks = _sectorStocksReal(sector, spots, industryIndex);
+      if (sectorStocks.length === 0) {
+        stats.note = (stats.note ? stats.note + '; ' : '') + 'sector=' + sector.name + ' 缺成分股映射, 跳过';
+        continue;
+      }
+      const stockPool = sectorStocks;
+      // P3: 真封板率 — 用 sectorStocks 里 changePct >= 9.5 的占比 (不新加 aktools 接口, 数据已在手)
+      //   A股 sector 50 只左右, 1-2 只涨停 ≈ 2-4%, 3% 算活跃
+      //   sectorUpCount 是板块整体涨跌家数(可能含新股/科创板门槛不同的), 不准
+      const sectorLimitUpCount = sectorStocks.filter(s => typeof s.changePct === 'number' && s.changePct >= 9.5).length;
+      const sectorLimitUpRate = sectorStocks.length > 0 ? +(sectorLimitUpCount / sectorStocks.length).toFixed(4) : 0;
       sectorStats[sector.name] = {
         score: ss.score,
         leader: sector.leaderStock,
         upCount: sector.upCount,
         downCount: sector.downCount,
+        limitUpRate: sectorLimitUpRate,
+        limitUpCount: sectorLimitUpCount,
+        memberCount: sectorStocks.length,
         pctChange: sector.pctChange
       };
 
-      // 板块成分股 (粗粒度, 用 spots 名字匹配 sector.name)
-      const sectorStocks = spots.filter(s => s.industry === sector.name || s.boardName === sector.name);
-      const approxStocks = sectorStocks.length > 0 ? sectorStocks : _sectorStocksApprox(sector, spots);
-
-      // 真实成分股缺失时, 降级: 用板块中所有当日活跃股
-      const stockPool = approxStocks.length > 0
-        ? approxStocks
-        : spots.filter(s => s.changePct > 0).slice(0, 50);  // 取当日上涨前 50 只
-
-      // 排除板块龙头
-      const leaderCode = _findLeaderCode(sector.leaderStock, stockPool);
+      // P1-3: 真龙头 — sector.leaderStock 是 name, 用 nameToCode 表查 code (查不到就 null, 不剔除)
+      const leaderCode = (sector.leaderStock && nameToCode[sector.leaderStock]) || null;
       const nonLeader = stockPool.filter(s => s.code !== leaderCode && s.changePct < 9.5);
+      // leaderCode 缺失时不剔除 (板块名跟 stocks.industry 对不上时常见, 别误伤)
 
       // 鱼尾排除: 60 日涨幅 > 60% 一票否决 (复用 SHORT_CRITERIA.maxGain60Pct)
       const filtered = nonLeader.filter(s => {
@@ -183,25 +224,33 @@
       // 板块内 PB 中位 (用 spots 的 PB 字段估算, 字段缺失降级)
       const sectorPbList = filtered.map(s => s.pb).filter(p => typeof p === 'number' && p > 0);
       const sectorPbMedian = _median(sectorPbList) || 50;
+      _lastSectorPbMedian = sectorPbMedian;  // 给 _buildGatesSummary 用
 
-      // 替身候选: PB 最低的几只
-      const sortedByPb = filtered
+      // P1-2: 替身候选 — 按 PB 分位 (vs 板块中位) 排序, 选最低的 PROXY_PER_SECTOR
+      // 之前按原始 PB 排序, 银行股 (PB~0.5) 会霸榜; 按分位后才真是"板块内低估"
+      // 每只都算分位 + 中位 (用板块真实成员, 不是 filtered 之后的子集)
+      const sortedByPbPercentile = filtered
         .filter(s => typeof s.pb === 'number' && s.pb > 0)
-        .sort((a, b) => a.pb - b.pb)
+        .map(s => ({ stock: s, pbPercentile: _estimatePbPercentile(s.pb, sectorPbList) }))
+        .sort((a, b) => a.pbPercentile - b.pbPercentile)   // 分位低 = 在板块内相对低估
         .slice(0, PROXY_PER_SECTOR);
 
       // 阶段 4: 4 闸预检
-      for (const stock of sortedByPb) {
+      for (const cand of sortedByPbPercentile) {
         if (candidates.length >= targetCount) break;
 
-        const pbPercentile = _estimatePbPercentile(stock.pb, sectorPbList);
-        const hasQuantSeat = false;  // 数据缺失; P1.5 接 RiskMine / 龙虎榜数据补
+        const stock = cand.stock;
+        const pbPercentile = cand.pbPercentile;
+        // P1-4: hasQuantSeat 真没数据 (P1.5 才接 RiskMine / 龙虎榜), 不传该字段, preBuyCheck 看到 undefined 不 block
         const isSectorLeader = stock.code === leaderCode;
 
         const checkOpt = {
           symbol: stock.code,
+          // P3: 真封板率 — 从 sectorStocks 实算 (changePct >= 9.5 / 总数)
+          //   之前用 sectorScores[0].score/100 (首个板块的强度分, 跟本板块无关)
+          //   再之前用 upCount/(upCount+downCount) (上涨率, 跟涨停率是两个量)
           sector: {
-            limitUpRate_2d: sectorScores[0].score / 100,  // 强度分作封板率近似
+            limitUpRate_2d: sectorLimitUpRate,
             active2d: ss.score >= 60,
             name: sector.name
           },
@@ -209,7 +258,6 @@
             pbPercentile,
             sectorPbMedian,
             isSectorLeader,
-            hasQuantSeat,
             name: stock.name || stock.code
           }
         };
@@ -234,8 +282,7 @@
           pbPercentile,
           sectorPbMedian,
           isSectorLeader,
-          hasQuantSeat,
-          limitsUpRate_2d: checkOpt.sector.limitUpRate_2d,
+          limitUpRate_2d: checkOpt.sector.limitUpRate_2d,
           aiReason: _buildAiReason(stock, sector, pbPercentile, sectorPbMedian, r),
           confidence: _confidence(sector, stock, rpsMap[stock.code])
         });
@@ -247,7 +294,7 @@
 
     // 4 闸聚合 (供 ReverseWatch UI 状态灯展示, V13 P2 UI 重搭需求)
     // 来源: 阶段 1 板块强度 + 阶段 2 PB 分位 + 阶段 3 鱼尾 + 阶段 4 量化席位
-    const gates = _buildGatesSummary(sectorScores, sectorPbMedian, candidates);
+    const gates = _buildGatesSummary(sectorScores, _lastSectorPbMedian, candidates);
 
     return {
       candidates,
@@ -299,9 +346,10 @@
   }
 
   /**
-   * 4 闸聚合 (供 ReverseWatch UI 4 闸状态灯)
+   * 闸状态聚合 (供 ReverseWatch UI 状态灯)
+   * v0.2.1-P2: 量化席位闸暂时 skipped (P1.5 接 RiskMine / 龙虎榜数据, 这之前一直是 false), 实际只 3 闸有效
    * 真实数据来源: sectorScores (阶段1) + sectorPbMedian (阶段2) + candidates (阶段4 通过的)
-   * 阈值: 强度≥60 通过, PB分位≤中位-20 通过, 量化席位数根据 candidates 中 hasQuantSeat 计数
+   * 阈值: 强度≥60 通过, PB分位≤中位-20 通过, 龙头剔除
    * @returns {Array<{key, label, status, metric, note}>}
    */
   function _buildGatesSummary(sectorScores, lastPbMedian, candidates) {
@@ -316,9 +364,6 @@
     const pbSample = candidates.length > 0
       ? candidates[0]
       : null;
-    // 闸 3: 量化席位 (candidates 中 hasQuantSeat=true 的数量; ≤3 通过, >3 warn)
-    const quantCount = candidates.filter(c => c.hasQuantSeat === true).length;
-    const quantPass = quantCount <= 3;
     // 闸 4: 非龙头 (candidates 中无 isSectorLeader=true)
     const leaderCount = candidates.filter(c => c.isSectorLeader === true).length;
     const noLeader = leaderCount === 0;
@@ -338,12 +383,13 @@
         metric: pbSample ? pbSample.pbPercentile + '%ile' : '—',
         note: pbPass ? '≤ 中位 - 20pp' : 'PB 不够低'
       },
+      // v0.2.1-P2: 量化席位闸暂未接数据, UI 上显示"待接"
       {
         key: 'quant',
         label: '量化席位',
-        status: quantPass ? (quantCount > 0 ? 'warn' : 'pass') : 'fail',
-        metric: quantCount + '只',
-        note: quantCount === 0 ? '无量化监测' : (quantPass ? '≤ 3 可容忍' : '> 3 拥挤')
+        status: 'skipped',
+        metric: '—',
+        note: 'P1.5 待接 RiskMine / 龙虎榜'
       },
       {
         key: 'dragon',
@@ -368,7 +414,7 @@
   }
 
   window.Core.ScreenerReverse = {
-    VERSION: 'v0.2.0-P2',
+    VERSION: 'v0.2.1-P2',
     run,
     preCheckOne,
     /** 内部工具 (测试可调) */

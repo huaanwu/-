@@ -57,7 +57,7 @@
    * @param {object} opt
    * @param {string} opt.symbol - 6 位股票代码
    * @param {object} opt.sector - 板块信息
-   * @param {number} opt.sector.limitUpRate_2d - 板块近 2 日封板率 (0-1)
+   * @param {number} opt.sector.limitUpRate_2d - 板块今日封板率 (0-1, 通常 0.01-0.15)
    * @param {boolean} opt.sector.active2d - 是否连续 2 日封板率 ≥ 0.6
    * @param {string} opt.sector.name - 板块名 (调试用)
    * @param {object} opt.stock - 个股信息
@@ -87,8 +87,10 @@
       return { blocks: ['no-data'], warns: [], reason: '缺少板块或股票数据', ok: false, positionRatio: null };
     }
 
-    // block 1: 板块封板率连续 2 日 ≥ 0.6 (规则 1)
-    if (!sector.active2d || (typeof sector.limitUpRate_2d === 'number' && sector.limitUpRate_2d < 0.6)) {
+    // block 1: 板块封板率 ≥ 0.03 (规则 1, A股 sector 50 只左右, 1-2 只涨停 ≈ 2-4%, 3% 算活跃)
+    //   v0.2.1-P3 阈值修正: 之前 0.6 跟实际封板率量级不匹配 (60% 涨停率 = 30/50, 不可能)
+    //   上游 ScreenerReverse 现在用 sectorStocks 里 changePct>=9.5 占比实算
+    if (!sector.active2d || (typeof sector.limitUpRate_2d === 'number' && sector.limitUpRate_2d < 0.03)) {
       blocks.push('block-1-sector-weak');
     }
 
@@ -172,7 +174,7 @@
 
   // 暴露 (inline 大字面量, 兼容测试正则 window.Core.X = ... { )
   window.Core.ReverseDiscipline = {
-    VERSION: 'v0.1.0-P0.5',
+    VERSION: 'v0.2.0-P3',
     CAPS,
     BLOCK_LABELS,
     WARN_LABELS,

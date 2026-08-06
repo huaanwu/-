@@ -361,6 +361,94 @@
         change: typeof it.change === 'number' ? sign + it.change.toFixed(2) + '%' : '-',
         changeNum: it.change
       };
+    },
+
+    // ========== 扩展 #2: 持仓 + 候选池 批量预下载 K 线 ==========
+    // 走 market-warmup-pure.mjs 的 warmupHoldings (纯函数, 可测)
+    // opts: { force, includeHoldings, includeCandidates, onProgress }
+    async warmupHoldings(opts) {
+      if (!window.Core || !Core.MarketWarmupPure || !Core.MarketWarmupPure.warmupHoldings) {
+        console.warn('[Market] warmupHoldings 未加载 (market-warmup-pure.mjs)');
+        return null;
+      }
+      const deps = {
+        listHoldings: async () => {
+          if (Core.Holdings && typeof Core.Holdings.list === 'function') {
+            return await Core.Holdings.list();
+          }
+          return [];
+        },
+        listCandidates: async () => {
+          // 候选池走 reverse-watch 的 REVERSE_POOL, 由 app 注入
+          if (window.__REVERSE_POOL_CODES__ && Array.isArray(window.__REVERSE_POOL_CODES__)) {
+            return window.__REVERSE_POOL_CODES__;
+          }
+          return [];
+        },
+        fetchKLine: async (code, start, end, adjust) => {
+          if (Core.Data && typeof Core.Data.getStockKLine === 'function') {
+            return await Core.Data.getStockKLine(code, 'daily', start, end, adjust);
+          }
+          return [];
+        },
+        cacheGet: async (key) => {
+          if (Core.Storage && typeof Core.Storage.cacheGet === 'function') {
+            return await Core.Storage.cacheGet(key);
+          }
+          return null;
+        },
+        cacheSet: async (key, val) => {
+          if (Core.Storage && typeof Core.Storage.cacheSet === 'function') {
+            return await Core.Storage.cacheSet(key, val);
+          }
+        }
+      };
+      return await Core.MarketWarmupPure.warmupHoldings({ deps, opts: opts || {} });
+    },
+
+    // 注册盘前/盘后自动预下载定时器
+    // opts: { slots, runOnStart, now }
+    // 返回: { timers, nextRun, nextMode, cancel }
+    scheduleWarmup(opts) {
+      if (!window.Core || !Core.MarketWarmupPure || !Core.MarketWarmupPure.scheduleWarmup) {
+        console.warn('[Market] scheduleWarmup 未加载 (market-warmup-pure.mjs)');
+        return { timers: [], nextRun: null, nextMode: null, cancel: () => {} };
+      }
+      const self = this;
+      const deps = {
+        // 拉 wide+style — 复用 Market 自身的 get (走 group='wide' / 'style')
+        warmup: async (o) => self.warmup(o || {}),
+        listHoldings: async () => {
+          if (Core.Holdings && typeof Core.Holdings.list === 'function') {
+            return await Core.Holdings.list();
+          }
+          return [];
+        },
+        listCandidates: async () => {
+          if (window.__REVERSE_POOL_CODES__ && Array.isArray(window.__REVERSE_POOL_CODES__)) {
+            return window.__REVERSE_POOL_CODES__;
+          }
+          return [];
+        },
+        fetchKLine: async (code, start, end, adjust) => {
+          if (Core.Data && typeof Core.Data.getStockKLine === 'function') {
+            return await Core.Data.getStockKLine(code, 'daily', start, end, adjust);
+          }
+          return [];
+        },
+        cacheGet: async (key) => {
+          if (Core.Storage && typeof Core.Storage.cacheGet === 'function') {
+            return await Core.Storage.cacheGet(key);
+          }
+          return null;
+        },
+        cacheSet: async (key, val) => {
+          if (Core.Storage && typeof Core.Storage.cacheSet === 'function') {
+            return await Core.Storage.cacheSet(key, val);
+          }
+        }
+      };
+      return Core.MarketWarmupPure.scheduleWarmup({ deps, opts: opts || {} });
     }
   };
 
