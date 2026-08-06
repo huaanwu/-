@@ -273,7 +273,9 @@ function _spawnAktools(py) {
   const args = [...(py.preArgs || []), startScript, host, String(port)];
   _aktoolsChild = spawn(py.cmd, args, {
     stdio: ['ignore', 'pipe', 'pipe'],
-    windowsHide: true
+    windowsHide: true,
+    // ?v=dev-proxy-utf8-1: 强制 UTF-8, Windows 控制台 cp936 不会乱码
+    env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' }
   });
   const tag = `[aktools pid=${_aktoolsChild.pid}]`;
   _aktoolsChild.stdout.on('data', (c) => process.stdout.write(`${tag} ${c}`));
@@ -406,7 +408,9 @@ function _spawnDatasources(py) {
   }
   _datasourcesChild = spawn(cmd, args, {
     stdio: ['ignore', 'pipe', 'pipe'],
-    windowsHide: true
+    windowsHide: true,
+    // ?v=dev-proxy-utf8-1: 强制子进程走 UTF-8, Windows 控制台 cp936 不会乱码
+    env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' }
   });
   const tag = `[datasources pid=${_datasourcesChild.pid}]`;
   _datasourcesChild.stdout.on('data', (c) => process.stdout.write(`${tag} ${c}`));

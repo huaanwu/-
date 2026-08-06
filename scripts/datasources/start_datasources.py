@@ -12,6 +12,15 @@ import os
 import sys
 import logging
 
+# ?v=datasources-utf8-1: Windows 控制台 cp936 默认会把 UTF-8 中文当 GBK 解, 看到 `??` / `δ��`
+#   reconfigure stdout/stderr → UTF-8, logger 也强制 UTF-8
+#   dev-proxy 拉起 sidecar 时再补 PYTHONIOENCODING=utf-8 双保险
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass  # Python < 3.7 或 IDE 重定向场景, 静默降级
+
 # 跟 start_aktools.py 一样, 把 patched aktools 塞 sys.path 最前面
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
@@ -28,12 +37,30 @@ try:
 except ImportError as e:
     print(f"[datasources] ⚠️  aktools 加载失败: {e}", file=sys.stderr)
 
-# 配 logging
+# 配 logging — StreamHandler 强制 UTF-8 避免 Windows 控制台 GBK 乱码
+class _Utf8StreamHandler(logging.StreamHandler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            stream = self.stream
+            if hasattr(stream, "buffer") and getattr(stream, "encoding", None) and stream.encoding.lower().replace("-", "") != "utf8":
+                stream.buffer.write(msg.encode("utf-8", errors="replace"))
+                stream.buffer.write(self.terminator.encode("utf-8"))
+                stream.buffer.flush()
+            else:
+                super().emit(record)
+        except Exception:
+            self.handleError(record)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     stream=sys.stderr,
 )
+# 替换 basicConfig 装的 handler, 强制走 UTF-8
+for _h in logging.getLogger().handlers:
+    logging.getLogger().removeHandler(_h)
+logging.getLogger().addHandler(_Utf8StreamHandler(logging.sys.stderr))
 log = logging.getLogger("datasources")
 
 from fastapi import FastAPI, HTTPException, Query
