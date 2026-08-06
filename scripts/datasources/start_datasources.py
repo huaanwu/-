@@ -99,6 +99,33 @@ def _bs_code_for(code: str) -> str:
     return "sz." + code
 
 
+def _bs_date(d: str) -> str:
+    """Baostock 日期必须是 YYYY-MM-DD (带连字符)
+    上游可能传 YYYYMMDD (紧凑) — normalize 一下, 避免外部脚本传错
+    无效格式 → 抛 400
+    """
+    import re
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", d):
+        return d
+    m = re.match(r"^(\d{4})(\d{2})(\d{2})$", d)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    raise HTTPException(400, f"日期格式错误: {d!r} (要 YYYY-MM-DD 或 YYYYMMDD)")
+
+
+def _ts_date(d: str) -> str:
+    """Tushare 日期: YYYYMMDD (无连字符)
+    上游可能传 YYYY-MM-DD — normalize
+    """
+    import re
+    if re.match(r"^\d{8}$", d):
+        return d
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", d)
+    if m:
+        return f"{m.group(1)}{m.group(2)}{m.group(3)}"
+    raise HTTPException(400, f"日期格式错误: {d!r} (要 YYYY-MM-DD 或 YYYYMMDD)")
+
+
 
 # ===== 健康检查: 探测三源状态 =====
 @app.get("/health")
@@ -137,15 +164,19 @@ except ImportError as e:
 @app.get("/tushare/daily")
 async def tushare_daily(
     code: str = Query(..., description="6 位股票代码, 例 000001"),
-    start_date: str = Query(..., description="YYYYMMDD"),
-    end_date: str = Query(..., description="YYYYMMDD"),
+    start_date: str = Query(..., description="YYYYMMDD 或 YYYY-MM-DD (自动 normalize)"),
+    end_date: str = Query(..., description="YYYYMMDD 或 YYYY-MM-DD (自动 normalize)"),
     adj: str = Query("qfq", description="qfq/hfq/None"),
 ):
     """日线行情 (Tushare Pro daily + pro_bar)
     返回: [{date, code, open, close, high, low, volume, amount, ...}]
+    ?v=datasources-date1: 兼容 YYYYMMDD 和 YYYY-MM-DD
     """
     if not _pro:
         raise HTTPException(503, "Tushare 未启用 (TUSHARE_TOKEN 未配)")
+    # 统一日期格式 (tushare 要 YYYYMMDD)
+    start_date = _ts_date(start_date)
+    end_date = _ts_date(end_date)
     # 自动补 .SH / .SZ 后缀
     ts_code = _ts_code_for(code)
     try:
@@ -335,8 +366,8 @@ def _bs_session():
 @app.get("/baostock/daily")
 def baostock_daily(
     code: str = Query(..., description="6 位股票代码, 例 000001"),
-    start_date: str = Query(..., description="YYYYMMDD"),
-    end_date: str = Query(..., description="YYYYMMDD"),
+    start_date: str = Query(..., description="YYYY-MM-DD 或 YYYYMMDD (自动 normalize)"),
+    end_date: str = Query(..., description="YYYY-MM-DD 或 YYYYMMDD (自动 normalize)"),
     adj: str = Query("3", description="1=后复权 2=前复权 3=不复权"),
 ):
     """日线 (Baostock 优势: 批量遍历快 + 无 token + 20+ 年历史)
@@ -344,7 +375,11 @@ def baostock_daily(
 
     ?v=datasources-baostock2: 用 sync def (不是 async def), 让 fastapi 走 threadpool
        之前用 async def, baostock 同步阻塞 + asyncio event loop 冲突, query 返 None
+    ?v=datasources-date1: 兼容 YYYYMMDD 和 YYYY-MM-DD (上游 dev-proxy/e2e 两种都传)
     """
+    # 统一日期格式 (baostock 严格要 YYYY-MM-DD)
+    start_date = _bs_date(start_date)
+    end_date = _bs_date(end_date)
     # ?v=datasources-baostock7: socket 半死自愈 — 一次 retry
     #   第一次失败 → 标脏 + 重试 (下次 _bs_session 入口会重 login)
     #   第二次失败 → 503 (真的 baostock 服务挂了)

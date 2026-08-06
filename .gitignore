@@ -55,6 +55,14 @@ yjyg_*.json
 scripts/aktools-patched/**/__pycache__/
 scripts/aktools-patched/**/__pycache__/**
 
+# Python datasources sidecar cache
+scripts/datasources/**/__pycache__/
+scripts/datasources/**/__pycache__/**
+
+# Python test cache
+test/__pycache__/
+test/**/__pycache__/
+
 # reverse-watch daemon 心跳文件 (每 30s 重写, 进 git 会污染每次 diff)
 #   工作树留着, daemon 启动后会重新生成; 新克隆用户手动跑一次 daemon 即可
 reverse-watch/_rw_daemon_state.json
